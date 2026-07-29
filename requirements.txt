@@ -1,0 +1,9 @@
+torch
+numpy
+pandas
+requests
+aiohttp
+websockets
+websocket-client
+scikit-learn
+python-dotenv

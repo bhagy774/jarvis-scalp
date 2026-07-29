@@ -1,0 +1,14 @@
+# Ignore secret environment variables
+.env
+
+# Ignore python virtual env and cache
+jenv/
+__pycache__/
+*.pyc
+
+# Ignore logs and temp data
+logs/
+data/
+*.log
+*.txt
+!requirements.txt
