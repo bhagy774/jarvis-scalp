@@ -121,6 +121,8 @@ import tempfile
 from pathlib import Path
 from collections import deque, defaultdict
 
+from typing import Dict, List, Tuple, Any, Optional, Union
+
 # Import Ollama Local AI Integration
 try:
     from ollama_integration import call_ollama
