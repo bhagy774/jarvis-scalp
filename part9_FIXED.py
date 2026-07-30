@@ -117,6 +117,7 @@ from pathlib import Path
 import gc
 import json
 import random
+from typing import Dict, List, Tuple, Any, Optional, Union
 
 # Import Ollama Local AI Integration
 try:
