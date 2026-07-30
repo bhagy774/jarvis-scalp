@@ -25,6 +25,40 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "deepseek-r1:14b")  # 24GB VRAM op
 OLLAMA_ENABLED = False
 
 
+def preload_committee_models():
+    """
+    Pre-load all committee models into VRAM with keep_alive=-1 (indefinite)
+    so they are instantly available when trading.
+    """
+    if not OLLAMA_ENABLED:
+        return
+        
+    models = [
+        os.environ.get("MODEL_ANALYST", "deepseek-r1:14b"),
+        os.environ.get("MODEL_VALIDATOR", "qwen2.5:14b"),
+        os.environ.get("MODEL_RISK", "mistral-nemo:12b")
+    ]
+    
+    # Unique models
+    models = list(set(models))
+    
+    logger.info(f"Ollama pre-loading committee models to VRAM: {models}")
+    for model in models:
+        try:
+            logger.info(f"Pre-loading {model}...")
+            resp = requests.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json={"model": model, "prompt": "", "keep_alive": -1},
+                timeout=60
+            )
+            if resp.status_code == 200:
+                logger.info(f"Successfully warm-loaded {model} into VRAM")
+            else:
+                logger.warning(f"Ollama failed to warm-load {model}: status {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Error warm-loading {model}: {e}")
+
+
 def _init_ollama():
     """Initialize and test the Ollama connection"""
     global OLLAMA_ENABLED
@@ -33,6 +67,9 @@ def _init_ollama():
         if resp.status_code == 200:
             OLLAMA_ENABLED = True
             logger.info(f"Ollama Local AI initialized ({OLLAMA_MODEL}) on {OLLAMA_BASE_URL}")
+            # Start pre-loading in a background thread to prevent blocking main startup
+            import threading
+            threading.Thread(target=preload_committee_models, daemon=True).start()
         else:
             OLLAMA_ENABLED = False
             logger.warning(f"Ollama returned status code: {resp.status_code}")
