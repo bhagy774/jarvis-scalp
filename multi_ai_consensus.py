@@ -10,10 +10,10 @@ from typing import Dict, Any
 
 logger = logging.getLogger("AIConsensus")
 
-# 3 Board Members - configurable from .env
-MODEL_ANALYST   = os.environ.get("MODEL_ANALYST",   "deepseek-r1:70b")
-MODEL_VALIDATOR = os.environ.get("MODEL_VALIDATOR", "llama3.1:70b")
-MODEL_RISK      = os.environ.get("MODEL_RISK",      "qwen2.5:32b")
+# 3 Board Members - configurable from .env (optimized for 24GB VRAM)
+MODEL_ANALYST   = os.environ.get("MODEL_ANALYST",   "deepseek-r1:14b")
+MODEL_VALIDATOR = os.environ.get("MODEL_VALIDATOR", "qwen2.5:14b")
+MODEL_RISK      = os.environ.get("MODEL_RISK",      "mistral-nemo:12b")
 
 
 def _call_model(prompt: str, model: str, timeout: int = 90) -> str:

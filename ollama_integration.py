@@ -21,7 +21,7 @@ except ImportError:
     pass  # dotenv optional
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "phi3.5:3.8b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "deepseek-r1:14b")  # 24GB VRAM optimized
 OLLAMA_ENABLED = False
 
 
