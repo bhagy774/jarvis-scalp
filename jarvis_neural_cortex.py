@@ -1,4 +1,4 @@
-﻿# jarvis_neural_cortex.py
+# jarvis_neural_cortex.py
 # Jarvis Neural Cortex - Continuous AI Brain with Memory
 # Replaces: ai_chain_brain.py + _get_deepseek_validation()
 # Uses: Ollama /api/chat - rolling 20-message history for live market memory
@@ -14,7 +14,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL", "phi3.5:3.8b")
+OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL", "deepseek-r1:14b")
 
 
 class JarvisNeuralCortex:
@@ -188,7 +188,7 @@ class JarvisNeuralCortex:
                 f"{self.ollama_url}/api/chat",
                 json={"model": self.model, "messages": messages, "stream": False,
                       "format": "json", "options": {"temperature": 0.1}},
-                timeout=30
+                timeout=90  # 14b models need up to 90s
             )
             if resp.status_code == 200:
                 return resp.json().get("message", {}).get("content", "").strip()
@@ -198,7 +198,7 @@ class JarvisNeuralCortex:
             logger.warning("[CORTEX] Ollama not reachable -- is GPU server running?")
             return None
         except requests.exceptions.Timeout:
-            logger.warning("[CORTEX] Ollama timeout (>30s)")
+            logger.warning("[CORTEX] Ollama timeout (>90s)")
             return None
         except Exception as e:
             logger.error(f"[CORTEX] Chat call error: {e}")
@@ -268,7 +268,7 @@ class JarvisNeuralCortex:
     def analyze_holistic_context(self, prompt: str, system_voice: str = "Assistant"):
         try:
             resp = requests.post(f"{self.ollama_url}/api/generate",
-                json={"model": self.model, "prompt": prompt, "stream": False, "format": "json"}, timeout=30)
+                json={"model": self.model, "prompt": prompt, "stream": False, "format": "json"}, timeout=90)
             if resp.status_code == 200:
                 return resp.json().get("response", "").strip(), None
             return "", f"HTTP {resp.status_code}"
