@@ -48,7 +48,7 @@ try:
     OLLAMA_INTEGRATION_AVAILABLE = True
 except ImportError:
     OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
+    def call_ollama(prompt, model=None, timeout=60):
         return None, "ollama_integration module not found"
 
 # FIX: Set EXTERNAL_ENGINES_AVAILABLE BEFORE imports to avoid circular dependency
@@ -1893,7 +1893,7 @@ Follow the tag with a 1-sentence options analyst insight.
         self.last_ollama_time = now
         try:
             prompt = self._generate_ollama_options_prompt(telemetry, current_price)
-            response, err = call_ollama(prompt, timeout=10)
+            response, err = call_ollama(prompt, timeout=60)
             if response and not err:
                 raw_text = response.strip()
                 if "[WHALE_BULLISH]" in raw_text.upper() or "WHALE_BULLISH" in raw_text.upper():
@@ -4096,7 +4096,7 @@ Follow the tag with a 1-sentence CEO executive directive.
         """Get AI validation for trade setup using local Supreme Commander AI (CEO) via Ollama"""
         try:
             prompt = self._generate_ollama_ceo_prompt(score, detailed_scores, telemetry)
-            response, err = call_ollama(prompt, timeout=10)
+            response, err = call_ollama(prompt, timeout=60)
             
             if response and not err:
                 raw_text = response.strip()
