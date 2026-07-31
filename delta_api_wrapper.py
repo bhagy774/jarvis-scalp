@@ -202,10 +202,10 @@ class DeltaExchangeData:
         seconds = multipliers.get(resolution, 300)
         start_time = end_time - (limit * seconds)
         
-        # FIX: Delta's BTCUSDT market has no history volume. Use its live Spot Index instead!
+        # Use BTCUSDT futures market (same as what traders see on Delta chart)
         query_sym = symbol
         if query_sym in ("BTCUSD", "BTCUSDT", "BTC_USDT"):
-            query_sym = ".DEXBTUSDT"
+            query_sym = "BTCUSDT"
             
         params = {
             "symbol": query_sym,
