@@ -187,8 +187,8 @@ class JarvisNeuralCortex:
             resp = requests.post(
                 f"{self.ollama_url}/api/chat",
                 json={"model": self.model, "messages": messages, "stream": False,
-                      "format": "json", "options": {"temperature": 0.1}},
-                timeout=90  # 14b models need up to 90s
+                      "options": {"temperature": 0.1}},
+                timeout=120  # increased to 120s for 14b
             )
             if resp.status_code == 200:
                 return resp.json().get("message", {}).get("content", "").strip()
