@@ -165,15 +165,17 @@ class DeltaExchangeData:
                 res = self._request("GET", "/v2/tickers", {"symbol": sym})
                 if res["success"]:
                     tickers = res["data"].get("result", [])
-                    # FIX BUG2: Exact match first, then fallback to any BTC perp/spot
+                    # mark_price = real-time price. close = stale (prev day close)
+                    # Priority: mark_price → spot_price → close
                     for t in tickers:
                         if t.get("symbol") == sym:
-                            price = float(t.get("close", 0) or t.get("mark_price", 0) or t.get("spot_price", 0))
+                            price = float(t.get("mark_price", 0) or t.get("spot_price", 0) or t.get("close", 0))
                             if price > 0:
+                                logger.debug(f"[DELTA PRICE] {sym} = ${price:,.2f} (mark)")
                                 return price
-                    # If exact match not found, try any ticker that has a usable price
+                    # fallback: any BTC ticker
                     for t in tickers:
-                        price = float(t.get("close", 0) or t.get("mark_price", 0) or t.get("spot_price", 0))
+                        price = float(t.get("mark_price", 0) or t.get("spot_price", 0) or t.get("close", 0))
                         if price > 0:
                             return price
             except Exception as e:
@@ -419,7 +421,61 @@ class DeltaExchangeData:
         }
 
     # ==========================================
-    # 4. ORDER EXECUTION & RISK MANAGEMENT (PHASE 3)
+    # 4. OPTIONS EXECUTION & MANAGEMENT (NEW)
+    # ==========================================
+
+    def get_nearest_expiries(self, underlying: str = "BTC") -> List[str]:
+        """Get sorted list of available option expiry dates"""
+        chain = self.get_options_chain(underlying)
+        expiries = set()
+        for opt in chain.get("calls", []) + chain.get("puts", []):
+            exp = opt.get("expiry")
+            if exp and exp != "PERPETUAL":
+                expiries.add(exp)
+        return sorted(list(expiries))
+
+    def get_option_positions(self) -> List[Dict]:
+        """Fetch all currently open option positions"""
+        res = self._request("GET", "/v2/positions", authorized=True)
+        option_positions = []
+        if res["success"]:
+            for pos in res["data"].get("result", []):
+                sym = pos.get("symbol", "")
+                if "-C" in sym or "-P" in sym:  # Rough heuristic for option symbols
+                    option_positions.append(pos)
+        return option_positions
+
+    def place_option_order(self, option_symbol: str, side: str, size: int) -> Dict:
+        """Place an option order (wrapper around place_order)"""
+        # Note: Delta options often require limit orders or have low liquidity
+        # For scalp hedging, we try market first
+        return self.place_order(option_symbol, side, size, order_type="market")
+
+    def get_option_by_criteria(self, underlying: str, option_type: str, target_strike: float, expiry_preference: str = "nearest") -> Optional[Dict]:
+        """Find best matching option contract"""
+        chain = self.get_options_chain(underlying)
+        key = "puts" if option_type.upper() == "PUT" else "calls"
+        options = chain.get(key, [])
+        
+        if not options:
+            return None
+            
+        # Filter by expiry if needed
+        if expiry_preference != "nearest":
+            options = [o for o in options if o.get("expiry") == expiry_preference]
+            
+        if not options:
+            return None
+            
+        # Find exact strike or closest
+        exact = next((o for o in options if o.get("strike") == target_strike), None)
+        if exact:
+            return exact
+            
+        return min(options, key=lambda x: abs(x.get("strike", 0) - target_strike))
+
+    # ==========================================
+    # 5. ORDER EXECUTION & RISK MANAGEMENT (PHASE 3)
     # ==========================================
 
     def get_wallet_balance(self) -> float:
