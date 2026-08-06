@@ -130,7 +130,41 @@ class BinanceData:
         return []
 
     # ─────────────────────────────────────────────
-    # 3. MULTI-TIMEFRAME FETCH (MTF)
+    # 3. BID / ASK PRICE (for Part 12)
+    # ─────────────────────────────────────────────
+
+    def get_bid_ask(self, symbol: str = "BTCUSDT") -> dict:
+        """
+        Fetch real-time best Bid and Ask price from Binance.
+        Uses /api/v3/bookTicker — no API key needed.
+        Returns: { "bid": float, "ask": float, "spread": float }
+        Used by: Part 12 (GPUOrderExecutionEngine)
+        """
+        sym = symbol.upper().replace("USD", "USDT") if "USDT" not in symbol.upper() else symbol.upper()
+        try:
+            resp = self.session.get(
+                f"{BINANCE_BASE_URL}/api/v3/bookTicker",
+                params={"symbol": sym},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                bid = float(data.get("bidPrice", 0))
+                ask = float(data.get("askPrice", 0))
+                spread = round(ask - bid, 2)
+                logger.debug(f"[BINANCE BID/ASK] Bid: ${bid:,.2f} | Ask: ${ask:,.2f} | Spread: ${spread}")
+                return {"bid": bid, "ask": ask, "spread": spread}
+            else:
+                logger.warning(f"[BINANCE BID/ASK] HTTP {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"[BINANCE BID/ASK] Error: {e}")
+
+        # Fallback: use live price as both bid and ask
+        price = self.get_live_price(symbol)
+        return {"bid": price, "ask": price, "spread": 0.0}
+
+    # ─────────────────────────────────────────────
+    # 4. MULTI-TIMEFRAME FETCH (MTF)
     # ─────────────────────────────────────────────
 
     def fetch_mtf_candles(

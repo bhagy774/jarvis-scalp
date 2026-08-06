@@ -191,11 +191,33 @@ class DeltaExchangeData:
         return 0.0
 
     def get_order_book(self, symbol: str = "BTCUSD") -> Dict:
-        """Get Level 2 Order Book (Bid/Ask)"""
+        """Get Bid/Ask — uses Binance bookTicker (real-time), falls back to Delta L2."""
+        # ── PRIMARY: Binance bookTicker (real-time, no API key) ──
+        if self._binance:
+            try:
+                ba = self._binance.get_bid_ask(symbol)
+                if ba["bid"] > 0:
+                    return {
+                        "buy": [{"price": str(ba["bid"]), "size": "1"}],
+                        "sell": [{"price": str(ba["ask"]), "size": "1"}],
+                        "bid": ba["bid"],
+                        "ask": ba["ask"],
+                        "spread": ba["spread"]
+                    }
+            except Exception as e:
+                logger.warning(f"[BINANCE BID/ASK] Failed: {e}")
+
+        # ── FALLBACK: Delta L2 order book ──
         res = self._request("GET", f"/v2/l2orderbook/{symbol}")
         if res["success"]:
             return res["data"].get("result", {})
         return {}
+
+    def get_bid_ask(self, symbol: str = "BTCUSDT") -> Dict:
+        """Convenience: Returns {bid, ask, spread} from Binance bookTicker."""
+        if self._binance:
+            return self._binance.get_bid_ask(symbol)
+        return {"bid": self.get_live_price(symbol), "ask": self.get_live_price(symbol), "spread": 0.0}
 
     # ==========================================
     # 2. HISTORICAL DATA (Replaces Binance)
