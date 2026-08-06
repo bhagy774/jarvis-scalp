@@ -65,6 +65,15 @@ class DeltaExchangeData:
         })
         self._cache = {}
 
+        # ── HYBRID: Use Binance for price+candles (more accurate, no API key needed) ──
+        try:
+            from binance_data import BinanceData
+            self._binance = BinanceData()
+            logger.info("[HYBRID] ✅ Binance data source loaded for price + candles")
+        except ImportError:
+            self._binance = None
+            logger.warning("[HYBRID] ⚠️  binance_data.py not found, using Delta for everything")
+
     def _generate_signature(self, method: str, path: str, payload: str = "") -> Dict[str, str]:
         """Generate HMAC SHA256 Signature for authenticated endpoints"""
         timestamp = str(int(time.time()))
@@ -154,35 +163,31 @@ class DeltaExchangeData:
         return self._request("GET", "/v2/wallet/balances", authorized=True)
 
     def get_live_price(self, symbol: str = "BTCUSDT") -> float:
-        """Get current Last Traded Price (LTP) for a symbol."""
-        # Try multiple symbol variants for reliability
-        symbols_to_try = [symbol]
-        if symbol == "BTCUSD" or symbol == "BTCUSDT":
-            symbols_to_try = ["BTCUSDT", "BTCUSD"]
+        """Get real-time BTC price — uses Binance (most accurate), falls back to Delta."""
+        # ── PRIMARY: Binance real-time price (no API key, most accurate) ──
+        if self._binance:
+            try:
+                price = self._binance.get_live_price(symbol)
+                if price > 100:
+                    return price
+            except Exception as e:
+                logger.warning(f"[BINANCE PRICE] Failed: {e}")
 
+        # ── FALLBACK: Delta Exchange mark_price ──
+        symbols_to_try = ["BTCUSDT", "BTCUSD"] if "BTC" in symbol.upper() else [symbol]
         for sym in symbols_to_try:
             try:
                 res = self._request("GET", "/v2/tickers", {"symbol": sym})
                 if res["success"]:
-                    tickers = res["data"].get("result", [])
-                    # mark_price = real-time price. close = stale (prev day close)
-                    # Priority: mark_price → spot_price → close
-                    for t in tickers:
+                    for t in res["data"].get("result", []):
                         if t.get("symbol") == sym:
                             price = float(t.get("mark_price", 0) or t.get("spot_price", 0) or t.get("close", 0))
                             if price > 0:
-                                logger.debug(f"[DELTA PRICE] {sym} = ${price:,.2f} (mark)")
                                 return price
-                    # fallback: any BTC ticker
-                    for t in tickers:
-                        price = float(t.get("mark_price", 0) or t.get("spot_price", 0) or t.get("close", 0))
-                        if price > 0:
-                            return price
             except Exception as e:
                 logger.warning(f"[DELTA PRICE] Failed for {sym}: {e}")
-                continue
 
-        logger.error("[DELTA PRICE] Could not fetch live price for any symbol variant")
+        logger.error("[DELTA PRICE] Could not fetch live price")
         return 0.0
 
     def get_order_book(self, symbol: str = "BTCUSD") -> Dict:
@@ -197,24 +202,25 @@ class DeltaExchangeData:
     # ==========================================
 
     def get_historical_candles(self, symbol: str = "BTCUSD", resolution: str = "5m", limit: int = 100) -> List[Dict]:
-        """Fetch historical OHLCV data."""
+        """Fetch OHLCV candles — uses Binance (primary, high volume), falls back to Delta."""
+        # ── PRIMARY: Binance candles (high volume, accurate, no API key) ──
+        if self._binance:
+            try:
+                candles = self._binance.get_historical_candles(symbol, resolution, limit)
+                if candles and len(candles) > 10:
+                    return candles
+            except Exception as e:
+                logger.warning(f"[BINANCE CANDLES] Failed: {e}")
+
+        # ── FALLBACK: Delta Exchange candles ──
         end_time = int(time.time())
-        # Calculate start time based on resolution (approximate)
         multipliers = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
         seconds = multipliers.get(resolution, 300)
         start_time = end_time - (limit * seconds)
-        
-        # Use BTCUSDT futures market (same as what traders see on Delta chart)
         query_sym = symbol
         if query_sym in ("BTCUSD", "BTCUSDT", "BTC_USDT"):
             query_sym = "BTCUSDT"
-            
-        params = {
-            "symbol": query_sym,
-            "resolution": resolution,
-            "start": start_time,
-            "end": end_time
-        }
+        params = {"symbol": query_sym, "resolution": resolution, "start": start_time, "end": end_time}
         res = self._request("GET", "/v2/history/candles", params)
         if res["success"]:
             results = res["data"].get("result", [])
