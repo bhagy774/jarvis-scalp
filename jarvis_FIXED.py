@@ -889,6 +889,21 @@ class LiveTradingEngine:
         self.paper_peak_balance = self.paper_balance
         self._load_paper_state()
         
+        # ═══ OPTIONS HEDGED SCALP ENGINE ═══
+        try:
+            from ai_hedge_advisor import AIHedgeAdvisor
+            from options_hedged_scalp import OptionsHedgedScalpEngine
+            self.ai_hedge_advisor = AIHedgeAdvisor()
+            self.hedged_engine = OptionsHedgedScalpEngine(
+                delta_client=self.jarvis.delta_data,
+                ai_hedge_advisor=self.ai_hedge_advisor,
+                ai_roundtable=None
+            )
+            logger.info("✅ Options Hedged Scalp Engine initialized.")
+        except ImportError as e:
+            logger.error(f"Failed to load Hedged Engine: {e}")
+            self.hedged_engine = None
+        
     def _print_professional_signal(self, part_details):
         """Print signals in professional format"""
         self.candle_count += 1
@@ -928,6 +943,21 @@ class LiveTradingEngine:
             'close_reason': None,
         }
         self.paper_open_trades.append(trade)
+
+        # ── TELEGRAM: Notify trade opened ──
+        try:
+            from telegram_notifier import send_trading_signal
+            send_trading_signal({
+                'direction': direction,
+                'score': confidence,
+                'entry_price': entry_price,
+                'tp1': tp1,
+                'sl': sl,
+                'expiry': expiry_name,
+            })
+        except Exception:
+            pass
+
         return trade
     
     def _check_paper_trades(self, current_price):
@@ -1020,6 +1050,19 @@ class LiveTradingEngine:
             print(f"  Result: {t['result']} | {t['close_reason']}")
             print(f"  P&L: {pnl_str} | 💰 Balance: ${self.paper_balance:,.2f}")
             print(f"{'═' * 60}")
+
+            # ── TELEGRAM: Notify trade closed ──
+            try:
+                from telegram_notifier import send_message
+                send_message(
+                    f"{emoji} JARVIS TRADE CLOSED\n"
+                    f"{t['direction']} #{t['id']}\n"
+                    f"Entry: ${t['entry_price']:,.2f} → Exit: ${t['exit_price']:,.2f}\n"
+                    f"Result: {t['result']} | P&L: {pnl_str}\n"
+                    f"Balance: ${self.paper_balance:,.2f}"
+                )
+            except Exception:
+                pass
         
         if newly_closed:
             self._save_paper_state()
@@ -1035,42 +1078,104 @@ class LiveTradingEngine:
         except (ValueError, IndexError):
             confidence = 0
         
-        entry_price = signal.get('entry_price', current_price)
+        raw_entry = signal.get('entry_price', current_price)
         tp1 = signal.get('take_profit_1')
         tp2 = signal.get('take_profit_2')
-        sl = signal.get('stop_loss')
+        sl  = signal.get('stop_loss')
         expiry = signal.get('recommended_expiry', '3M')
         thoughts = result.get('intelligence_board', [])
         market_ctx = result.get('market_context', {})
-        
+
+        # ── SMART ENTRY: Compute optimal limit entry based on ATR ──
+        entry_price, entry_type = self._calculate_smart_entry(direction, current_price, result)
+
         now = datetime.now().strftime('%H:%M:%S')
-        
+
         print(f"\n{'─' * 60}")
         print(f"  ⏰ [{now}] LIVE SIGNAL | BTC: ${current_price:,.2f}" if current_price else f"  ⏰ [{now}] LIVE SIGNAL")
         print(f"{'─' * 60}")
-        
+
         if direction == 'NO_TRADE':
             reason = result.get('no_trade_reason', 'No clear setup')
             print(f"  ⏸️  Signal: NO TRADE | Confidence: {confidence}%")
             print(f"  💭 Reason: {reason}")
-            return direction, confidence, entry_price, tp1, tp2, sl, expiry
-        
+            return direction, confidence, raw_entry, tp1, tp2, sl, expiry
+
         emoji = "🟢" if direction == "CALL" else "🔴"
         print(f"  {emoji} Signal: {direction} | Confidence: {confidence}%")
-        print(f"  💰 Entry: ${entry_price:,.2f}" if entry_price else "")
-        if tp1: print(f"  🎯 TP1: ${tp1:,.2f}")
-        if tp2: print(f"  🎯 TP2: ${tp2:,.2f}")
-        if sl:  print(f"  🛑 SL:  ${sl:,.2f}")
+        print(f"  💰 Market:  ${current_price:,.2f}")
+        print(f"  🎯 Entry:   ${entry_price:,.2f} ({entry_type})")
+        if tp1: print(f"  ✅ TP1: ${tp1:,.2f}")
+        if tp2: print(f"  ✅ TP2: ${tp2:,.2f}")
+        if sl:  print(f"  ❌ SL:  ${sl:,.2f}")
         print(f"  ⏱️  Expiry: {expiry} | 📈 Vol: {market_ctx.get('volatility', 'N/A')}")
-        
+
         if thoughts:
             print(f"  🧠 AI:")
             for t in thoughts[:3]:
                 print(f"     → {str(t)[:75]}")
-        
+
         return direction, confidence, entry_price, tp1, tp2, sl, expiry
     
+    def _calculate_smart_entry(self, direction: str, current_price: float, result: dict):
+        """
+        Calculate optimal entry price using ATR-based pullback logic.
+        Returns: (entry_price, entry_type_label)
+
+        Rules:
+          CALL: Market price is good for strong momentum candles.
+                For weak signals, wait for a small pullback (0.1-0.25% below current)
+          PUT:  Wait for a small bounce (0.1-0.25% above current)
+
+        This improves R:R by getting better fill prices.
+        """
+        if not direction or direction == 'NO_TRADE' or not current_price:
+            return current_price, 'MARKET'
+
+        try:
+            signal = result.get('trade_signal', {})
+            market_ctx = result.get('market_context', {})
+
+            # Get ATR if available from signal, else estimate
+            atr = signal.get('atr', current_price * 0.003)  # default 0.3% ATR
+            if atr and atr > 0:
+                atr_pct = atr / current_price
+            else:
+                atr_pct = 0.003  # 0.3% default
+
+            # Clamp ATR pullback between 0.05% and 0.4%
+            pullback_pct = max(0.0005, min(0.004, atr_pct * 0.25))
+
+            # Strong momentum = enter at market (body > 60% of candle range)
+            volatility = str(market_ctx.get('volatility', 'MEDIUM')).upper()
+            conf_str = signal.get('confidence_score', '0/100')
+            try:
+                confidence = int(str(conf_str).split('/')[0])
+            except Exception:
+                confidence = 0
+
+            # HIGH confidence (≥85%) + LOW volatility → MARKET entry (momentum)
+            if confidence >= 85 and volatility in ('LOW', 'VERY_LOW'):
+                return current_price, 'MARKET (High Conf)'
+
+            # Compute limit entry
+            if direction == 'CALL':
+                # Wait for small dip below current for better fill
+                entry = round(current_price * (1.0 - pullback_pct), 2)
+                label = f'LIMIT PULL ({pullback_pct*100:.2f}% below)'
+            else:  # PUT
+                # Wait for small bounce above current for better fill
+                entry = round(current_price * (1.0 + pullback_pct), 2)
+                label = f'LIMIT BOUNCE ({pullback_pct*100:.2f}% above)'
+
+            return entry, label
+
+        except Exception as e:
+            logger.debug(f"[SMART ENTRY] Fallback to market: {e}")
+            return current_price, 'MARKET'
+
     def _print_paper_dashboard(self):
+
         """Print paper trading dashboard"""
         total = self.paper_wins + self.paper_losses + self.paper_breakeven
         wr = (self.paper_wins / total * 100) if total > 0 else 0
@@ -1186,16 +1291,60 @@ class LiveTradingEngine:
                             
                             # 4. Run full AI analysis
                             result = self.jarvis.analyze_trade_setup(df)
+
+                            # 4b. Multi-AI Consensus (DeepSeek + Qwen + Mistral roundtable)
+                            try:
+                                from multi_ai_consensus import run_ai_roundtable
+                                market_ctx = result.get('market_context', {})
+                                signal_data = result.get('trade_signal', {})
+                                consensus = run_ai_roundtable(
+                                    market_context={
+                                        'symbol': 'BTC/USDT',
+                                        'current_price': current_price,
+                                        'trend': market_ctx.get('trend', 'NEUTRAL'),
+                                        'volatility': market_ctx.get('volatility', 'MEDIUM'),
+                                    },
+                                    signal_data=signal_data
+                                )
+                                # Inject consensus verdict into result for downstream use
+                                if consensus and consensus.get('final_verdict'):
+                                    result['ai_consensus'] = consensus
+                                    logger.info(f"[CONSENSUS] {consensus.get('final_verdict','?')} | Agree: {consensus.get('agreement_pct','?')}%")
+                            except Exception as ce:
+                                logger.debug(f"[CONSENSUS] Skipped: {ce}")
                             
                             # 5. Print live signal
                             direction, confidence, entry_price, tp1, tp2, sl, expiry = \
                                 self._print_live_signal(result, current_price)
                             
-                            # 6. Open paper trade if conditions met
+                            # 6. Open paper trade or Hedged Scalp if conditions met
                             if direction in ('CALL', 'PUT') and self.can_trade():
                                 if confidence >= self.PAPER_CONFIG['min_confidence']:
+                                    # Compute ATR for hedge advisor
+                                    try:
+                                        atr = float((df['high'] - df['low']).rolling(14).mean().iloc[-1])
+                                    except Exception:
+                                        atr = current_price * 0.005  # Fallback ATR (0.5%)
+
+                                    if hasattr(self, 'hedged_engine') and self.hedged_engine:
+                                        # Use AI Options Hedged Scalp Engine
+                                        try:
+                                            options_chain = self.jarvis.delta_data.get_options_chain('BTC') \
+                                                if hasattr(self.jarvis.delta_data, 'get_options_chain') else {}
+                                        except Exception:
+                                            options_chain = {}
+                                        hedged_result = self.hedged_engine.execute_hedged_scalp(
+                                            signal={'direction': direction, 'confidence': confidence},
+                                            current_price=current_price,
+                                            atr=atr,
+                                            options_chain=options_chain,
+                                            jarvis_result=result
+                                        )
+                                        print(f"\n  ✅ HEDGED SCALP | Status: {hedged_result.get('status')} | Hedged: {hedged_result.get('hedge_applied')}")
+                                    
+                                    # Always open paper trade to track P&L
                                     trade = self._open_paper_trade(
-                                        direction, entry_price or current_price, 
+                                        direction, entry_price or current_price,
                                         confidence, expiry, tp1, tp2, sl
                                     )
                                     if trade:
