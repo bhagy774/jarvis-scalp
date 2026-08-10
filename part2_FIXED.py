@@ -543,11 +543,19 @@ class NeuralNetworkManager:
                         predictions[name] = float(pred.mean())
                 except:
                     predictions[name] = 0.0
-            
+            if hasattr(self, 'bus') and self.bus:
+                avg_pred = sum(predictions.values()) / max(1, len(predictions))
+                direction = "BULLISH" if avg_pred > 0.05 else "BEARISH" if avg_pred < -0.05 else "NEUTRAL"
+                msg = f"Neural Network Predictions: {direction} (Avg score: {avg_pred:.3f})"
+                self.bus.publish('THOUGHTS', 'Part2_Neural', msg)
+                
             return predictions
             
         except Exception as e:
-            print(f"ERROR AI prediction failed: {e}")
+            if hasattr(self, 'bus') and self.bus:
+                self.bus.report_error('Part2_Neural', e, context='predict - neural/ml inference')
+            else:
+                print(f"ERROR AI prediction failed: {e}")
             return {'default': 0.0}
 
 # ==================== AUTO UPDATE SYSTEM ====================

@@ -534,12 +534,18 @@ class EnhancedGPUPatternRecognitionEngine:
             
             if all_patterns:
                 total = sum(len(p) for p in all_patterns.values())
-                print(f"  🎯 Pattern MTF: {total} patterns across {list(all_patterns.keys())}")
+                msg = f"Pattern MTF: Detected {total} patterns across {list(all_patterns.keys())}"
+                print(f"  🎯 {msg}")
+                if hasattr(self, 'bus') and self.bus:
+                    self.bus.publish('THOUGHTS', 'Part8_Pattern', msg)
             
             return all_patterns
             
         except Exception as e:
-            print(f"ERROR MTF Pattern scan error: {e}")
+            if hasattr(self, 'bus') and self.bus:
+                self.bus.report_error('Part8_Pattern', e, context='scan_patterns_mtf top-level')
+            else:
+                print(f"ERROR MTF Pattern scan error: {e}")
             return {}
     
     # ==================== ENHANCED GPU-ACCELERATED PATTERN DETECTION ====================

@@ -866,6 +866,7 @@ class LiveTradingEngine:
         self.daily_trades = 0
         self.consecutive_losses = 0
         self.last_trade_time = None
+        self.last_trading_date = datetime.now().date()
         self.trade_history = []
         self.performance_stats = {
             'total_trades': 0,
@@ -900,7 +901,7 @@ class LiveTradingEngine:
                 ai_roundtable=None
             )
             logger.info("✅ Options Hedged Scalp Engine initialized.")
-        except ImportError as e:
+        except Exception as e:
             logger.error(f"Failed to load Hedged Engine: {e}")
             self.hedged_engine = None
         
@@ -922,10 +923,14 @@ class LiveTradingEngine:
     #  PAPER TRADE MANAGEMENT
     # ═══════════════════════════════════════════════════════════════
     
-    def _open_paper_trade(self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl):
+    def _open_paper_trade(self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl, current_price=None):
         """Open a new paper trade"""
         if len(self.paper_open_trades) >= self.PAPER_CONFIG['max_open_trades']:
             return None
+            
+        is_limit = False
+        if current_price and abs(entry_price - current_price) / current_price > 0.0001:
+            is_limit = True
         
         expiry_min = self.PAPER_CONFIG['expiry_map'].get(expiry_name, 3)
         trade = {
@@ -935,6 +940,7 @@ class LiveTradingEngine:
             'confidence': confidence,
             'expiry_name': expiry_name,
             'tp1': tp1, 'tp2': tp2, 'sl': sl,
+            'status': 'PENDING_LIMIT' if is_limit else 'OPEN',
             'entry_time': datetime.now().isoformat(),
             'expiry_time': (datetime.now() + timedelta(minutes=expiry_min)).isoformat(),
             'exit_price': None,
@@ -970,6 +976,25 @@ class LiveTradingEngine:
         
         for trade in self.paper_open_trades:
             closed = False
+            
+            # --- Handle Pending Limits ---
+            if trade.get('status') == 'PENDING_LIMIT':
+                if trade['direction'] == 'CALL' and current_price <= trade['entry_price']:
+                    trade['status'] = 'OPEN'
+                    trade['entry_time'] = datetime.now().isoformat()
+                    expiry_min = self.PAPER_CONFIG['expiry_map'].get(trade['expiry_name'], 3)
+                    trade['expiry_time'] = (datetime.now() + timedelta(minutes=expiry_min)).isoformat()
+                    print(f"  ⚡ LIMIT FILLED: {trade['direction']} @ {trade['entry_price']}")
+                elif trade['direction'] == 'PUT' and current_price >= trade['entry_price']:
+                    trade['status'] = 'OPEN'
+                    trade['entry_time'] = datetime.now().isoformat()
+                    expiry_min = self.PAPER_CONFIG['expiry_map'].get(trade['expiry_name'], 3)
+                    trade['expiry_time'] = (datetime.now() + timedelta(minutes=expiry_min)).isoformat()
+                    print(f"  ⚡ LIMIT FILLED: {trade['direction']} @ {trade['entry_price']}")
+                else:
+                    still_open.append(trade)
+                    continue
+            
             direction = trade['direction']
             entry = trade['entry_price']
             sl = trade.get('sl')
@@ -1019,13 +1044,17 @@ class LiveTradingEngine:
             if closed:
                 trade['exit_price'] = current_price
                 risk_amt = self.paper_balance * self.PAPER_CONFIG['risk_per_trade_pct']
+                position_size = risk_amt / self.PAPER_CONFIG['risk_per_trade_pct']  # Full position base
                 
                 if trade['result'] == 'WIN':
-                    trade['pnl_dollar'] = risk_amt * self.PAPER_CONFIG['reward_ratio']
+                    # Calculate actual P&L from % move
+                    price_move_pct = abs(current_price - entry) / entry
+                    trade['pnl_dollar'] = position_size * price_move_pct * 10  # Assume 10x leverage
                     self.paper_balance += trade['pnl_dollar']
                     self.paper_wins += 1
                 elif trade['result'] == 'LOSS':
-                    trade['pnl_dollar'] = -risk_amt
+                    price_move_pct = abs(current_price - entry) / entry
+                    trade['pnl_dollar'] = -(position_size * price_move_pct * 10)  # Assume 10x leverage
                     self.paper_balance += trade['pnl_dollar']
                     self.paper_losses += 1
                 else:
@@ -1035,6 +1064,9 @@ class LiveTradingEngine:
                 self.paper_peak_balance = max(self.paper_peak_balance, self.paper_balance)
                 newly_closed.append(trade)
                 self.paper_closed_trades.append(trade)
+                
+                # FIX BUG 1: Call record_trade here when it actually closes
+                self.record_trade(direction, trade.get('confidence', 0), trade['result'])
             else:
                 still_open.append(trade)
         
@@ -1253,6 +1285,13 @@ class LiveTradingEngine:
         def _live_loop():
             while self.is_running:
                 try:
+                    # FIX BUG 5: Auto-reset daily stats at midnight
+                    current_date = datetime.now().date()
+                    if current_date != self.last_trading_date:
+                        self.reset_daily_stats()
+                        self.last_trading_date = current_date
+                        logger.info("📅 Midnight reached: Daily trades reset to 0.")
+                        
                     cycle_count[0] += 1
                     current_price = None
                     
@@ -1286,6 +1325,12 @@ class LiveTradingEngine:
                             elif not isinstance(df.index, pd.DatetimeIndex):
                                 df.index = pd.date_range(end=pd.Timestamp.now(), periods=len(df), freq='1min')
                             
+                            # 7. Dashboard + AI Health Report every 5 cycles
+                            if cycle_count[0] % 5 == 0:
+                                self._print_paper_dashboard()
+                                if hasattr(self.jarvis, 'bus') and self.jarvis.bus:
+                                    self.jarvis.bus.print_health_report()
+
                             if current_price is None and len(df) > 0:
                                 current_price = float(df['close'].iloc[-1])
                             
@@ -1293,25 +1338,27 @@ class LiveTradingEngine:
                             result = self.jarvis.analyze_trade_setup(df)
 
                             # 4b. Multi-AI Consensus (DeepSeek + Qwen + Mistral roundtable)
-                            try:
-                                from multi_ai_consensus import run_ai_roundtable
-                                market_ctx = result.get('market_context', {})
-                                signal_data = result.get('trade_signal', {})
-                                consensus = run_ai_roundtable(
-                                    market_context={
-                                        'symbol': 'BTC/USDT',
-                                        'current_price': current_price,
-                                        'trend': market_ctx.get('trend', 'NEUTRAL'),
-                                        'volatility': market_ctx.get('volatility', 'MEDIUM'),
-                                    },
-                                    signal_data=signal_data
-                                )
-                                # Inject consensus verdict into result for downstream use
-                                if consensus and consensus.get('final_verdict'):
-                                    result['ai_consensus'] = consensus
-                                    logger.info(f"[CONSENSUS] {consensus.get('final_verdict','?')} | Agree: {consensus.get('agreement_pct','?')}%")
-                            except Exception as ce:
-                                logger.debug(f"[CONSENSUS] Skipped: {ce}")
+                            # FIX BUG 3: Only run every 5th cycle to prevent blocking live loop
+                            if cycle_count[0] % 5 == 0:
+                                try:
+                                    from multi_ai_consensus import run_ai_roundtable
+                                    market_ctx = result.get('market_context', {})
+                                    signal_data = result.get('trade_signal', {})
+                                    consensus = run_ai_roundtable(
+                                        market_context={
+                                            'symbol': 'BTC/USDT',
+                                            'current_price': current_price,
+                                            'trend': market_ctx.get('trend', 'NEUTRAL'),
+                                            'volatility': market_ctx.get('volatility', 'MEDIUM'),
+                                        },
+                                        signal_data=signal_data
+                                    )
+                                    # Inject consensus verdict into result for downstream use
+                                    if consensus and consensus.get('final_verdict'):
+                                        result['ai_consensus'] = consensus
+                                        logger.info(f"[CONSENSUS] {consensus.get('final_verdict','?')} | Agree: {consensus.get('agreement_pct','?')}%")
+                                except Exception as ce:
+                                    logger.debug(f"[CONSENSUS] Skipped: {ce}")
                             
                             # 5. Print live signal
                             direction, confidence, entry_price, tp1, tp2, sl, expiry = \
@@ -1345,11 +1392,11 @@ class LiveTradingEngine:
                                     # Always open paper trade to track P&L
                                     trade = self._open_paper_trade(
                                         direction, entry_price or current_price,
-                                        confidence, expiry, tp1, tp2, sl
+                                        confidence, expiry, tp1, tp2, sl, current_price=current_price
                                     )
                                     if trade:
                                         risk_amt = self.paper_balance * self.PAPER_CONFIG['risk_per_trade_pct']
-                                        print(f"\n  ✅ PAPER TRADE OPENED #{trade['id']}")
+                                        print(f"\n  ✅ PAPER TRADE LOGGED #{trade['id']} [{trade['status']}]")
                                         print(f"     {direction} @ ${trade['entry_price']:,.2f} | Risk: ${risk_amt:.2f}")
                                         exp_dt = datetime.fromisoformat(trade['expiry_time'])
                                         print(f"     Expires: {exp_dt.strftime('%H:%M:%S')}")
@@ -1358,7 +1405,7 @@ class LiveTradingEngine:
                                 else:
                                     print(f"  ⚠️  PAPER: Skipped (Conf {confidence}% < {self.PAPER_CONFIG['min_confidence']}%)")
                                 
-                                self.record_trade(direction, confidence, 'PENDING')
+                                # FIX BUG 1: PENDING record_trade removed to fix Consecutive Loss Circuit Breaker
                             
                         else:
                             logger.debug("[LIVE] No candle data received")
@@ -1375,6 +1422,9 @@ class LiveTradingEngine:
                     logger.error(f"[LIVE] Trading loop error: {e}")
                     import traceback
                     traceback.print_exc()
+                    # Report main loop error to Cognitive Bus
+                    if hasattr(self.jarvis, 'bus') and self.jarvis.bus:
+                        self.jarvis.bus.report_error('JarvisElite_LiveLoop', e, context='main _live_loop cycle', try_ollama=True)
                     time.sleep(30)
         
         self.executor.submit(_live_loop)
@@ -1435,8 +1485,10 @@ class LiveTradingEngine:
         self.consecutive_losses = 0
         self.trade_history = []
         
-    def _get_session_quality(self, current_hour):
+    def _get_session_quality(self, current_hour=None):
         """Get current session quality"""
+        if current_hour is None:
+            current_hour = (datetime.utcnow() + timedelta(hours=5, minutes=30)).hour
         for session, times in TRADING_SESSIONS.items():
             if times['start'] <= current_hour < times['end']:
                 return times['quality']
@@ -1444,7 +1496,7 @@ class LiveTradingEngine:
         
     def _get_current_session(self):
         """Get current trading session name"""
-        current_hour = datetime.now().hour
+        current_hour = (datetime.utcnow() + timedelta(hours=5, minutes=30)).hour
         for session, times in TRADING_SESSIONS.items():
             if times['start'] <= current_hour < times['end']:
                 return session
@@ -3286,6 +3338,15 @@ class JarvisElite:
         self.hud_enabled = True  # FIX #1: HUD backend now exists in jarvis_hud/
         self.hud_url = "http://localhost:8000/api/update"
         self.is_backtest_mode = False  # Track if running in backtest mode
+        
+        # 🧠 INITIALIZE COGNITIVE EVENT BUS
+        try:
+            from jarvis_cognitive_bus import CognitiveBus
+            self.bus = CognitiveBus()
+            logger.info("🧠 Jarvis Cognitive Swarm Bus Initialized")
+        except ImportError:
+            self.bus = None
+            logger.warning("⚠️ jarvis_cognitive_bus not found, running without swarm thoughts")
 
     
         # Initialize Data Source (Delta Exchange only)
@@ -3335,6 +3396,20 @@ class JarvisElite:
                 self.engines['fusion'] = GPUEnhancedFusionEngine(self.parts)
                 self.engines['confidence'] = GPUUnifiedConfidenceEngine()
                 self.engines['pattern'] = EnhancedGPUPatternRecognitionEngine()
+                try:
+                    from part7_FIXED import EnhancedGPULiveDataEngine
+                    from part9_FIXED import GPUAIAdaptiveLearningEngine
+                    self.engines['live_data'] = EnhancedGPULiveDataEngine()
+                    self.engines['adaptive'] = GPUAIAdaptiveLearningEngine()
+                    logger.info("✅ Live Data & Adaptive Engines Connected (Parts 7 & 9)")
+                except Exception as e:
+                    logger.error(f"❌ Failed to load Parts 7/9: {e}")
+                
+                # Attach bus to all engines
+                if self.bus:
+                    for name, engine in self.engines.items():
+                        engine.bus = self.bus
+                
                 logger.info("✅ External GPU Engines Initialized")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize external engines: {e}") 

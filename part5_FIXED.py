@@ -426,10 +426,15 @@ Respond in 1 short sentence validating or questioning this fused signal. State [
             consensus = weighted_sum / total_weight if total_weight > 0 else 0
             direction = "CALL" if consensus > 0.15 else "PUT" if consensus < -0.15 else "NO TRADE"
             avg_conf = sum(r.get('confidence', 0) for r in tf_results.values()) / max(len(tf_results), 1)
-            
-            return self._create_gpu_signal(direction, avg_conf, f"MTF Fusion ({len(tf_results)} TFs)")
+            final_signal = self._create_gpu_signal(direction, avg_conf, f"MTF Fusion ({len(tf_results)} TFs)")
+            if hasattr(self, 'bus') and self.bus:
+                msg = f"Fusion Engine (MTF): Consensus = {consensus:.2f}, Direction = {direction}, Confidence = {avg_conf:.1f}%"
+                self.bus.publish('THOUGHTS', 'Part5_Fusion', msg)
+            return final_signal
             
         except Exception as e:
+            if hasattr(self, 'bus') and self.bus:
+                self.bus.report_error('Part5_Fusion', e, context='fuse_modules_mtf')
             return self._create_gpu_signal("NO TRADE", 0, f"MTF error: {e}")
 
     def _prepare_gpu_data(self, df_1min, df_5min, df_15min):

@@ -569,7 +569,10 @@ Follow the tag with a 1-sentence risk justification.
             return trade_result
             
         except Exception as e:
-            print(f"ERROR Trade execution error: {e}")
+            if hasattr(self, 'trading_system') and hasattr(self.trading_system, 'bus') and self.trading_system.bus:
+                self.trading_system.bus.report_error('Part12_Execution', e, context='execute_trade')
+            else:
+                print(f"ERROR Trade execution error: {e}")
             return {'status': 'error', 'reason': str(e)}
     
     async def _calculate_optimal_execution_price(self, signal_type: str, bid: float, ask: float) -> float:

@@ -372,8 +372,11 @@ class GPUComprehensiveBacktester:
             return report
             
         except Exception as e:
-            error_msg = f"Backtest error: {str(e)}"
-            print(f"ERROR {error_msg}")
+            if hasattr(self, 'trading_system') and hasattr(self.trading_system, 'bus') and self.trading_system.bus:
+                self.trading_system.bus.report_error('Part6_Backtest', e, context='run_full_year_backtest')
+            else:
+                error_msg = f"Backtest error: {str(e)}"
+                print(f"ERROR {error_msg}")
             return self._generate_error_report(error_msg)
 
     async def _prepare_ssd_streaming_data(self, historical_data):

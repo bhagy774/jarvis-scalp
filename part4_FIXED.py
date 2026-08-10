@@ -1115,7 +1115,10 @@ class InstitutionalBacktestingOrchestrator:
             }
             return comprehensive_report
         except Exception as e:
-            logging.error(f"Comprehensive backtest failed: {e}")
+            if hasattr(self, 'trading_engine') and hasattr(self.trading_engine, 'bus') and self.trading_engine.bus:
+                self.trading_engine.bus.report_error('Part4_Backtest', e, context='run_comprehensive_backtest')
+            else:
+                logging.error(f"Comprehensive backtest failed: {e}")
             return {'error': str(e), 'test_name': test_name}
 
 

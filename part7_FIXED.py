@@ -556,7 +556,10 @@ class EnhancedGPULiveDataEngine:
             self.logger.error(f"❌ JSON decode error: {e}")
             self.quality_metrics.append({'type': 'json_error', 'timestamp': time.time()})
         except Exception as e:
-            self.logger.error(f"❌ Message processing error: {e}")
+            if hasattr(self, 'bus') and self.bus:
+                self.bus.report_error('Part7_LiveData', e, context='_process_enhanced_message')
+            else:
+                self.logger.error(f"❌ Message processing error: {e}")
             self.quality_metrics.append({'type': 'processing_error', 'timestamp': time.time()})
         
         finally:

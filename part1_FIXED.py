@@ -1786,7 +1786,9 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
                 confidence *= (1.0 - reversal_prob)
                 
             return final_signal, float(confidence)
-        except:
+        except Exception as e:
+            if hasattr(self, 'bus') and self.bus:
+                self.bus.report_error('Part1_Breakout', e, context='analyze')
             return 0, 0
             
     def _get_error_response(self):

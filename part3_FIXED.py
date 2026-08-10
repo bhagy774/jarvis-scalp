@@ -622,13 +622,21 @@ Provide a concise 1-2 sentence institutional analysis, then end your response wi
                         all_components['_max_tf'] = tf_name
                     
                 except Exception as e:
-                    print(f"ERROR MTF Institutional {tf_name} error: {e}")
+                    if hasattr(self, 'bus') and self.bus:
+                        self.bus.report_error('Part3_Institutional', e, context=f'MTF analysis on timeframe {tf_name}')
+                    else:
+                        print(f"ERROR MTF Institutional {tf_name} error: {e}")
             
             final_weighted = weighted_signal_sum / total_weight if total_weight > 0 else 0.0
             all_components['tf_signals'] = all_tf_results
             all_components['weighted_consensus'] = round(final_weighted, 3)
             all_components['active_timeframes'] = len(all_tf_results)
             all_components.pop('_max_tf', None)
+            
+            if hasattr(self, 'bus') and self.bus:
+                direction = "BULLISH" if final_weighted > 0.3 else "BEARISH" if final_weighted < -0.3 else "NEUTRAL"
+                msg = f"Institutional MTF Analysis: {direction} (Consensus: {final_weighted:.2f}). Dominant Regime: {all_components.get('regime', 'unknown')}"
+                self.bus.publish('THOUGHTS', 'Part3_Institutional', msg)
             
             return {
                 'signals': aggregated_signals,
@@ -637,7 +645,10 @@ Provide a concise 1-2 sentence institutional analysis, then end your response wi
             }
             
         except Exception as e:
-            print(f"ERROR GPU MTF Institutional error: {e}")
+            if hasattr(self, 'bus') and self.bus:
+                self.bus.report_error('Part3_Institutional', e, context='generate_mtf_signals top-level')
+            else:
+                print(f"ERROR GPU MTF Institutional error: {e}")
             return {'signals': [], 'components': {}, 'mtf_consensus': 0.0}
 
     def _gpu_detect_market_regime(self, df_5min) -> str:

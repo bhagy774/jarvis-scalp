@@ -347,10 +347,17 @@ class GPUUnifiedConfidenceEngine:
             # Validate signal
             validation_result = await self._validate_signal_gpu(final_confidence, signal_data)
             
+            if hasattr(self, 'bus') and self.bus:
+                msg = f"Confidence Engine: Final Score = {final_confidence:.1f}%. {validation_result} | Ollama Adj: {ollama_adj:+d}"
+                self.bus.publish('THOUGHTS', 'Part11_Confidence', msg)
+                
             return final_confidence, f"{validation_result} | Ollama Adj: {ollama_adj:+d}"
             
         except Exception as e:
-            print(f"ERROR Unified confidence computation error: {e}")
+            if hasattr(self, 'bus') and self.bus:
+                self.bus.report_error('Part11_Confidence', e, context='compute_unified_confidence')
+            else:
+                print(f"ERROR Unified confidence computation error: {e}")
             return 0.0, f"Confidence computation error: {str(e)}"
     
     async def _prepare_signal_tensors_gpu(self, signal_data):

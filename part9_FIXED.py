@@ -860,7 +860,10 @@ class GPUAIAdaptiveLearningEngine:
                     self._last_metrics_time = time.time()
                 
             except Exception as e:
-                print(f"ERROR Learning loop error: {e}")
+                if hasattr(self, 'trading_system') and hasattr(self.trading_system, 'bus') and self.trading_system.bus:
+                    self.trading_system.bus.report_error('Part9_Adaptive', e, context='_continuous_learning_loop')
+                else:
+                    print(f"ERROR Learning loop error: {e}")
                 await asyncio.sleep(5)  # Wait 5 seconds before retrying
     
     async def process_trade_outcome(self, trade_result: dict):
@@ -894,7 +897,10 @@ class GPUAIAdaptiveLearningEngine:
             }
             
         except Exception as e:
-            print(f"ERROR Trade outcome processing error: {e}")
+            if hasattr(self, 'trading_system') and hasattr(self.trading_system, 'bus') and self.trading_system.bus:
+                self.trading_system.bus.report_error('Part9_Adaptive', e, context='process_trade_outcome')
+            else:
+                print(f"ERROR Trade outcome processing error: {e}")
             return {'error': str(e)}
     
     async def get_ai_trading_recommendation(self, market_state: dict, pattern_signals: dict):
