@@ -1044,6 +1044,12 @@ Follow the tag with a 1-2 sentence Chief Strategy Officer executive recommendati
                 'ollama_insight': insight
             }
             
+            # Publish to CognitiveBus for Watcher AI monitoring
+            if hasattr(self, 'trading_system') and hasattr(self.trading_system, 'bus') and self.trading_system.bus:
+                running = analysis.get('system_status', {}).get('is_running', False)
+                rec = str(analysis.get('ollama_strategy_recommendation', 'N/A'))[:60]
+                msg = f"Adaptive Learning: Status={'RUNNING' if running else 'IDLE'}. Strategy Recommendation: {rec}"
+                self.trading_system.bus.publish('THOUGHTS', 'Part9_Adaptive', msg)
             return analysis
             
         except Exception as e:

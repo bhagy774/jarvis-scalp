@@ -5,7 +5,7 @@ import traceback
 import threading
 from datetime import datetime
 from queue import Queue, Empty
-from collections import defaultdict
+from collections import defaultdict, deque
 
 
 class CognitiveLogger:
@@ -113,10 +113,24 @@ class CognitiveBus:
             'HEALTH': [],
             'SIGNALS': [],
             'ERROR': [],
+            'GEMINI_INSIGHT': [],   # Gemini Supreme Advisor -- 10-min strategic insights
+            'ORACLE_FORECAST': [],  # JARVIS Market Oracle -- 5-min multi-timeframe market map
+            'HEALTH_REPORT': [],    # JARVIS Doctor -- self-healing fix reports
             'ALL': []
         }
         self.logger = CognitiveLogger()
         self.health_monitor = PartHealthMonitor()
+
+        # In-memory ring buffer -- last 100 THOUGHTS messages
+        # Used by GeminiSupremeAdvisor to read parts' opinions
+        self._thoughts_buffer: deque = deque(maxlen=100)
+        # Latest message per sender (for quick per-part lookup)
+        self._latest_by_sender: dict = {}
+        # Latest Oracle forecast
+        self._latest_oracle_forecast: dict = {}
+        # Doctor health reports ring-buffer (last 50)
+        self._doctor_reports: deque = deque(maxlen=50)
+
         self.logger.log('SYSTEM', 'CognitiveBus', 'Jarvis Cognitive Swarm Bus Initialized.')
         
     def subscribe(self, topic, callback):
@@ -130,26 +144,51 @@ class CognitiveBus:
         """Publish a message to all subscribers of a topic, and log it."""
         topic = topic.upper()
         self.logger.log(topic, sender, payload)
-        
+
         message = {
             'topic': topic,
             'sender': sender,
             'payload': payload,
             'timestamp': datetime.now().isoformat()
         }
-        
+
+        # Store THOUGHTS + SIGNALS in ring buffer for Gemini to read
+        if topic in ('THOUGHTS', 'SIGNALS'):
+            self._thoughts_buffer.append(message)
+            self._latest_by_sender[sender] = message
+        elif topic == 'ORACLE_FORECAST':
+            self._latest_oracle_forecast = payload if isinstance(payload, dict) else {'raw': payload}
+        elif topic == 'HEALTH_REPORT':
+            self._doctor_reports.append(message)
+
         if topic in self.subscribers:
             for callback in self.subscribers[topic]:
                 try:
                     callback(message)
                 except Exception as e:
                     self.logger.log('ERROR', 'CognitiveBus', f"Subscriber error on {topic}: {e}")
-                    
+
         for callback in self.subscribers['ALL']:
             try:
                 callback(message)
             except Exception:
                 pass
+
+    def get_recent_thoughts(self, n: int = 30) -> list:
+        """Return last N THOUGHTS/SIGNALS messages for Gemini context."""
+        return list(self._thoughts_buffer)[-n:]
+
+    def get_latest_by_sender(self) -> dict:
+        """Return latest message per part/sender. Used for per-part status."""
+        return dict(self._latest_by_sender)
+
+    def get_latest_oracle_forecast(self) -> dict:
+        """Return latest Market Oracle forecast."""
+        return dict(self._latest_oracle_forecast)
+
+    def get_doctor_reports(self, n: int = 10) -> list:
+        """Return last N Doctor health reports. Used by HUD and Gemini advisor."""
+        return list(self._doctor_reports)[-n:]
 
     def report_error(self, part_name: str, error: Exception, context: str = "", try_ollama: bool = True):
         """

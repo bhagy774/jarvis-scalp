@@ -885,6 +885,10 @@ class FinalExecutionEngine:
         }
         
         logging.info(f"🚀 [EXEC] Executing {internal_signal['direction']} | Confidence: {confidence}%")
+        # Publish to CognitiveBus for Watcher AI monitoring
+        if hasattr(self, 'bus') and self.bus:
+            msg = f"Execution Engine: Direction={direction}, Confidence={confidence}%. Entry price={unified_signal.get('entry_price', 0)}"
+            self.bus.publish('THOUGHTS', 'Part10_Execution', msg)
         
         try:
             # Try to use existing event loop

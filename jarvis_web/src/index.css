@@ -1,0 +1,175 @@
+/* ============================================================
+   JARVIS ELITE v7.0 — Global Stylesheet
+   Deep-space dark theme with holographic accent system
+   ============================================================ */
+
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;600&display=swap');
+
+:root {
+  --c-bg: #030407;
+  --c-surface: #080c14;
+  --c-border: rgba(255,255,255,0.06);
+  --c-border-glow: rgba(0,229,255,0.2);
+  --c-cyan: #00e5ff;
+  --c-cyan-dim: rgba(0,229,255,0.15);
+  --c-purple: #a855f7;
+  --c-purple-dim: rgba(168,85,247,0.15);
+  --c-green: #22c55e;
+  --c-green-dim: rgba(34,197,94,0.15);
+  --c-red: #ef4444;
+  --c-red-dim: rgba(239,68,68,0.15);
+  --c-yellow: #f59e0b;
+  --c-yellow-dim: rgba(245,158,11,0.15);
+  --c-text: #e2e8f0;
+  --c-text-muted: #64748b;
+  --c-text-dim: #475569;
+  --font-display: 'Orbitron', monospace;
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: var(--c-bg);
+  color: var(--c-text);
+  font-family: var(--font-body);
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0,229,255,0.3); }
+
+/* Holographic glow animations */
+@keyframes pulse-cyan { 0%,100%{box-shadow:0 0 8px rgba(0,229,255,0.3);} 50%{box-shadow:0 0 20px rgba(0,229,255,0.6);} }
+@keyframes pulse-green { 0%,100%{box-shadow:0 0 8px rgba(34,197,94,0.3);} 50%{box-shadow:0 0 20px rgba(34,197,94,0.6);} }
+@keyframes pulse-red { 0%,100%{box-shadow:0 0 8px rgba(239,68,68,0.3);} 50%{box-shadow:0 0 20px rgba(239,68,68,0.6);} }
+@keyframes scan-line { 0%{transform:translateY(-100%);} 100%{transform:translateY(100vh);} }
+@keyframes float { 0%,100%{transform:translateY(0px);} 50%{transform:translateY(-6px);} }
+@keyframes holo-shimmer { 0%{background-position:0% 50%;} 50%{background-position:100% 50%;} 100%{background-position:0% 50%;} }
+@keyframes rotate-slow { from{transform:rotateY(0deg);} to{transform:rotateY(360deg);} }
+
+.pulse-cyan { animation: pulse-cyan 2s ease-in-out infinite; }
+.pulse-green { animation: pulse-green 2s ease-in-out infinite; }
+.pulse-red { animation: pulse-red 2s ease-in-out infinite; }
+
+/* Glass card */
+.glass {
+  background: rgba(8,12,20,0.7);
+  backdrop-filter: blur(20px);
+  border: 1px solid var(--c-border);
+  border-radius: 16px;
+}
+.glass-cyan { border-color: rgba(0,229,255,0.2); box-shadow: 0 0 20px rgba(0,229,255,0.05), inset 0 1px 0 rgba(0,229,255,0.1); }
+.glass-purple { border-color: rgba(168,85,247,0.2); box-shadow: 0 0 20px rgba(168,85,247,0.05), inset 0 1px 0 rgba(168,85,247,0.1); }
+.glass-green { border-color: rgba(34,197,94,0.2); box-shadow: 0 0 20px rgba(34,197,94,0.05), inset 0 1px 0 rgba(34,197,94,0.1); }
+.glass-red { border-color: rgba(239,68,68,0.2); box-shadow: 0 0 20px rgba(239,68,68,0.05), inset 0 1px 0 rgba(239,68,68,0.1); }
+.glass-yellow { border-color: rgba(245,158,11,0.2); box-shadow: 0 0 20px rgba(245,158,11,0.05), inset 0 1px 0 rgba(245,158,11,0.1); }
+
+/* Text glow effects */
+.text-glow-cyan { color: var(--c-cyan); text-shadow: 0 0 20px rgba(0,229,255,0.5); }
+.text-glow-green { color: var(--c-green); text-shadow: 0 0 20px rgba(34,197,94,0.5); }
+.text-glow-red { color: var(--c-red); text-shadow: 0 0 20px rgba(239,68,68,0.5); }
+.text-glow-purple { color: var(--c-purple); text-shadow: 0 0 20px rgba(168,85,247,0.5); }
+
+/* Dot background pattern */
+.dot-grid {
+  background-image: radial-gradient(circle, rgba(255,255,255,0.06) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Scan line effect */
+.scan-overlay::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to bottom, transparent 50%, rgba(0,229,255,0.02) 50%);
+  background-size: 100% 4px;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Nav */
+.nav-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--c-text-muted);
+  text-decoration: none;
+  transition: all 0.2s;
+  border: 1px solid transparent;
+}
+.nav-link:hover {
+  color: var(--c-cyan);
+  background: var(--c-cyan-dim);
+  border-color: rgba(0,229,255,0.2);
+}
+.nav-link.active {
+  color: var(--c-cyan);
+  background: var(--c-cyan-dim);
+  border-color: rgba(0,229,255,0.3);
+  text-shadow: 0 0 10px rgba(0,229,255,0.5);
+}
+
+/* Metric card */
+.metric-value {
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+/* Status dot */
+.status-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.status-dot.bullish { background: var(--c-green); box-shadow: 0 0 8px rgba(34,197,94,0.7); }
+.status-dot.bearish { background: var(--c-red); box-shadow: 0 0 8px rgba(239,68,68,0.7); }
+.status-dot.neutral { background: var(--c-yellow); box-shadow: 0 0 8px rgba(245,158,11,0.5); }
+.status-dot.online { background: var(--c-green); animation: pulse-green 2s infinite; }
+.status-dot.offline { background: var(--c-red); animation: pulse-red 2s infinite; }
+
+/* Terminal lines */
+.terminal-line { font-family: var(--font-mono); font-size: 11px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
+.terminal-line.error { color: var(--c-red); }
+.terminal-line.warn { color: var(--c-yellow); }
+.terminal-line.success { color: var(--c-green); }
+.terminal-line.signal { color: var(--c-cyan); font-weight: 600; }
+.terminal-line.quantum { color: var(--c-purple); }
+.terminal-line.normal { color: #94a3b8; }
+
+/* 3D Holographic cube animation for the hero element */
+.holo-ring {
+  position: absolute;
+  border-radius: 50%;
+  border: 1px solid rgba(0,229,255,0.3);
+  animation: rotate-slow 8s linear infinite;
+}
+
+/* Page layout */
+.page-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 16px;
+  gap: 16px;
+  overflow: hidden;
+}
+
+/* Chart container */
+.chart-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}

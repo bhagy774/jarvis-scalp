@@ -48,12 +48,14 @@ class DeltaExchangeData:
     Handles all data ingestion for Jarvis.
     """
     
-    # FIX #20: HYBRID CONFIG (Documented)
-    # ├── PUBLIC_URL  → MAINNET (api.delta.exchange) → Real market prices, order book, candles
-    # └── PRIVATE_URL → TESTNET (cdn-ind.testnet.deltaex.org) → Paper trading, order placement
-    # This means: You see REAL prices but trades go to TESTNET (no real money risk)
-    PRIVATE_URL = "https://cdn-ind.testnet.deltaex.org" # India Testnet for Execution
-    PUBLIC_URL = "https://api.delta.exchange" # Mainnet for Real Price Data
+    # ── MAINNET vs TESTNET controlled via .env ──────────────────────────────
+    # DELTA_USE_MAINNET=true  → real orders on api.delta.exchange
+    # DELTA_USE_MAINNET=false → paper orders on testnet (default, safe)
+    _USE_MAINNET = os.environ.get("DELTA_USE_MAINNET", "false").lower() == "true"
+    PRIVATE_URL  = ("https://api.india.delta.exchange"      # MAINNET India (real money!)
+                    if _USE_MAINNET else
+                    "https://cdn-ind.testnet.deltaex.org")  # TESTNET (safe test)
+    PUBLIC_URL   = "https://api.india.delta.exchange"  # India endpoint for real prices
     
     def __init__(self, api_key: str = None, api_secret: str = None):
         self.api_key = api_key or DEMO_API_KEY
@@ -229,7 +231,7 @@ class DeltaExchangeData:
         if self._binance:
             try:
                 candles = self._binance.get_historical_candles(symbol, resolution, limit)
-                if candles and len(candles) > 10:
+                if candles and len(candles) > 0:
                     return candles
             except Exception as e:
                 logger.warning(f"[BINANCE CANDLES] Failed: {e}")
@@ -445,8 +447,37 @@ class DeltaExchangeData:
             "bias": final_bias,
             "score": total_score,
             "reasons": reasons,
-            "raw_data": {"expiries": expiries, "total_oi": chain["total_oi"]}
+            "pcr": round(chain.get("pcr", 0), 3),  # FIX: expose pcr at top level
+            "max_pain": self._calculate_max_pain(chain),  # FIX: expose max_pain at top level
+            "raw_data": {
+                "expiries": expiries,
+                "total_oi": chain["total_oi"],
+                "pcr": round(chain.get("pcr", 0), 3),  # FIX: also in raw_data for compatibility
+            }
         }
+
+    def _calculate_max_pain(self, chain: Dict) -> float:
+        """
+        Calculate Max Pain: the strike where combined option sellers lose the least.
+        Simplified: find the strike with highest combined OI (Call + Put).
+        """
+        try:
+            all_opts = chain.get("calls", []) + chain.get("puts", [])
+            if not all_opts:
+                return 0.0
+            strike_oi = {}
+            for opt in all_opts:
+                strike = opt.get("strike", 0)
+                oi = opt.get("oi", 0)
+                if strike > 0:
+                    strike_oi[strike] = strike_oi.get(strike, 0) + oi
+            if not strike_oi:
+                return 0.0
+            max_pain_strike = max(strike_oi, key=strike_oi.get)
+            return float(max_pain_strike)
+        except Exception:
+            return 0.0
+
 
     # ==========================================
     # 4. OPTIONS EXECUTION & MANAGEMENT (NEW)
@@ -528,6 +559,40 @@ class DeltaExchangeData:
             except:
                 pass
         return 0.0
+
+    def get_open_positions(self, symbol: str = "BTCUSDT") -> List[Dict]:
+        """Get all currently open positions on Delta Exchange."""
+        res = self._request("GET", "/v2/positions", authorized=True)
+        if res["success"]:
+            try:
+                positions = res["data"].get("result", [])
+                if symbol:
+                    positions = [p for p in positions
+                                 if p.get("product", {}).get("symbol") == symbol
+                                 or p.get("symbol") == symbol]
+                return positions
+            except Exception:
+                return []
+        return []
+
+    def close_all_positions(self, symbol: str = "BTCUSDT") -> List[Dict]:
+        """
+        EMERGENCY: Close all open positions at market.
+        Returns list of close order results.
+        """
+        positions = self.get_open_positions(symbol)
+        results = []
+        for pos in positions:
+            size = abs(int(pos.get("size", 0)))
+            if size == 0:
+                continue
+            # If long (size > 0) → sell to close. If short → buy to close.
+            raw_size = pos.get("size", 0)
+            close_side = "sell" if raw_size > 0 else "buy"
+            res = self.place_order(symbol, close_side, size, order_type="market")
+            results.append(res)
+            logger.warning(f"[EMERGENCY] Closed {size}x {symbol}: {res}")
+        return results
 
     def get_product_id(self, symbol: str) -> Optional[str]:
         """Fetch Product ID for a given Symbol (required for Leverage)."""

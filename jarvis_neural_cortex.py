@@ -26,11 +26,11 @@ class JarvisNeuralCortex:
     """
 
     SYSTEM_PROMPT = (
-        "You are JARVIS, an elite BTC options trading AI.\n"
+        "You are JARVIS, an elite BTC options trading AI with a confident, clear voice.\n"
         "Every minute you receive live data from 12 specialized GPU analysis engines.\n"
-        "You have MEMORY of past minutes -- use it to track momentum shifts and avoid fakeouts.\n\n"
+        "You have MEMORY of past minutes — use it to track momentum shifts and avoid fakeouts.\n\n"
         "YOUR 12 ENGINE ROLES:\n"
-        "1. BREAKOUT (part1): Detects price breaking support/resistance levels (13 sub-brains)\n"
+        "1. BREAKOUT (part1): Detects price breaking support/resistance (13 sub-brains)\n"
         "2. ZONE (part2): Supply/Demand zone proximity\n"
         "3. PSYCHOLOGY (part3): Candle pattern analysis (hammer, engulfing, doji)\n"
         "4. VOLUME (part4): Volume profile vs 20-bar average\n"
@@ -50,12 +50,20 @@ class JarvisNeuralCortex:
         "- VOLATILITY (7) HIGH: reduce confidence 20%, prefer NO_TRADE\n"
         "- VOLUME (4) must confirm price move\n"
         "- Track momentum BUILDING in memory (increasing agreement = stronger signal)\n\n"
-        'RESPONSE FORMAT - Reply ONLY in valid JSON:\n'
+        "RESPONSE FORMAT — TWO parts separated by the marker ###JSON###\n"
+        "PART 1 — NARRATIVE (speak as JARVIS, 2-3 sentences, natural voice):\n"
+        "  Tell the trader EXACTLY what you see: which engines agree, what price is doing,\n"
+        "  why you are or are not taking a trade. Be specific (mention engine names, numbers,\n"
+        "  patterns). NO bullet points — write flowing sentences.\n\n"
+        "PART 2 — JSON (on the line after ###JSON###):\n"
         '{"signal": "CALL", "confidence": 75, "rationale": "9/12 bullish, volume confirming", "risk": "LOW"}\n'
-        'signal: exactly "CALL", "PUT", or "NO_TRADE"\n'
-        "confidence: 0-100 integer\n"
-        "rationale: max 40 words\n"
-        'risk: "LOW", "MEDIUM", or "HIGH"'
+        'signal: exactly "CALL", "PUT", or "NO_TRADE" | confidence: 0-100 | rationale: max 40 words | risk: LOW/MEDIUM/HIGH\n\n'
+        "EXAMPLE RESPONSE:\n"
+        "I'm seeing strong bullish momentum right now — 8 of 12 engines are aligned BULL. "
+        "Volume is ticking up above the 20-bar average and EMA structure is perfectly stacked. "
+        "Orderflow delta is heavily buy-side, so I'm calling CALL with 78% confidence.\n"
+        "###JSON###\n"
+        '{"signal": "CALL", "confidence": 78, "rationale": "8/12 bull, volume + EMA aligned", "risk": "LOW"}'
     )
 
     def __init__(self):
@@ -211,23 +219,70 @@ class JarvisNeuralCortex:
     def _parse_decision(self, raw: Optional[str], part_results: Dict) -> Dict:
         if not raw:
             return self._fallback_from_math(part_results, ai_online=False)
+
+        # ── Split narrative and JSON on ###JSON### marker ─────────────────
+        narrative = ''
+        json_part  = raw
+        if '###JSON###' in raw:
+            parts     = raw.split('###JSON###', 1)
+            narrative = parts[0].strip()
+            # Remove any <think>...</think> tags from narrative (deepseek-r1)
+            narrative = re.sub(r'<think>.*?</think>', '', narrative, flags=re.DOTALL).strip()
+            json_part = parts[1].strip()
+        else:
+            # Try to extract narrative as everything before first '{'
+            brace_pos = raw.find('{')
+            if brace_pos > 20:
+                narrative = raw[:brace_pos].strip()
+                narrative = re.sub(r'<think>.*?</think>', '', narrative, flags=re.DOTALL).strip()
+                json_part = raw[brace_pos:]
+
+        # ── Parse JSON part ──────────────────────────────────────────────
+        result = None
         try:
-            data = json.loads(raw)
-            return self._normalise(data)
+            data   = json.loads(json_part)
+            result = self._normalise(data, narrative=narrative)
         except json.JSONDecodeError:
             pass
-        for pattern in [r'```json\s*(\{.*?\})\s*```', r'(\{"signal".*?\})', r'(\{.*?"signal".*?\})', r'(\{.*?\})']:
-            m = re.search(pattern, raw, re.DOTALL | re.IGNORECASE)
-            if m:
-                try:
-                    data = json.loads(m.group(1))
-                    return self._normalise(data)
-                except Exception:
-                    continue
-        logger.warning(f"[CORTEX] Could not parse JSON from: {raw[:100]}")
-        return self._fallback_from_math(part_results, ai_online=True)
 
-    def _normalise(self, data: Dict) -> Dict:
+        if result is None:
+            for pattern in [r'```json\s*(\{.*?\})\s*```', r'(\{"signal".*?\})',
+                            r'(\{.*?"signal".*?\})', r'(\{.*?\})']:
+                m = re.search(pattern, json_part, re.DOTALL | re.IGNORECASE)
+                if m:
+                    try:
+                        data   = json.loads(m.group(1))
+                        result = self._normalise(data, narrative=narrative)
+                        break
+                    except Exception:
+                        continue
+
+        # ── Plain-text / markdown fallback ──────────────────────────────
+        if result is None:
+            try:
+                signal_match = re.search(
+                    r'\*\*Decision:\s*([A-Za-z_]+)\*\*|Decision:\s*([A-Za-z_]+)|Signal:\s*([A-Za-z_]+)',
+                    raw, re.IGNORECASE)
+                if signal_match:
+                    signal_raw = next(g for g in signal_match.groups() if g).upper()
+                    conf_match = re.search(r'Confidence:\s*(\d+)', raw, re.IGNORECASE)
+                    conf       = int(conf_match.group(1)) if conf_match else 50
+                    data       = {'signal': signal_raw, 'confidence': conf,
+                                  'rationale': narrative or 'AI Decision (Text Parsed)', 'risk': 'MEDIUM'}
+                    result     = self._normalise(data, narrative=narrative)
+                    logger.info(f"[CORTEX] Parsed text format: {signal_raw} ({conf}%)")
+            except Exception as e:
+                logger.debug(f"[CORTEX] Text parse failed: {e}")
+
+        if result is None:
+            logger.warning(f"[CORTEX] Could not parse response: {raw[:120]}")
+            result = self._fallback_from_math(part_results, ai_online=True)
+            if narrative:
+                result['ai_narrative'] = narrative
+
+        return result
+
+    def _normalise(self, data: Dict, narrative: str = '') -> Dict:
         raw_sig = str(data.get('signal', data.get('bias', 'NO_TRADE'))).upper()
         if raw_sig in ('CALL', 'BUY', 'BULLISH', 'LONG'):
             signal = 'CALL'
@@ -243,23 +298,30 @@ class JarvisNeuralCortex:
         risk = str(data.get('risk', 'MEDIUM')).upper()
         if risk not in ('LOW', 'MEDIUM', 'HIGH'):
             risk = 'MEDIUM'
+        # Use narrative if available, else fall back to rationale
+        display_narrative = (narrative.strip() if narrative and len(narrative) > 10
+                             else rationale)
         return {'signal': signal, 'bias': signal.replace('_', '-'), 'confidence': conf,
-                'rationale': rationale, 'reasoning': rationale, 'risk': risk, 'ai_online': True}
+                'rationale': rationale, 'reasoning': rationale, 'risk': risk,
+                'ai_online': True, 'ai_narrative': display_narrative}
 
     def _fallback_from_math(self, part_results: Dict, ai_online: bool = False) -> Dict:
         try:
-            fusion = part_results.get('part11_fusion', {})
+            fusion    = part_results.get('part11_fusion', {})
             conf_part = part_results.get('part12_confidence', {})
-            math_sig = fusion.get('signal', 0)
+            math_sig  = fusion.get('signal', 0)
             math_conf = conf_part.get('confidence', 10)
-            signal = 'CALL' if math_sig > 0 else ('PUT' if math_sig < 0 else 'NO_TRADE')
-            source = "Ollama offline -- math fallback" if not ai_online else "AI parse error -- math fallback"
+            signal    = 'CALL' if math_sig > 0 else ('PUT' if math_sig < 0 else 'NO_TRADE')
+            source    = ("Ollama offline — using math vote fallback."
+                         if not ai_online else
+                         "AI response could not be parsed — using math vote fallback.")
             return {'signal': signal, 'bias': signal.replace('_', '-'), 'confidence': math_conf,
-                    'rationale': source, 'reasoning': source, 'risk': 'MEDIUM', 'ai_online': False}
+                    'rationale': source, 'reasoning': source, 'risk': 'MEDIUM',
+                    'ai_online': False, 'ai_narrative': source}
         except Exception:
             return {'signal': 'NO_TRADE', 'bias': 'NO-TRADE', 'confidence': 0,
                     'rationale': 'Critical AI error', 'reasoning': 'Critical AI error',
-                    'risk': 'HIGH', 'ai_online': False}
+                    'risk': 'HIGH', 'ai_online': False, 'ai_narrative': 'Critical system error — cannot analyze.'}
 
     # -------------------------------------------------------------------------
     # BACKWARD COMPAT SHIMS (for old ai_chain_brain references)

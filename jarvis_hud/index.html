@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JARVIS — Ultra 3D Command Center</title>
+<!-- Three.js Core & PostProcessing -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --cyan: #00e5ff;
+    --purple: #b400ff;
+    --green: #00ff66;
+    --gold: #ffcc00;
+    --red: #ff2a55;
+    --dark: #010409;
+    --glass: rgba(0, 20, 40, 0.45);
+    --glass-border: rgba(0, 229, 255, 0.2);
+    --neon-shadow: 0 0 20px rgba(0, 229, 255, 0.4);
+  }
+
+  * { margin:0; padding:0; box-sizing:border-box; }
+
+  body {
+    background: radial-gradient(circle at center, #020b1a 0%, #000000 100%);
+    color: #e0f7ff;
+    font-family: 'Rajdhani', sans-serif;
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+    perspective: 1500px; /* 3D Perspective for UI */
+  }
+
+  /* ── 3D CANVAS (BACKGROUND) ── */
+  #canvas-container {
+    position: fixed; top:0; left:0; width:100%; height:100%; z-index: 1;
+    pointer-events: none;
+  }
+
+  /* ── MAIN APP WRAPPER ── */
+  #app {
+    position: relative; z-index: 2;
+    display: flex;
+    justify-content: space-between;
+    align-items: stretch;
+    height: 100vh;
+    padding: 20px 30px;
+    pointer-events: none; /* Let clicks pass to panels */
+  }
+
+  /* Make panels clickable */
+  .interactive { pointer-events: auto; }
+
+  /* ── 3D UI PANELS ── */
+  .panel-column {
+    display: flex; flex-direction: column;
+    gap: 20px;
+    width: 340px;
+    transform-style: preserve-3d;
+    transition: transform 0.5s ease;
+  }
+  
+  /* Tilt Left Panels Right */
+  #left-col {
+    transform: rotateY(12deg) translateZ(50px);
+    transform-origin: left center;
+  }
+  /* Tilt Right Panels Left */
+  #right-col {
+    transform: rotateY(-12deg) translateZ(50px);
+    transform-origin: right center;
+  }
+
+  .glass-panel {
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border-radius: 12px;
+    padding: 15px;
+    position: relative;
+    overflow: hidden;
+    box-shadow: inset 0 0 20px rgba(0,229,255,0.05), 0 10px 30px rgba(0,0,0,0.8);
+  }
+  
+  /* Animated glowing edge */
+  .glass-panel::before {
+    content:''; position:absolute; top:-1px; left:-1px; right:-1px; height:2px;
+    background: linear-gradient(90deg, transparent, var(--cyan), var(--purple), transparent);
+    background-size: 200%;
+    animation: flowLight 4s linear infinite;
+  }
+  @keyframes flowLight { 0%{background-position:100%} 100%{background-position:-100%} }
+
+  .panel-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--cyan);
+    text-transform: uppercase;
+    letter-spacing: 4px;
+    margin-bottom: 15px;
+    display: flex; align-items: center; gap: 10px;
+    text-shadow: 0 0 10px var(--cyan);
+  }
+  .panel-title .glow-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--cyan);
+    box-shadow: 0 0 10px var(--cyan), 0 0 20px var(--cyan);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.4;transform:scale(1.2)} }
+
+  /* ── CENTER HUD (Top & Bottom) ── */
+  #center-hud {
+    flex: 1;
+    display: flex; flex-direction: column;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 20px;
+  }
+
+  .header-logo {
+    margin-top: 10px;
+    text-align: center;
+    transform: translateZ(100px);
+  }
+  .logo-text {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 42px;
+    font-weight: 900;
+    letter-spacing: 15px;
+    background: linear-gradient(180deg, #ffffff, var(--cyan));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    filter: drop-shadow(0 0 15px var(--cyan));
+  }
+  .sub-logo {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 14px;
+    color: var(--purple);
+    letter-spacing: 8px;
+    text-shadow: 0 0 10px var(--purple);
+    margin-top: -5px;
+  }
+
+  /* ── CENTER PIPELINE / TRADE ── */
+  .center-bottom-cluster {
+    width: 100%;
+    max-width: 800px;
+    display: flex; flex-direction: column; gap: 20px;
+    margin-bottom: 20px;
+  }
+
+  /* ── PARTS LIST (LEFT) ── */
+  #parts-list {
+    display: flex; flex-direction: column; gap: 8px;
+    max-height: calc(100vh - 120px);
+    overflow-y: auto;
+  }
+  #parts-list::-webkit-scrollbar { width: 2px; }
+  #parts-list::-webkit-scrollbar-thumb { background: var(--cyan); }
+
+  .part-item {
+    display: flex; flex-direction: column; gap: 4px;
+    background: rgba(0, 10, 25, 0.6);
+    border: 1px solid rgba(0,229,255,0.1);
+    padding: 10px; border-radius: 8px;
+    transition: all 0.3s;
+  }
+  .part-item:hover {
+    background: rgba(0,229,255,0.05);
+    border-color: var(--cyan);
+    box-shadow: inset 0 0 15px rgba(0,229,255,0.1);
+    transform: translateZ(10px);
+  }
+  .part-top { display: flex; justify-content: space-between; align-items: center; }
+  .part-name { font-family:'Share Tech Mono', monospace; font-size:12px; color:#fff; }
+  .part-badge { 
+    font-family: 'Orbitron', sans-serif; font-size: 9px; padding: 3px 8px; border-radius: 4px; letter-spacing: 1px;
+  }
+  .b-bull { background: rgba(0,255,102,0.15); color: var(--green); border: 1px solid var(--green); box-shadow: 0 0 8px rgba(0,255,102,0.4); }
+  .b-bear { background: rgba(255,42,85,0.15); color: var(--red); border: 1px solid var(--red); box-shadow: 0 0 8px rgba(255,42,85,0.4); }
+  .b-neut { background: rgba(255,204,0,0.15); color: var(--gold); border: 1px solid var(--gold); box-shadow: 0 0 8px rgba(255,204,0,0.4); }
+  
+  .part-bot { display: flex; align-items: center; gap: 10px; }
+  .conf-bar-bg { flex:1; height:4px; background:rgba(255,255,255,0.1); border-radius:2px; overflow:hidden; }
+  .conf-bar-fill { height:100%; background: linear-gradient(90deg, var(--cyan), var(--purple)); transition: width 0.5s; }
+  .conf-text { font-family:'Share Tech Mono',monospace; font-size:10px; color:var(--cyan); }
+
+  /* ── THOUGHTS STREAM (RIGHT) ── */
+  #thoughts-feed {
+    height: 300px;
+    overflow-y: auto;
+    display: flex; flex-direction: column; gap: 8px;
+    font-family: 'Share Tech Mono', monospace;
+  }
+  #thoughts-feed::-webkit-scrollbar { width: 2px; }
+  #thoughts-feed::-webkit-scrollbar-thumb { background: var(--purple); }
+  .thought-row {
+    background: rgba(0,0,0,0.4);
+    border-left: 2px solid var(--cyan);
+    padding: 8px;
+    font-size: 11px;
+    line-height: 1.4;
+    animation: slideIn 0.3s ease-out;
+  }
+  @keyframes slideIn { from{opacity:0; transform:translateX(20px);} to{opacity:1; transform:translateX(0);} }
+  .t-time { color: rgba(255,255,255,0.4); font-size:9px; margin-right:8px; }
+  .t-name { font-weight: bold; margin-right:5px; text-shadow:0 0 5px currentColor; }
+
+  /* ── LIVE TRADE / STATS (RIGHT) ── */
+  .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 15px; }
+  .stat-card { text-align: center; background:rgba(0,0,0,0.4); padding:10px; border-radius:8px; border:1px solid rgba(255,255,255,0.05);}
+  .stat-val { font-family:'Orbitron',sans-serif; font-size:24px; font-weight:700; }
+  .stat-val.win { color:var(--green); text-shadow:0 0 15px var(--green); }
+  .stat-val.loss { color:var(--red); text-shadow:0 0 15px var(--red); }
+  .stat-val.wr { color:var(--gold); text-shadow:0 0 15px var(--gold); }
+  .stat-lbl { font-size:10px; color:rgba(255,255,255,0.5); letter-spacing:1px; margin-top:5px; }
+
+  /* ── EQUITY CHART ── */
+  .chart-container { height: 180px; width:100%; position:relative; }
+
+  /* ── CENTRAL PIPELINE ── */
+  .pipeline-container {
+    display: flex; align-items: center; justify-content: space-between;
+    background: rgba(0,10,30,0.6); border: 1px solid var(--glass-border);
+    padding: 15px 30px; border-radius: 50px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    backdrop-filter: blur(10px);
+  }
+  .pipe-node {
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+  }
+  .pipe-icon {
+    width: 45px; height: 45px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px;
+    background: rgba(0,0,0,0.5); border: 2px solid;
+    box-shadow: inset 0 0 15px rgba(255,255,255,0.1);
+    position: relative;
+  }
+  .pipe-icon::after {
+    content:''; position:absolute; top:-5px; left:-5px; right:-5px; bottom:-5px;
+    border-radius:50%; border: 1px dashed currentColor;
+    animation: rotateDash 10s linear infinite;
+  }
+  @keyframes rotateDash { to{transform:rotate(360deg);} }
+  .pi-watch { color: var(--cyan); border-color: var(--cyan); box-shadow: 0 0 20px rgba(0,229,255,0.4); }
+  .pi-anlst { color: var(--purple); border-color: var(--purple); box-shadow: 0 0 20px rgba(180,0,255,0.4); }
+  .pi-valid { color: #0088ff; border-color: #0088ff; box-shadow: 0 0 20px rgba(0,136,255,0.4); }
+  .pi-risk  { color: var(--gold); border-color: var(--gold); box-shadow: 0 0 20px rgba(255,204,0,0.4); }
+  .pi-chair { color: #fff; border-color: #fff; box-shadow: 0 0 20px rgba(255,255,255,0.4); }
+  .pi-signl { color: var(--green); border-color: var(--green); box-shadow: 0 0 30px var(--green); }
+  
+  .pipe-text { font-family:'Orbitron',sans-serif; font-size:10px; letter-spacing:1px; color:rgba(255,255,255,0.7); }
+  
+  .pipe-arrow {
+    flex:1; height: 2px; background: rgba(255,255,255,0.1); position: relative; margin: 0 15px;
+  }
+  .pipe-arrow::after {
+    content:''; position:absolute; top:-3px; left:0; width:30px; height:8px;
+    background: linear-gradient(90deg, transparent, var(--cyan));
+    filter: blur(2px);
+    animation: flowData 1.5s linear infinite;
+  }
+  @keyframes flowData { 0%{left:0; opacity:0;} 50%{opacity:1;} 100%{left:100%; opacity:0;} }
+
+  /* ── CENTRAL TRADE INFO ── */
+  .big-trade {
+    background: linear-gradient(135deg, rgba(0,15,30,0.8), rgba(0,5,10,0.9));
+    border: 1px solid rgba(0,229,255,0.3);
+    border-radius: 16px;
+    padding: 20px 30px;
+    display: flex; justify-content: space-between; align-items: center;
+    box-shadow: 0 20px 50px rgba(0,0,0,0.8), inset 0 0 40px rgba(0,229,255,0.1);
+  }
+  .bt-left { display: flex; flex-direction: column; }
+  .bt-sym { font-family:'Orbitron',sans-serif; font-size:24px; font-weight:900; display:flex; align-items:center; gap:15px; }
+  .bt-dir { font-size:14px; padding:4px 12px; border-radius:6px; background:rgba(0,255,102,0.2); color:var(--green); border:1px solid var(--green); }
+  .bt-pnl { font-family:'Orbitron',sans-serif; font-size:52px; font-weight:900; margin:10px 0; text-shadow:0 0 30px currentColor; }
+  .bt-pnl.positive { color:var(--green); }
+  .bt-pnl.negative { color:var(--red); }
+  .bt-prices { font-family:'Share Tech Mono',monospace; font-size:14px; color:rgba(255,255,255,0.6); display:flex; gap:20px; }
+  
+  .bt-right { width: 300px; display:flex; flex-direction:column; gap:15px; }
+  .tgt-row { display:flex; align-items:center; gap:10px; }
+  .tgt-lbl { font-family:'Orbitron',sans-serif; font-size:12px; width:25px; }
+  .tgt-bar-bg { flex:1; height:8px; background:rgba(255,255,255,0.1); border-radius:4px; overflow:hidden; position:relative; }
+  .tgt-bar-fill { height:100%; position:relative; transition:width 1s; }
+  .tgt-bar-fill.tp { background: linear-gradient(90deg, rgba(0,255,102,0.2), var(--green)); box-shadow: 0 0 15px var(--green); }
+  .tgt-bar-fill.sl { background: linear-gradient(90deg, rgba(255,42,85,0.2), var(--red)); box-shadow: 0 0 15px var(--red); }
+  /* Animated scanline on target bars */
+  .tgt-bar-fill::after {
+    content:''; position:absolute; top:0;left:0;bottom:0;width:20px;
+    background:rgba(255,255,255,0.8); filter:blur(4px);
+    animation: flowData 2s infinite;
+  }
+  .tgt-val { font-family:'Share Tech Mono',monospace; font-size:12px; width:70px; text-align:right; }
+
+</style>
+</head>
+<body>
+
+<!-- 3D BACKGROUND LAYER -->
+<div id="canvas-container"></div>
+
+<!-- CONNECTION SPINNER -->
+<div id="conn-overlay" style="position:fixed;inset:0;background:#000;z-index:999;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--cyan);font-family:'Orbitron',sans-serif;">
+  <h1 style="letter-spacing:10px;animation:pulse 2s infinite;">JARVIS</h1>
+  <p style="font-family:'Share Tech Mono',monospace;margin-top:20px;" id="conn-status">Connecting to core...</p>
+</div>
+
+<!-- UI LAYER -->
+<div id="app">
+  
+  <!-- LEFT COLUMN (Tilted Right) -->
+  <div class="panel-column interactive" id="left-col">
+    <div class="glass-panel" style="flex:1; display:flex; flex-direction:column;">
+      <div class="panel-title"><div class="glow-dot"></div> NEURAL NETWORK STATUS</div>
+      <div id="parts-list">
+        <!-- JS populates this -->
+      </div>
+    </div>
+  </div>
+
+  <!-- CENTER HUD -->
+  <div id="center-hud">
+    <div class="header-logo">
+      <div class="logo-text">JARVIS</div>
+      <div class="sub-logo">AI COMMAND CENTER</div>
+      <div id="ticker" style="font-family:'Share Tech Mono',monospace; color:var(--gold); margin-top:15px; font-size:16px;">BTC: $67,420 ▲</div>
+    </div>
+
+    <div class="center-bottom-cluster interactive">
+      <!-- PIPELINE -->
+      <div class="pipeline-container">
+        <div class="pipe-node"><div class="pipe-icon pi-watch">👁</div><div class="pipe-text">WATCHER</div></div>
+        <div class="pipe-arrow"></div>
+        <div class="pipe-node"><div class="pipe-icon pi-anlst">🧠</div><div class="pipe-text">ANALYST</div></div>
+        <div class="pipe-arrow"></div>
+        <div class="pipe-node"><div class="pipe-icon pi-valid">✓</div><div class="pipe-text">VALIDATOR</div></div>
+        <div class="pipe-arrow"></div>
+        <div class="pipe-node"><div class="pipe-icon pi-risk">⚠</div><div class="pipe-text">RISK</div></div>
+        <div class="pipe-arrow"></div>
+        <div class="pipe-node"><div class="pipe-icon pi-chair">👑</div><div class="pipe-text">CHAIRMAN</div></div>
+        <div class="pipe-arrow"></div>
+        <div class="pipe-node"><div class="pipe-icon pi-signl" id="sig-hex">⚡</div><div class="pipe-text" id="sig-lbl">SIGNAL</div></div>
+      </div>
+
+      <!-- MARKET ORACLE MAP PANEL -->
+      <div class="glass-panel" id="oracle-panel" style="padding:12px 16px; background:rgba(0,15,30,0.7); border:1px solid rgba(0,229,255,0.3); border-radius:14px; box-shadow: 0 10px 30px rgba(0,0,0,0.6);">
+        <div class="panel-title" style="margin-bottom:8px; font-size:12px; display:flex; justify-content:space-between; align-items:center;">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <div class="glow-dot" style="background:var(--cyan); box-shadow:0 0 10px var(--cyan);"></div>
+            JARVIS MARKET ORACLE <span style="font-size:10px; color:var(--purple); letter-spacing:2px; font-family:'Share Tech Mono',monospace;">[5-MIN MULTI-TIMEFRAME MAP]</span>
+          </div>
+          <div id="orc-spot-header" style="font-family:'Share Tech Mono',monospace; font-size:11px; color:var(--gold);">
+            SPOT: $78,344 | MAX PAIN: $73,000 | PCR: 0.54
+          </div>
+        </div>
+
+        <!-- 4 TIMEFRAMES + FULL DAY -->
+        <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap:8px; margin-bottom:8px;">
+          <div class="stat-card" style="padding:6px;">
+            <div class="stat-lbl" style="font-size:9px;">NEXT 5 MIN</div>
+            <div id="orc-5m-dir" class="stat-val" style="font-size:12px; color:var(--red);">BEARISH</div>
+            <div id="orc-5m-rng" style="font-size:9px; color:rgba(255,255,255,0.7); font-family:'Share Tech Mono',monospace;">$78.2k-$78.4k</div>
+            <div id="orc-5m-cnf" style="font-size:8px; color:var(--cyan); margin-top:2px;">72% CONF</div>
+          </div>
+          <div class="stat-card" style="padding:6px;">
+            <div class="stat-lbl" style="font-size:9px;">NEXT 30 MIN</div>
+            <div id="orc-30m-dir" class="stat-val" style="font-size:12px; color:var(--red);">BEARISH</div>
+            <div id="orc-30m-rng" style="font-size:9px; color:rgba(255,255,255,0.7); font-family:'Share Tech Mono',monospace;">$78.0k-$78.4k</div>
+            <div id="orc-30m-cnf" style="font-size:8px; color:var(--cyan); margin-top:2px;">68% CONF</div>
+          </div>
+          <div class="stat-card" style="padding:6px;">
+            <div class="stat-lbl" style="font-size:9px;">NEXT 1 HOUR</div>
+            <div id="orc-1h-dir" class="stat-val" style="font-size:12px; color:var(--gold);">NEUTRAL</div>
+            <div id="orc-1h-rng" style="font-size:9px; color:rgba(255,255,255,0.7); font-family:'Share Tech Mono',monospace;">$77.8k-$78.6k</div>
+            <div id="orc-1h-cnf" style="font-size:8px; color:var(--cyan); margin-top:2px;">62% CONF</div>
+          </div>
+          <div class="stat-card" style="padding:6px;">
+            <div class="stat-lbl" style="font-size:9px;">NEXT 4 HOUR</div>
+            <div id="orc-4h-dir" class="stat-val" style="font-size:12px; color:var(--red);">BEARISH</div>
+            <div id="orc-4h-rng" style="font-size:9px; color:rgba(255,255,255,0.7); font-family:'Share Tech Mono',monospace;">$77.4k-$79.1k</div>
+            <div id="orc-4h-cnf" style="font-size:8px; color:var(--cyan); margin-top:2px;">65% CONF</div>
+          </div>
+          <div class="stat-card" style="padding:6px;">
+            <div class="stat-lbl" style="font-size:9px;">FULL DAY</div>
+            <div id="orc-day-dir" class="stat-val" style="font-size:12px; color:var(--gold);">NEUTRAL</div>
+            <div id="orc-day-rng" style="font-size:9px; color:rgba(255,255,255,0.7); font-family:'Share Tech Mono',monospace;">BASE: $78.2k</div>
+            <div id="orc-day-bounds" style="font-size:8px; color:#888; margin-top:2px;">$76.5k - $79.8k</div>
+          </div>
+        </div>
+
+        <!-- ORACLE TRADE PLAN & GEMINI SAYS -->
+        <div style="display:flex; gap:10px; align-items:center;">
+          <div style="background:rgba(0,0,0,0.4); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:5px 8px; min-width:160px; font-family:'Share Tech Mono',monospace; font-size:11px;">
+            <div style="font-size:9px; color:rgba(255,255,255,0.5);">TRADE PLAN</div>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-top:2px;">
+              <span id="orc-plan-sugg" style="color:var(--green); font-weight:bold; font-size:12px;">PUT</span>
+              <span id="orc-plan-targets" style="font-size:10px; color:#ccc;">TP: $77.8k | SL: $78.6k</span>
+            </div>
+          </div>
+          <div style="flex:1; background:rgba(0,10,25,0.5); border-left:3px solid var(--purple); padding:5px 10px; border-radius:0 8px 8px 0; font-size:11px; color:#cce8f5; line-height:1.3;">
+            <span style="color:var(--purple); font-weight:bold;">🧠 GEMINI ORACLE:</span>
+            <span id="orc-gemini-quote">"Short-term order book imbalance signals active sell pressure, triggering high-probability scalp..."</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- BIG TRADE INFO -->
+      <div class="big-trade">
+        <div class="bt-left">
+          <div class="bt-sym">BTC/USDT <span class="bt-dir" id="trade-dir">LONG</span></div>
+          <div class="bt-pnl positive" id="trade-pnl">+$0.00</div>
+          <div class="bt-prices">
+            <span>ENTRY: <strong style="color:#fff" id="trade-entry">$0</strong></span>
+            <span>CURRENT: <strong style="color:var(--cyan)" id="trade-curr">$0</strong></span>
+          </div>
+        </div>
+        <div class="bt-right">
+          <div class="tgt-row">
+            <div class="tgt-lbl" style="color:var(--green)">TP</div>
+            <div class="tgt-bar-bg"><div class="tgt-bar-fill tp" id="tp-fill" style="width:0%"></div></div>
+            <div class="tgt-val" id="tp-val">$0</div>
+          </div>
+          <div class="tgt-row">
+            <div class="tgt-lbl" style="color:var(--red)">SL</div>
+            <div class="tgt-bar-bg"><div class="tgt-bar-fill sl" id="sl-fill" style="width:0%"></div></div>
+            <div class="tgt-val" id="sl-val">$0</div>
+          </div>
+          <div style="font-family:'Orbitron',sans-serif; color:var(--gold); font-size:12px; margin-top:10px; text-align:right;">
+            RISK EXPOSURE: <span id="trade-risk">1.2%</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT COLUMN (Tilted Left) -->
+  <div class="panel-column interactive" id="right-col">
+    <!-- STATS -->
+    <div class="glass-panel">
+      <div class="panel-title"><div class="glow-dot" style="background:var(--gold);box-shadow:0 0 10px var(--gold)"></div> SYSTEM PERFORMANCE</div>
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-val win" id="st-win">0</div><div class="stat-lbl">WINS</div></div>
+        <div class="stat-card"><div class="stat-val loss" id="st-loss">0</div><div class="stat-lbl">LOSSES</div></div>
+        <div class="stat-card"><div class="stat-val wr" id="st-wr">0%</div><div class="stat-lbl">WIN RATE</div></div>
+      </div>
+      <div class="chart-container"><canvas id="equityChart"></canvas></div>
+    </div>
+
+    <!-- THOUGHTS STREAM -->
+    <div class="glass-panel" style="flex:1; display:flex; flex-direction:column;">
+      <div class="panel-title"><div class="glow-dot" style="background:var(--purple);box-shadow:0 0 10px var(--purple)"></div> LIVE AI THOUGHTS</div>
+      <div id="thoughts-feed"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ==========================================
+// 1. THREE.JS HYPER-FUTURISTIC SCENE (BLOOM)
+// ==========================================
+(function initThreeJS() {
+  const container = document.getElementById('canvas-container');
+  const scene = new THREE.Scene();
+  // Slight fog to blend edges into the dark gradient background
+  scene.fog = new THREE.FogExp2(0x020b1a, 0.04);
+
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 100);
+  camera.position.z = 18;
+  camera.position.y = 2; // Look slightly down
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.toneMapping = THREE.ReinhardToneMapping;
+  container.appendChild(renderer.domElement);
+
+  // Post-Processing for BLOOM (Glow effect)
+  const renderScene = new THREE.RenderPass(scene, camera);
+  const bloomPass = new THREE.UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+  bloomPass.threshold = 0.1;
+  bloomPass.strength = 1.8; // High glow
+  bloomPass.radius = 0.5;
+
+  const composer = new THREE.EffectComposer(renderer);
+  composer.addPass(renderScene);
+  composer.addPass(bloomPass);
+
+  // --- CORE: Holographic Torus Knot ---
+  const coreGeo = new THREE.TorusKnotGeometry(2.5, 0.6, 128, 32);
+  const coreMat = new THREE.MeshStandardMaterial({
+    color: 0x002244, emissive: 0x0088ff, emissiveIntensity: 0.5,
+    wireframe: true, transparent: true, opacity: 0.15
+  });
+  const coreMesh = new THREE.Mesh(coreGeo, coreMat);
+  scene.add(coreMesh);
+
+  // --- CORE: Inner glowing sphere ---
+  const innerSphere = new THREE.Mesh(
+    new THREE.SphereGeometry(1.8, 32, 32),
+    new THREE.MeshBasicMaterial({ color: 0x00e5ff, transparent: true, opacity: 0.05 })
+  );
+  scene.add(innerSphere);
+
+  // --- PARTICLES (Data Dust) ---
+  const pGeo = new THREE.BufferGeometry();
+  const pCount = 1500;
+  const pPos = new Float32Array(pCount * 3);
+  for(let i=0; i<pCount*3; i++) pPos[i] = (Math.random() - 0.5) * 30;
+  pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+  const pMat = new THREE.PointsMaterial({ color: 0x00e5ff, size: 0.05, transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending });
+  const particles = new THREE.Points(pGeo, pMat);
+  scene.add(particles);
+
+  // --- ORBITING NODES (The 12 Parts) ---
+  const nodeGroup = new THREE.Group();
+  const nodes = [];
+  window._threeNodes = nodes; // export for color updates
+  
+  for(let i=0; i<12; i++) {
+    // Math to space them evenly on a sphere
+    const phi = Math.acos(-1 + (2 * i) / 12);
+    const theta = Math.sqrt(12 * Math.PI) * phi;
+    
+    // Node geometry (Diamond shape)
+    const nGeo = new THREE.OctahedronGeometry(0.3, 0);
+    const nMat = new THREE.MeshStandardMaterial({
+      color: 0x00e5ff, emissive: 0x00e5ff, emissiveIntensity: 1.0, wireframe:true
+    });
+    const node = new THREE.Mesh(nGeo, nMat);
+    
+    // Position at radius 5.5
+    const r = 5.5;
+    node.position.set(r*Math.sin(phi)*Math.cos(theta), r*Math.cos(phi), r*Math.sin(phi)*Math.sin(theta));
+    
+    // Add point light to each node
+    const light = new THREE.PointLight(0x00e5ff, 0.5, 3);
+    node.add(light);
+    
+    nodes.push({ mesh: node, light: light });
+    nodeGroup.add(node);
+  }
+  scene.add(nodeGroup);
+
+  // --- LINES CONNECTING NODES TO CORE ---
+  const lineMat = new THREE.LineBasicMaterial({ color: 0x00e5ff, transparent: true, opacity: 0.1, blending: THREE.AdditiveBlending });
+  nodes.forEach(n => {
+    const pts = [n.mesh.position, new THREE.Vector3(0,0,0)];
+    const geo = new THREE.BufferGeometry().setFromPoints(pts);
+    scene.add(new THREE.Line(geo, lineMat));
+  });
+
+  // Lighting
+  scene.add(new THREE.AmbientLight(0x000000));
+
+  // Mouse interactivity (parallax)
+  let mouseX = 0, mouseY = 0;
+  document.addEventListener('mousemove', (e) => {
+    mouseX = (e.clientX / window.innerWidth) * 2 - 1;
+    mouseY = -(e.clientY / window.innerHeight) * 2 + 1;
+  });
+
+  let clock = new THREE.Clock();
+  function animate() {
+    requestAnimationFrame(animate);
+    const t = clock.getElapsedTime();
+
+    // Rotate core
+    coreMesh.rotation.x = t * 0.2;
+    coreMesh.rotation.y = t * 0.3;
+    
+    // Rotate node group
+    nodeGroup.rotation.y = t * 0.1;
+    nodeGroup.rotation.z = Math.sin(t * 0.05) * 0.2;
+
+    // Bob nodes up and down
+    nodes.forEach((n, idx) => {
+      n.mesh.rotation.x += 0.02;
+      n.mesh.rotation.y += 0.03;
+      const s = 1 + Math.sin(t * 3 + idx) * 0.2;
+      n.mesh.scale.setScalar(s);
+    });
+
+    // Parallax camera
+    camera.position.x += (mouseX * 2 - camera.position.x) * 0.05;
+    camera.position.y += (mouseY * 2 - camera.position.y) * 0.05;
+    camera.lookAt(scene.position);
+    
+    // Particle rotation
+    particles.rotation.y = t * 0.02;
+
+    composer.render();
+  }
+  animate();
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    composer.setSize(window.innerWidth, window.innerHeight);
+  });
+})();
+
+// ==========================================
+// 2. CHART.JS (EQUITY CURVE)
+// ==========================================
+let eqChart;
+function initChart() {
+  const ctx = document.getElementById('equityChart').getContext('2d');
+  const gradient = ctx.createLinearGradient(0, 0, 0, 180);
+  gradient.addColorStop(0, 'rgba(0, 229, 255, 0.4)');
+  gradient.addColorStop(1, 'rgba(0, 229, 255, 0.0)');
+
+  eqChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{
+      data: [], borderColor: '#00e5ff', borderWidth: 2, pointRadius: 0,
+      fill: true, backgroundColor: gradient, tension: 0.4
+    }]},
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      scales: {
+        x: { display: false },
+        y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: 'rgba(255,255,255,0.5)' } }
+      },
+      animation: { duration: 0 }
+    }
+  });
+}
+initChart();
+
+// ==========================================
+// 3. WEBSOCKET LOGIC & DOM UPDATES
+// ==========================================
+const COLORS = {
+  BULLISH: { hex: 0x00ff66, css: '#00ff66' },
+  BEARISH: { hex: 0xff2a55, css: '#ff2a55' },
+  NEUTRAL: { hex: 0xffcc00, css: '#ffcc00' }
+};
+
+const PART_NAMES = [
+  "Part1_Breakout", "Part2_Neural", "Part3_Institutional", "Part4_Backtest",
+  "Part5_Fusion", "Part6_Backtest", "Part7_LiveData", "Part8_Pattern",
+  "Part9_Adaptive", "Part10_Execution", "Part11_Confidence", "Part12_Execution"
+];
+// Pre-build part list HTML
+const plist = document.getElementById('parts-list');
+PART_NAMES.forEach((name, i) => {
+  const div = document.createElement('div');
+  div.id = 'pcard-' + name;
+  div.className = 'part-item';
+  div.innerHTML = `
+    <div class="part-top">
+      <div class="part-name">${name.replace('Part','P').replace('_','·')}</div>
+      <div class="part-badge b-neut" id="pbadge-${name}">WAIT</div>
+    </div>
+    <div class="part-bot">
+      <div class="conf-bar-bg"><div class="conf-bar-fill" id="pfill-${name}" style="width:0%"></div></div>
+      <div class="conf-text" id="pconf-${name}">0%</div>
+    </div>
+  `;
+  plist.appendChild(div);
+});
+
+let prevPartsTs = {};
+
+function connectWS() {
+  const ws = new WebSocket(`ws://${window.location.host}/ws`);
+  ws.onopen = () => {
+    document.getElementById('conn-overlay').style.display = 'none';
+  };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if(msg.type === 'STATE_UPDATE') updateUI(msg.data);
+  };
+  ws.onclose = () => {
+    document.getElementById('conn-overlay').style.display = 'flex';
+    document.getElementById('conn-status').textContent = 'Connection lost. Retrying...';
+    setTimeout(connectWS, 2000);
+  };
+}
+
+function updateUI(data) {
+  // 1. Update Parts List & 3D Nodes
+  PART_NAMES.forEach((name, i) => {
+    const pdata = data.parts[name];
+    if(pdata) {
+      // DOM
+      const badge = document.getElementById(`pbadge-${name}`);
+      const fill  = document.getElementById(`pfill-${name}`);
+      const confT = document.getElementById(`pconf-${name}`);
+      
+      const dir = pdata.direction || 'NEUTRAL';
+      const conf = pdata.confidence || 0;
+      
+      badge.textContent = dir;
+      badge.className = `part-badge b-${dir.substring(0,4).toLowerCase()}`;
+      fill.style.width = `${conf}%`;
+      confT.textContent = `${conf.toFixed(0)}%`;
+
+      // 3D Sphere Color Sync
+      if(window._threeNodes && window._threeNodes[i]) {
+        const c = COLORS[dir] || COLORS.NEUTRAL;
+        window._threeNodes[i].mesh.material.color.setHex(c.hex);
+        window._threeNodes[i].mesh.material.emissive.setHex(c.hex);
+        window._threeNodes[i].light.color.setHex(c.hex);
+      }
+
+      // Thoughts Stream
+      if(pdata.ts !== prevPartsTs[name]) {
+        addThought(name, pdata.raw, COLORS[dir].css);
+        prevPartsTs[name] = pdata.ts;
+      }
+    }
+  });
+
+  // 2. Big Trade
+  if(data.trades && data.trades.length > 0) {
+    const t = data.trades[0];
+    const pnl = t.pnl || 0;
+    document.getElementById('trade-dir').textContent = t.direction;
+    document.getElementById('trade-dir').className = `bt-dir ${t.direction==='LONG'?'b-bull':'b-bear'}`;
+    const pnlEl = document.getElementById('trade-pnl');
+    pnlEl.textContent = (pnl>=0?'+$':'-$') + Math.abs(pnl).toFixed(2);
+    pnlEl.className = `bt-pnl ${pnl>=0?'positive':'negative'}`;
+    document.getElementById('trade-entry').textContent = `$${(t.entry||0).toLocaleString()}`;
+    document.getElementById('trade-curr').textContent = `$${(t.current||0).toLocaleString()}`;
+    document.getElementById('trade-risk').textContent = `${t.risk_pct||0}%`;
+    document.getElementById('ticker').textContent = `${t.symbol} $${t.current} ${pnl>=0?'▲':'▼'}`;
+
+    const en = t.entry||1, cu = t.current||1, tp = t.tp||1, sl = t.sl||1;
+    document.getElementById('tp-val').textContent = `$${tp.toLocaleString()}`;
+    document.getElementById('sl-val').textContent = `$${sl.toLocaleString()}`;
+    document.getElementById('tp-fill').style.width = `${Math.max(0, Math.min(100, (cu-en)/(tp-en)*100))}%`;
+    document.getElementById('sl-fill').style.width = `${Math.max(0, Math.min(100, (en-cu)/(en-sl)*100))}%`;
+  }
+
+  // 3. Stats
+  document.getElementById('st-win').textContent = data.stats.wins;
+  document.getElementById('st-loss').textContent = data.stats.losses;
+  document.getElementById('st-wr').textContent = (data.stats.win_rate).toFixed(1)+'%';
+  
+  if(data.stats.equity_curve) {
+    eqChart.data.labels = data.stats.equity_curve.map(()=>'');
+    eqChart.data.datasets[0].data = data.stats.equity_curve;
+    eqChart.update();
+  }
+
+  // 4. Central Signal Node
+  const votes = Object.values(data.parts).map(v=>v.direction);
+  const bull = votes.filter(v=>v==='BULLISH').length;
+  const bear = votes.filter(v=>v==='BEARISH').length;
+  const sHex = document.getElementById('sig-hex');
+  if(bull > bear && bull >= 3) { sHex.textContent='📈'; sHex.className='pipe-icon pi-signl'; sHex.style.color='var(--green)'; sHex.style.borderColor='var(--green)';}
+  else if(bear > bull && bear >= 3) { sHex.textContent='📉'; sHex.className='pipe-icon pi-signl'; sHex.style.color='var(--red)'; sHex.style.borderColor='var(--red)';}
+  else { sHex.textContent='⟳'; sHex.className='pipe-icon pi-signl'; sHex.style.color='var(--gold)'; sHex.style.borderColor='var(--gold)';}
+
+  // 5. Update JARVIS Market Oracle Panel
+  if(data.oracle && Object.keys(data.oracle).length > 0) {
+    const o = data.oracle;
+    const spot = o.btc_spot || (data.trades && data.trades[0] ? data.trades[0].current : 0);
+    const opt = o.options_intel || {};
+    const tf5 = o['5min'] || {};
+    const tf30 = o['30min'] || {};
+    const tf1h = o['1hour'] || {};
+    const tf4h = o['4hour'] || {};
+    const day = o['day'] || {};
+
+    const spotEl = document.getElementById('orc-spot-header');
+    if(spotEl && spot > 0) {
+      spotEl.textContent = `SPOT: $${Math.round(spot).toLocaleString()} | MAX PAIN: $${Math.round(opt.max_pain||0).toLocaleString()} | PCR: ${(opt.pcr||0).toFixed(2)}`;
+    }
+
+    function setTf(prefix, tf) {
+      const dEl = document.getElementById(`orc-${prefix}-dir`);
+      const rEl = document.getElementById(`orc-${prefix}-rng`);
+      const cEl = document.getElementById(`orc-${prefix}-cnf`);
+      if(dEl && tf.direction) {
+        dEl.textContent = tf.direction;
+        dEl.style.color = tf.direction.includes('BULL') ? 'var(--green)' : (tf.direction.includes('BEAR') ? 'var(--red)' : 'var(--gold)');
+      }
+      if(rEl && tf.range) rEl.textContent = tf.range;
+      if(cEl && tf.confidence) cEl.textContent = `${tf.confidence}% CONF`;
+    }
+
+    setTf('5m', tf5);
+    setTf('30m', tf30);
+    setTf('1h', tf1h);
+    setTf('4h', tf4h);
+
+    const dayDirEl = document.getElementById('orc-day-dir');
+    const dayRngEl = document.getElementById('orc-day-rng');
+    const dayBndEl = document.getElementById('orc-day-bounds');
+    if(dayDirEl && day.direction) {
+      dayDirEl.textContent = day.direction;
+      dayDirEl.style.color = day.direction.includes('BULL') ? 'var(--green)' : (day.direction.includes('BEAR') ? 'var(--red)' : 'var(--gold)');
+    }
+    if(dayRngEl && day.base) dayRngEl.textContent = `BASE: $${Math.round(day.base).toLocaleString()}`;
+    if(dayBndEl && day.bear && day.bull) dayBndEl.textContent = `$${Math.round(day.bear/1000)}k - $${Math.round(day.bull/1000)}k`;
+
+    const suggEl = document.getElementById('orc-plan-sugg');
+    const tgtEl = document.getElementById('orc-plan-targets');
+    if(suggEl && o.trade_suggestion) {
+      suggEl.textContent = o.trade_suggestion;
+      suggEl.style.color = o.trade_suggestion === 'CALL' ? 'var(--green)' : (o.trade_suggestion === 'PUT' ? 'var(--red)' : 'var(--gold)');
+    }
+    if(tgtEl && o.exit_target && o.stop_loss) {
+      tgtEl.textContent = `TP: $${Math.round(o.exit_target).toLocaleString()} | SL: $${Math.round(o.stop_loss).toLocaleString()}`;
+    }
+
+    const quoteEl = document.getElementById('orc-gemini-quote');
+    if(quoteEl && o.gemini_summary) {
+      quoteEl.textContent = `"${o.gemini_summary}"`;
+    }
+  }
+}
+
+function addThought(name, text, color) {
+  const feed = document.getElementById('thoughts-feed');
+  const d = new Date();
+  const ts = `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}:${d.getSeconds().toString().padStart(2,'0')}`;
+  const el = document.createElement('div');
+  el.className = 'thought-row';
+  el.style.borderLeftColor = color;
+  el.innerHTML = `<span class="t-time">[${ts}]</span> <span class="t-name" style="color:${color}">${name.replace('Part','P')}</span> <span style="color:#bbb">${text.substring(0,90)}</span>`;
+  feed.prepend(el);
+  if(feed.children.length > 30) feed.lastChild.remove();
+}
+
+connectWS();
+</script>
+</body>
+</html>

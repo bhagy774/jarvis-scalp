@@ -31,7 +31,6 @@ else:
 
 import time
 import threading
-import asyncio
 import importlib
 import traceback
 from pathlib import Path

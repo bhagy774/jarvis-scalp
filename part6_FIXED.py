@@ -12,13 +12,9 @@ import sys
 import os
 import gc
 import time
-import json
-import math
 import logging
 import asyncio
 import tempfile
-import threading
-import traceback
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Union, Callable
@@ -26,7 +22,6 @@ from contextlib import nullcontext
 from collections import deque, defaultdict, OrderedDict
 
 import numpy as np
-import pandas as pd
 
 # Safe stdout encoding wrapper for Windows terminals
 if hasattr(sys.stdout, 'reconfigure'):
@@ -369,6 +364,13 @@ class GPUComprehensiveBacktester:
             
             end_time = time.time()
             print(f"OK Backtest completed in {end_time - start_time:.2f} seconds")
+            # Publish to CognitiveBus for Watcher AI monitoring
+            if hasattr(self, 'trading_system') and hasattr(self.trading_system, 'bus') and self.trading_system.bus:
+                trades = report.get('total_trades', 'N/A')
+                wr = report.get('win_rate', 'N/A')
+                pnl = report.get('total_pnl', 'N/A')
+                msg = f"Backtest Complete: Trades={trades}, WinRate={wr}, PnL={pnl}. Duration={end_time - start_time:.1f}s"
+                self.trading_system.bus.publish('THOUGHTS', 'Part6_Backtest', msg)
             return report
             
         except Exception as e:

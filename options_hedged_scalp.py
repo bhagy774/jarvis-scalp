@@ -221,7 +221,7 @@ class OptionsHedgedScalpEngine:
             self.closed_positions.append(pos)
             
             logger.info(f"\n{'='*50}")
-            logger.info(f"🏁 CLOSED HEDGED POSITION: {pos_id}")
+            logger.info(f"🏁 CLOSED HEDGED POSITION: {position_id}")
             logger.info(f"Reason: {pos.get('close_reason')}")
             logger.info(f"Futures PnL: ${pos['futures_leg']['pnl']:.2f}")
             if pos.get("hedge_leg"):

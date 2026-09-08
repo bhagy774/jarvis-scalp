@@ -1,4 +1,3 @@
-import pandas as pd
 import numpy as np
 
 from collections import deque
@@ -1641,6 +1640,11 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
             }
             
             self.signal_history.append(result)
+            # Publish to CognitiveBus for Watcher AI monitoring
+            if hasattr(self, 'bus') and self.bus:
+                direction_str = 'BULLISH' if signal > 0 else 'BEARISH' if signal < 0 else 'NEUTRAL'
+                msg = f"Breakout Analysis: {direction_str} (Signal: {signal}, Confidence: {confidence:.2f}). Regime: {regime_data.get('regime', 'unknown')}"
+                self.bus.publish('THOUGHTS', 'Part1_Breakout', msg)
             return result
             
         except Exception as e:

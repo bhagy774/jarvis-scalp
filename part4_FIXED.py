@@ -1113,6 +1113,11 @@ class InstitutionalBacktestingOrchestrator:
                 'total_duration_seconds': end_time - start_time,
                 'data_points_processed': len(historical_data)
             }
+            # Publish to CognitiveBus for Watcher AI monitoring
+            if hasattr(self, 'trading_engine') and hasattr(self.trading_engine, 'bus') and self.trading_engine.bus:
+                duration = comprehensive_report.get('processing_metrics', {}).get('total_duration_seconds', 0)
+                msg = f"Backtest Engine: Completed '{test_name}' in {duration:.1f}s. Data points: {len(historical_data)}"
+                self.trading_engine.bus.publish('THOUGHTS', 'Part4_Backtest', msg)
             return comprehensive_report
         except Exception as e:
             if hasattr(self, 'trading_engine') and hasattr(self.trading_engine, 'bus') and self.trading_engine.bus:

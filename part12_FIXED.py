@@ -936,6 +936,18 @@ Follow the tag with a 1-sentence risk justification.
             analytics['ollama_multiplier'] = self.last_ollama_multiplier
             analytics['ollama_insight'] = self.last_ollama_insight
 
+            # Publish to CognitiveBus for Watcher AI monitoring
+            if hasattr(self, 'trading_system') and hasattr(self.trading_system, 'bus') and self.trading_system.bus:
+                cap = analytics.get('capital_metrics', {})
+                trades = analytics.get('trade_metrics', {})
+                pnl = cap.get('total_pnl', 0)
+                ret = cap.get('return_percentage', 0)
+                total = trades.get('total_trades', 0)
+                pos = self.current_position
+                pos_str = 'LONG' if pos > 0 else 'SHORT' if pos < 0 else 'FLAT'
+                msg = f"Execution Analytics: Position={pos_str}, PnL={pnl:.2f}, Return={ret:.2f}%, Total Trades={total}"
+                self.trading_system.bus.publish('THOUGHTS', 'Part12_Execution', msg)
+
             return analytics
             
         except Exception as e:

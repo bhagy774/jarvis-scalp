@@ -5,16 +5,11 @@
 # ==============================================================================
 
 import sys
-import os
 import time
 import json
 import math
 import asyncio
-import threading
 import hashlib
-import hmac
-import requests
-import traceback
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime, timedelta

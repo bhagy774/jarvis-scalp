@@ -142,12 +142,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Async & Networking
 import asyncio
-import aiohttp
 import websockets
 import json
 
 # Data Processing
-import pandas as pd
 import numpy as np
 
 # GPU Acceleration
@@ -1057,6 +1055,12 @@ class EnhancedGPULiveDataEngine:
                 market_state['current_price'] = float(candle_1s['close'][-1])
                 market_state['current_volume'] = float(candle_1s['volume'][-1])
             
+            # Publish to CognitiveBus for Watcher AI monitoring
+            if hasattr(self, 'bus') and self.bus:
+                price = market_state.get('current_price', 'UNKNOWN')
+                vol   = market_state.get('current_volume', 0)
+                msg   = f"Live Data Engine: Price={price}, Volume={vol:.2f}, Symbol={self.symbol}. Messages processed: {self.message_count}"
+                self.bus.publish('THOUGHTS', 'Part7_LiveData', msg)
             return market_state
             
         except Exception as e:
