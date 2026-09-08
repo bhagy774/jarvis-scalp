@@ -499,18 +499,22 @@ Recent 1h Closes: {candles.get('1h', [])[-4:]}
         }
 
         opinions = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {
-                executor.submit(_ask, prompts["analyst"], MODEL_ANALYST): "analyst",
-                executor.submit(_ask, prompts["validator"], MODEL_VALIDATOR): "validator",
-                executor.submit(_ask, prompts["risk_officer"], MODEL_RISK): "risk_officer",
-            }
-            for future in concurrent.futures.as_completed(futures, timeout=40):
-                key = futures[future]
-                try:
-                    opinions[key] = future.result()
-                except Exception as exc:
-                    opinions[key] = f"[Unavailable: {exc}]"
+        import threading
+        
+        def run_model(role, prompt, model):
+            try:
+                opinions[role] = _ask(prompt, model)
+            except Exception as e:
+                opinions[role] = f"[Unavailable: {e}]"
+                
+        t1 = threading.Thread(target=run_model, args=("analyst", prompts["analyst"], MODEL_ANALYST))
+        t2 = threading.Thread(target=run_model, args=("validator", prompts["validator"], MODEL_VALIDATOR))
+        t3 = threading.Thread(target=run_model, args=("risk_officer", prompts["risk_officer"], MODEL_RISK))
+        
+        t1.start(); t2.start(); t3.start()
+        t1.join(timeout=40)
+        t2.join(timeout=40)
+        t3.join(timeout=40)
 
         # Chairman synthesis
         chairman_prompt = f"""You are the Board Chairman ({MODEL_CHAIRMAN}).
