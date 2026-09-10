@@ -74,6 +74,24 @@ try:
 except ImportError:
     _get_oracle_gate = lambda: None
 
+# ── Coin Scanner (lazy import) ───────────────────────────────
+try:
+    from jarvis_coin_scanner import get_coin_scanner as _get_coin_scanner
+except ImportError:
+    _get_coin_scanner = lambda: None
+
+# ── Dynamic Sizer (lazy import) ──────────────────────────────
+try:
+    from jarvis_sizer import get_sizer as _get_sizer
+except ImportError:
+    _get_sizer = lambda: None
+
+# ── Position Manager (lazy import) ───────────────────────────
+try:
+    from jarvis_position_manager import get_position_manager as _get_position_manager
+except ImportError:
+    _get_position_manager = lambda: None
+
 # ── Scalp target percentages ─────────────────────────────────────
 SCALP_TP_PCT = 0.004    # 0.4% take profit
 SCALP_SL_PCT = 0.002    # 0.2% stop loss
@@ -337,15 +355,32 @@ class JarvisAutoTrader:
 
         is_call    = direction in ("CALL", "BUY")
         futures_side = "buy" if is_call else "sell"
-        symbol     = "BTCUSDT"
 
-        # ── Calculate position size ──────────────────────────────
+        # ── Dynamic symbol from Coin Scanner ────────────────────
+        scanner = _get_coin_scanner()
+        if scanner:
+            symbol = scanner.get_delta_symbol()
+        else:
+            symbol = "BTCUSDT"
+
+        # ── Calculate position size via Dynamic Sizer ────────────
         try:
-            balance  = self.delta.get_wallet_balance()
+            balance = self.delta.get_wallet_balance()
         except Exception:
-            balance  = MAX_RISK_USDT * 5  # fallback estimate
+            balance = MAX_RISK_USDT * 5
 
-        contracts = self._calc_contracts(price, balance)
+        sizer = _get_sizer(self.delta)
+        if sizer:
+            sizer.set_compound_pool(
+                getattr(_get_position_manager(), "compounded_balance", 0)
+            )
+            size_info = sizer.calculate_size(confidence, symbol, force_balance=balance)
+            contracts = size_info["contracts"]
+            margin    = size_info["margin_usdt"]
+        else:
+            contracts = self._calc_contracts(price, balance)
+            margin    = MAX_RISK_USDT
+
         tp_pct    = SWING_TP_PCT if trade_type == "SWING" else SCALP_TP_PCT
         sl_pct    = SWING_SL_PCT if trade_type == "SWING" else SCALP_SL_PCT
         tp_price  = round(price * (1 + tp_pct) if is_call else price * (1 - tp_pct), 2)
@@ -468,6 +503,20 @@ class JarvisAutoTrader:
         self.last_trade_time = datetime.now()
         self.daily_trades   += 1
 
+        # ─ Register with Position Manager ────────────────────────
+        pm = _get_position_manager()
+        if pm:
+            coin = symbol.replace("USDT", "")
+            pm.register_position(
+                position_id = str(pos["id"]),
+                direction   = direction,
+                entry_price = price,
+                contracts   = contracts,
+                confidence  = confidence,
+                coin        = coin,
+                trade_type  = trade_type,
+            )
+
         # ─ Estimated P&L ─────────────────────────────────────────
         notional    = price * contracts / 1  # 1 contract = 1 USD on Delta perp
         risk_usdt   = notional * sl_pct
@@ -476,6 +525,8 @@ class JarvisAutoTrader:
         print(f"  {_p('RISK:', DG)}   ${risk_usdt:.2f}"
               f"   {_p('REWARD:', DG)} ${reward_usdt:.2f}"
               f"   {_p('R:R =', DG)} {_p(f'1:{reward_usdt/max(risk_usdt,0.01):.1f}', BD+G)}")
+        if sizer:
+            sizer.print_sizing(size_info)
         print(f"  Position ID: {_p(pos['id'], C)}")
         print(f"{'═'*70}\n")
 

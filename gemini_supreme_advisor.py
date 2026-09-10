@@ -110,12 +110,16 @@ class GeminiSupremeAdvisor:
 
     def _init_gemini(self):
         """Initialize the Gemini SDK (google.genai - new SDK)."""
+        self._local_fallback_enabled = False  # Will be set True if Ollama available
+
         if not self._enabled:
             logger.info("[GeminiAdvisor] Disabled via GEMINI_ADVISOR_ENABLED=false")
+            self._try_enable_local_fallback()
             return
         if not GEMINI_API_KEY:
-            logger.warning("[GeminiAdvisor] No GEMINI_API_KEY found in .env -- advisor disabled")
+            logger.warning("[GeminiAdvisor] No GEMINI_API_KEY found in .env -- trying Local AI fallback")
             self._enabled = False
+            self._try_enable_local_fallback()
             return
         try:
             from google import genai
@@ -129,21 +133,52 @@ class GeminiSupremeAdvisor:
             print(f"{DG}  |- Interval: {W}{ADVISOR_INTERVAL_SEC//60} minutes{RST}")
             print(f"{DG}  |- Override: {W}{'HARD' if HARD_OVERRIDE else 'ADVISORY ONLY'}{RST}")
             print(f"{DG}  '- Status  : {G}ACTIVE{RST}\n")
+            # Also try enabling local fallback as backup (even if Gemini works)
+            self._try_enable_local_fallback(silent=True)
         except ImportError:
             logger.error("[GeminiAdvisor] google-genai not installed! Run: pip install google-genai")
             self._enabled = False
+            self._try_enable_local_fallback()
         except Exception as e:
             logger.error(f"[GeminiAdvisor] Init failed: {e}")
             self._enabled = False
+            self._try_enable_local_fallback()
+
+    def _try_enable_local_fallback(self, silent: bool = False):
+        """Try to connect to Ollama for local AI fallback advisory."""
+        try:
+            from ollama_integration import test_ollama_connection, OLLAMA_ENABLED
+            import ollama_integration as _oli
+            # Re-test connection live (OLLAMA_ENABLED may already be set)
+            import requests as _req
+            from ollama_integration import OLLAMA_BASE_URL
+            resp = _req.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+            if resp.status_code == 200:
+                self._local_fallback_enabled = True
+                local_model = os.environ.get("OLLAMA_MODEL", "deepseek-r1:14b")
+                if not silent:
+                    print(f"\n{BD}{Y}  LOCAL AI FALLBACK ADVISOR{RST}")
+                    print(f"{DG}  |- Model   : {W}{local_model}{RST}")
+                    print(f"{DG}  |- Backend : {W}Ollama (localhost){RST}")
+                    print(f"{DG}  '- Status  : {G}READY (Gemini backup){RST}\n")
+                logger.info(f"[GeminiAdvisor] Local Ollama fallback enabled (model={local_model})")
+            else:
+                self._local_fallback_enabled = False
+                if not silent:
+                    logger.warning("[GeminiAdvisor] Ollama not available — system will use last known insight")
+        except Exception as e:
+            self._local_fallback_enabled = False
+            if not silent:
+                logger.warning(f"[GeminiAdvisor] Local fallback init failed: {e}")
 
     # ──────────────────────────────────────────────────────────
     #  PUBLIC API
     # ──────────────────────────────────────────────────────────
 
     def start(self):
-        """Start the background advisory loop."""
-        if not self._enabled:
-            logger.warning("[GeminiAdvisor] Not starting — disabled or no API key")
+        """Start the background advisory loop (Gemini or Local AI fallback)."""
+        if not self._enabled and not self._local_fallback_enabled:
+            logger.warning("[GeminiAdvisor] Not starting — neither Gemini nor Local AI available")
             return
         if self._running:
             return
@@ -152,7 +187,8 @@ class GeminiSupremeAdvisor:
             target=self._advisory_loop, daemon=True, name="GeminiAdvisor"
         )
         self._thread.start()
-        logger.info(f"[GeminiAdvisor] Background loop started (interval={ADVISOR_INTERVAL_SEC}s)")
+        source = "Gemini" if self._enabled else "Local AI (Ollama)"
+        logger.info(f"[GeminiAdvisor] Background loop started via {source} (interval={ADVISOR_INTERVAL_SEC}s)")
 
     def stop(self):
         """Gracefully stop the advisory loop."""
@@ -167,22 +203,25 @@ class GeminiSupremeAdvisor:
 
     def is_trading_allowed(self, direction: str = None) -> tuple:
         """
-        Check if trading is allowed per current Gemini override.
+        Check if trading is allowed per current advisor override.
+        Works with both Gemini insights and Local AI fallback insights.
         Returns: (allowed: bool, reason: str)
         """
-        if not self._enabled:
-            return True, "Gemini advisor disabled — no override"
+        # If completely disabled and no local fallback, allow trading freely
+        if not self._enabled and not self._local_fallback_enabled:
+            return True, "Advisor disabled — no override"
 
         override = self.last_insight.get("trading_override", "STAY_NEUTRAL")
+        source   = self.last_insight.get("_source", "Gemini")
 
         if override == "AVOID_TRADING" and HARD_OVERRIDE:
-            return False, f"🧠 Gemini AVOID_TRADING: {self.last_insight.get('key_insight', '')}"
+            return False, f"🧠 [{source}] AVOID_TRADING: {self.last_insight.get('key_insight', '')}"
 
         if direction and HARD_OVERRIDE:
             if override == "FORCE_LONG" and direction in ("PUT", "SELL"):
-                return False, f"🧠 Gemini FORCE_LONG override — rejecting {direction}"
+                return False, f"🧠 [{source}] FORCE_LONG override — rejecting {direction}"
             if override == "FORCE_SHORT" and direction in ("CALL", "BUY"):
-                return False, f"🧠 Gemini FORCE_SHORT override — rejecting {direction}"
+                return False, f"🧠 [{source}] FORCE_SHORT override — rejecting {direction}"
 
         return True, "OK"
 
@@ -239,9 +278,12 @@ class GeminiSupremeAdvisor:
     def _run_advisory_cycle(self) -> Dict[str, Any]:
         """Core: collect data -> call Gemini -> parse -> store -> return.
         Auto-retries on 503 (server busy), falls back to alternate model if needed.
+        If ALL Gemini options fail, automatically falls back to Local Ollama AI.
         """
         if not hasattr(self, '_client') or not self._client:
-            return self._default_insight()
+            # No Gemini client — try local AI fallback directly
+            logger.info("[GeminiAdvisor] No Gemini client — using Local AI advisory.")
+            return self._run_local_advisory_cycle()
 
         snapshot = self._collect_system_snapshot()
         prompt   = self._build_prompt(snapshot)
@@ -298,8 +340,99 @@ class GeminiSupremeAdvisor:
                         logger.error(f"[GeminiAdvisor] Gemini call failed: {e}")
                         return self.last_insight
 
-        logger.error("[GeminiAdvisor] All models exhausted. Using last insight.")
-        return self.last_insight
+        logger.warning("[GeminiAdvisor] All Gemini models exhausted — switching to Local AI fallback.")
+        return self._run_local_advisory_cycle()
+
+    def _run_local_advisory_cycle(self) -> Dict[str, Any]:
+        """
+        Fallback: Use Ollama local AI (deepseek-r1/qwen2.5) to generate
+        the strategic advisory insight when Gemini is unavailable.
+        Trading continues uninterrupted with local intelligence.
+        """
+        if not self._local_fallback_enabled:
+            logger.warning("[GeminiAdvisor] Local fallback not available — using last known insight.")
+            return self.last_insight
+
+        try:
+            from ollama_integration import call_ollama, OLLAMA_BASE_URL
+            import requests as _req
+            # Quick liveness check before calling
+            try:
+                _req.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
+            except Exception:
+                logger.warning("[GeminiAdvisor] Ollama not reachable — using last insight.")
+                return self.last_insight
+
+            local_model = os.environ.get("OLLAMA_MODEL", "deepseek-r1:14b")
+            snapshot    = self._collect_system_snapshot()
+            market      = snapshot.get("market", {})
+            trading     = snapshot.get("trading", {})
+            oracle      = snapshot.get("oracle", {})
+
+            local_prompt = f"""{SYSTEM_PROMPT}
+
+JARVIS SNAPSHOT (Local AI Advisory — Gemini unavailable):
+Timestamp  : {snapshot['timestamp']}
+BTC Price  : ${market.get('btc_price', 'unknown')}
+5m Trend   : {market.get('trend_5m', 'UNKNOWN')}
+Volatility : {market.get('volatility', 'UNKNOWN')}
+Daily P&L  : ${trading.get('daily_pnl', 0):+.4f} USDT
+Trades     : {trading.get('daily_trades', 0)} | Losses: {trading.get('consec_losses', 0)}
+Emergency  : {trading.get('emergency_stop', False)}
+Oracle     : {oracle.get('trade_suggestion', 'N/A')} | Hold: {oracle.get('hold_minutes', 0)}m
+
+Respond ONLY in valid JSON. No markdown, no extra text."""
+
+            logger.info(f"[GeminiAdvisor] Calling Local AI ({local_model}) for advisory...")
+            ts_start = time.time()
+            response, err = call_ollama(local_prompt, model=local_model, timeout=120)
+            elapsed = round(time.time() - ts_start, 1)
+
+            if err or not response:
+                logger.warning(f"[GeminiAdvisor] Local AI advisory failed: {err}")
+                return self.last_insight
+
+            # Clean markdown fences if present
+            raw = response.strip()
+            if raw.startswith("```"):
+                parts = raw.split("```")
+                raw = parts[1] if len(parts) > 1 else raw
+                if raw.lower().startswith("json"):
+                    raw = raw[4:]
+
+            # Extract JSON block
+            import re as _re
+            json_match = _re.search(r'\{.*\}', raw, _re.DOTALL)
+            if json_match:
+                raw = json_match.group(0)
+
+            insight = json.loads(raw)
+            self.last_insight = insight
+            self.call_count  += 1
+            self.last_call_time = datetime.now()
+
+            # Annotate so we know it came from local AI
+            insight["_source"] = f"LocalAI:{local_model}"
+
+            # Pretty print
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"\n{'━'*60}")
+            print(f"{BD}{Y}  🤖 LOCAL AI ADVISOR (Gemini fallback)  {DG}[{ts}] Call #{self.call_count} | {elapsed}s{RST}")
+            print(f"{'━'*60}")
+            print(f"  {DG}Market Regime    :{RST} {BD}{W}{insight.get('market_regime', 'UNKNOWN')}{RST}")
+            print(f"  {DG}Risk Level       :{RST} {insight.get('risk_level', 'UNKNOWN')}")
+            print(f"  {DG}Trading Override :{RST} {BD}{insight.get('trading_override', 'STAY_NEUTRAL')}{RST}")
+            print(f"  {DG}Key Insight      :{RST} {Y}{insight.get('key_insight', '')}{RST}")
+            print(f"{'━'*60}\n")
+            logger.info(f"[GeminiAdvisor] Local AI advisory complete in {elapsed}s")
+            return insight
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[GeminiAdvisor] Local AI JSON parse error: {e} | Raw: {response[:200] if response else 'N/A'}")
+            return self.last_insight
+        except Exception as e:
+            logger.error(f"[GeminiAdvisor] Local AI advisory error: {e}")
+            return self.last_insight
 
     # ──────────────────────────────────────────────────────────
     #  INTERNAL — DATA COLLECTION
