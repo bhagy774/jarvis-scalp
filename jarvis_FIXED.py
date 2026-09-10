@@ -64,6 +64,16 @@ except ImportError as _oe:
     MARKET_ORACLE_AVAILABLE = False
     print(f"[JARVIS CORE] ⚠️  JarvisMarketOracle not loaded: {_oe}")
 
+# Import Indian Signal Engine (Dual Market: NSE + Crypto)
+try:
+    from jarvis_indian_signal import get_indian_signal_engine as _get_indian_engine
+    INDIAN_SIGNAL_AVAILABLE = True
+except ImportError as _ise:
+    _get_indian_engine = None
+    INDIAN_SIGNAL_AVAILABLE = False
+    print(f"[JARVIS CORE] ⚠️  IndianSignalEngine not loaded: {_ise}")
+
+
 # Import JARVIS Self-Healing Doctor
 try:
     from jarvis_doctor import init_doctor as _init_doctor, get_doctor as _get_doctor
@@ -1017,6 +1027,18 @@ class LiveTradingEngine:
             except Exception as mo_err:
                 print(f"[JARVIS CORE] Market Oracle init error: {mo_err}")
                 self.market_oracle = None
+
+        # === INDIAN SIGNAL ENGINE (Dual Market: NSE Nifty + Crypto) ===
+        self.indian_signal_engine = None
+        if INDIAN_SIGNAL_AVAILABLE and _get_indian_engine:
+            try:
+                bus = getattr(self, 'cognitive_bus', None)
+                self.indian_signal_engine = _get_indian_engine(bus=bus)
+                self.indian_signal_engine.start()
+                print("🇮🇳 [JARVIS CORE] Indian Signal Engine ONLINE (NSE Nifty + BankNifty + Crypto Dual-Market)")
+            except Exception as _ise_err:
+                print(f"[JARVIS CORE] ⚠️  Indian Signal Engine init error: {_ise_err}")
+                self.indian_signal_engine = None
 
         # === JARVIS SELF-HEALING DOCTOR (60-sec monitor + auto-fix) ===
         self.doctor = None
