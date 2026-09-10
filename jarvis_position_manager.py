@@ -144,9 +144,23 @@ class JarvisPositionManager:
                           entry_price: float, contracts: int,
                           confidence: int, coin: str = "BTC",
                           trade_type: str = "SCALP") -> PositionRecord:
+        if not isinstance(position_id, str) or not position_id:
+            raise ValueError("position_id is required")
+        if not isinstance(direction, str) or direction.upper() not in ("CALL", "PUT", "BUY", "SELL"):
+            raise ValueError("invalid position direction")
+        try:
+            entry_price = float(entry_price)
+            contracts = int(contracts)
+            confidence = int(confidence)
+        except (TypeError, ValueError):
+            raise ValueError("invalid position fields")
+        if entry_price <= 0 or contracts <= 0 or not 0 <= confidence <= 100:
+            raise ValueError("invalid position fields")
+        if not isinstance(coin, str) or not coin.strip():
+            raise ValueError("invalid coin")
         pos = PositionRecord(
-            position_id, direction, entry_price,
-            contracts, confidence, coin, trade_type
+            position_id, direction.upper(), entry_price,
+            contracts, confidence, coin.strip(), trade_type
         )
         with self._lock:
             self.open_positions.append(pos)
@@ -157,7 +171,15 @@ class JarvisPositionManager:
 
     def get_sizing_for_coin(self, balance: float, confidence: int,
                             symbol: str = "BTCUSDT") -> Dict:
-        """Dynamic sizing: confidence + compounding."""
+        """Dynamic sizing: confidence + compounding, never above collateral cap."""
+        try:
+            balance = float(balance)
+            confidence = int(confidence)
+        except (TypeError, ValueError):
+            balance, confidence = 0.0, 0
+        if balance <= 0:
+            return {"margin_usdt": 0.0, "contracts": 0, "notional_usdt": 0.0,
+                    "confidence": confidence, "multiplier": 0.0, "compound_bonus": 0.0}
         base_margin = balance * 0.02
 
         if confidence >= 95:    mult = 2.5
@@ -166,12 +188,12 @@ class JarvisPositionManager:
         elif confidence >= 70:  mult = 1.0
         else:                   mult = 0.5
 
-        compound_bonus   = self.compounded_balance * 0.5 if COMPOUND_ENABLED else 0
-        effective_margin = base_margin * mult + compound_bonus
-        max_margin       = balance * MAX_MARGIN_PCT
-        effective_margin = max(MIN_MARGIN, min(effective_margin, max_margin))
-        notional         = effective_margin * LEVERAGE
-        contracts        = max(1, int(notional))
+        compound_bonus = max(0.0, self.compounded_balance) * 0.5 if COMPOUND_ENABLED else 0.0
+        max_margin = max(0.0, balance * MAX_MARGIN_PCT)
+        # MIN_MARGIN is a target, not permission to exceed a tiny balance.
+        effective_margin = min(max_margin, max(MIN_MARGIN, base_margin * mult + compound_bonus))
+        notional = effective_margin * LEVERAGE
+        contracts = int(notional)
 
         return {
             "margin_usdt":    round(effective_margin, 4),
@@ -275,17 +297,32 @@ class JarvisPositionManager:
         if should_close:
             self._close_position(pos, current_price, close_reason)
 
-    def _close_position(self, pos: PositionRecord, exit_price: float, reason: str):
-        pnl_pct  = pos.current_pnl_pct(exit_price)
-        pnl_usdt = pnl_pct * pos.contracts * LEVERAGE
-        is_win   = pnl_pct > 0
+    def _close_position(self, pos: PositionRecord, exit_price: float, reason: str) -> bool:
+        """Close at the venue before changing local accounting state."""
+        try:
+            close_side = "sell" if pos.is_call else "buy"
+            venue_result = self.delta.place_order(pos.coin + "USDT", close_side, pos.contracts, "market")
+            if not isinstance(venue_result, dict) or not venue_result.get("success"):
+                pos.status = "CLOSE_UNKNOWN"
+                logger.error("[PM] Exchange close unconfirmed for %s", pos.id)
+                return False
+        except Exception as e:
+            pos.status = "CLOSE_UNKNOWN"
+            logger.error("[PM] Exchange close failed: %s", type(e).__name__)
+            return False
 
-        pos.status      = "CLOSED"
-        pos.exit_price  = exit_price
+        pnl_pct = pos.current_pnl_pct(exit_price)
+        # Contracts represent notional under this repository's Delta convention;
+        # multiplying by leverage again double-counts exposure.
+        pnl_usdt = pnl_pct * pos.contracts
+        is_win = pnl_pct > 0
+
+        pos.status = "CLOSED"
+        pos.exit_price = exit_price
         pos.exit_reason = reason
-        pos.close_time  = datetime.now()
-        pos.pnl_usdt    = round(pnl_usdt, 4)
-        pos.pnl_pct     = round(pnl_pct * 100, 3)
+        pos.close_time = datetime.now()
+        pos.pnl_usdt = round(pnl_usdt, 4)
+        pos.pnl_pct = round(pnl_pct * 100, 3)
 
         with self._lock:
             if pos in self.open_positions:
@@ -298,7 +335,7 @@ class JarvisPositionManager:
             elif not is_win and self.compounded_balance > 0:
                 self.compounded_balance = max(0, self.compounded_balance - abs(pnl_usdt) * 0.3)
 
-        col    = BD + G if is_win else BD + R
+        col = BD + G if is_win else BD + R
         result = "WIN" if is_win else "LOSS"
         print(f"\n{'=' * 60}")
         print(f"  {col}{result} - {reason}{RST}")
@@ -311,17 +348,12 @@ class JarvisPositionManager:
             print(f"  {DG}Compound Pool: ${self.compounded_balance:.4f}{RST}")
         print(f"{'=' * 60}\n")
 
-        try:
-            close_side = "sell" if pos.is_call else "buy"
-            self.delta.place_order(pos.coin + "USDT", close_side, pos.contracts, "market")
-        except Exception as e:
-            logger.error("[PM] Exchange close failed: %s", e)
-
         if self.bus:
             try:
                 self.bus.publish("POSITION_CLOSED", "JarvisPositionManager", pos.to_dict())
             except Exception:
                 pass
+        return True
 
     def status_line(self) -> str:
         with self._lock:

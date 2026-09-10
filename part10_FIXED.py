@@ -112,6 +112,7 @@ try:
     CUPY_AVAILABLE = True
 except ImportError:
     CUPY_AVAILABLE = False
+from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import aiohttp
 import time

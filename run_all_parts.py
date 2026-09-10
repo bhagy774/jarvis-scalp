@@ -8,6 +8,7 @@ This script coordinates all 13 components to run in a unified system
 import sys
 import os
 import io
+import secrets
 import subprocess
 
 # FIX #11: Only add Linux site-packages path on Linux
@@ -51,6 +52,37 @@ BACKTEST_MODE = True
 BACKTEST_CANDLES = 500
 # ================================================================
 
+# The HUD is a local, read-only telemetry display.  Keep its service address
+# separate from any exchange or model endpoint so coordinator telemetry cannot
+# be redirected to an arbitrary URL through a generic environment setting.
+HUD_HOST = "127.0.0.1"
+try:
+    HUD_PORT = int(os.environ.get("JARVIS_HUD_PORT", "7788"))
+except ValueError:
+    HUD_PORT = 7788
+HUD_BASE_URL = f"http://{HUD_HOST}:{HUD_PORT}"
+HUD_TELEMETRY_ENABLED = os.environ.get("JARVIS_HUD_TELEMETRY", "true").lower() == "true"
+
+
+def post_hud_telemetry(payload, token=None):
+    """Best-effort post of display-only coordinator telemetry to the local HUD.
+
+    This route does not accept trading commands.  A token is supplied when the
+    coordinator launches the HUD; keeping it optional retains compatibility
+    with a separately started, loopback-bound HUD server.
+    """
+    if not HUD_TELEMETRY_ENABLED:
+        return False
+    try:
+        import requests
+        headers = {"X-Jarvis-Hud-Token": token} if token else None
+        response = requests.post(
+            f"{HUD_BASE_URL}/api/telemetry", json=payload, headers=headers, timeout=2
+        )
+        return 200 <= response.status_code < 300
+    except Exception:
+        return False
+
 
 # ==================== AI CHAIN INTEGRATION ====================
 # Import AI Chain for intelligent part analysis
@@ -67,7 +99,14 @@ except ImportError as e:
 ai_chain_instance = None
 
 def run_all_parts(ai_brain=None, predictor=None):
-    """Run all 13 parts in a coordinated manner"""
+    """Run all 13 parts in a coordinated manner after an explicit paper opt-in."""
+    if os.environ.get("JARVIS_START_PAPER") != "1" or any(
+        os.environ.get(flag, "").lower() == "true"
+        for flag in ("JARVIS_AUTO_TRADE", "JARVIS_LIVE_EXECUTION", "DELTA_ORDER_EXECUTION_ENABLED")
+    ):
+        print("[SAFE DEFAULT] Disable live execution flags and set JARVIS_START_PAPER=1 to start coordinator services.")
+        return None, None
+
     # NEW: Distributed AI - no need for background loop
     # AI analysis happens in broadcast_status every 2 seconds
     
@@ -94,7 +133,7 @@ def run_all_parts(ai_brain=None, predictor=None):
     
     # File 1: Specialized Analysis Brains (part1_fixed.py)
     try:
-        from part1_fixed import (
+        from part1_FIXED import (
             TrendBrain, VolatilityBrain, StrengthBrain,
             RiskBrain, ReversalBrain, RegimeBrain, SmartBreakoutAI
         )
@@ -111,7 +150,7 @@ def run_all_parts(ai_brain=None, predictor=None):
     
     # File 2: Advanced AI Models (part2_fixed.py -> symlink to 'part2_fixed (1).py')
     try:
-        from part2_fixed import (
+        from part2_FIXED import (
             LSTMPredictor, TransformerPredictor,
             AdvancedAnalysisSystem
         )
@@ -139,7 +178,7 @@ def run_all_parts(ai_brain=None, predictor=None):
 
     # File 5: Enhanced GPU Pattern Recognition Engine (part8_fixed.py -> symlink to 'part8_fixed (1).py')
     try:
-        from part8_fixed import EnhancedGPUPatternRecognitionEngine
+        from part8_FIXED import EnhancedGPUPatternRecognitionEngine
         print("✅ File 5: GPU Pattern Engine loaded")
     except Exception as e:
         print(f"⚠️  File 5 import failed: {e}")
@@ -147,7 +186,7 @@ def run_all_parts(ai_brain=None, predictor=None):
 
     # File 6: GPU Institutional Backtesting Engine (part4_fixed.py -> symlink to 'part4_fixed (1).py')
     try:
-        from part4_fixed import (
+        from part4_FIXED import (
             GPUInstitutionalBacktestingEngine, 
             GPUAccelerationEngine
         )
@@ -274,8 +313,7 @@ def run_all_parts(ai_brain=None, predictor=None):
     # --- START HUD BROADCASTER ---
     def broadcast_status(system_ref, ai_system, prediction_engine):
         import time
-        import requests
-        
+
         # Inline signal merger (replaces missing signal_merger.py)
         def merge_signals(jarvis_signal, ai_decision, ai_prediction, options_chain_data=None):
             """Merge Jarvis math signal with AI decision into unified signal"""
@@ -1472,8 +1510,9 @@ def run_all_parts(ai_brain=None, predictor=None):
                     "ai_consensus": ai_consensus
                 }
                 
-                if not BACKTEST_MODE:
-                    requests.post("http://localhost:8000/api/update", json=payload, timeout=5)  # Increased timeout
+                # The current HUD consumes this display-only telemetry endpoint.
+                # It remains useful during backtests and never carries a command.
+                post_hud_telemetry(payload, os.environ.get("JARVIS_HUD_INGEST_TOKEN"))
                 
             except Exception as loop_err:
                 # Don't clutter terminal with connection refused during backtest if missed
@@ -1510,132 +1549,65 @@ def run_all_parts(ai_brain=None, predictor=None):
     
     return jarvis_main, results
 
-def kill_port_8000():
-    """Clean up any old backend process"""
-    try:
-        if sys.platform == "win32":
-            output = subprocess.check_output(["netstat", "-ano", "-p", "tcp"]).decode()
-            for line in output.splitlines():
-                if ":8000" in line and "LISTENING" in line:
-                    pid = line.strip().split()[-1]
-                    print(f"🧹 Cleaning up old HUD process (PID {pid})...")
-                    subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
-        else:
-            subprocess.run(["fuser", "-k", "8000/tcp"], capture_output=True)
-    except Exception:
-        pass
-
 def start_hud_backend():
-    """Start the Jarvis HUD Backend"""
-    print("="*60)
-    print("🚀 STARTING JARVIS HUD V1.1.0")
-    print("="*60)
-    
-    kill_port_8000()
-    
-    # Path to backend script
-    backend_path = os.path.join(os.path.dirname(__file__), "jarvis_hud", "hud_backend.py")
-    
-    # Initialize AI Brain regardless of HUD status
-    from distributed_ai_engine import DistributedAISystem
+    """Launch the maintained local HUD server and wait for its read-only status API."""
+    print("=" * 60)
+    print("STARTING JARVIS HUD")
+    print("=" * 60)
+
     try:
+        from distributed_ai_engine import DistributedAISystem
         ai_brain = DistributedAISystem()
-        print("[INFO] 🧠 Distributed AI System initialized (Standalone Mode)")
-    except Exception as e:
-        print(f"[ERROR] Failed to init AI Brain: {e}")
+        print("[INFO] Distributed AI System initialized (Standalone Mode)")
+    except Exception as exc:
+        print(f"[WARNING] Failed to init AI Brain: {exc}")
         ai_brain = None
 
-    if not os.path.exists(backend_path):
-        print(f"[WARNING] HUD Backend not found at: {backend_path}")
-        print("⚠️  System running in HEADLESS mode (No Web Interface)")
+    server_path = os.path.join(os.path.dirname(__file__), "jarvis_hud_server.py")
+    if not os.path.isfile(server_path):
+        print(f"[WARNING] HUD server not found at: {server_path}")
         return None, ai_brain
-        
-    print(f"📡 Launching HUD Backend on port 8000...")
+
+    # A fresh token protects the write-only telemetry channel between the two
+    # local processes.  It is deliberately not printed or passed to browsers.
+    token = secrets.token_urlsafe(32)
+    os.environ["JARVIS_HUD_INGEST_TOKEN"] = token
+    env = os.environ.copy()
+    env["JARVIS_HOST"] = HUD_HOST
+    env["JARVIS_PORT"] = str(HUD_PORT)
+    env["JARVIS_HUD_INGEST_TOKEN"] = token
+    log_path = os.path.join(os.path.dirname(__file__), "hud_server.log")
+
     try:
-        # Start in background with environment variables passed
-        env = os.environ.copy()
-        proc = subprocess.Popen([sys.executable, "-u", backend_path],
-                                stdout=open("backend_debug.log", "w"),
-                                stderr=subprocess.STDOUT,
-                                env=env) 
-                              
-        # Import new distributed AI system
-        from distributed_ai_engine import DistributedAISystem
-        from prediction_engine import PredictionEngine
-        
-        ai_brain = DistributedAISystem()
-        predictor = PredictionEngine()
-        
-        print("[INFO] 🧠 Distributed AI System initialized")
-        print("[INFO] 🔮 Prediction Engine ready")
-        
-        # Wait for backend to be ACTUALLY ready (HTTP serving)
+        with open(log_path, "w", encoding="utf-8") as log_file:
+            proc = subprocess.Popen(
+                [sys.executable, "-u", server_path],
+                stdout=log_file, stderr=subprocess.STDOUT, env=env,
+                cwd=os.path.dirname(__file__),
+            )
+
         import requests
-        print("⏳ Waiting for backend HTTP server...")
-        backend_ready = False
-        for attempt in range(15):  # Try for 15 seconds
+        print(f"Waiting for HUD at {HUD_BASE_URL}...")
+        for attempt in range(15):
             time.sleep(1)
-            
-            # Check if process died
             if proc.poll() is not None:
-                print("[ERROR] HUD Backend process terminated unexpectedly!")
-                print("🔍 Check 'backend_debug.log' for details")
-                return None, ai_brain  # FIX: return tuple
-            
-            # Check if HTTP is responding
+                print("[ERROR] HUD server terminated unexpectedly; see hud_server.log")
+                return None, ai_brain
             try:
-                resp = requests.get("http://localhost:8000/api/status", timeout=1)
-                if resp.status_code == 200:
-                    print(f"[OK] HUD Backend Ready (attempt {attempt+1})")
-                    backend_ready = True
-                    break
-            except:
-                print(f"   Waiting for HTTP... {attempt+1}/15")
+                response = requests.get(f"{HUD_BASE_URL}/api/status", timeout=1)
+                if response.status_code == 200:
+                    print(f"[OK] HUD server ready (attempt {attempt + 1})")
+                    print(f"[INFO] Dashboard: {HUD_BASE_URL}")
+                    return proc, ai_brain
+            except Exception:
                 pass
-        
-        if not backend_ready:
-            print("[ERROR] Backend didn't respond after 15 seconds")
-            print("🔍 Check 'backend_debug.log' for errors")
-            print("📋 Common issues:")
-            print("   - Missing dependencies (fastapi, uvicorn)")
-            print("   - Port 8000 already in use")
-            print("   - Python environment issues")
-            proc.terminate()
-            return None, ai_brain  # FIX: return tuple not just None
-              
-        print("[OK] HUD Backend Running")
-        print("="*60)
-        print("🌐 OPEN DASHBOARD IN BROWSER:")
-        print("👉 http://localhost:8000")
-        print("="*60)
-        
-        # FIX #11: Cross-platform browser opening (Windows-native)
-        try:
-            import platform
-            if sys.platform == 'win32':
-                os.startfile("http://localhost:8000")
-                print("✅ Browser opened automatically")
-            else:
-                try:
-                    is_wsl = "microsoft" in platform.uname().release.lower()
-                except Exception:
-                    is_wsl = False
-                if is_wsl:
-                    subprocess.Popen(["cmd.exe", "/c", "start", "http://localhost:8000"], 
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    print("✅ Browser command sent to Windows")
-                else:
-                    import webbrowser
-                    webbrowser.open("http://localhost:8000")
-                    print("✅ Browser opened automatically")
-        except Exception as e:
-            print(f"⚠️  Could not auto-open browser: {e}")
-            print("📋 Please manually open: http://localhost:8000")
-        
-        return proc, ai_brain
-    except Exception as e:
-        print(f"[ERROR] Failed to start HUD: {e}")
-        return None, None
+
+        print("[ERROR] HUD server did not become ready; see hud_server.log")
+        proc.terminate()
+        return None, ai_brain
+    except Exception as exc:
+        print(f"[ERROR] Failed to start HUD: {exc}")
+        return None, ai_brain
 
 def ensure_ollama_running():
     """Check if Ollama is running, if not start it"""
@@ -1694,7 +1666,14 @@ def ensure_ollama_running():
         return False
 
 def main():
-    """Main function to run all parts"""
+    """Main function to run all parts."""
+    if os.environ.get("JARVIS_START_PAPER") != "1" or any(
+        os.environ.get(flag, "").lower() == "true"
+        for flag in ("JARVIS_AUTO_TRADE", "JARVIS_LIVE_EXECUTION", "DELTA_ORDER_EXECUTION_ENABLED")
+    ):
+        print("[SAFE DEFAULT] Refusing to start services. Disable live execution flags and set JARVIS_START_PAPER=1 for paper workflow.")
+        return 2
+
     hud_proc = None
     try:
         check_requirements()

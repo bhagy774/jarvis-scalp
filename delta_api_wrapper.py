@@ -34,11 +34,11 @@ except ImportError:
 # API keys loaded from environment. Set these in your .env file:
 #   DELTA_API_KEY=your_key_here
 #   DELTA_API_SECRET=your_secret_here
-DEMO_API_KEY = os.environ.get("DELTA_API_KEY", "Fw94x6DjeLXRKmUxsaxAoZ4IYgS9rF")
-DEMO_API_SECRET = os.environ.get("DELTA_API_SECRET", "iBlF54psjAuWeT06Hc34DE8FrOeAc3ukxvjiRzYp7ybqwfLFKXYBlEDh4fsR")
-
-if DEMO_API_KEY == "Fw94x6DjeLXRKmUxsaxAoZ4IYgS9rF" and not os.environ.get("DELTA_API_KEY"):
-    logging.warning("⚠️  Using DEMO API keys. Set DELTA_API_KEY and DELTA_API_SECRET in .env for production.")
+# Credentials must be supplied by the deployment environment.  Do not put
+# fallback credentials in source code: an unauthenticated private request is
+# safer than silently signing it with a leaked or unintended account.
+DEMO_API_KEY = os.environ.get("DELTA_API_KEY")
+DEMO_API_SECRET = os.environ.get("DELTA_API_SECRET")
 
 logger = logging.getLogger(__name__)
 
@@ -77,19 +77,17 @@ class DeltaExchangeData:
             logger.warning("[HYBRID] ⚠️  binance_data.py not found, using Delta for everything")
 
     def _generate_signature(self, method: str, path: str, payload: str = "") -> Dict[str, str]:
-        """Generate HMAC SHA256 Signature for authenticated endpoints"""
+        """Generate HMAC SHA256 Signature for authenticated endpoints."""
+        if not self.api_key or not self.api_secret:
+            raise ValueError("Delta API credentials are not configured")
         timestamp = str(int(time.time()))
         msg = method + timestamp + path + payload
         signature = hmac.new(
-            self.api_secret.encode('utf-8'),
-            msg.encode('utf-8'),
-            hashlib.sha256
+            self.api_secret.encode("utf-8"),
+            msg.encode("utf-8"),
+            hashlib.sha256,
         ).hexdigest()
-        return {
-            "api-key": self.api_key,
-            "timestamp": timestamp,
-            "signature": signature
-        }
+        return {"api-key": self.api_key, "timestamp": timestamp, "signature": signature}
 
     def _request(self, method: str, endpoint: str, payload: Dict = None, authorized: bool = False) -> Dict:
         """
@@ -98,6 +96,10 @@ class DeltaExchangeData:
         authorized=False -> Uses Production/Public URL (Real Prices)
         """
         try:
+            # Fail before constructing or sending a private request when the
+            # process was not explicitly provisioned with credentials.
+            if authorized and (not self.api_key or not self.api_secret):
+                return {"success": False, "error": "Delta API credentials are not configured"}
             base_url = self.PRIVATE_URL if authorized else self.PUBLIC_URL
             headers = {}
             payload_str = ""
@@ -123,11 +125,10 @@ class DeltaExchangeData:
                     response = self.session.request(method, url, headers=headers, timeout=10)
                     elapsed = time.time() - start_t
                     logger.debug(f"[DELTA API] {method} {endpoint} took {elapsed:.2f}s")
-                    if response.status_code == 200:
+                    if 200 <= response.status_code < 300:
                         return {"success": True, "data": response.json()}
-                    else:
-                        logger.error(f"[DELTA API] Error {response.status_code}: {response.text}")
-                        return {"success": False, "error": response.text}
+                    logger.error("[DELTA API] Error status %s", response.status_code)
+                    return {"success": False, "error": f"HTTP {response.status_code}"}
 
                 else:
                     # authorized GET with no payload
@@ -146,15 +147,14 @@ class DeltaExchangeData:
             elapsed = time.time() - start_t
             logger.debug(f"[DELTA API] {method} {endpoint} took {elapsed:.2f}s")
 
-            if response.status_code == 200:
+            if 200 <= response.status_code < 300:
                 return {"success": True, "data": response.json()}
-            else:
-                logger.error(f"[DELTA API] Error {response.status_code}: {response.text}")
-                return {"success": False, "error": response.text}
+            logger.error("[DELTA API] Error status %s", response.status_code)
+            return {"success": False, "error": f"HTTP {response.status_code}"}
 
         except Exception as e:
-            logger.error(f"[DELTA API] Connection failed: {e}")
-            return {"success": False, "error": str(e)}
+            logger.error("[DELTA API] Connection failed: %s", type(e).__name__)
+            return {"success": False, "error": "Delta request failed"}
 
     # ==========================================
     # 1. LIVE MARKET DATA (Replaces Binance)
@@ -583,11 +583,17 @@ class DeltaExchangeData:
         positions = self.get_open_positions(symbol)
         results = []
         for pos in positions:
-            size = abs(int(pos.get("size", 0)))
-            if size == 0:
+            # Venue responses may encode size as a string, including signed
+            # decimal strings.  Do not infer a close from malformed data.
+            try:
+                raw_size = float(pos.get("size", 0))
+                size = int(abs(raw_size))
+            except (TypeError, ValueError):
+                logger.warning("[EMERGENCY] Skipping position with invalid size")
+                continue
+            if size <= 0:
                 continue
             # If long (size > 0) → sell to close. If short → buy to close.
-            raw_size = pos.get("size", 0)
             close_side = "sell" if raw_size > 0 else "buy"
             res = self.place_order(symbol, close_side, size, order_type="market")
             results.append(res)
@@ -610,6 +616,17 @@ class DeltaExchangeData:
         Force Leverage to 200x (User Request).
         Warning: High Risk.
         """
+        if os.environ.get("DELTA_ORDER_EXECUTION_ENABLED", "false").lower() != "true":
+            logger.warning("[RISK] Leverage change blocked: order execution is disabled")
+            return False
+        if not isinstance(symbol, str) or not symbol.strip():
+            return False
+        try:
+            leverage = int(leverage)
+        except (TypeError, ValueError):
+            return False
+        if leverage <= 0:
+            return False
         product_id = self.get_product_id(symbol)
         if not product_id:
             logger.error(f"[RISK] Output: Product ID not found for {symbol}")
@@ -634,14 +651,36 @@ class DeltaExchangeData:
         size: number of contracts
         order_type: "market", "limit", "market_order", or "limit_order" — all handled
         """
-        # FIX BUG3: Normalize order_type robustly — accept any variant
+        # An explicit process-level opt-in is required even on testnet.  This
+        # prevents a caller or configuration mistake from turning analysis into
+        # an order submission.
+        if os.environ.get("DELTA_ORDER_EXECUTION_ENABLED", "false").lower() != "true":
+            return {"success": False, "error": "Order execution is disabled"}
+        if not isinstance(symbol, str) or not symbol.strip():
+            return {"success": False, "error": "Invalid symbol"}
+        if not isinstance(side, str) or side.lower() not in ("buy", "sell"):
+            return {"success": False, "error": "Invalid order side"}
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return {"success": False, "error": "Invalid order size"}
+        if size <= 0:
+            return {"success": False, "error": "Invalid order size"}
+        if not isinstance(order_type, str):
+            return {"success": False, "error": "Invalid order type"}
         ot = order_type.lower().replace("_order", "").strip()
         if ot not in ("market", "limit"):
-            logger.warning(f"[EXECUTION] Unknown order_type '{order_type}', defaulting to market")
-            ot = "market"
+            return {"success": False, "error": "Invalid order type"}
+        if ot == "limit":
+            try:
+                limit_price = float(limit_price)
+            except (TypeError, ValueError):
+                return {"success": False, "error": "Invalid limit price"}
+            if limit_price <= 0:
+                return {"success": False, "error": "Invalid limit price"}
         final_type = f"{ot}_order"  # Delta API expects: market_order or limit_order
 
-        product_id = self.get_product_id(symbol)
+        product_id = self.get_product_id(symbol.strip())
         if not product_id:
             logger.error(f"[EXECUTION] Product ID not found for {symbol}")
             return {"success": False, "error": "Product ID not found"}

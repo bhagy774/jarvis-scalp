@@ -7,3 +7,7 @@ websockets
 websocket-client
 scikit-learn
 python-dotenv
+
+psutil
+fastapi
+uvicorn

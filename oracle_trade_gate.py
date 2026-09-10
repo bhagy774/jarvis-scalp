@@ -63,50 +63,41 @@ class OracleTradeGate:
             return True, "Oracle gate disabled (bypassed)"
 
         forecast = self.get_forecast()
-        if not forecast or forecast.get("model_used") == "startup_default":
-            # Still warming up
-            return True, "Oracle initializing — passing with default risk"
+        if not isinstance(direction, str) or direction.upper() not in ("CALL", "BUY", "LONG", "PUT", "SELL", "SHORT"):
+            return False, "Invalid trade direction"
+        if not isinstance(forecast, dict) or not forecast or forecast.get("model_used") == "startup_default":
+            if self.hard_gate:
+                return False, "Oracle forecast unavailable or initializing"
+            return True, "Oracle unavailable; hard gate is off"
 
         is_call = direction.upper() in ("CALL", "BUY", "LONG")
-        is_put  = direction.upper() in ("PUT", "SELL", "SHORT")
-        sig_type = "CALL" if is_call else "PUT"
+        tf5 = forecast.get("5min")
+        tf30 = forecast.get("30min")
+        suggestion = forecast.get("trade_suggestion", "WAIT")
+        if not isinstance(tf5, dict) or not isinstance(tf30, dict) or not isinstance(suggestion, str):
+            return (False, "Oracle forecast is incomplete") if self.hard_gate else (True, "Oracle forecast incomplete; hard gate is off")
+        dir_5m = str(tf5.get("direction", "")).upper()
+        dir_30m = str(tf30.get("direction", "")).upper()
+        sugg = suggestion.upper()
 
-        tf5 = forecast.get("5min", {})
-        tf30 = forecast.get("30min", {})
-        sugg = forecast.get("trade_suggestion", "WAIT").upper()
+        if self.hard_gate:
+            if sugg == "WAIT":
+                return False, "Oracle advises WAIT"
+            expected = "BULLISH" if is_call else "BEARISH"
+            # Hard gate requires exact consensus, rather than accepting one
+            # favorable timeframe while the other is neutral or contradictory.
+            if dir_5m != expected or dir_30m != expected:
+                return False, f"Oracle lacks {expected} 5m/30m consensus ({dir_5m}/{dir_30m})"
+            allowed_suggestions = ("CALL", "BUY", "LONG") if is_call else ("PUT", "SELL", "SHORT")
+            if sugg not in allowed_suggestions:
+                return False, "Oracle suggestion conflicts with trade direction"
+            return True, f"Oracle aligned ({expected} on 5m and 30m)"
 
-        dir_5m = tf5.get("direction", "NEUTRAL").upper()
-        dir_30m = tf30.get("direction", "NEUTRAL").upper()
-
-        # 1. Oracle explicit trade suggestion check
-        if sugg == "WAIT" and self.hard_gate:
-            # If both timeframes are neutral or conflicting
-            if dir_5m == "NEUTRAL" and dir_30m == "NEUTRAL":
-                return False, f"Oracle advises WAIT — market in consolidation (5m & 30m NEUTRAL)"
-
-        # 2. Rejection of direct contradictions
-        if is_call:
-            if dir_5m == "BEARISH" and dir_30m == "BEARISH":
-                return False, f"Oracle BEARISH (5m {tf5.get('confidence')}% & 30m {tf30.get('confidence')}%) contradicts CALL signal"
-            if sugg == "PUT" and self.hard_gate:
-                return False, f"Oracle recommends PUT scalp — rejecting opposing CALL signal"
-
-        elif is_put:
-            if dir_5m == "BULLISH" and dir_30m == "BULLISH":
-                return False, f"Oracle BULLISH (5m {tf5.get('confidence')}% & 30m {tf30.get('confidence')}%) contradicts PUT signal"
-            if sugg == "CALL" and self.hard_gate:
-                return False, f"Oracle recommends CALL scalp — rejecting opposing PUT signal"
-
-        # 3. Positive confirmation
-        if (is_call and dir_5m == "BULLISH") or (is_put and dir_5m == "BEARISH"):
-            conf = tf5.get("confidence", 70)
-            return True, f"Oracle aligned ({dir_5m} on 5m, conf: {conf}%)"
-
-        # Neutral on 5m but favorable on 30m
-        if (is_call and dir_30m == "BULLISH") or (is_put and dir_30m == "BEARISH"):
-            return True, f"Oracle aligned (30m trend is {dir_30m})"
-
-        return True, f"Oracle neutral ({dir_5m} 5m / {dir_30m} 30m) — trade allowed"
+        if is_call and (dir_5m == "BEARISH" and dir_30m == "BEARISH"):
+            return False, "Oracle bearish on both timeframes"
+        if not is_call and (dir_5m == "BULLISH" and dir_30m == "BULLISH"):
+            return False, "Oracle bullish on both timeframes"
+        return True, f"Oracle advisory ({dir_5m} 5m / {dir_30m} 30m)"
 
     # ──────────────────────────────────────────────────────────
     #  GATE CHECK: ENTRY ZONE VERIFICATION
@@ -120,19 +111,28 @@ class OracleTradeGate:
         if not self.enabled:
             return True, "Oracle gate disabled"
 
+        try:
+            current_price = float(current_price)
+        except (TypeError, ValueError):
+            return False, "Invalid price"
         if current_price <= 0:
-            return True, "Invalid price passed"
+            return False, "Invalid price"
 
         forecast = self.get_forecast()
-        if not forecast or forecast.get("model_used") == "startup_default":
-            return True, "Oracle initializing — entry zone check bypassed"
+        if not isinstance(forecast, dict) or not forecast or forecast.get("model_used") == "startup_default":
+            return (False, "Oracle forecast unavailable or initializing") if self.hard_gate else (True, "Oracle unavailable; hard gate is off")
 
-        ez = forecast.get("entry_zone", {})
-        p_from = float(ez.get("price_from", 0) or 0)
-        p_to   = float(ez.get("price_to", 0) or 0)
+        ez = forecast.get("entry_zone")
+        if not isinstance(ez, dict):
+            return (False, "Oracle entry zone is missing") if self.hard_gate else (True, "Oracle entry zone missing; hard gate is off")
+        try:
+            p_from = float(ez.get("price_from", 0) or 0)
+            p_to = float(ez.get("price_to", 0) or 0)
+        except (TypeError, ValueError):
+            return (False, "Oracle entry zone is invalid") if self.hard_gate else (True, "Oracle entry zone invalid; hard gate is off")
 
         if p_from <= 0 or p_to <= 0:
-            return True, "No specific entry zone defined by Oracle"
+            return (False, "Oracle entry zone is invalid") if self.hard_gate else (True, "No specific entry zone defined by Oracle")
 
         low_bound  = min(p_from, p_to) * (1.0 - self.tolerance)
         high_bound = max(p_from, p_to) * (1.0 + self.tolerance)
@@ -160,14 +160,25 @@ class OracleTradeGate:
         Validates logical geometry before allowing use.
         """
         forecast = self.get_forecast()
+        if not isinstance(direction, str) or direction.upper() not in ("CALL", "BUY", "LONG", "PUT", "SELL", "SHORT"):
+            return {"use_oracle": False, "reason": "Invalid direction"}
+        try:
+            current_price = float(current_price)
+        except (TypeError, ValueError):
+            return {"use_oracle": False, "reason": "Invalid price"}
         is_call = direction.upper() in ("CALL", "BUY", "LONG")
 
-        if not forecast or forecast.get("model_used") == "startup_default":
+        if not isinstance(forecast, dict) or not forecast or forecast.get("model_used") == "startup_default":
             return {"use_oracle": False, "reason": "Oracle not ready"}
 
-        tp = float(forecast.get("exit_target", 0) or 0)
-        sl = float(forecast.get("stop_loss", 0) or 0)
-        hold_min = int(forecast.get("hold_minutes", 15) or 15)
+        try:
+            tp = float(forecast.get("exit_target", 0) or 0)
+            sl = float(forecast.get("stop_loss", 0) or 0)
+            hold_min = int(forecast.get("hold_minutes", 15) or 15)
+        except (TypeError, ValueError):
+            return {"use_oracle": False, "reason": "Oracle TP/SL fields are invalid"}
+        if current_price <= 0 or tp <= 0 or sl <= 0 or hold_min <= 0:
+            return {"use_oracle": False, "reason": "Oracle TP/SL fields are invalid"}
 
         # Validate geometry
         if is_call:

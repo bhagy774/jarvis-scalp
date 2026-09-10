@@ -54,7 +54,10 @@ class JarvisSizer:
 
     def set_compound_pool(self, amount: float):
         """Update compounding pool from Position Manager."""
-        self._compound_pool = max(0.0, amount)
+        try:
+            self._compound_pool = max(0.0, float(amount))
+        except (TypeError, ValueError):
+            self._compound_pool = 0.0
 
     def get_live_balance(self) -> float:
         """Fetch real balance from Delta Exchange."""
@@ -82,8 +85,17 @@ class JarvisSizer:
           sizing_note   : human-readable explanation
         """
         balance = force_balance if force_balance is not None else self.get_live_balance()
+        try:
+            balance = float(balance)
+            confidence = int(confidence)
+        except (TypeError, ValueError):
+            balance, confidence = 0.0, 0
         if balance <= 0:
-            balance = 0.5  # emergency fallback
+            return {
+                "margin_usdt": 0.0, "contracts": 0, "notional_usdt": 0.0,
+                "confidence": confidence, "multiplier": 0.0, "balance": 0.0,
+                "compound_used": 0.0, "sizing_note": "No available collateral; no position sized",
+            }
 
         # Get multiplier from confidence table
         multiplier = 0.25
@@ -92,15 +104,14 @@ class JarvisSizer:
                 multiplier = mult
                 break
 
-        base_margin  = balance * BASE_RISK_PCT * multiplier
+        base_margin = balance * BASE_RISK_PCT * multiplier
         compound_use = min(self._compound_pool * COMPOUND_RATIO, balance * 0.02)
-        effective_margin = base_margin + compound_use
+        max_margin = max(0.0, balance * MAX_RISK_PCT)
+        # The minimum is only a target; it can never exceed the hard cap.
+        effective_margin = min(max_margin, max(MIN_MARGIN_USDT, base_margin + compound_use))
 
-        max_margin = balance * MAX_RISK_PCT
-        effective_margin = max(MIN_MARGIN_USDT, min(effective_margin, max_margin))
-
-        notional  = effective_margin * LEVERAGE
-        contracts = max(1, int(notional))
+        notional = effective_margin * LEVERAGE
+        contracts = int(notional)
 
         note = (
             f"Balance=${balance:.4f} | Conf={confidence}% -> {multiplier}x"
