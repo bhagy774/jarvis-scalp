@@ -8,9 +8,7 @@ import requests
 import time
 import logging
 import math
-import numpy as np
 from typing import Dict, List, Optional, Tuple
-from scipy.stats import norm
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +36,8 @@ class DeribitOptionsClient:
         self.access_token = None
         self.token_expiry = 0
         
-        # Authenticate if credentials provided
-        if self.client_id and self.client_secret:
-            self._authenticate()
-        
+        # Authentication is intentionally lazy.  Constructing an analysis
+        # client must not emit a credential-bearing request.
         self._cache = None
         self._cache_time = 0
         
@@ -124,11 +120,16 @@ class DeribitOptionsClient:
                 return None
                 
             instruments = data['result']
-            
+            if not isinstance(instruments, list):
+                logger.error("Invalid Deribit result type")
+                return None
+
             # Parse and aggregate by strike
             strike_data = {}
             for inst in instruments:
                 try:
+                    if not isinstance(inst, dict):
+                        continue
                     name = inst['instrument_name']
                     parts = name.split('-')
                     
@@ -138,8 +139,10 @@ class DeribitOptionsClient:
                         
                     strike = int(parts[2])
                     option_type = parts[3]  # 'C' or 'P'
-                    oi = inst.get('open_interest', 0)
-                    
+                    oi = float(inst.get('open_interest', 0) or 0)
+                    if not math.isfinite(oi) or oi < 0:
+                        continue
+
                     if strike not in strike_data:
                         strike_data[strike] = {'call_oi': 0, 'put_oi': 0}
                     
@@ -397,8 +400,10 @@ class DeribitOptionsClient:
             if 'result' not in data:
                 return None
                 
-            current_price = data['result']['last_price']
-            
+            current_price = float(data['result']['last_price'])
+            if not math.isfinite(current_price) or current_price <= 0:
+                return None
+
             # Find nearest ATM strike (round to nearest 1000)
             atm_strike = round(current_price / 1000) * 1000
             
@@ -662,11 +667,13 @@ class DeribitOptionsClient:
         if T <= 0 or sigma <= 0 or S <= 0 or K <= 0: return {'delta': 0, 'gamma': 0}
         try:
             d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-            gamma = norm.pdf(d1) / (S * sigma * math.sqrt(T))
+            normal_pdf = math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi)
+            normal_cdf = 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
+            gamma = normal_pdf / (S * sigma * math.sqrt(T))
             if option_type == 'C':
-                delta = norm.cdf(d1)
+                delta = normal_cdf
             else:
-                delta = norm.cdf(d1) - 1
+                delta = normal_cdf - 1
             return {'delta': delta, 'gamma': gamma}
         except Exception:
             return {'delta': 0, 'gamma': 0}

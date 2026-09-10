@@ -6,6 +6,8 @@ Executes dual-leg trades: Futures Scalp (main) + Options (hedge)
 
 import time
 import logging
+import math
+import uuid
 from datetime import datetime, timedelta
 import threading
 
@@ -17,8 +19,11 @@ class OptionsHedgedScalpEngine:
         self.ai_advisor = ai_hedge_advisor
         self.ai_roundtable = ai_roundtable
         
+        # This implementation is a paper simulator: it never calls an order
+        # endpoint.  Lock state because the monitor and caller can mutate it.
         self.active_positions = {}
         self.closed_positions = []
+        self._lock = threading.RLock()
         self.is_monitoring = False
         self.monitor_thread = None
         
@@ -39,12 +44,20 @@ class OptionsHedgedScalpEngine:
         """
         Main entry point for placing a hedged scalp trade.
         """
+        if not isinstance(signal, dict) or not isinstance(options_chain, dict):
+            return {"status": "skipped", "reason": "Invalid signal or options chain"}
         direction = signal.get('direction', 'NO_TRADE')
-        
-        if direction not in ['BUY', 'SELL', 'CALL', 'PUT']:
-            return {"status": "skipped", "reason": f"Invalid direction: {direction}"}
-            
-        confidence = signal.get('confidence', 0)
+        if not isinstance(direction, str) or direction.upper() not in ['BUY', 'SELL', 'CALL', 'PUT']:
+            return {"status": "skipped", "reason": "Invalid direction"}
+        direction = direction.upper()
+        try:
+            confidence = int(signal.get('confidence', 0))
+            current_price = float(current_price)
+            atr = float(atr)
+        except (TypeError, ValueError):
+            return {"status": "skipped", "reason": "Invalid price, ATR, or confidence"}
+        if not 0 <= confidence <= 100 or not math.isfinite(current_price) or not math.isfinite(atr) or current_price <= 0 or atr <= 0:
+            return {"status": "skipped", "reason": "Invalid price, ATR, or confidence"}
         expected_profit = self._estimate_scalp_profit(current_price, atr)
         
         # 1. Ask AI Hedge Advisor
@@ -58,10 +71,18 @@ class OptionsHedgedScalpEngine:
             jarvis_result=jarvis_result
         )
         
-        # 2. Extract AI Decision
+        # 2. Extract and validate AI decision before it reaches state.
+        if not isinstance(hedge_decision, dict):
+            hedge_decision = {}
         do_hedge = hedge_decision.get('hedge', 'NO') == 'YES'
         target_strike = hedge_decision.get('strike')
-        hedge_ratio = hedge_decision.get('hedge_ratio', 0.5)
+        try:
+            hedge_ratio = float(hedge_decision.get('hedge_ratio', 0.5))
+            target_strike = float(target_strike) if target_strike is not None else None
+        except (TypeError, ValueError):
+            do_hedge, target_strike, hedge_ratio = False, None, 0.0
+        if not math.isfinite(hedge_ratio) or hedge_ratio <= 0 or hedge_ratio > 1 or target_strike is not None and (not math.isfinite(target_strike) or target_strike <= 0):
+            do_hedge, target_strike = False, None
         
         # Determine Option Type needed
         # BUY Futures (Long) -> Hedge with PUT (downside protection)
@@ -85,9 +106,9 @@ class OptionsHedgedScalpEngine:
                 do_hedge = False
 
         # 4. Execute orders (Paper mode for now, easily switchable to Delta API)
-        futures_size = 0.01  # Fixed size for example
-        position_id = f"pos_{int(time.time())}"
-        
+        futures_size = 0.01  # Fixed size for paper-model example
+        position_id = f"paper_{uuid.uuid4().hex}"
+
         position = {
             "id": position_id,
             "status": "OPEN",
@@ -102,6 +123,7 @@ class OptionsHedgedScalpEngine:
                 "pnl": 0.0
             },
             "hedge_leg": None,
+            "realized_hedge_pnl": 0.0,
             "net_pnl": 0.0
         }
         
@@ -120,8 +142,9 @@ class OptionsHedgedScalpEngine:
         else:
             logger.info(f"🚀 Executed Single-Leg: {direction} Futures (Unhedged)")
             
-        self.active_positions[position_id] = position
-        
+        with self._lock:
+            self.active_positions[position_id] = position
+
         # Ensure monitor is running
         self.start_monitor()
         
@@ -130,7 +153,9 @@ class OptionsHedgedScalpEngine:
     def _monitor_loop(self):
         """Background thread monitoring active dual-leg positions"""
         while self.is_monitoring:
-            if not self.active_positions:
+            with self._lock:
+                has_positions = bool(self.active_positions)
+            if not has_positions:
                 time.sleep(5)
                 continue
                 
@@ -143,7 +168,9 @@ class OptionsHedgedScalpEngine:
                     
                 to_close = []
                 
-                for pos_id, pos in self.active_positions.items():
+                with self._lock:
+                    positions = list(self.active_positions.items())
+                for pos_id, pos in positions:
                     # Update Futures PnL
                     f_leg = pos["futures_leg"]
                     f_dir = f_leg["direction"]
@@ -174,8 +201,8 @@ class OptionsHedgedScalpEngine:
                         h_pnl = (current_premium - h_leg["entry_premium"]) * h_leg["size"]
                         h_leg["pnl"] = h_pnl
                         
-                    pos["net_pnl"] = f_pnl + h_pnl
-                    
+                    pos["net_pnl"] = f_pnl + h_pnl + pos.get("realized_hedge_pnl", 0.0)
+
                     # Ask AI Monitor if we have a hedge
                     if h_leg:
                         monitor_decision = self.ai_advisor.monitor_active_hedge(
@@ -184,12 +211,16 @@ class OptionsHedgedScalpEngine:
                             main_trade_pnl=f_pnl,
                             hedge_pnl=h_pnl
                         )
-                        
+                        if not isinstance(monitor_decision, dict):
+                            monitor_decision = {}
+
                         if monitor_decision.get("action") == "CLOSE_HEDGE_EARLY":
                             logger.info(f"🤖 AI advised taking hedge profit: {monitor_decision.get('reason')}")
-                            # Close hedge leg only
-                            pos["hedge_leg"] = None 
-                            pos["net_pnl"] += h_pnl # Lock it in
+                            # Close hedge leg only in the paper ledger.  Carry
+                            # its realized result forward exactly once.
+                            pos["realized_hedge_pnl"] = pos.get("realized_hedge_pnl", 0.0) + h_pnl
+                            pos["hedge_leg"] = None
+                            pos["net_pnl"] = f_pnl + pos["realized_hedge_pnl"]
                             
                     # Check Futures TP / SL
                     close_reason = None
@@ -214,36 +245,42 @@ class OptionsHedgedScalpEngine:
             time.sleep(10) # 10 sec polling
 
     def _close_position(self, position_id: str):
-        if position_id in self.active_positions:
-            pos = self.active_positions.pop(position_id)
+        with self._lock:
+            pos = self.active_positions.pop(position_id, None)
+            if pos is None:
+                return
             pos["status"] = "CLOSED"
             pos["exit_time"] = datetime.now().isoformat()
             self.closed_positions.append(pos)
-            
-            logger.info(f"\n{'='*50}")
-            logger.info(f"🏁 CLOSED HEDGED POSITION: {position_id}")
-            logger.info(f"Reason: {pos.get('close_reason')}")
-            logger.info(f"Futures PnL: ${pos['futures_leg']['pnl']:.2f}")
-            if pos.get("hedge_leg"):
-                logger.info(f"Hedge PnL: ${pos['hedge_leg']['pnl']:.2f}")
-            logger.info(f"💰 NET PnL: ${pos['net_pnl']:.2f}")
-            logger.info(f"{'='*50}\n")
 
-    def _find_matching_option(self, options_chain: dict, target_strike: int, option_type: str) -> dict:
-        """Find the specific option contract from the chain"""
+        logger.info(f"\n{'='*50}")
+        logger.info(f"🏁 CLOSED HEDGED POSITION: {position_id}")
+        logger.info(f"Reason: {pos.get('close_reason')}")
+        logger.info(f"Futures PnL: ${pos['futures_leg']['pnl']:.2f}")
+        if pos.get("hedge_leg"):
+            logger.info(f"Hedge PnL: ${pos['hedge_leg']['pnl']:.2f}")
+        logger.info(f"💰 NET PnL: ${pos['net_pnl']:.2f}")
+        logger.info(f"{'='*50}\n")
+
+    def _find_matching_option(self, options_chain: dict, target_strike: float, option_type: str) -> dict:
+        """Find a valid specific option contract from the supplied paper chain."""
+        if option_type not in ("PUT", "CALL") or not isinstance(options_chain, dict):
+            return None
         key = "puts" if option_type == "PUT" else "calls"
         options = options_chain.get(key, [])
-        
-        # Find exact strike match
+        if not isinstance(options, list):
+            return None
+        valid = []
         for opt in options:
-            if opt.get("strike") == target_strike:
-                return opt
-                
-        # If not exact, find closest
-        if options:
-            return min(options, key=lambda x: abs(x.get("strike", 0) - target_strike))
-            
-        return None
+            try:
+                strike = float(opt.get("strike"))
+                if isinstance(opt, dict) and opt.get("symbol") and math.isfinite(strike) and strike > 0:
+                    valid.append((strike, opt))
+            except (AttributeError, TypeError, ValueError):
+                continue
+        if not valid:
+            return None
+        return min(valid, key=lambda item: abs(item[0] - target_strike))[1]
 
     def _estimate_scalp_profit(self, current_price: float, atr: float) -> float:
         """Rough estimate of $ profit for a 1 ATR move on 0.01 BTC"""

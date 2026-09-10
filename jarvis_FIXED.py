@@ -3752,8 +3752,11 @@ class JarvisElite:
         self.expiry_optimizer = TradeOptimizer()
         self.scalping_engine = ScalpingEngine() # NEW: Scalping Targets
         self.deepseek_enabled = True  # ENABLED: DeepSeek AI Judge for signal validation
-        self.hud_enabled = True  # FIX #1: HUD backend now exists in jarvis_hud/
-        self.hud_url = "http://localhost:8000/api/update"
+        # The HUD is a local display channel, not a command interface.
+        self.hud_enabled = True
+        self.hud_url = "http://127.0.0.1:7788/api/telemetry"
+        token = os.environ.get("JARVIS_HUD_INGEST_TOKEN")
+        self.hud_headers = {"X-Jarvis-Hud-Token": token} if token else None
         self.is_backtest_mode = False  # Track if running in backtest mode
         
         # 🧠 INITIALIZE COGNITIVE EVENT BUS
@@ -4761,7 +4764,7 @@ class JarvisElite:
             # Fire and forget update (with proper error handling)
             def safe_hud_post():
                 try:
-                    requests.post(self.hud_url, json=payload, timeout=5)
+                    requests.post(self.hud_url, json=payload, headers=self.hud_headers, timeout=2)
                 except Exception:
                     pass  # Silently ignore HUD failures
             threading.Thread(target=safe_hud_post, daemon=True).start()
@@ -5704,7 +5707,14 @@ class Jarvis4EngineSystem:
 # ==================== MAIN EXECUTION ====================
 
 def main():
-    """Main function with trade trading system"""
+    """Main function with an explicit paper-workflow opt-in."""
+    if os.environ.get("JARVIS_START_PAPER") != "1" or any(
+        os.environ.get(flag, "").lower() == "true"
+        for flag in ("JARVIS_AUTO_TRADE", "JARVIS_LIVE_EXECUTION", "DELTA_ORDER_EXECUTION_ENABLED")
+    ):
+        logger.error("[SAFE DEFAULT] Disable live execution flags and set JARVIS_START_PAPER=1 before starting JARVIS services.")
+        return 2
+
     logger.info("🚀 JARVIS TRADE ELITE v7.0 - FULLY INTEGRATED")
     logger.info("==========================================")
     
@@ -5750,4 +5760,4 @@ def main():
         logger.error(f"System error: {e}")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

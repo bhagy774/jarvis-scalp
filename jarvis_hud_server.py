@@ -1,361 +1,340 @@
 #!/usr/bin/env python3
-"""
-JARVIS HUD Server — WebSocket Bridge
-CognitiveBus THOUGHTS/HEALTH → WebSocket → Browser Dashboard
-Serves the 3D dashboard at http://localhost:7788
+"""Local, read-only JARVIS HUD server.
+
+The browser receives state over ``/ws``.  The coordinator may submit bounded
+telemetry to ``/api/telemetry``; that endpoint deliberately has no order,
+strategy, or execution action.
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
 import random
-import time
+import re
 import threading
+import time
 from datetime import datetime
-from typing import Set
+from typing import Any, Dict, Set
+from urllib.parse import urlparse
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [HUD] %(message)s")
 logger = logging.getLogger("JarvisHUD")
 
 app = FastAPI(title="JARVIS HUD Server")
-
-# ── Connected WebSocket clients ─────────────────────────────
 connected_clients: Set[WebSocket] = set()
-
-# ── Live State (shared between bus thread and WS broadcaster) ─
-state = {
-    "parts": {},          # Part1_Breakout: {direction, confidence, raw, ts}
-    "trades": [],         # list of trade dicts
-    "stats": {
-        "wins": 0, "losses": 0, "total_pnl": 0.0,
-        "equity_curve": [], "win_rate": 0.0
-    },
-    "health": {},         # partName: {severity, ts}
-    "pipeline": {
-        "watcher_active": False,
-        "last_packet_ts": None,
-        "specialist_opinions": {}
-    },
-    "oracle": {},         # JARVIS Market Oracle multi-timeframe forecast
+state: Dict[str, Any] = {
+    "parts": {},
+    "trades": [],
+    "stats": {"wins": 0, "losses": 0, "total_pnl": 0.0, "equity_curve": [], "win_rate": 0.0},
+    "health": {},
+    "pipeline": {"watcher_active": False, "last_packet_ts": None, "specialist_opinions": {}},
+    "oracle": {},
     "chat_history": [],
     "system_online": True,
+    "coordinator_telemetry": {},
 }
 
-# ── Broadcast to all connected clients ──────────────────────
-async def broadcast(payload: dict):
-    global connected_clients
-    dead = set()
-    msg  = json.dumps(payload)
-    for ws in connected_clients:
-        try:
-            await ws.send_text(msg)
-        except Exception:
-            dead.add(ws)
-    connected_clients -= dead
+MAX_TEXT = 500
+MAX_THOUGHTS = 50
+MAX_CHAT_HISTORY = 100
+MAX_TELEMETRY_BYTES = 64 * 1024
 
 
-# ── CognitiveBus integration ────────────────────────────────
-def start_bus_listener():
-    """Runs in a background thread. Hooks into the real CognitiveBus if available."""
-    # Pre-load initial market map from disk if present
-    try:
-        map_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "jarvis_market_map.json")
-        if os.path.exists(map_path):
-            with open(map_path, "r", encoding="utf-8") as f:
-                state["oracle"] = json.load(f)
-                logger.info("Loaded initial Oracle Market Map from disk")
-    except Exception as me:
-        logger.debug(f"Could not load initial market map: {me}")
-
-    try:
-        import sys
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from jarvis_cognitive_bus import CognitiveBus
-        from jarvis_watcher_ai import JarvisWatcherAI
-
-        bus     = CognitiveBus()
-        watcher = JarvisWatcherAI(bus=bus)
-        watcher.start()
-        state["pipeline"]["watcher_active"] = True
-        logger.info("CognitiveBus connected — live data mode ACTIVE")
-
-        def on_thoughts(msg):
-            sender  = msg.get("sender", "Unknown")
-            payload = msg.get("payload", "")
-            # Update part state
-            state["parts"][sender] = {
-                "direction":  _extract_direction(payload),
-                "confidence": _extract_confidence(payload),
-                "raw":        str(payload)[:100],
-                "ts":         datetime.now().isoformat()
-            }
-            state["pipeline"]["last_packet_ts"] = datetime.now().isoformat()
-
-        def on_health(msg):
-            sender   = msg.get("sender", "Unknown")
-            payload  = msg.get("payload", {})
-            severity = payload.get("severity", "WARNING") if isinstance(payload, dict) else "WARNING"
-            state["health"][sender] = {"severity": severity, "ts": datetime.now().isoformat()}
-
-        def on_oracle(msg):
-            payload = msg.get("payload", {})
-            if isinstance(payload, dict):
-                state["oracle"] = payload
-                logger.info("HUD received live ORACLE_FORECAST update")
-
-        bus.subscribe("THOUGHTS", on_thoughts)
-        bus.subscribe("HEALTH",   on_health)
-        bus.subscribe("ORACLE_FORECAST", on_oracle)
-
-    except Exception as e:
-        logger.warning(f"CognitiveBus not available — using DEMO mode: {e}")
-        _start_demo_data()
-
-# ── Terminal Log Tailer ──────────────────────────────────────
-def start_terminal_tailer():
-    """Tails jarvis_terminal.log and pushes new lines to state."""
-    log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "jarvis_terminal.log")
-    if not os.path.exists(log_file):
-        try:
-            os.makedirs(os.path.dirname(log_file), exist_ok=True)
-            with open(log_file, 'w') as f: f.write("")
-        except:
-            pass
-
-    state["terminal_logs"] = []
-    
-    def _tail():
-        while not os.path.exists(log_file):
-            time.sleep(1)
-        
-        with open(log_file, 'r', encoding='utf-8') as f:
-            # Go to the end of the file initially to avoid sending old logs
-            f.seek(0, 2)
-            while True:
-                line = f.readline()
-                if not line:
-                    time.sleep(0.1)
-                    continue
-                
-                # Add to state and limit size
-                state["terminal_logs"].append(line)
-                if len(state["terminal_logs"]) > 200:
-                    state["terminal_logs"] = state["terminal_logs"][-200:]
-                    
-                # Parsing logic for specific advanced engines
-                if "⚛️ QUANTUM" in line:
-                    state["pipeline"]["quantum_status"] = line.strip()
-                elif "🛡️ HEDGE ADVISOR" in line or "🚀 Executed Dual-Leg" in line:
-                    state["pipeline"]["hedge_status"] = line.strip()
-                elif "[PART 1 OLLAMA LIVE THOUGHTS]" in line or "🧠 AI RATIONALE:" in line:
-                    # Very simple capture - wait for actual lines in frontend
-                    state["pipeline"]["ai_rationale_trigger"] = datetime.now().isoformat()
-
-    threading.Thread(target=_tail, daemon=True).start()
-    logger.info("Terminal tailer started")
+def _bounded_text(value: Any, limit: int = MAX_TEXT) -> str:
+    return str(value).replace("\x00", "")[:limit]
 
 
-def _extract_direction(text: str) -> str:
-    t = str(text).upper()
-    if "BULLISH" in t or "CALL" in t or "BUY" in t:
+def _json_safe(value: Any, depth: int = 0) -> Any:
+    """Produce a small JSON-only display value from untrusted telemetry."""
+    if depth >= 5:
+        return _bounded_text(value, 120)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _bounded_text(value)
+    if isinstance(value, dict):
+        return {
+            _bounded_text(key, 80): _json_safe(item, depth + 1)
+            for key, item in list(value.items())[:50]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item, depth + 1) for item in value[:MAX_THOUGHTS]]
+    return _bounded_text(value)
+
+
+def _extract_direction(text: Any) -> str:
+    upper = _bounded_text(text).upper()
+    if any(word in upper for word in ("BULLISH", "CALL", "BUY", "LONG")):
         return "BULLISH"
-    if "BEARISH" in t or "PUT" in t or "SELL" in t:
+    if any(word in upper for word in ("BEARISH", "PUT", "SELL", "SHORT")):
         return "BEARISH"
     return "NEUTRAL"
 
 
-def _extract_confidence(text: str) -> float:
-    import re
-    m = re.search(r"(?:confidence|score|avg score)[^\d]*([0-9]+\.?[0-9]*)", str(text), re.IGNORECASE)
-    if m:
-        v = float(m.group(1))
-        return v * 100.0 if v <= 1.5 else v
-    return round(random.uniform(50, 90), 1)
+def _extract_confidence(text: Any) -> float:
+    match = re.search(r"(?:confidence|score|avg score)[^\d]*([0-9]+\.?[0-9]*)", _bounded_text(text), re.I)
+    if not match:
+        return 0.0
+    value = float(match.group(1))
+    value = value * 100.0 if value <= 1.5 else value
+    return max(0.0, min(100.0, value))
 
 
-# ── Demo / Simulation Mode ───────────────────────────────────
-PART_NAMES = [
-    "Part1_Breakout", "Part2_Neural", "Part3_Institutional",
-    "Part4_Backtest", "Part5_Fusion", "Part6_Backtest",
-    "Part7_LiveData", "Part8_Pattern", "Part9_Adaptive",
-    "Part10_Execution", "Part11_Confidence", "Part12_Execution"
-]
+def apply_coordinator_telemetry(payload: Any) -> Dict[str, Any]:
+    """Apply display-only coordinator output; never invokes a trading module."""
+    if not isinstance(payload, dict):
+        raise ValueError("telemetry must be an object")
+    try:
+        encoded = json.dumps(payload, default=str)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("telemetry is not serializable") from exc
+    if len(encoded.encode("utf-8")) > MAX_TELEMETRY_BYTES:
+        raise ValueError("telemetry is too large")
 
-DEMO_THOUGHTS = {
-    "Part1_Breakout":      "Breakout Analysis: BULLISH (Signal: 1, Confidence: 7.42). Regime: trending",
-    "Part2_Neural":        "Neural Network Predictions: BULLISH (Avg score: 0.76)",
-    "Part3_Institutional": "Institutional MTF Analysis: BULLISH (Consensus: 0.62). Dominant Regime: trending",
-    "Part4_Backtest":      "Backtest Engine: Completed in 3.2s. Data points: 5000",
-    "Part5_Fusion":        "Fusion Engine (MTF): Consensus = 0.48, Direction = CALL, Confidence = 81.5%",
-    "Part6_Backtest":      "Backtest Complete: Trades=142, WinRate=0.76, PnL=8420.0. Duration=12.4s",
-    "Part7_LiveData":      "Live Data Engine: Price=67420.5, Volume=18342.22, Symbol=BTCUSDT",
-    "Part8_Pattern":       "Pattern Recognition: Bullish Engulfing detected. BULLISH. Confidence = 77.0%",
-    "Part9_Adaptive":      "Adaptive Learning: Status=RUNNING. Strategy Recommendation: Increase trend weight",
-    "Part10_Execution":    "Execution Engine: Direction=BUY, Confidence=82%. Entry price=67420.0",
-    "Part11_Confidence":   "Confidence Engine: Final Score = 88.0%. VALID | Ollama Adj: +5",
-    "Part12_Execution":    "Execution Analytics: Position=LONG, PnL=342.50, Return=1.24%, Total Trades=59",
-}
+    allowed = ("market_data", "thoughts", "matrix", "regime", "signal", "ai_consensus")
+    telemetry = {key: _json_safe(payload[key]) for key in allowed if key in payload}
+    telemetry["received_at"] = datetime.now().isoformat()
+    state["coordinator_telemetry"] = telemetry
+    state["pipeline"]["coordinator_regime"] = _bounded_text(telemetry.get("regime", "NEUTRAL"), 80)
+    state["pipeline"]["last_packet_ts"] = telemetry["received_at"]
 
-_equity_base = 10000.0
-
-def _start_demo_data():
-    """Simulate live data when no real CognitiveBus is present."""
-    global _equity_base
-    state["pipeline"]["watcher_active"] = True
-
-    # Init all parts
-    for name, thought in DEMO_THOUGHTS.items():
-        state["parts"][name] = {
-            "direction":  _extract_direction(thought),
-            "confidence": _extract_confidence(thought),
-            "raw":        thought[:100],
-            "ts":         datetime.now().isoformat()
+    signal = telemetry.get("signal")
+    if isinstance(signal, dict):
+        direction = _extract_direction(signal.get("direction", ""))
+        confidence = _extract_confidence(signal.get("confidence", signal.get("score", "")))
+        raw = _bounded_text(
+            f"Coordinator: {direction}; confidence {confidence:.1f}%; "
+            f"regime {state['pipeline']['coordinator_regime']}",
+            200,
+        )
+        state["parts"]["Coordinator"] = {
+            "direction": direction,
+            "confidence": confidence,
+            "raw": raw,
+            "ts": telemetry["received_at"],
         }
-
-    # Init equity curve
-    val = 10000.0
-    curve = []
-    for i in range(60):
-        val += random.gauss(25, 80)
-        curve.append(round(val, 2))
-    state["stats"]["equity_curve"] = curve
-    state["stats"]["wins"]         = 47
-    state["stats"]["losses"]       = 12
-    state["stats"]["total_pnl"]    = round(val - 10000.0, 2)
-    state["stats"]["win_rate"]     = round(47 / 59 * 100, 1)
-
-    # Initial trade
-    state["trades"] = [{
-        "symbol":    "BTC/USDT",
-        "direction": "LONG",
-        "entry":     67420.0,
-        "current":   67762.5,
-        "pnl":       342.5,
-        "risk_pct":  1.2,
-        "tp":        68500.0,
-        "sl":        66800.0,
-        "ts":        datetime.now().isoformat()
-    }]
-
-    def _demo_tick():
-        global _equity_base
-        directions = ["BULLISH", "BEARISH", "NEUTRAL"]
-        weights    = [0.6, 0.25, 0.15]
-        part_list  = list(DEMO_THOUGHTS.keys())
-        idx        = 0
-
-        while True:
-            time.sleep(2.0)
-            # Rotate through parts — update 2 per tick for live feel
-            for _ in range(2):
-                part = part_list[idx % len(part_list)]
-                idx += 1
-                conf = round(random.uniform(55, 95), 1)
-                direction = random.choices(directions, weights)[0]
-                state["parts"][part] = {
-                    "direction":  direction,
-                    "confidence": conf,
-                    "raw":        f"{part}: {direction} (Confidence: {conf}%)",
-                    "ts":         datetime.now().isoformat()
-                }
-
-            # Update live trade P&L
-            if state["trades"]:
-                t   = state["trades"][0]
-                t["current"] = round(t["current"] + random.gauss(0, 15), 1)
-                t["pnl"]     = round((t["current"] - t["entry"]) * 0.01, 2)
-                t["ts"]      = datetime.now().isoformat()
-
-            # Equity curve rolling
-            last = state["stats"]["equity_curve"][-1] if state["stats"]["equity_curve"] else 10000.0
-            last += random.gauss(8, 45)
-            state["stats"]["equity_curve"].append(round(last, 2))
-            if len(state["stats"]["equity_curve"]) > 120:
-                state["stats"]["equity_curve"] = state["stats"]["equity_curve"][-120:]
-
-            state["pipeline"]["last_packet_ts"] = datetime.now().isoformat()
-
-    t = threading.Thread(target=_demo_tick, daemon=True)
-    t.start()
-    logger.info("DEMO mode active — simulating all 12 Parts live data")
+    return telemetry
 
 
-# ── State push loop ──────────────────────────────────────────
-async def state_push_loop():
-    """Broadcasts full state to all clients every 1 second."""
-    while True:
-        await asyncio.sleep(1.0)
-        if connected_clients:
-            await broadcast({"type": "STATE_UPDATE", "data": state})
+def _allowed_origin(origin: str | None, host: str | None) -> bool:
+    """Allow same-host browsers or explicit deployment origins."""
+    if not origin:
+        return True  # non-browser local clients have no Origin header
+    configured = {item.strip() for item in os.environ.get("JARVIS_ALLOWED_ORIGINS", "").split(",") if item.strip()}
+    if origin in configured:
+        return True
+    return bool(host and urlparse(origin).netloc == host)
 
 
-# ── WebSocket endpoint ───────────────────────────────────────
+def _loopback_request(request: Request) -> bool:
+    return bool(request.client and request.client.host in {"127.0.0.1", "::1", "localhost", "testclient"})
+
+
+async def broadcast(payload: Dict[str, Any]) -> None:
+    dead = set()
+    message = json.dumps(payload, default=str, separators=(",", ":"))
+    for ws in tuple(connected_clients):
+        try:
+            await ws.send_text(message)
+        except Exception:
+            dead.add(ws)
+    connected_clients.difference_update(dead)
+
+
+@app.get("/api/status")
+async def status() -> Dict[str, str]:
+    """Small readiness endpoint; it exposes no telemetry or controls."""
+    return {"status": "online"}
+
+
+@app.post("/api/telemetry")
+async def receive_telemetry(request: Request) -> Dict[str, Any]:
+    """Accept bounded local display telemetry, with optional launcher token."""
+    if not _loopback_request(request):
+        raise HTTPException(status_code=403, detail="telemetry is local only")
+    expected_token = os.environ.get("JARVIS_HUD_INGEST_TOKEN")
+    supplied_token = request.headers.get("X-Jarvis-Hud-Token", "")
+    if expected_token and not hmac.compare_digest(supplied_token, expected_token):
+        raise HTTPException(status_code=403, detail="invalid telemetry token")
+    try:
+        payload = await request.json()
+        accepted = apply_coordinator_telemetry(payload)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await broadcast({"type": "STATE_UPDATE", "data": state})
+    return {"accepted": True, "received_at": accepted["received_at"]}
+
+
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
+async def websocket_endpoint(ws: WebSocket) -> None:
+    if not _allowed_origin(ws.headers.get("origin"), ws.headers.get("host")):
+        await ws.close(code=1008)
+        return
     await ws.accept()
     connected_clients.add(ws)
-    logger.info(f"Client connected. Total: {len(connected_clients)}")
-    # Send full state immediately
-    await ws.send_text(json.dumps({"type": "STATE_UPDATE", "data": state}))
     try:
+        await ws.send_text(json.dumps({"type": "STATE_UPDATE", "data": state}, default=str))
         while True:
-            raw = await ws.receive_text()
-            msg = json.loads(raw)
-            if msg.get("type") == "CHAT":
-                await handle_chat(ws, msg.get("text", ""))
+            try:
+                message = json.loads(await ws.receive_text())
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(message, dict) and message.get("type") == "CHAT":
+                await handle_chat(message.get("text", ""))
     except WebSocketDisconnect:
+        pass
+    finally:
         connected_clients.discard(ws)
-        logger.info(f"Client disconnected. Total: {len(connected_clients)}")
 
 
-async def handle_chat(ws: WebSocket, user_text: str):
-    state["chat_history"].append({"role": "user", "text": user_text, "ts": datetime.now().isoformat()})
-    # Try real Ollama, fallback to canned response
-    reply = await asyncio.get_event_loop().run_in_executor(None, _call_jarvis_chat, user_text)
+async def handle_chat(user_text: Any) -> str:
+    text = _bounded_text(user_text).strip()
+    if not text:
+        return "Please enter a message."
+    state["chat_history"].append({"role": "user", "text": text, "ts": datetime.now().isoformat()})
+    reply = _bounded_text(await asyncio.get_running_loop().run_in_executor(None, _call_jarvis_chat, text))
     state["chat_history"].append({"role": "jarvis", "text": reply, "ts": datetime.now().isoformat()})
+    state["chat_history"] = state["chat_history"][-MAX_CHAT_HISTORY:]
     await broadcast({"type": "CHAT_REPLY", "role": "jarvis", "text": reply})
+    return reply
+
+
+@app.post("/chat")
+async def http_chat(request: Request) -> Dict[str, str]:
+    if not _allowed_origin(request.headers.get("origin"), request.headers.get("host")):
+        raise HTTPException(status_code=403, detail="origin not allowed")
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail="invalid JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="chat payload must be an object")
+    return {"reply": await handle_chat(body.get("message", body.get("text", "")))}
+
+
+@app.get("/chat")
+async def chat_status() -> Dict[str, str]:
+    """Compatibility/readiness route; no history or execution data is exposed."""
+    return {"status": "available"}
 
 
 def _call_jarvis_chat(user_text: str) -> str:
     try:
         from ollama_integration import call_ollama
-        agg = state.get("parts", {})
-        context = f"JARVIS Trading System. Active parts: {len(agg)}. User asks: {user_text}"
-        resp, err = call_ollama(context, model="qwen2.5:14b", timeout=15)
-        return resp.strip() if resp else f"Ollama unavailable: {err}"
-    except Exception as e:
-        return f"Chat unavailable: {e}"
+        context = f"JARVIS Trading System. Active parts: {len(state.get('parts', {}))}. User asks: {user_text}"
+        response, error = call_ollama(context, model="qwen2.5:14b", timeout=15)
+        return response.strip() if response else f"Ollama unavailable: {error}"
+    except Exception:
+        return "Chat unavailable."
 
 
-# ── Serve dashboard HTML ─────────────────────────────────────
 @app.get("/")
-async def serve_dashboard():
-    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_hud", "index.html")
-    with open(html_path, encoding="utf-8") as f:
-        return HTMLResponse(f.read())
+async def serve_dashboard() -> HTMLResponse:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_hud", "index.html")
+    with open(path, encoding="utf-8") as file:
+        return HTMLResponse(file.read())
 
 
 @app.get("/api/oracle")
-async def get_oracle_map():
-    """Return latest Market Oracle multi-timeframe forecast."""
-    return state.get("oracle", {})
+async def get_oracle_map() -> Dict[str, Any]:
+    return _json_safe(state.get("oracle", {}))
 
 
-# ── Startup ──────────────────────────────────────────────────
+async def state_push_loop() -> None:
+    while True:
+        await asyncio.sleep(1)
+        if connected_clients:
+            await broadcast({"type": "STATE_UPDATE", "data": state})
+
+
+def start_bus_listener() -> None:
+    """Attach optional local cognitive-bus telemetry; failure does not affect HUD."""
+    try:
+        from jarvis_cognitive_bus import CognitiveBus
+        from jarvis_watcher_ai import JarvisWatcherAI
+        bus = CognitiveBus()
+        watcher = JarvisWatcherAI(bus=bus)
+        watcher.start()
+        state["pipeline"]["watcher_active"] = True
+
+        def on_thoughts(message: Dict[str, Any]) -> None:
+            sender = _bounded_text(message.get("sender", "Unknown"), 80)
+            payload = message.get("payload", "")
+            state["parts"][sender] = {
+                "direction": _extract_direction(payload), "confidence": _extract_confidence(payload),
+                "raw": _bounded_text(payload, 100), "ts": datetime.now().isoformat(),
+            }
+
+        def on_health(message: Dict[str, Any]) -> None:
+            sender = _bounded_text(message.get("sender", "Unknown"), 80)
+            payload = message.get("payload", {})
+            severity = payload.get("severity", "WARNING") if isinstance(payload, dict) else "WARNING"
+            state["health"][sender] = {"severity": _bounded_text(severity, 40), "ts": datetime.now().isoformat()}
+
+        def on_oracle(message: Dict[str, Any]) -> None:
+            if isinstance(message.get("payload"), dict):
+                state["oracle"] = _json_safe(message["payload"])
+
+        bus.subscribe("THOUGHTS", on_thoughts)
+        bus.subscribe("HEALTH", on_health)
+        bus.subscribe("ORACLE_FORECAST", on_oracle)
+    except Exception as exc:
+        logger.info("CognitiveBus unavailable; starting demo display data: %s", exc)
+        _start_demo_data()
+
+
+def _start_demo_data() -> None:
+    """Retain the existing display-only fallback when local bus modules are absent."""
+    state["pipeline"]["watcher_active"] = True
+    now = datetime.now().isoformat()
+    for number in range(1, 13):
+        name = f"Part{number}_Demo"
+        state["parts"][name] = {
+            "direction": "NEUTRAL", "confidence": 0.0,
+            "raw": "Demo telemetry — no local CognitiveBus connected", "ts": now,
+        }
+
+
+def start_terminal_tailer() -> None:
+    """Tail the optional local terminal log without affecting coordinator state."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "jarvis_terminal.log")
+    state["terminal_logs"] = []
+
+    def tail() -> None:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a+", encoding="utf-8") as file:
+                file.seek(0, 2)
+                while True:
+                    line = file.readline()
+                    if line:
+                        state["terminal_logs"] = (state["terminal_logs"] + [_bounded_text(line, 500)])[-200:]
+                    else:
+                        time.sleep(0.1)
+        except Exception as exc:
+            logger.debug("terminal tailer stopped: %s", exc)
+
+    threading.Thread(target=tail, daemon=True).start()
+
+
 @app.on_event("startup")
-async def on_startup():
-    logger.info("JARVIS HUD Server starting...")
+async def on_startup() -> None:
     threading.Thread(target=start_bus_listener, daemon=True).start()
     start_terminal_tailer()
     asyncio.create_task(state_push_loop())
-    logger.info("HUD Server ONLINE → http://localhost:7788")
+    logger.info("HUD Server online on local address")
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=7788, log_level="warning")
+    host = os.environ.get("JARVIS_HOST", "127.0.0.1")
+    try:
+        port = int(os.environ.get("JARVIS_PORT", "7788"))
+    except ValueError:
+        port = 7788
+    uvicorn.run(app, host=host, port=port, log_level="warning")
