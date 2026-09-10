@@ -150,6 +150,7 @@ class JarvisMarketOracle:
         self._binance = None
         self._deribit = None
         self._delta = None
+        self._upstox = None      # ← Upstox Indian market (optional)
         self._gemini_client = None
         self._gemini_types = None
 
@@ -187,7 +188,19 @@ class JarvisMarketOracle:
         except Exception as e:
             logger.warning(f"[Oracle] Delta client init failed: {e}")
 
-        # 4. Gemini SDK
+        # 4. Upstox Indian Market (OPTIONAL — silently skips if disabled/no token)
+        try:
+            from upstox_data import get_upstox_data
+            ud = get_upstox_data()
+            if ud._enabled:
+                self._upstox = ud
+                logger.info("[Oracle] Upstox Indian market client ready ✅")
+            else:
+                logger.info("[Oracle] Upstox disabled (UPSTOX_ENABLED=false or no token)")
+        except Exception as e:
+            logger.info(f"[Oracle] Upstox not loaded (optional): {e}")
+
+        # 5. Gemini SDK
         if GEMINI_API_KEY:
             try:
                 from google import genai
@@ -378,8 +391,26 @@ class JarvisMarketOracle:
             except Exception as e:
                 logger.warning(f"[Oracle] Delta collection warning: {e}")
 
-        # 4. Parts 1-12 Opinions & Signals
+        # 4. Upstox Indian Market (OPTIONAL — only if UPSTOX_ENABLED=true)
+        data["upstox"] = {}
+        if self._upstox:
+            try:
+                snap = self._upstox.get_market_snapshot()
+                data["upstox"] = {
+                    "market_open":   snap.get("market_open", False),
+                    "nifty50":       snap.get("nifty50", 0.0),
+                    "banknifty":     snap.get("banknifty", 0.0),
+                    "default_stock": snap.get("default_stock", 0.0),
+                    "instruments":   snap.get("instruments", {}),
+                }
+                if snap.get("nifty50", 0) > 0:
+                    logger.debug(f"[Oracle] Upstox: Nifty50={snap['nifty50']:.1f}, BankNifty={snap['banknifty']:.1f}")
+            except Exception as e:
+                logger.warning(f"[Oracle] Upstox collection warning: {e}")
+
+        # 5. Parts 1-12 Opinions & Signals
         data["parts_opinions"] = self._collect_parts_opinions()
+
 
         self.last_raw_data = data
         return data
@@ -644,6 +675,8 @@ Major Order Book Walls: Bid at ${micro.get('bid_wall', 0):,}, Ask at ${micro.get
 24h Volume:           ${micro.get('volume_24h_usdt', 0)/1e9:.2f}B (24h Change: {micro.get('change_24h_pct', 0):+.2f}%)
 Liquidation Zones:    Longs at ${liq_longs:,}, Shorts at ${liq_shorts:,}
 
+{self._format_upstox_section(market_data.get('upstox', {}))}
+
 === PARTS AI OPINIONS (12 systems) ===
 {parts_text}
 
@@ -656,6 +689,27 @@ Chairman:  {ollama_board.get('chairman', 'N/A')}
 Provide JSON market forecast for ALL timeframes matching the requested schema.
 """
         return prompt
+
+    def _format_upstox_section(self, upstox: Dict[str, Any]) -> str:
+        """Format Upstox Indian market data for the prompt. Returns empty string if no data."""
+        if not upstox or upstox.get("nifty50", 0) <= 0:
+            return ""
+        lines = ["=== INDIAN MARKET CONTEXT (Upstox NSE) ==="]
+        lines.append(f"NSE Market:  {'OPEN 🟢' if upstox.get('market_open') else 'CLOSED 🔴'}")
+        if upstox.get("nifty50", 0) > 0:
+            lines.append(f"Nifty 50:    ₹{upstox['nifty50']:,.2f}")
+        if upstox.get("banknifty", 0) > 0:
+            lines.append(f"Bank Nifty:  ₹{upstox['banknifty']:,.2f}")
+        if upstox.get("default_stock", 0) > 0:
+            lines.append(f"Stock Price: ₹{upstox['default_stock']:,.2f}")
+        # Add any extra configured instruments
+        for sym, price in (upstox.get("instruments") or {}).items():
+            if price > 0 and sym not in ("NSE_INDEX|Nifty 50", "NSE_INDEX|Nifty Bank"):
+                short_name = sym.split("|")[-1] if "|" in sym else sym
+                lines.append(f"  {short_name:20s}: ₹{price:,.2f}")
+        return "\n".join(lines)
+
+
 
     def _call_ollama_oracle(self, market_data: Dict[str, Any], ollama_board: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -928,6 +982,17 @@ Provide JSON market forecast for ALL timeframes matching the requested schema.
         sugg_col = G if trade_sugg == "CALL" else (R if trade_sugg == "PUT" else Y)
         print(f"  {BD}ORACLE TRADE PLAN:{RST} {sugg_col}{BD}[{trade_sugg}]{RST} | Entry: ${ez_from:,.0f}-${ez_to:,.0f} | TP: ${tp_val:,.0f} | SL: ${sl_val:,.0f}")
         print(f"\n  {M}{BD}AI ORACLE SAYS:{RST} \"{W}{summary}{RST}\"")
+
+        # ── Indian Market Context (Upstox) ──────────────────────────────
+        upstox_data = self.last_raw_data.get("upstox", {})
+        if upstox_data.get("nifty50", 0) > 0:
+            mkt_str = f"{G}OPEN 🟢{RST}" if upstox_data.get("market_open") else f"{DG}CLOSED{RST}"
+            print(f"{C}╟────────────────────────────────────────────────────────────────────────────────────╢{RST}")
+            print(f"  {BD}INDIAN MARKET (NSE via Upstox){RST}  {mkt_str}")
+            print(f"  {DG}Nifty 50   :{RST} {W}₹{upstox_data['nifty50']:,.2f}{RST}  {DG}Bank Nifty:{RST} {W}₹{upstox_data.get('banknifty', 0):,.2f}{RST}")
+            if upstox_data.get("default_stock", 0) > 0:
+                print(f"  {DG}Stock Price:{RST} {W}₹{upstox_data['default_stock']:,.2f}{RST}")
+
         print(f"{C}╚════════════════════════════════════════════════════════════════════════════════════╝{RST}\n")
 
     # ──────────────────────────────────────────────────────────
