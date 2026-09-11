@@ -6164,13 +6164,22 @@ class Jarvis4EngineSystem:
 # ==================== MAIN EXECUTION ====================
 
 def main():
-    """Main function with an explicit paper-workflow opt-in."""
-    if os.environ.get("JARVIS_START_PAPER") != "1" or any(
-        os.environ.get(flag, "").lower() == "true"
-        for flag in ("JARVIS_AUTO_TRADE", "JARVIS_LIVE_EXECUTION", "DELTA_ORDER_EXECUTION_ENABLED")
-    ):
-        logger.error("[SAFE DEFAULT] Disable live execution flags and set JARVIS_START_PAPER=1 before starting JARVIS services.")
+    """Main function with an explicit opt-in safety gate.
+    
+    Set JARVIS_START_PAPER=1 in .env to start services.
+    For LIVE trading: also set JARVIS_AUTO_TRADE=true.
+    For PAPER trading: set JARVIS_AUTO_TRADE=false.
+    """
+    if os.environ.get("JARVIS_START_PAPER") != "1":
+        logger.error("[SAFE DEFAULT] Set JARVIS_START_PAPER=1 in .env to start JARVIS services.")
         return 2
+
+    is_live = os.environ.get("JARVIS_AUTO_TRADE", "").lower() == "true"
+    if is_live:
+        logger.warning("⚡ LIVE TRADING MODE — Real orders will be placed on Delta Exchange!")
+    else:
+        logger.info("📄 PAPER TRADING MODE — Simulated trades only, no real money.")
+
 
     logger.info("🚀 JARVIS TRADE ELITE v7.0 - FULLY INTEGRATED")
     logger.info("==========================================")
