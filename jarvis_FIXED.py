@@ -313,6 +313,37 @@ logging.basicConfig(
 )
 logger = logging.getLogger("JarvisElite")
 
+# --- CLEAN OUTPUT MODE (default) -----------------------------------------
+# Terminal ma fakt JARVIS no FINAL decision dekhay. Badha parts no chatter
+# logs/engine_chatter.log ma save thay. Full detail mate:
+#   JARVIS_OUTPUT_MODE=verbose python jarvis_FIXED.py
+JARVIS_OUTPUT_MODE = os.environ.get("JARVIS_OUTPUT_MODE", "clean").lower()
+JARVIS_VERBOSE = JARVIS_OUTPUT_MODE == "verbose"
+
+def _vprint(*args, **kwargs):
+    """Print only in verbose mode."""
+    if JARVIS_VERBOSE:
+        print(*args, **kwargs)
+
+def _run_quietly(fn, *args, **kwargs):
+    """Run fn with stdout captured in clean mode; chatter goes to logs/engine_chatter.log."""
+    if JARVIS_VERBOSE:
+        return fn(*args, **kwargs)
+    import contextlib, io
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        _result = fn(*args, **kwargs)
+    _chatter = _buf.getvalue()
+    if _chatter.strip():
+        try:
+            os.makedirs("logs", exist_ok=True)
+            with open("logs/engine_chatter.log", "a", encoding="utf-8") as _fh:
+                _fh.write(_chatter)
+        except Exception:
+            pass
+    return _result
+
+
 
 # ==================== TRADE CONFIGURATION ====================
 TRADE_CONFIG = {
@@ -1443,6 +1474,20 @@ class LiveTradingEngine:
             logger.debug(f"[SMART ENTRY] Fallback to market: {e}")
             return current_price, 'MARKET'
 
+    def _print_compact_status(self, current_price=None):
+        """Clean mode: ek j line ma system status (dashaarath FULL dashboard nathi)."""
+        try:
+            total = self.paper_wins + self.paper_losses + self.paper_breakeven
+            wr = (self.paper_wins / total * 100) if total > 0 else 0
+            profit = self.paper_balance - self.PAPER_CONFIG['initial_balance']
+            uptime = str(timedelta(seconds=int(time.time() - self.engine_start_time)))
+            now = datetime.now().strftime('%H:%M:%S')
+            price_str = f"BTC ${current_price:,.2f}" if current_price else "BTC --"
+            print(f"  \U0001F4CA [{now}] {price_str} | \U0001F4B0 ${self.paper_balance:,.2f} ({'+' if profit >= 0 else ''}${profit:,.2f}) | "
+                  f"\U0001F3C6 {wr:.0f}% | \U0001F4C2 Open: {len(self.paper_open_trades)} | \u23F1\uFE0F {uptime}")
+        except Exception as e:
+            logger.debug(f"[COMPACT STATUS] failed: {e}")
+
     def _print_paper_dashboard(self):
         """Print God-Mode Paper Trading Dashboard"""
         import os
@@ -1700,17 +1745,20 @@ class LiveTradingEngine:
                             
                             # 7. Dashboard + AI Health Report every 5 cycles
                             if cycle_count[0] % 5 == 0:
-                                self._print_paper_dashboard()
-                                if hasattr(self.jarvis, 'bus') and self.jarvis.bus:
-                                    self.jarvis.bus.print_health_report()
-                                if hasattr(self, 'market_oracle') and self.market_oracle:
-                                    self.market_oracle.print_market_map()
+                                if JARVIS_VERBOSE:
+                                    self._print_paper_dashboard()
+                                    if hasattr(self.jarvis, 'bus') and self.jarvis.bus:
+                                        self.jarvis.bus.print_health_report()
+                                    if hasattr(self, 'market_oracle') and self.market_oracle:
+                                        self.market_oracle.print_market_map()
+                                else:
+                                    self._print_compact_status(current_price)
 
                             if current_price is None and len(df) > 0:
                                 current_price = float(df['close'].iloc[-1])
                             
                             # 4. Run full AI analysis
-                            result = self.jarvis.analyze_trade_setup(df)
+                            result = _run_quietly(self.jarvis.analyze_trade_setup, df)
                             self.last_jarvis_result = result
                             # Keep auto_trader updated with latest live data for reversal checks
                             if self.auto_trader:
