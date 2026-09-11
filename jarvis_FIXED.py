@@ -1344,6 +1344,23 @@ class LiveTradingEngine:
                 
                 # FIX BUG 1: Call record_trade here when it actually closes
                 self.record_trade(direction, trade.get('confidence', 0), trade['result'])
+
+                # --- LEARNING LOOP: record outcome + engine attribution (guarded) ---
+                try:
+                    from jarvis_learning import record_trade as _jl_record, learning_enabled as _jl_enabled
+                    if _jl_enabled():
+                        engine_signals = {}
+                        jarvis = getattr(self, 'jarvis', None)
+                        part_results = getattr(jarvis, 'latest_part_results', None) if jarvis else None
+                        if isinstance(part_results, dict):
+                            for pname, pres in part_results.items():
+                                if isinstance(pres, dict) and isinstance(pres.get('signal'), (int, float)):
+                                    engine_signals[pname] = pres['signal']
+                        trade_snapshot = dict(trade)
+                        trade_snapshot.setdefault('symbol', 'BTC/USDT')
+                        _jl_record(trade_snapshot, engine_signals=engine_signals or None)
+                except Exception as e:
+                    logger.debug(f"[Learning] record on close failed (ignored): {e}")
                 
                 # --- WIRING FIX: CNS PAIN DETECTION ---
                 if trade['result'] == 'LOSS' and hasattr(self.jarvis, 'cns') and self.jarvis.cns:
@@ -2732,9 +2749,20 @@ Follow the tag with a 1-sentence options analyst insight.
             return {"signal": 0, "thought": "Institutional error", "telemetry": {"error": str(e), "signal": 0}}
 
 # FIX #6: Properly calling local Ollama (GPU) instead of Gemini cloud
-def _call_ollama_local(prompt, model="phi3.5:3.8b", timeout=30):
-    """Call local Ollama GPU model — uses OLLAMA_BASE_URL from .env"""
+def _call_ollama_local(prompt, model=None, timeout=30):
+    """Call local Ollama GPU model — uses OLLAMA_BASE_URL from .env.
+
+    model=None auto-detects the installed model (or OLLAMA_MODEL env override).
+    """
     import requests, os
+    if model is None:
+        try:
+            from ollama_integration import resolve_ollama_model
+            model = resolve_ollama_model()
+        except Exception as e:
+            return None, f"Ollama model resolution failed: {e}"
+        if not model:
+            return None, "No Ollama model found (math fallback)"
     base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
     try:
         resp = requests.post(
@@ -2752,7 +2780,7 @@ def _call_ollama_local(prompt, model="phi3.5:3.8b", timeout=30):
 
 class DeepSeekV3Brain:
     def __init__(self):
-        self.model_name = "phi3.5:3.8b"  # FIX: Use local Ollama model
+        self.model_name = None  # Auto-detect installed Ollama model (or OLLAMA_MODEL env)
         self.enabled = True  # FIX: Always enabled via Ollama
 
     def analyze_sentiment(self, data, market_context):
@@ -2774,7 +2802,7 @@ class DeepSeekV3Brain:
 
 class DeepSeekR1ReasoningBrain:
     def __init__(self):
-        self.model_name = "phi3.5:3.8b"  # FIX: Use local Ollama model
+        self.model_name = None  # Auto-detect installed Ollama model (or OLLAMA_MODEL env)
         self.enabled = True  # FIX: Always enabled via Ollama
 
     def complex_reasoning(self, all_signals, market_data, context):
@@ -4464,8 +4492,16 @@ class JarvisElite:
                                 weighted_signals[name] = 0.0
                                 weight_totals[name] = 0.0
                             
-                            weighted_signals[name] += signal * tf_weight
-                            weight_totals[name] += tf_weight
+                            # Learning loop: scale engine contribution by its
+                            # historical performance multiplier (guarded, 1.0 default)
+                            try:
+                                from jarvis_learning import get_engine_weight as _jl_weight
+                                learn_w = _jl_weight(name)
+                            except Exception:
+                                learn_w = 1.0
+
+                            weighted_signals[name] += signal * tf_weight * learn_w
+                            weight_totals[name] += tf_weight * learn_w
                             
                             if 'telemetry' in res and tf_name == '1m':
                                 full_telemetry[name] = res['telemetry']

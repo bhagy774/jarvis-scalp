@@ -8,11 +8,30 @@ contacted unless you explicitly opt in via environment variables:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Local Ollama server URL used by the DeepSeek V3/R1 brains and specialist pool. |
+| `OLLAMA_MODEL` | unset (auto) | Pin a specific Ollama model. When unset, JARVIS auto-detects from installed models (`GET /api/tags`) using a preference order (phi3.5/phi3 → qwen2.5 → mistral → llama3.1/llama3 → deepseek-r1 → gemma2 → whatever exists). The choice is logged once at startup and cached in-process. |
+| `JARVIS_LEARNING` | `1` (on) | Set `0` to disable the Learning Loop (trade-outcome recording and per-engine adaptive weights). |
 | `JARVIS_ENABLE_GEMINI` | `0` (off) | Set `1` **and** provide `GEMINI_API_KEY` to enable the external Gemini Supreme Advisor. Otherwise it is skipped at startup. |
 | `JARVIS_ENABLE_EXTERNAL_AI` | `0` (off) | Set `1` to enable external AI clients (e.g. KIE GPT-6). When off, external clients return a clean `disabled` result and never make a network call. |
 
-If Ollama is unreachable, the local brains degrade gracefully through their
-existing fallbacks.
+If Ollama is unreachable or has no installed model, the local brains degrade
+gracefully through their existing fallbacks (log: "No Ollama model found — AI
+brains in math-fallback mode").
+
+## Learning Loop
+
+`jarvis_learning.py` records every closed paper-trade outcome (timestamp,
+symbol, direction, entry/exit, P&L, plus the per-engine signal snapshot when
+available) into `jarvis_learning.json` (atomic writes, corruption-safe).
+
+From those outcomes it maintains per-engine running stats (trades, wins,
+losses, win rate) and derives a weight multiplier in `[0.5, 1.5]`
+(`0.5 + win_rate`: 0% win rate → 0.5, 50% → 1.0, 100% → 1.5). Engines with
+fewer than 10 recorded trades stay neutral at `1.0`. The brain's weighted
+signal fusion multiplies each engine's static weight by this factor, so
+consistently winning engines gradually get more say and losing ones less.
+
+Everything is fail-safe — any error is logged and ignored, never breaking the
+trading loop. Disable with `JARVIS_LEARNING=0`.
 
 ## Crash recovery & watchdog
 
