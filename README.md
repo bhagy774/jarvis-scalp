@@ -65,6 +65,43 @@ tracked in `presim_stats` and shown in the compact status line. The whole
 call is fail-open — any exception behaves as `pass`. Disable entirely with
 `JARVIS_PRESIM=0`.
 
+## Data Validator
+
+`jarvis_data_validator.py` is a pre-brain data quality gate that ensures the
+brain (`JarvisElite.analyze_trade_setup()`) never makes a trading decision on
+stale, incomplete, or suspicious data.
+
+**Four checks run on every cycle, before any analysis begins:**
+
+1. **Completeness** — OHLC values must all exist; NaN, None, and Inf are
+   rejected.
+2. **Price Sanity** — price must be > 0 and must not jump > 20% from the
+   last known good price (spike filter). The spike filter does **not** update
+   its reference on a rejected candle, so recovery after a bad tick is
+   automatic.
+3. **Staleness** — the data timestamp must be < 30 seconds old. Millisecond
+   timestamps are auto-detected and converted. Future timestamps are also
+   flagged.
+4. **Cross-Source** — Delta vs Binance live price divergence:
+   - \> 1% → warning logged, trading continues.
+   - \> 3% → this cycle is blocked (`WAIT/NO-DATA`).
+
+When any check fails the brain receives a `NO_TRADE` signal with reason
+`WAIT/NO-DATA: <details>` — it never sees the bad data. Reject and warning
+counts are shown in the compact status line (`DV: 2R/1W`).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `JARVIS_DATA_VALIDATOR` | `1` (on) | Set `0` to disable all validation (data passes through unchecked). |
+
+Safety guarantees:
+- **Fail-open**: if the validator itself crashes, data passes through. The
+  validator can never break the brain.
+- Thread-safe counters (supports concurrent cycle evaluation).
+- Zero network calls — pure local validation only.
+- Per-source spike tracking (Delta and Binance maintain independent last
+  prices).
+
 ## Crash recovery & watchdog
 
 `jarvis_watchdog.py` provides:

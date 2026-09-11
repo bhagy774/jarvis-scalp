@@ -118,6 +118,12 @@ except Exception:
     _get_cross_exchange_perspective = None
     MULTI_SOURCE_DATA_AVAILABLE = False
 try:
+    from jarvis_data_validator import get_validator as _get_data_validator
+    DATA_VALIDATOR_AVAILABLE = True
+except Exception:
+    _get_data_validator = None
+    DATA_VALIDATOR_AVAILABLE = False
+try:
     from jarvis_backtester import JarvisFullBacktester as _JarvisFullBacktester
     BACKTESTER_AVAILABLE = True
 except Exception:
@@ -1576,8 +1582,18 @@ class LiveTradingEngine:
             price_str = f"BTC ${current_price:,.2f}" if current_price else "BTC --"
             ps = getattr(self, 'presim_stats', {}) or {}
             presim_str = f" | PreSim: {ps.get('vetoes', 0)}V/{ps.get('adjustments', 0)}A" if (ps.get('vetoes') or ps.get('adjustments')) else ""
+            dv_str = ""
+            if DATA_VALIDATOR_AVAILABLE and _get_data_validator is not None:
+                try:
+                    _dv_s = _get_data_validator().get_stats()
+                    _dv_rej = _dv_s.get('rejected', 0)
+                    _dv_wrn = _dv_s.get('warnings', 0)
+                    if _dv_rej or _dv_wrn:
+                        dv_str = f" | DV: {_dv_rej}R/{_dv_wrn}W"
+                except Exception:
+                    pass
             print(f"  \U0001F4CA [{now}] {price_str} | \U0001F4B0 ${self.paper_balance:,.2f} ({'+' if profit >= 0 else ''}${profit:,.2f}) | "
-                  f"\U0001F3C6 {wr:.0f}% | \U0001F4C2 Open: {len(self.paper_open_trades)} | \u23F1\uFE0F {uptime}{presim_str}")
+                  f"\U0001F3C6 {wr:.0f}% | \U0001F4C2 Open: {len(self.paper_open_trades)} | \u23F1\uFE0F {uptime}{presim_str}{dv_str}")
         except Exception as e:
             logger.debug(f"[COMPACT STATUS] failed: {e}")
 
@@ -4271,7 +4287,46 @@ class JarvisElite:
                 
             if len(data) < 20:
                 return self._get_no_trade_signal("Insufficient data")
-                
+
+            # ── DATA VALIDATOR GATE (pre-brain quality check) ────────────
+            # Validates completeness, price sanity, staleness of incoming
+            # DataFrame. On failure → brain gets WAIT/NO-DATA, no decision
+            # on bad data. Fail-open: validator crash never blocks brain.
+            if DATA_VALIDATOR_AVAILABLE and _get_data_validator is not None:
+                try:
+                    _dv = _get_data_validator()
+                    _dv_result = _dv.validate_dataframe(data, source="delta")
+                    if not _dv_result.ok:
+                        logger.warning(
+                            "🛡️ DATA-VALIDATOR GATE: %s — %s",
+                            _dv_result.status, "; ".join(_dv_result.failures)
+                        )
+                        return self._get_no_trade_signal(
+                            f"WAIT/NO-DATA: {'; '.join(_dv_result.failures)}"
+                        )
+                    # Cross-source: Delta vs Binance price divergence
+                    if self.binance_data is not None:
+                        try:
+                            _bn_price = self.binance_data.get_live_price()
+                            if _bn_price and _bn_price > 0:
+                                _delta_price = float(data['close'].iloc[-1])
+                                _xs_result = _dv.cross_source_check(
+                                    _delta_price, _bn_price, "delta", "binance"
+                                )
+                                if not _xs_result.ok:
+                                    logger.warning(
+                                        "🛡️ DATA-VALIDATOR CROSS-SOURCE BLOCK: %s",
+                                        "; ".join(_xs_result.failures)
+                                    )
+                                    return self._get_no_trade_signal(
+                                        f"WAIT/NO-DATA: {'; '.join(_xs_result.failures)}"
+                                    )
+                        except Exception as _xs_err:
+                            logger.debug("Cross-source check skipped: %s", _xs_err)
+                except Exception as _dv_err:
+                    # FAIL-OPEN: validator crash must never block the brain
+                    logger.debug("Data validator skipped (error): %s", _dv_err)
+
             # Get current price and context
             current_price = float(data['close'].iloc[-1])
             self.last_price = current_price  # Store for AI Chain global context

@@ -57,11 +57,15 @@ TRADING_CONFIG: Dict[str, Any] = get_active_config()
 #                            Default: off — external clients return a "disabled" result
 #                            and never make a network call.
 # JARVIS_WATCHDOG            "0" to disable the crash-recovery watchdog. Default: on.
+# JARVIS_DATA_VALIDATOR      "0" to disable the pre-brain data quality gate
+#                            (completeness, price sanity, staleness, cross-source).
+#                            Default: on.
 AI_ENV_DEFAULTS: Dict[str, str] = {
     "OLLAMA_BASE_URL": "http://localhost:11434",
     "JARVIS_ENABLE_GEMINI": "0",
     "JARVIS_ENABLE_EXTERNAL_AI": "0",
     "JARVIS_WATCHDOG": "1",
+    "JARVIS_DATA_VALIDATOR": "1",
 }
 
 
