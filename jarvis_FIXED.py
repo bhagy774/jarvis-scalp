@@ -1159,6 +1159,9 @@ class LiveTradingEngine:
         self.paper_breakeven = 0
         self.paper_peak_balance = self.paper_balance
         self._load_paper_state()
+
+        # ═══ PRE-TRADE SIMULATOR STATS (fail-open; JARVIS_PRESIM=0 disables) ═══
+        self.presim_stats = {'checks': 0, 'vetoes': 0, 'adjustments': 0}
         
         # ═══ OPTIONS HEDGED SCALP ENGINE ═══
         try:
@@ -1193,6 +1196,47 @@ class LiveTradingEngine:
     #  PAPER TRADE MANAGEMENT
     # ═══════════════════════════════════════════════════════════════
     
+    def _presim_gate(self, direction, confidence, entry_price, result=None, df=None, current_price=None):
+        """Pre-Trade Simulator gate (fail-open).
+
+        Runs jarvis_presim on a candidate ENTER signal. Returns
+        (direction, confidence): direction is set to None on veto (skip the
+        entry), confidence is adjusted (clamped ±10) on 'adjust'.
+        Any exception → returns inputs unchanged ('pass').
+        """
+        try:
+            if os.getenv('JARVIS_PRESIM', '1') == '0':
+                return direction, confidence
+            from jarvis_presim import run_presim
+            market_ctx = (result or {}).get('market_context', {}) if isinstance(result, dict) else {}
+            decision = run_presim(
+                signal={
+                    'symbol': 'BTC/USDT',
+                    'direction': direction,
+                    'entry_price': entry_price or current_price,
+                    'regime': market_ctx.get('trend'),
+                },
+                candles=df,
+                snapshot=market_ctx,
+            )
+            self.presim_stats['checks'] += 1
+            action = decision.get('action', 'pass')
+            if action == 'veto':
+                self.presim_stats['vetoes'] += 1
+                print(f"  [PRESIM] VETO: {decision.get('reason', '')}")
+                logger.info(f"[PRESIM] VETO {direction}: {decision.get('reason', '')}")
+                return None, confidence
+            if action == 'adjust':
+                self.presim_stats['adjustments'] += 1
+                delta = max(-10, min(10, int(decision.get('confidence_delta', 0))))
+                confidence = max(0, min(100, confidence + delta))
+                print(f"  [PRESIM] ADJUST {delta:+d} → conf {confidence}%: {decision.get('reason', '')}")
+                logger.info(f"[PRESIM] ADJUST {delta:+d}: {decision.get('reason', '')}")
+            return direction, confidence
+        except Exception as e:
+            logger.debug(f"[PRESIM] gate error (fail-open → pass): {e}")
+            return direction, confidence
+
     def _open_paper_trade(self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl, current_price=None):
         """Open a new paper trade"""
         if len(self.paper_open_trades) >= self.PAPER_CONFIG['max_open_trades']:
@@ -1530,8 +1574,10 @@ class LiveTradingEngine:
             uptime = str(timedelta(seconds=int(time.time() - self.engine_start_time)))
             now = datetime.now().strftime('%H:%M:%S')
             price_str = f"BTC ${current_price:,.2f}" if current_price else "BTC --"
+            ps = getattr(self, 'presim_stats', {}) or {}
+            presim_str = f" | PreSim: {ps.get('vetoes', 0)}V/{ps.get('adjustments', 0)}A" if (ps.get('vetoes') or ps.get('adjustments')) else ""
             print(f"  \U0001F4CA [{now}] {price_str} | \U0001F4B0 ${self.paper_balance:,.2f} ({'+' if profit >= 0 else ''}${profit:,.2f}) | "
-                  f"\U0001F3C6 {wr:.0f}% | \U0001F4C2 Open: {len(self.paper_open_trades)} | \u23F1\uFE0F {uptime}")
+                  f"\U0001F3C6 {wr:.0f}% | \U0001F4C2 Open: {len(self.paper_open_trades)} | \u23F1\uFE0F {uptime}{presim_str}")
         except Exception as e:
             logger.debug(f"[COMPACT STATUS] failed: {e}")
 
@@ -1861,7 +1907,12 @@ class LiveTradingEngine:
                                 except Exception as at_err:
                                     print(f"  ⚠️  AutoTrader error: {at_err}")
                             elif direction in ('CALL', 'PUT') and self.can_trade():
-                                if confidence >= self.PAPER_CONFIG['min_confidence']:
+                                # --- PRE-TRADE SIMULATOR (fail-open; JARVIS_PRESIM=0 disables) ---
+                                direction, confidence = self._presim_gate(
+                                    direction, confidence, entry_price,
+                                    result=result, df=df, current_price=current_price
+                                )
+                                if direction in ('CALL', 'PUT') and confidence >= self.PAPER_CONFIG['min_confidence']:
                                     # Compute ATR for hedge advisor
                                     try:
                                         atr = float((df['high'] - df['low']).rolling(14).mean().iloc[-1])
@@ -1898,7 +1949,7 @@ class LiveTradingEngine:
                                         print(f"     Expires: {exp_dt.strftime('%H:%M:%S')}")
                                     else:
                                         print(f"  ⚠️  Max open trades reached")
-                                else:
+                                elif direction in ('CALL', 'PUT'):
                                     print(f"  ⚠️  PAPER: Skipped (Conf {confidence}% < {self.PAPER_CONFIG['min_confidence']}%)")
                                 
                                 # FIX BUG 1: PENDING record_trade removed to fix Consecutive Loss Circuit Breaker
