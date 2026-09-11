@@ -73,6 +73,56 @@ except ImportError as _ise:
     INDIAN_SIGNAL_AVAILABLE = False
     print(f"[JARVIS CORE] ⚠️  IndianSignalEngine not loaded: {_ise}")
 
+# Optional, on-demand integrations.  These imports create no network clients or
+# background work; each feature is explicitly activated by its owning path.
+try:
+    from jarvis_sizer import get_sizer as _get_jarvis_sizer
+    SIZER_AVAILABLE = True
+except Exception:
+    _get_jarvis_sizer = lambda *_args, **_kwargs: None
+    SIZER_AVAILABLE = False
+try:
+    from jarvis_position_manager import get_position_manager as _get_jarvis_position_manager
+    POSITION_MANAGER_AVAILABLE = True
+except Exception:
+    _get_jarvis_position_manager = lambda *_args, **_kwargs: None
+    POSITION_MANAGER_AVAILABLE = False
+try:
+    from jarvis_coin_scanner import get_coin_scanner as _get_jarvis_coin_scanner
+    COIN_SCANNER_AVAILABLE = True
+except Exception:
+    _get_jarvis_coin_scanner = lambda *_args, **_kwargs: None
+    COIN_SCANNER_AVAILABLE = False
+try:
+    from jarvis_specialist_pool import SpecialistPool as _SpecialistPool
+    SPECIALIST_POOL_AVAILABLE = True
+except Exception:
+    _SpecialistPool = None
+    SPECIALIST_POOL_AVAILABLE = False
+try:
+    from binance_data import get_binance_data as _get_binance_data
+    BINANCE_DATA_AVAILABLE = True
+except Exception:
+    _get_binance_data = lambda: None
+    BINANCE_DATA_AVAILABLE = False
+try:
+    from upstox_data import get_upstox_data as _get_upstox_data
+    UPSTOX_DATA_AVAILABLE = True
+except Exception:
+    _get_upstox_data = lambda: None
+    UPSTOX_DATA_AVAILABLE = False
+try:
+    from jarvis_backtester import JarvisFullBacktester as _JarvisFullBacktester
+    BACKTESTER_AVAILABLE = True
+except Exception:
+    _JarvisFullBacktester = None
+    BACKTESTER_AVAILABLE = False
+try:
+    from kie_gpt6_client import KieGPT6Client as _KieGPT6Client
+    KIE_GPT6_AVAILABLE = True
+except Exception:
+    _KieGPT6Client = None
+    KIE_GPT6_AVAILABLE = False
 
 # Import JARVIS Self-Healing Doctor
 try:
@@ -3792,6 +3842,64 @@ class JarvisElite:
             self.delta_data = None
             self.delta_client = None
 
+        # Optional wiring: keep supplemental sources and utilities discoverable,
+        # but do not start scanners, model calls, backtests, or another position
+        # monitor as a side effect of starting the brain.
+        self.position_manager = None
+        self.position_sizer = None
+        self.coin_scanner = None
+        self.binance_data = None
+        self.upstox_data = None
+        self.specialist_pool = None
+        self.specialist_pool_class = _SpecialistPool
+        self.backtester_class = _JarvisFullBacktester
+        self.kie_gpt6_client_class = _KieGPT6Client
+        self.integration_sources = {}
+        if self.delta_data is not None:
+            try:
+                self.position_manager = _get_jarvis_position_manager(
+                    self.delta_data, self.bus
+                )
+                # JarvisAutoTrader owns TP/SL lifecycle monitoring.  It already
+                # uses this singleton for its compound pool; do not start the
+                # manager here or it could submit a duplicate close order.
+                self.position_sizer = _get_jarvis_sizer(self.delta_data)
+            except Exception as integration_error:
+                logger.debug("Optional sizing/position integration unavailable: %s", integration_error)
+        try:
+            self.coin_scanner = _get_jarvis_coin_scanner(
+                bus=self.bus,
+                position_check_fn=(self.position_manager.has_open_position if self.position_manager else None),
+            )
+        except Exception as integration_error:
+            logger.debug("Optional coin scanner unavailable: %s", integration_error)
+        try:
+            self.binance_data = _get_binance_data()
+        except Exception as integration_error:
+            logger.debug("Optional Binance data source unavailable: %s", integration_error)
+        try:
+            self.upstox_data = _get_upstox_data()
+        except Exception as integration_error:
+            logger.debug("Optional Upstox data source unavailable: %s", integration_error)
+        self.integration_sources = {
+            "position_manager": self.position_manager,
+            "sizer": self.position_sizer,
+            "coin_scanner": self.coin_scanner,
+            "binance_data": self.binance_data,
+            "upstox_data": self.upstox_data,
+            "specialist_pool": self.specialist_pool_class,
+            "backtester": self.backtester_class,
+            "kie_gpt6": self.kie_gpt6_client_class,
+        }
+        if self.bus:
+            try:
+                self.bus.publish("THOUGHTS", "JarvisIntegrations", {
+                    "available": sorted(name for name, value in self.integration_sources.items() if value is not None),
+                    "on_demand_only": ["coin_scanner", "specialist_pool", "backtester", "kie_gpt6"],
+                })
+            except Exception:
+                pass
+
         # FIX #4 (UPDATED): Re-Enabled Deribit for Dual-Source Options Intelligence!
         try:
             from deribit_options_client import DeribitOptionsClient
@@ -3934,6 +4042,25 @@ class JarvisElite:
         self.current_score = 0
         self.current_signals = {}
         self.market_context = {}
+
+    def get_optional_utility(self, name, **kwargs):
+        """Return an explicitly requested optional analysis utility.
+
+        This method is intentionally not called from the execution loop.  It makes
+        external data, backtesting, specialist models and GPT analysis available to
+        operators without allowing any of them to alter a trading decision by
+        default.
+        """
+        key = str(name).lower()
+        if key == "specialist_pool" and self.specialist_pool_class:
+            if self.specialist_pool is None:
+                self.specialist_pool = self.specialist_pool_class(**kwargs)
+            return self.specialist_pool
+        if key == "backtester" and self.backtester_class:
+            return self.backtester_class(**kwargs)
+        if key in {"kie_gpt6", "kie"} and self.kie_gpt6_client_class:
+            return self.kie_gpt6_client_class(**kwargs)
+        return self.integration_sources.get(key)
     
     def _fetch_mtf_from_api(self):
         """Fetch real historical OHLCV data for all timeframes from Delta Exchange API"""
@@ -5535,7 +5662,7 @@ class Jarvis4EngineSystem:
         except Exception as e:
             logger.debug(f"Multi-TF system not available (optional): {e}")
             self.multi_tf_engine = None
-            self.trading_config = {'mode': 'trade'}  # Fallback to trade
+            self.trading_config = {'mode': 'paper', 'paper_trading': True, 'live_execution': False}  # Safe optional fallback
         
         # Data storage
         self.historical_data = None
