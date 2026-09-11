@@ -10,6 +10,9 @@ contacted unless you explicitly opt in via environment variables:
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Local Ollama server URL used by the DeepSeek V3/R1 brains and specialist pool. |
 | `OLLAMA_MODEL` | unset (auto) | Pin a specific Ollama model. When unset, JARVIS auto-detects from installed models (`GET /api/tags`) using a preference order (phi3.5/phi3 → qwen2.5 → mistral → llama3.1/llama3 → deepseek-r1 → gemma2 → whatever exists). The choice is logged once at startup and cached in-process. |
 | `JARVIS_LEARNING` | `1` (on) | Set `0` to disable the Learning Loop (trade-outcome recording and per-engine adaptive weights). |
+| `JARVIS_PRESIM` | `1` (on) | Set `0` to disable the Pre-Trade Simulator (instant offline history check before each paper entry). |
+| `JARVIS_PRESIM_MIN_RR` | `1.0` | Minimum reward:risk ratio required by the Pre-Trade Simulator; setups below this are vetoed. |
+| `JARVIS_PRESIM_BUDGET_MS` | `500` | Time budget (milliseconds) for the pre-trade simulation. When exhausted, remaining checks abstain (pass). |
 | `JARVIS_ENABLE_GEMINI` | `0` (off) | Set `1` **and** provide `GEMINI_API_KEY` to enable the external Gemini Supreme Advisor. Otherwise it is skipped at startup. |
 | `JARVIS_ENABLE_EXTERNAL_AI` | `0` (off) | Set `1` to enable external AI clients (e.g. KIE GPT-6). When off, external clients return a clean `disabled` result and never make a network call. |
 
@@ -32,6 +35,35 @@ consistently winning engines gradually get more say and losing ones less.
 
 Everything is fail-safe — any error is logged and ignored, never breaking the
 trading loop. Disable with `JARVIS_LEARNING=0`.
+
+## Pre-Trade Simulator
+
+`jarvis_presim.py` runs a fast, fully offline "instant backtest check" on
+every candidate ENTER signal **before** the paper trade is opened — *"aa
+setup history ma kaam karyu hato?"* (did this setup work in history?). It
+never touches the network and never blocks the decision loop beyond a bounded
+time budget (`JARVIS_PRESIM_BUDGET_MS`, default 500 ms).
+
+Three checks (each returns pass / adjust / veto with a reason):
+
+1. **Historical win-rate** — win rate of similar recorded trades (same
+   direction + symbol, + regime when available) from `jarvis_learning.json`.
+   Fewer than 5 similar trades → abstain (`pass`, delta 0) — it never vetoes
+   on missing data. Win rate < 35% → veto; < 50% → confidence penalty;
+   ≥ 60% → small boost.
+2. **R:R sanity** — TP/SL from `smart_tpsl_calculator` (import guarded);
+   reward:risk below `JARVIS_PRESIM_MIN_RR` (default 1.0) → veto.
+3. **Volatility regime** — ATR extremely low/high vs price (or an extreme
+   `volatility` label in the market snapshot) → `adjust` with a small
+   confidence penalty, never a veto.
+
+The brain (`jarvis_FIXED.py`) calls the simulator after its fused decision
+and existing safety/risk checks, just before the paper-trade open path.
+`veto` skips the entry and logs `[PRESIM] VETO: {reason}`; `adjust` applies
+the confidence delta (clamped ±10); `pass` is silent. Veto/adjust counts are
+tracked in `presim_stats` and shown in the compact status line. The whole
+call is fail-open — any exception behaves as `pass`. Disable entirely with
+`JARVIS_PRESIM=0`.
 
 ## Crash recovery & watchdog
 
