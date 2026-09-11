@@ -33,6 +33,9 @@ def run_ai_roundtable(market_context: Dict[str, Any], signal_data: Dict[str, Any
     gemini_context = "No Gemini advisor data available"
     gemini_override = "STAY_NEUTRAL"
     try:
+        # LOCAL-ONLY AI DEFAULT: skip external Gemini advisor unless explicitly enabled.
+        if os.environ.get("JARVIS_ENABLE_GEMINI", "0") != "1":
+            raise ImportError("Gemini advisor disabled (Ollama-only mode)")
         from gemini_supreme_advisor import get_advisor
         advisor = get_advisor()
         if advisor:

@@ -47,3 +47,32 @@ def get_active_config() -> Dict[str, Any]:
 
 # Backwards-compatible mapping consumed by jarvis_FIXED.py.
 TRADING_CONFIG: Dict[str, Any] = get_active_config()
+
+
+# ── AI PROVIDER ENVIRONMENT VARIABLES (all safe defaults = local Ollama only) ──
+# OLLAMA_BASE_URL            Local Ollama server URL. Default: http://localhost:11434
+# JARVIS_ENABLE_GEMINI       "1" to opt in to the external Gemini Supreme Advisor
+#                            (also requires GEMINI_API_KEY). Default: off (Ollama-only).
+# JARVIS_ENABLE_EXTERNAL_AI  "1" to opt in to external AI clients (e.g. KIE GPT-6).
+#                            Default: off — external clients return a "disabled" result
+#                            and never make a network call.
+# JARVIS_WATCHDOG            "0" to disable the crash-recovery watchdog. Default: on.
+AI_ENV_DEFAULTS: Dict[str, str] = {
+    "OLLAMA_BASE_URL": "http://localhost:11434",
+    "JARVIS_ENABLE_GEMINI": "0",
+    "JARVIS_ENABLE_EXTERNAL_AI": "0",
+    "JARVIS_WATCHDOG": "1",
+}
+
+
+def external_ai_enabled() -> bool:
+    """True only when the user explicitly opted in to external AI calls."""
+    return os.environ.get("JARVIS_ENABLE_EXTERNAL_AI", "0") == "1"
+
+
+def gemini_enabled() -> bool:
+    """True only with explicit opt-in AND an API key present."""
+    return (
+        os.environ.get("JARVIS_ENABLE_GEMINI", "0") == "1"
+        and bool(os.environ.get("GEMINI_API_KEY", "").strip())
+    )

@@ -11,7 +11,19 @@ class KieGPT6Client:
         self.base_url = (base_url or os.getenv("KIE_BASE_URL", "https://api.kie.ai")).rstrip("/")
         self.endpoint = f"{self.base_url}/codex/v1/responses"
 
+    def _external_ai_enabled(self) -> bool:
+        return os.getenv("JARVIS_ENABLE_EXTERNAL_AI", "0") == "1"
+
     def ask(self, prompt: str, stream: bool = False, reasoning_effort: str = "low", web_search: bool = False):
+        # LOCAL-ONLY AI DEFAULT: external AI calls are inert unless explicitly enabled.
+        if not self._external_ai_enabled():
+            disabled = {
+                "disabled": True,
+                "reason": "External AI disabled (Ollama-only mode). Set JARVIS_ENABLE_EXTERNAL_AI=1 to enable.",
+            }
+            if stream:
+                return iter(())
+            return disabled["reason"], disabled
         if not self.api_key:
             raise ValueError("KIE_API_KEY missing! Set it in .env or pass to KieGPT6Client.")
 
