@@ -4214,7 +4214,7 @@ class JarvisElite:
                     
                 try:
                     from part2_FIXED import CorrelationMatrixBrainGPU
-                    self.correlation_brain = CorrelationMatrixBrainGPU()
+                    self.correlation_brain = CorrelationMatrixBrainGPU(self)  # pass master_system
                     logger.info("✅ [CORRELATION] CorrelationMatrixBrainGPU Connected")
                 except Exception as e:
                     self.correlation_brain = None
@@ -4238,8 +4238,26 @@ class JarvisElite:
                         
                 if 'confidence' in self.engines:
                     try:
-                        self.engines['confidence'].start_confidence_monitoring()
-                        logger.info("✅ [CONFIDENCE] Enhanced Confidence Monitor STARTED")
+                        engine = self.engines['confidence']
+                        if hasattr(engine, 'start_confidence_monitoring'):
+                            import asyncio
+                            import inspect
+                            method = engine.start_confidence_monitoring
+                            if inspect.iscoroutinefunction(method):
+                                # async method — schedule it safely
+                                try:
+                                    loop = asyncio.get_event_loop()
+                                    if loop.is_running():
+                                        asyncio.ensure_future(method())
+                                    else:
+                                        loop.run_until_complete(method())
+                                except RuntimeError:
+                                    asyncio.run(method())
+                            else:
+                                method()
+                            logger.info("✅ [CONFIDENCE] Enhanced Confidence Monitor STARTED")
+                        else:
+                            logger.warning("⚠️ [CONFIDENCE] start_confidence_monitoring not found on engine")
                     except Exception as e:
                         logger.warning(f"⚠️ [CONFIDENCE] start failed: {e}")
                 # ----------------------------------------
