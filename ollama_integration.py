@@ -24,6 +24,74 @@ OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "deepseek-r1:14b")  # 24GB VRAM optimized
 OLLAMA_ENABLED = False
 
+# ── Auto model resolution ────────────────────────────────────────────
+# Preference order when auto-detecting an installed model.
+_MODEL_PREFERENCE = (
+    "phi3.5", "phi3", "qwen2.5", "mistral", "llama3.1", "llama3",
+    "deepseek-r1", "gemma2",
+)
+_resolved_model_cache = None  # in-process cache; None = not resolved yet
+_model_resolution_done = False
+_no_model_logged = False
+
+
+def list_installed_models() -> list:
+    """Query Ollama /api/tags and return installed model names ([] on failure)."""
+    try:
+        base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        resp = requests.get(f"{base}/api/tags", timeout=5)
+        if resp.status_code == 200:
+            return [m.get("name", "") for m in resp.json().get("models", []) if m.get("name")]
+    except Exception as e:
+        logger.debug(f"Could not list Ollama models: {e}")
+    return []
+
+
+def resolve_ollama_model(force_refresh: bool = False):
+    """Resolve which Ollama model to use.
+
+    Priority:
+      1. OLLAMA_MODEL env var (explicit override wins)
+      2. First installed model matching the preference order
+      3. First installed model of any kind
+      4. None (callers must use their graceful fallbacks)
+
+    Result is cached in-process; pass force_refresh=True to re-query.
+    """
+    global _resolved_model_cache, _model_resolution_done, _no_model_logged
+
+    env_model = os.environ.get("OLLAMA_MODEL")
+    if env_model:
+        if _resolved_model_cache != env_model:
+            logger.info(f"[JARVIS CORE] Ollama model: {env_model} (from OLLAMA_MODEL)")
+        _resolved_model_cache = env_model
+        _model_resolution_done = True
+        return env_model
+
+    if _model_resolution_done and not force_refresh:
+        return _resolved_model_cache
+
+    installed = list_installed_models()
+    chosen = None
+    for pref in _MODEL_PREFERENCE:
+        for name in installed:
+            if name.startswith(pref):
+                chosen = name
+                break
+        if chosen:
+            break
+    if chosen is None and installed:
+        chosen = installed[0]
+
+    _model_resolution_done = True
+    _resolved_model_cache = chosen
+    if chosen:
+        logger.info(f"[JARVIS CORE] Ollama model: {chosen} (auto-detected)")
+    elif not _no_model_logged:
+        _no_model_logged = True
+        logger.warning("No Ollama model found — AI brains in math-fallback mode")
+    return chosen
+
 
 def preload_committee_models():
     """
@@ -41,7 +109,22 @@ def preload_committee_models():
     
     # Unique models
     models = list(set(models))
-    
+
+    # Skip models that are not actually installed instead of failing
+    try:
+        installed = list_installed_models()
+        if installed:
+            before = list(models)
+            models = [m for m in models if m in installed]
+            skipped = [m for m in before if m not in models]
+            if skipped:
+                logger.info(f"Skipping non-installed committee models: {skipped}")
+            if not models:
+                logger.info("No committee models installed — nothing to pre-load")
+                return
+    except Exception as e:
+        logger.warning(f"Committee model availability check failed, continuing anyway: {e}")
+
     logger.info(f"Ollama pre-loading committee models to VRAM: {models}")
     for model in models:
         try:
