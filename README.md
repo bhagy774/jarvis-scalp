@@ -1,5 +1,38 @@
 # JARVIS Scalp
 
+## Local AI (Ollama only)
+
+JARVIS runs on **local Ollama models only** by default. No external cloud AI is
+contacted unless you explicitly opt in via environment variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Local Ollama server URL used by the DeepSeek V3/R1 brains and specialist pool. |
+| `JARVIS_ENABLE_GEMINI` | `0` (off) | Set `1` **and** provide `GEMINI_API_KEY` to enable the external Gemini Supreme Advisor. Otherwise it is skipped at startup. |
+| `JARVIS_ENABLE_EXTERNAL_AI` | `0` (off) | Set `1` to enable external AI clients (e.g. KIE GPT-6). When off, external clients return a clean `disabled` result and never make a network call. |
+
+If Ollama is unreachable, the local brains degrade gracefully through their
+existing fallbacks.
+
+## Crash recovery & watchdog
+
+`jarvis_watchdog.py` provides:
+
+- **Startup reconciliation** — compares persisted local open trades
+  (`jarvis_state.json`) with exchange open positions; logs mismatches and
+  adopts exchange truth. Fail-safe: any API error is logged and startup
+  continues; it never places orders.
+- **Watchdog thread** — every 60 s checks heartbeats of core services (brain
+  loop, data feeds) and alerts via log (and Telegram if configured). Detection
+  + alerting only; no auto-restart. `get_health()` returns a status dict.
+- **State persistence** — open paper trades are saved to `jarvis_state.json`
+  on open/close for reconciliation after a crash.
+
+Disable with `JARVIS_WATCHDOG=0`. All wiring in `jarvis_FIXED.py` is guarded by
+`try/except` so the watchdog can never break startup. Paper-mode safety guards
+are unchanged.
+
+
 Python trading/analysis modules with a React/Vite dashboard and a local FastAPI HUD. This repository is experimental, not production-ready trading software. Offline tests do not establish profitability, exchange compatibility, or live safety.
 
 ## Safe installation and tests

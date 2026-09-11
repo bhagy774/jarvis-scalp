@@ -1082,7 +1082,15 @@ class LiveTradingEngine:
 
         # === GEMINI SUPREME ADVISOR (10-min strategic brain) ===
         self.gemini_advisor = None
-        if GEMINI_ADVISOR_AVAILABLE and _init_gemini_advisor:
+        # LOCAL-ONLY AI: Gemini is opt-in. Requires BOTH JARVIS_ENABLE_GEMINI=1
+        # and GEMINI_API_KEY; otherwise JARVIS runs Ollama-only.
+        _gemini_enabled = (
+            os.environ.get("JARVIS_ENABLE_GEMINI", "0") == "1"
+            and bool(os.environ.get("GEMINI_API_KEY", "").strip())
+        )
+        if not _gemini_enabled:
+            print("[JARVIS CORE] Gemini advisor disabled (Ollama-only mode)")
+        if _gemini_enabled and GEMINI_ADVISOR_AVAILABLE and _init_gemini_advisor:
             try:
                 bus = getattr(self, 'cognitive_bus', None)
                 self.gemini_advisor = _init_gemini_advisor(
@@ -1211,6 +1219,13 @@ class LiveTradingEngine:
             'close_reason': None,
         }
         self.paper_open_trades.append(trade)
+
+        # Persist state for crash recovery (guarded; never raises)
+        try:
+            from jarvis_watchdog import save_state
+            save_state(self.paper_open_trades)
+        except Exception:
+            pass
 
         # ── TELEGRAM: Notify trade opened ──
         try:
@@ -1345,7 +1360,16 @@ class LiveTradingEngine:
                 still_open.append(trade)
         
         self.paper_open_trades = still_open
-        
+
+        # Watchdog: heartbeat + persist state when trades closed (guarded)
+        try:
+            from jarvis_watchdog import beat, save_state
+            beat("paper_trade_loop")
+            if newly_closed:
+                save_state(self.paper_open_trades)
+        except Exception:
+            pass
+
         # Print closed trade results
         for t in newly_closed:
             emoji = '✅' if t['result'] == 'WIN' else ('❌' if t['result'] == 'LOSS' else '➖')
@@ -5945,7 +5969,16 @@ def main():
 
     # Initialize the complete trade system
     jarvis_trade = Jarvis4EngineSystem()
-    
+
+    # --- CRASH RECOVERY + WATCHDOG (guarded; can never break startup) ---
+    try:
+        if os.environ.get("JARVIS_WATCHDOG", "1") != "0":
+            from jarvis_watchdog import start_watchdog
+            exchange_client = getattr(getattr(jarvis_trade, "jarvis", None), "delta_data", None)
+            start_watchdog(exchange_client=exchange_client)
+    except Exception as wd_err:
+        logger.warning(f"[WATCHDOG] startup wiring failed (continuing): {wd_err}")
+
     try:
         # Run all 4 engines automatically
         results = jarvis_trade.run_complete_system()
