@@ -1802,10 +1802,89 @@ class LiveTradingEngine:
                     logger.warning(f"⚠️ [RISK] monitor_and_manage failed: {e}")
         
         cycle_count = [0]  # Use list for closure access
+        last_report_date = [datetime.now().date() - timedelta(days=1)] # Force report if time matches on startup
         
         def _live_loop():
             while self.is_running:
                 try:
+                    # --- KILL-SWITCH CHECK ---
+                    if os.getenv("JARVIS_KILL_SWITCH", "1") != "0" and os.path.exists("C:\\jarvis\\STOP_JARVIS"):
+                        logger.warning("🛑 KILL-SWITCH TRIGGERED (STOP_JARVIS file found). Initiating safe exit...")
+                        try:
+                            from telegram_notifier import send_message
+                            send_message("🛑 JARVIS stopped via kill-switch")
+                        except Exception:
+                            pass
+                        self.is_running = False
+                        break # Safe exit, does not close existing positions
+                        
+                    # --- DAILY REPORT CHECK ---
+                    current_time = datetime.now()
+                    report_time_str = os.getenv("JARVIS_REPORT_TIME", "20:00")
+                    try:
+                        report_hour, report_minute = map(int, report_time_str.split(':'))
+                    except:
+                        report_hour, report_minute = 20, 0
+                        
+                    if os.getenv("JARVIS_DAILY_REPORT", "1") != "0":
+                        if current_time.hour == report_hour and current_time.minute == report_minute and last_report_date[0] != current_time.date():
+                            last_report_date[0] = current_time.date()
+                            try:
+                                from telegram_notifier import send_daily_report
+                                trades_taken = self.daily_trades
+                                total = self.paper_wins + self.paper_losses + self.paper_breakeven
+                                wr = (self.paper_wins / total * 100) if total > 0 else 0
+                                pnl = self.paper_balance - self.PAPER_CONFIG['initial_balance']
+                                
+                                best_trade = 0
+                                worst_trade = 0
+                                for t in self.paper_closed_trades:
+                                    if t.get('pnl'):
+                                        best_trade = max(best_trade, t['pnl'])
+                                        worst_trade = min(worst_trade, t['pnl'])
+                                        
+                                ps = getattr(self, 'presim_stats', {}) or {}
+                                presim_vetoes = ps.get('vetoes', 0)
+                                
+                                dv_rejects = 0
+                                if hasattr(self.jarvis, 'data_validator') and self.jarvis.data_validator:
+                                    try:
+                                        dv_rejects = self.jarvis.data_validator.get_stats().get('rejected', 0)
+                                    except:
+                                        pass
+                                
+                                uptime = str(timedelta(seconds=int(time.time() - self.engine_start_time)))
+                                
+                                errors = 0
+                                if hasattr(self.jarvis, 'bus') and self.jarvis.bus:
+                                    errors = self.jarvis.bus.get_errors_count() if hasattr(self.jarvis.bus, 'get_errors_count') else 0
+                                
+                                top_engines = "1. AI Core\\n2. Momentum\\n3. Scalp"
+                                if 'adaptive' in getattr(self.jarvis, 'engines', {}):
+                                    try:
+                                        ins = self.jarvis.engines['adaptive'].get_learning_insights()
+                                        if ins and 'top' in ins:
+                                            top_engines = str(ins['top'])
+                                    except:
+                                        pass
+                                        
+                                stats = {
+                                    'trades_taken': trades_taken,
+                                    'win_rate': wr,
+                                    'pnl': pnl,
+                                    'best_trade': best_trade,
+                                    'worst_trade': worst_trade,
+                                    'presim_vetoes': presim_vetoes,
+                                    'dv_rejects': dv_rejects,
+                                    'top_engines': top_engines,
+                                    'uptime': uptime,
+                                    'errors': errors
+                                }
+                                send_daily_report(stats)
+                                logger.info("📊 Daily report sent.")
+                            except Exception as e:
+                                logger.error(f"Failed to send daily report: {e}")
+
                     # FIX BUG 5: Auto-reset daily stats at midnight
                     current_date = datetime.now().date()
                     if current_date != self.last_trading_date:

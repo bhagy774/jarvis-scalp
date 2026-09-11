@@ -120,6 +120,18 @@ Disable with `JARVIS_WATCHDOG=0`. All wiring in `jarvis_FIXED.py` is guarded by
 `try/except` so the watchdog can never break startup. Paper-mode safety guards
 are unchanged.
 
+## Kill-switch & Daily Report
+
+**Kill-switch:**
+JARVIS provides an emergency kill-switch. If you create a file named `STOP_JARVIS` in the root folder, the live trading loop will perform a safe exit immediately. Open positions are intentionally left open so you can manage them manually.
+- To disable this check, set `JARVIS_KILL_SWITCH=0`.
+- A Telegram notification ("JARVIS stopped via kill-switch") is sent upon shutdown.
+
+**Daily Report:**
+A comprehensive performance report is sent to Telegram daily at a configured time (default 20:00). It includes the number of trades taken, win rate, total P&L, best/worst trades, PreSim vetoes, Data Validator rejects, top AI engines, system uptime, and error count.
+- Disable with `JARVIS_DAILY_REPORT=0`.
+- Change time using `JARVIS_REPORT_TIME=20:00` (e.g., IST).
+- The report is sent via `telegram_notifier.py`.
 
 Python trading/analysis modules with a React/Vite dashboard and a local FastAPI HUD. This repository is experimental, not production-ready trading software. Offline tests do not establish profitability, exchange compatibility, or live safety.
 
