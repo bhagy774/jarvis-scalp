@@ -112,6 +112,12 @@ except Exception:
     _get_upstox_data = lambda: None
     UPSTOX_DATA_AVAILABLE = False
 try:
+    from multi_source_data import get_cross_exchange_perspective as _get_cross_exchange_perspective
+    MULTI_SOURCE_DATA_AVAILABLE = True
+except Exception:
+    _get_cross_exchange_perspective = None
+    MULTI_SOURCE_DATA_AVAILABLE = False
+try:
     from jarvis_backtester import JarvisFullBacktester as _JarvisFullBacktester
     BACKTESTER_AVAILABLE = True
 except Exception:
@@ -4652,8 +4658,39 @@ class JarvisElite:
                         detailed_scores['fusion_boost'] = 3
                         logger.info("🔧 FUSION ENGINE: Aligned with signal (+3%)")
             
-            # 3D. Pattern Recognition confluence (was computed but never read)
-            pattern_mtf = self.market_context.get('pattern_mtf', {})
+            # 3X. CROSS-EXCHANGE perspective (Binance + Upstox vs Delta signal)
+            # Light-weight (~1.1 weight) advisory check. Fail-closed: if Binance is
+            # unreachable this perspective is skipped entirely and Delta remains
+            # primary. Never touches execution; only adjusts confidence / vetoes.
+            if MULTI_SOURCE_DATA_AVAILABLE and _get_cross_exchange_perspective is not None:
+                try:
+                    xres = _get_cross_exchange_perspective(logic_signal)
+                    detailed_scores['cross_exchange'] = {
+                        'active': xres.get('active', False),
+                        'adjustment': xres.get('adjustment', 0),
+                        'veto': xres.get('veto', False),
+                        'binance_ok': xres.get('binance', {}).get('ok', False),
+                        'upstox_ok': xres.get('upstox', {}).get('ok', False),
+                    }
+                    if xres.get('active'):
+                        adj = int(xres.get('adjustment', 0))
+                        if adj != 0:
+                            old_score = score
+                            score = max(0, min(100, score + adj))
+                            sign = "+" if adj > 0 else ""
+                            ai_thought += f" | 🌐 CROSS-EXCHANGE ({sign}{adj}%)"
+                            logger.info(f"🌐 CROSS-EXCHANGE: {'; '.join(xres.get('notes', []))} → {old_score}→{score}")
+                        if xres.get('veto') and logic_signal != 0:
+                            logger.warning("🌐 CROSS-EXCHANGE VETO: Binance 15m trend strongly opposes Delta signal — entry vetoed")
+                            return self._get_no_trade_signal("Cross-exchange veto: Binance trend strongly opposes signal")
+                    else:
+                        for note in xres.get('notes', []):
+                            logger.debug(f"🌐 CROSS-EXCHANGE: {note}")
+                except Exception as xe:
+                    # Never let the advisory perspective break the decision flow
+                    logger.debug(f"🌐 CROSS-EXCHANGE skipped (error): {xe}")
+
+            # 3D. Pattern Recognition confluence (was computed but never read)            pattern_mtf = self.market_context.get('pattern_mtf', {})
             if pattern_mtf and isinstance(pattern_mtf, dict):
                 pattern_tf_count = len(pattern_mtf)
                 if pattern_tf_count >= 3:
