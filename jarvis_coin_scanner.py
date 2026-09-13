@@ -188,11 +188,13 @@ class JarvisCoinScanner:
             [f"{c}={s.get('total', 0):.0f}" for c, s in sorted_coins[:3]]
         )
         switched = "SWITCHED" if best_coin != old_coin else "SAME"
-        print(f"\n{BD}{C}  COIN SCANNER{RST} {DG}[{datetime.now().strftime('%H:%M:%S')}]{RST}")
-        print(f"  Best: {BD}{G}{best_coin}{RST}  [{switched}]")
-        print(f"  Top3: {W}{top3_str}{RST}")
-        if not can_switch:
-            print(f"  {Y}(Position open - kept {self._best_coin}){RST}")
+        # Scanner detail belongs in logs. Clean terminal mode must show only
+        # JARVIS's final decision, not a second stream of candidate chatter.
+        logger.info(
+            "[CoinScanner] %s | best=%s | top=%s%s",
+            switched, best_coin, top3_str,
+            " | position open: route locked" if not can_switch else "",
+        )
 
         if self.bus:
             try:

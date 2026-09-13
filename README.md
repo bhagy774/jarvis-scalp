@@ -102,6 +102,28 @@ Safety guarantees:
 - Per-source spike tracking (Delta and Binance maintain independent last
   prices).
 
+## Dynamic crypto market routing
+
+`jarvis_market_router.py` makes crypto selection symbol-safe. Every selection follows this sequence:
+
+1. `jarvis_coin_scanner.py` ranks its liquid Binance candidates.
+2. The exact winner is checked against Delta's current product list.
+3. Only a verified Delta contract is routed into candles, validation, analysis, option-chain lookup, paper ledger, and (after independent live opt-ins) order execution.
+4. The route is locked while a paper or live position remains open. JARVIS cannot switch coin in the middle of a trade.
+
+If scanning, product verification, or a selected contract fails, the cycle is **blocked**; it never silently substitutes BTC or submits an order for a different coin. Selection refreshes every five minutes by default, not every loop.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `JARVIS_MULTI_MARKET` | `1` | `1` selects from scanner candidates; `0` uses `JARVIS_DEFAULT_SYMBOL` after Delta verification. |
+| `JARVIS_DEFAULT_SYMBOL` | `BTCUSDT` | Fixed crypto symbol when multi-market selection is disabled. |
+| `JARVIS_SELECTION_INTERVAL_SEC` | `300` | Minimum seconds between selections (minimum accepted value: 30). |
+| `JARVIS_INDIA_DATA` | `1` | Enables India-market readiness reporting when Upstox data is authenticated. It does **not** enable India orders. |
+
+### India / Upstox boundary
+
+Upstox currently provides Indian-market LTP, quote, and NSE option-chain data. That is useful for a separate NIFTY/BANKNIFTY analysis lane, but it is **not an execution adapter**: this repository contains no verified Upstox order-placement, fill reconciliation, contract resolver, or India risk/sizing implementation. Therefore the router reports NSE as `DATA_ONLY` even with valid data. It must remain separate from Delta crypto execution until those components are built and paper-tested.
+
 ## Crash recovery & watchdog
 
 `jarvis_watchdog.py` provides:
