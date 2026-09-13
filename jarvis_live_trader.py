@@ -371,6 +371,9 @@ class JarvisAutoTrader:
     def _place_trade(self, direction, confidence, price,
                      trade_type, hedge_plan, symbol: str = "BTCUSDT") -> Dict:
         """Execute both legs (futures + optional hedge)."""
+        symbol = str(symbol or "").upper().replace("-", "").replace("_", "").strip()
+        if not symbol:
+            return {"success": False, "reason": "Execution symbol is missing"}
 
         is_call    = direction in ("CALL", "BUY")
         futures_side = "buy" if is_call else "sell"
@@ -490,7 +493,10 @@ class JarvisAutoTrader:
             try:
                 opt_type = hedge_plan.get("option_type")
                 opt_strike = float(hedge_plan.get("strike"))
-                opt_symbol = self._find_option_symbol(opt_type, opt_strike)
+                opt_symbol = self._find_option_symbol(
+                    opt_type, opt_strike,
+                    symbol.removesuffix("USDT").removesuffix("USD")
+                )
                 if self.is_enabled:
                     # A live requested hedge is mandatory, not a best-effort
                     # follow-up after leaving naked futures exposure.
@@ -830,7 +836,10 @@ class JarvisAutoTrader:
 
         hedge_plan = {"do_hedge": False, "reason": "Reversal trade — no hedge"}
         trade_type = pos.get("trade_type", "SCALP")
-        result = self._place_trade(new_dir, confidence, price, trade_type, hedge_plan)
+        result = self._place_trade(
+            new_dir, confidence, price, trade_type, hedge_plan,
+            symbol=pos.get("symbol", "")
+        )
 
         if result.get("success"):
             print(f"  {_p('✅ Reverse trade OPENED', BD+G)}")
@@ -860,10 +869,10 @@ class JarvisAutoTrader:
             pass
         return None
 
-    def _find_option_symbol(self, option_type: str, strike: float) -> Optional[str]:
-        """Find matching option contract symbol on Delta."""
+    def _find_option_symbol(self, option_type: str, strike: float, underlying: str = "BTC") -> Optional[str]:
+        """Find matching option contract for the same asset as the futures trade."""
         try:
-            chain  = self.delta.get_options_chain("BTC")
+            chain  = self.delta.get_options_chain(underlying)
             key    = "puts" if option_type == "PUT" else "calls"
             options = chain.get(key, [])
             if not options:
