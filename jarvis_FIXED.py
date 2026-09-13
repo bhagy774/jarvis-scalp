@@ -100,6 +100,13 @@ except Exception:
     MarketRouter = None
     MARKET_ROUTER_AVAILABLE = False
 try:
+    from jarvis_options_context import resolve_options_context, apply_options_confirmation
+    OPTIONS_CONTEXT_AVAILABLE = True
+except Exception:
+    resolve_options_context = None
+    apply_options_confirmation = None
+    OPTIONS_CONTEXT_AVAILABLE = False
+try:
     from jarvis_specialist_pool import SpecialistPool as _SpecialistPool
     SPECIALIST_POOL_AVAILABLE = True
 except Exception:
@@ -1481,7 +1488,33 @@ class LiveTradingEngine:
         if newly_closed:
             self._save_paper_state()
     
-    def _print_live_signal(self, result, current_price):
+    def _apply_options_confirmation(self, result, symbol):
+        """Attach asset-specific options intelligence before final display/trade.
+
+        BTC is used only as bounded macro confirmation when an altcoin has no
+        usable option chain. It is never used as the altcoin's hedge contract,
+        strike, TP, or SL source.
+        """
+        if not OPTIONS_CONTEXT_AVAILABLE or not resolve_options_context:
+            return result
+        try:
+            signal = result.get('trade_signal', {})
+            direction = signal.get('direction', 'NO_TRADE')
+            raw_conf = signal.get('confidence_score', '0/100')
+            confidence = int(str(raw_conf).split('/')[0])
+            context = resolve_options_context(self.jarvis.delta_data, symbol)
+            adjusted, note = apply_options_confirmation(direction, confidence, context)
+            result.setdefault('market_context', {})['options_context'] = context.to_dict()
+            result['market_context']['options_confirmation'] = note
+            if direction in ('CALL', 'PUT', 'BUY', 'SELL'):
+                signal['confidence_score'] = f'{adjusted}/100'
+            logger.info('[OPTIONS] %s | selected=%s | source=%s | %s',
+                        context.role, context.selected_asset, context.source_asset or 'none', note)
+        except Exception as options_error:
+            logger.debug('[OPTIONS] confirmation skipped: %s', options_error)
+        return result
+
+    def _print_live_signal(self, result, current_price, symbol='BTCUSDT'):
         """Print live signal in professional format"""
         signal = result.get('trade_signal', {})
         direction = signal.get('direction', 'NO_TRADE')
@@ -1506,7 +1539,7 @@ class LiveTradingEngine:
         now = datetime.now().strftime('%H:%M:%S')
 
         print(f"\n{'─' * 60}")
-        print(f"  ⏰ [{now}] LIVE SIGNAL | BTC: ${current_price:,.2f}" if current_price else f"  ⏰ [{now}] LIVE SIGNAL")
+        print(f"  ⏰ [{now}] LIVE SIGNAL | {symbol}: ${current_price:,.2f}" if current_price else f"  ⏰ [{now}] LIVE SIGNAL | {symbol}")
         print(f"{'─' * 60}")
 
         if direction == 'NO_TRADE':
@@ -2011,9 +2044,11 @@ class LiveTradingEngine:
                                 import threading
                                 threading.Thread(target=_run_consensus_bg, daemon=True).start()
                             
-                            # 5. Print live signal
+                            # 5. Apply selected-asset options intelligence before
+                            # the displayed final decision and any order path.
+                            result = self._apply_options_confirmation(result, symbol)
                             direction, confidence, entry_price, tp1, tp2, sl, expiry = \
-                                self._print_live_signal(result, current_price)
+                                self._print_live_signal(result, current_price, symbol=symbol)
                             
                             # 6. AUTO-TRADE: Execute on Delta Exchange if enabled
                             if self.auto_trader and direction in ('CALL', 'PUT'):
