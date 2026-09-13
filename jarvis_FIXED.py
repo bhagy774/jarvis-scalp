@@ -94,6 +94,12 @@ except Exception:
     _get_jarvis_coin_scanner = lambda *_args, **_kwargs: None
     COIN_SCANNER_AVAILABLE = False
 try:
+    from jarvis_market_router import MarketRouter
+    MARKET_ROUTER_AVAILABLE = True
+except Exception:
+    MarketRouter = None
+    MARKET_ROUTER_AVAILABLE = False
+try:
     from jarvis_specialist_pool import SpecialistPool as _SpecialistPool
     SPECIALIST_POOL_AVAILABLE = True
 except Exception:
@@ -1166,6 +1172,16 @@ class LiveTradingEngine:
         self.paper_peak_balance = self.paper_balance
         self._load_paper_state()
 
+        # ═══ SYMBOL-SAFE MARKET ROUTER ═══
+        # The route is chosen before data is fetched and remains locked while a
+        # position is open.  Every downstream crypto value must use this symbol.
+        self.market_router = None
+        if MARKET_ROUTER_AVAILABLE and MarketRouter is not None:
+            self.market_router = MarketRouter(
+                scanner=getattr(self.jarvis, 'coin_scanner', None),
+                delta_client=getattr(self.jarvis, 'delta_data', None),
+            )
+
         # ═══ PRE-TRADE SIMULATOR STATS (fail-open; JARVIS_PRESIM=0 disables) ═══
         self.presim_stats = {'checks': 0, 'vetoes': 0, 'adjustments': 0}
         
@@ -1202,7 +1218,7 @@ class LiveTradingEngine:
     #  PAPER TRADE MANAGEMENT
     # ═══════════════════════════════════════════════════════════════
     
-    def _presim_gate(self, direction, confidence, entry_price, result=None, df=None, current_price=None):
+    def _presim_gate(self, direction, confidence, entry_price, result=None, df=None, current_price=None, symbol='BTCUSDT'):
         """Pre-Trade Simulator gate (fail-open).
 
         Runs jarvis_presim on a candidate ENTER signal. Returns
@@ -1217,7 +1233,7 @@ class LiveTradingEngine:
             market_ctx = (result or {}).get('market_context', {}) if isinstance(result, dict) else {}
             decision = run_presim(
                 signal={
-                    'symbol': 'BTC/USDT',
+                    'symbol': symbol,
                     'direction': direction,
                     'entry_price': entry_price or current_price,
                     'regime': market_ctx.get('trend'),
@@ -1243,7 +1259,7 @@ class LiveTradingEngine:
             logger.debug(f"[PRESIM] gate error (fail-open → pass): {e}")
             return direction, confidence
 
-    def _open_paper_trade(self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl, current_price=None):
+    def _open_paper_trade(self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl, current_price=None, symbol='BTCUSDT'):
         """Open a new paper trade"""
         if len(self.paper_open_trades) >= self.PAPER_CONFIG['max_open_trades']:
             return None
@@ -1256,6 +1272,7 @@ class LiveTradingEngine:
         trade = {
             'id': datetime.now().strftime('%H%M%S'),
             'direction': direction,
+            'symbol': symbol,
             'entry_price': entry_price,
             'confidence': confidence,
             'expiry_name': expiry_name,
@@ -1900,24 +1917,40 @@ class LiveTradingEngine:
                         
                     cycle_count[0] += 1
                     current_price = None
-                    
-                    # 1. Get current price for open trade checks
+
+                    # 1. Select a verified crypto contract before collecting any
+                    # data. A route is locked for the entire life of an open
+                    # position, so analysis, paper ledger and execution cannot
+                    # accidentally use different symbols.
+                    route = None
+                    if self.market_router:
+                        has_position = bool(self.paper_open_trades) or bool(
+                            self.auto_trader and getattr(self.auto_trader, 'open_positions', [])
+                        )
+                        route = self.market_router.select_crypto(has_open_position=has_position)
+                        if route.status != 'READY':
+                            logger.warning('[MARKET-ROUTER] Cycle blocked: %s', route.reason)
+                            time.sleep(5)
+                            continue
+                    symbol = route.symbol if route else os.getenv('JARVIS_DEFAULT_SYMBOL', 'BTCUSDT')
+                    base_asset = route.base_asset if route else 'BTC'
+
+                    # 2. Get price and check open paper trades for this exact symbol.
                     try:
                         if hasattr(self.jarvis, 'delta_data') and self.jarvis.delta_data:
-                            cp = self.jarvis.delta_data.get_live_price("BTCUSDT")
-                            if cp and float(cp) > 100:
+                            cp = self.jarvis.delta_data.get_live_price(symbol)
+                            if cp and float(cp) > 0:
                                 current_price = float(cp)
                     except Exception:
                         pass
-                    
-                    # 2. Check open paper trades
+
                     if current_price:
                         self._check_paper_trades(current_price)
-                    
-                    # 3. Fetch live data for analysis
+
+                    # 3. Fetch the selected symbol's live candles for analysis.
                     if hasattr(self.jarvis, 'delta_data') and self.jarvis.delta_data:
                         candles = self.jarvis.delta_data.get_historical_candles(
-                            symbol="BTCUSDT", resolution="1m", limit=500
+                            symbol=symbol, resolution="1m", limit=500
                         )
                         if candles:
                             df = pd.DataFrame(candles)
@@ -1962,7 +1995,7 @@ class LiveTradingEngine:
                                         signal_data = result.get('trade_signal', {})
                                         consensus = run_ai_roundtable(
                                             market_context={
-                                                'symbol': 'BTC/USDT',
+                                                'symbol': f'{symbol[:-4]}/USDT' if symbol.endswith('USDT') else symbol,
                                                 'current_price': current_price,
                                                 'trend': market_ctx.get('trend', 'NEUTRAL'),
                                                 'volatility': market_ctx.get('volatility', 'MEDIUM'),
@@ -1993,6 +2026,7 @@ class LiveTradingEngine:
                                         direction=direction,
                                         confidence=confidence,
                                         current_price=current_price or 0,
+                                        symbol=symbol,
                                         part_results=getattr(self.jarvis, 'latest_part_results', {}),
                                         trade_type=trade_type,
                                     )
@@ -2005,7 +2039,7 @@ class LiveTradingEngine:
                                 # --- PRE-TRADE SIMULATOR (fail-open; JARVIS_PRESIM=0 disables) ---
                                 direction, confidence = self._presim_gate(
                                     direction, confidence, entry_price,
-                                    result=result, df=df, current_price=current_price
+                                    result=result, df=df, current_price=current_price, symbol=symbol
                                 )
                                 if direction in ('CALL', 'PUT') and confidence >= self.PAPER_CONFIG['min_confidence']:
                                     # Compute ATR for hedge advisor
@@ -2017,7 +2051,7 @@ class LiveTradingEngine:
                                     if hasattr(self, 'hedged_engine') and self.hedged_engine:
                                         # Use AI Options Hedged Scalp Engine
                                         try:
-                                            options_chain = self.jarvis.delta_data.get_options_chain('BTC') \
+                                            options_chain = self.jarvis.delta_data.get_options_chain(base_asset) \
                                                 if hasattr(self.jarvis.delta_data, 'get_options_chain') else {}
                                         except Exception:
                                             options_chain = {}
@@ -2034,7 +2068,8 @@ class LiveTradingEngine:
                                     # Always open paper trade to track P&L
                                     trade = self._open_paper_trade(
                                         direction, entry_price or current_price,
-                                        confidence, expiry, tp1, tp2, sl, current_price=current_price
+                                        confidence, expiry, tp1, tp2, sl, current_price=current_price,
+                                        symbol=symbol
                                     )
                                     if trade:
                                         risk_amt = self.paper_balance * self.PAPER_CONFIG['risk_per_trade_pct']

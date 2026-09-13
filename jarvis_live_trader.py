@@ -159,7 +159,7 @@ class JarvisAutoTrader:
 
     def execute(self, direction: str, confidence: int,
                 current_price: float, part_results: Dict = None,
-                trade_type: str = "SCALP") -> Dict:
+                trade_type: str = "SCALP", symbol: str = "BTCUSDT") -> Dict:
         """
         Main entry: receive signal → run all gates → place order.
         direction  : 'CALL' or 'PUT'
@@ -179,6 +179,9 @@ class JarvisAutoTrader:
             return self._skip("Invalid confidence or price")
         if trade_type not in ("SCALP", "SWING"):
             return self._skip("Invalid trade type")
+        symbol = str(symbol or "").upper().replace("-", "").replace("_", "").strip()
+        if not symbol or symbol in {"BTC", "USDT"}:
+            return self._skip("Invalid execution symbol")
 
         # Reset daily stats at midnight
         if date.today() != self.today_date:
@@ -211,11 +214,11 @@ class JarvisAutoTrader:
         hedge_plan = {"do_hedge": False, "reason": "Hedge disabled"}
         if HEDGE_ENABLED and self.hedge_advisor:
             hedge_plan = self._get_hedge_plan(
-                direction, confidence, current_price, part_results)
+                direction, confidence, current_price, part_results, symbol)
 
         # ─ Gate 3: Execute ───────────────────────────────────────
         return self._place_trade(
-            direction, confidence, current_price, trade_type, hedge_plan)
+            direction, confidence, current_price, trade_type, hedge_plan, symbol)
 
     def trigger_emergency_stop(self):
         """Close ALL positions immediately."""
@@ -325,11 +328,11 @@ class JarvisAutoTrader:
     #  GATE 2: HEDGE DECISION
     # ──────────────────────────────────────────────────────────────
 
-    def _get_hedge_plan(self, direction, confidence, price, part_results) -> Dict:
+    def _get_hedge_plan(self, direction, confidence, price, part_results, symbol: str) -> Dict:
         try:
             options_chain = {}
             try:
-                options_chain = self.delta.get_options_chain("BTC")
+                options_chain = self.delta.get_options_chain(symbol.removesuffix("USDT").removesuffix("USD"))
             except Exception:
                 pass
 
@@ -366,18 +369,14 @@ class JarvisAutoTrader:
     # ──────────────────────────────────────────────────────────────
 
     def _place_trade(self, direction, confidence, price,
-                     trade_type, hedge_plan) -> Dict:
+                     trade_type, hedge_plan, symbol: str = "BTCUSDT") -> Dict:
         """Execute both legs (futures + optional hedge)."""
 
         is_call    = direction in ("CALL", "BUY")
         futures_side = "buy" if is_call else "sell"
 
-        # ── Dynamic symbol from Coin Scanner ────────────────────
-        scanner = _get_coin_scanner()
-        if scanner:
-            symbol = scanner.get_delta_symbol()
-        else:
-            symbol = "BTCUSDT"
+        # The caller owns routing.  Do not read the scanner again here: a
+        # second scan could turn an ETH analysis into a SOL order.
 
         # ── Calculate position size via Dynamic Sizer ────────────
         try:
