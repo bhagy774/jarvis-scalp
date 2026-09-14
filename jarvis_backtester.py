@@ -20,6 +20,10 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# Must be set before importing jarvis_FIXED / ollama_integration so that
+# module-level Ollama initialization is skipped in isolated replay.
+os.environ["JARVIS_BACKTEST_MODE"] = "1"
+
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8")
