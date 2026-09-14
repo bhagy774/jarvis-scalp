@@ -4133,14 +4133,17 @@ class JarvisElite:
         self.hud_headers = {"X-Jarvis-Hud-Token": token} if token else None
         # Backtest mode was intentionally set before optional components started.
         
-        # 🧠 INITIALIZE COGNITIVE EVENT BUS
-        try:
-            from jarvis_cognitive_bus import CognitiveBus
-            self.bus = CognitiveBus()
-            logger.info("🧠 Jarvis Cognitive Swarm Bus Initialized")
-        except ImportError:
+        # Historical replay has no asynchronous/live event bus.
+        if not self.is_backtest_mode:
+            try:
+                from jarvis_cognitive_bus import CognitiveBus
+                self.bus = CognitiveBus()
+                logger.info("🧠 Jarvis Cognitive Swarm Bus Initialized")
+            except ImportError:
+                self.bus = None
+                logger.warning("⚠️ jarvis_cognitive_bus not found, running without swarm thoughts")
+        else:
             self.bus = None
-            logger.warning("⚠️ jarvis_cognitive_bus not found, running without swarm thoughts")
 
         # 👁️ INITIALIZE WATCHER AI (Pipeline Layer 1)
         # Starts as a background daemon — continuously monitors bus & builds Smart Packets
@@ -4155,14 +4158,18 @@ class JarvisElite:
                 logger.warning(f"⚠️ WatcherAI init failed (non-critical): {_we}")
 
     
-        # Initialize Data Source (Delta Exchange only)
-        try:
-            from delta_api_wrapper import DeltaExchangeData
-            self.delta_data = DeltaExchangeData()
-            self.delta_client = self.delta_data
-            logger.info("✅ Delta Exchange Data Initialized")
-        except Exception as e:
-            logger.warning(f"Delta initialization failed: {e}")
+        # Historical replay must not even construct a live data client.
+        if not self.is_backtest_mode:
+            try:
+                from delta_api_wrapper import DeltaExchangeData
+                self.delta_data = DeltaExchangeData()
+                self.delta_client = self.delta_data
+                logger.info("✅ Delta Exchange Data Initialized")
+            except Exception as e:
+                logger.warning(f"Delta initialization failed: {e}")
+                self.delta_data = None
+                self.delta_client = None
+        else:
             self.delta_data = None
             self.delta_client = None
 
@@ -4190,21 +4197,22 @@ class JarvisElite:
                 self.position_sizer = _get_jarvis_sizer(self.delta_data)
             except Exception as integration_error:
                 logger.debug("Optional sizing/position integration unavailable: %s", integration_error)
-        try:
-            self.coin_scanner = _get_jarvis_coin_scanner(
-                bus=self.bus,
-                position_check_fn=(self.position_manager.has_open_position if self.position_manager else None),
-            )
-        except Exception as integration_error:
-            logger.debug("Optional coin scanner unavailable: %s", integration_error)
-        try:
-            self.binance_data = _get_binance_data()
-        except Exception as integration_error:
-            logger.debug("Optional Binance data source unavailable: %s", integration_error)
-        try:
-            self.upstox_data = _get_upstox_data()
-        except Exception as integration_error:
-            logger.debug("Optional Upstox data source unavailable: %s", integration_error)
+        if not self.is_backtest_mode:
+            try:
+                self.coin_scanner = _get_jarvis_coin_scanner(
+                    bus=self.bus,
+                    position_check_fn=(self.position_manager.has_open_position if self.position_manager else None),
+                )
+            except Exception as integration_error:
+                logger.debug("Optional coin scanner unavailable: %s", integration_error)
+            try:
+                self.binance_data = _get_binance_data()
+            except Exception as integration_error:
+                logger.debug("Optional Binance data source unavailable: %s", integration_error)
+            try:
+                self.upstox_data = _get_upstox_data()
+            except Exception as integration_error:
+                logger.debug("Optional Upstox data source unavailable: %s", integration_error)
         self.integration_sources = {
             "position_manager": self.position_manager,
             "sizer": self.position_sizer,
@@ -4224,7 +4232,7 @@ class JarvisElite:
             except Exception:
                 pass
 
-        # Backtests do not initialize remote options clients; hedge simulation is local.
+        # Backtests exclude remote options inputs; historical option data must be supplied separately.
         if not self.is_backtest_mode:
             try:
                 from deribit_options_client import DeribitOptionsClient
