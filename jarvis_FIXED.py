@@ -4118,18 +4118,20 @@ class JarvisCNS:
 class JarvisElite:
     """JARVIS TRADE ELITE v7.0 - Complete SwingScalp Trading System"""
     
-    def __init__(self):
+    def __init__(self, backtest_mode=False):
+        """Backtests retain GPU analysis but block AI and live-data side effects."""
+        self.is_backtest_mode = bool(backtest_mode)
         self.scoring_matrix = TradeScoringMatrix()
         self.trade_manager = TradeManager()
         self.expiry_optimizer = TradeOptimizer()
         self.scalping_engine = ScalpingEngine() # NEW: Scalping Targets
-        self.deepseek_enabled = True  # ENABLED: DeepSeek AI Judge for signal validation
+        self.deepseek_enabled = not self.is_backtest_mode  # Backtests are deterministic and Ollama-free.
         # The HUD is a local display channel, not a command interface.
-        self.hud_enabled = True
+        self.hud_enabled = not self.is_backtest_mode
         self.hud_url = "http://127.0.0.1:7788/api/telemetry"
         token = os.environ.get("JARVIS_HUD_INGEST_TOKEN")
         self.hud_headers = {"X-Jarvis-Hud-Token": token} if token else None
-        self.is_backtest_mode = False  # Track if running in backtest mode
+        # Backtest mode was intentionally set before optional components started.
         
         # 🧠 INITIALIZE COGNITIVE EVENT BUS
         try:
@@ -4143,7 +4145,7 @@ class JarvisElite:
         # 👁️ INITIALIZE WATCHER AI (Pipeline Layer 1)
         # Starts as a background daemon — continuously monitors bus & builds Smart Packets
         self.watcher_ai = None
-        if self.bus is not None:
+        if self.bus is not None and not self.is_backtest_mode:
             try:
                 from jarvis_watcher_ai import JarvisWatcherAI
                 self.watcher_ai = JarvisWatcherAI(bus=self.bus)
@@ -4222,16 +4224,19 @@ class JarvisElite:
             except Exception:
                 pass
 
-        # FIX #4 (UPDATED): Re-Enabled Deribit for Dual-Source Options Intelligence!
-        try:
-            from deribit_options_client import DeribitOptionsClient
-            client_id = os.getenv("DERIBIT_CLIENT_ID", "")
-            client_secret = os.getenv("DERIBIT_CLIENT_SECRET", "")
-            self.deribit = DeribitOptionsClient(currency='BTC', client_id=client_id, client_secret=client_secret)
-            logger.info("✅ Deribit Options Client Initialized (Dual Intelligence)")
-        except Exception as e:
-            logger.warning(f"Deribit init failed: {e}")
-            self.deribit = None    
+        # Backtests do not initialize remote options clients; hedge simulation is local.
+        if not self.is_backtest_mode:
+            try:
+                from deribit_options_client import DeribitOptionsClient
+                client_id = os.getenv("DERIBIT_CLIENT_ID", "")
+                client_secret = os.getenv("DERIBIT_CLIENT_SECRET", "")
+                self.deribit = DeribitOptionsClient(currency='BTC', client_id=client_id, client_secret=client_secret)
+                logger.info("✅ Deribit Options Client Initialized (Dual Intelligence)")
+            except Exception as e:
+                logger.warning(f"Deribit init failed: {e}")
+                self.deribit = None
+        else:
+            self.deribit = None
         # Initialize Parts Dictionary (Empty first, passed by reference to Fusion Engine)
         self.parts = {}
 
@@ -4265,14 +4270,15 @@ class JarvisElite:
                 self.engines['fusion'] = GPUEnhancedFusionEngine(self.parts)
                 self.engines['confidence'] = GPUUnifiedConfidenceEngine()
                 self.engines['pattern'] = EnhancedGPUPatternRecognitionEngine()
-                try:
-                    from part7_FIXED import EnhancedGPULiveDataEngine
-                    from part9_FIXED import GPUAIAdaptiveLearningEngine
-                    self.engines['live_data'] = EnhancedGPULiveDataEngine()
-                    self.engines['adaptive'] = GPUAIAdaptiveLearningEngine()
-                    logger.info("✅ Live Data & Adaptive Engines Connected (Parts 7 & 9)")
-                except Exception as e:
-                    logger.error(f"❌ Failed to load Parts 7/9: {e}")
+                if not self.is_backtest_mode:
+                    try:
+                        from part7_FIXED import EnhancedGPULiveDataEngine
+                        from part9_FIXED import GPUAIAdaptiveLearningEngine
+                        self.engines['live_data'] = EnhancedGPULiveDataEngine()
+                        self.engines['adaptive'] = GPUAIAdaptiveLearningEngine()
+                        logger.info("✅ Live Data & Adaptive Engines Connected (Parts 7 & 9)")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to load Parts 7/9: {e}")
                     
                 # --- WIRING FIX PHASE 2: Additional Engines ---
                 try:
@@ -4299,14 +4305,14 @@ class JarvisElite:
                 logger.info("✅ External GPU Engines Initialized")
                 
                 # --- NEW WIRING: Start dormant engines ---
-                if 'adaptive' in self.engines:
+                if not self.is_backtest_mode and 'adaptive' in self.engines:
                     try:
                         self.engines['adaptive'].start_ai_learning()
                         logger.info("✅ [ADAPTIVE] AI Learning Engine STARTED")
                     except Exception as e:
                         logger.warning(f"⚠️ [ADAPTIVE] start_ai_learning failed: {e}")
                         
-                if 'confidence' in self.engines:
+                if not self.is_backtest_mode and 'confidence' in self.engines:
                     try:
                         engine = self.engines['confidence']
                         if hasattr(engine, 'start_confidence_monitoring'):
@@ -4403,7 +4409,9 @@ class JarvisElite:
         return self.integration_sources.get(key)
     
     def _fetch_mtf_from_api(self):
-        """Fetch real historical OHLCV data for all timeframes from Delta Exchange API"""
+        """Fetch live MTF data only outside isolated historical backtests."""
+        if self.is_backtest_mode:
+            return {}  # Caller resamples only the supplied historical window.
         import pandas as pd
         
         # Map our timeframe names to Delta API resolution strings
@@ -4459,7 +4467,8 @@ class JarvisElite:
             # Validates completeness, price sanity, staleness of incoming
             # DataFrame. On failure → brain gets WAIT/NO-DATA, no decision
             # on bad data. Fail-open: validator crash never blocks brain.
-            if DATA_VALIDATOR_AVAILABLE and _get_data_validator is not None:
+            if (not self.is_backtest_mode and DATA_VALIDATOR_AVAILABLE
+                    and _get_data_validator is not None):
                 try:
                     _dv = _get_data_validator()
                     _dv_result = _dv.validate_dataframe(data, source="delta")
@@ -4842,14 +4851,14 @@ class JarvisElite:
             intel_deribit = None
             
             # Fetch Delta Intel
-            if self.delta_data:
+            if not self.is_backtest_mode and self.delta_data:
                 try:
                     intel_delta = self.delta_data.get_institutional_bias('BTC')
                     options_intel = intel_delta
                 except Exception: pass
 
             # Fetch Deribit Intel
-            if self.deribit:
+            if not self.is_backtest_mode and self.deribit:
                 try:
                     current_price = float(data['close'].iloc[-1])
                     intel_deribit = self.deribit.get_institutional_bias(current_price)
@@ -4879,7 +4888,7 @@ class JarvisElite:
             # Judge is now ENABLED and validates high-confidence signals (score >= 10)
             # System uses: Mathematical Analyst + Quantum V5 + DeepSeek Judge
             neural_res = None
-            if TRADE_CONFIG.get('use_neural_fusion', True):
+            if not self.is_backtest_mode and TRADE_CONFIG.get('use_neural_fusion', True):
                 # Always run AI (Full Power in both Live and Backtest)
                 if math_signal != 0 and math_confidence >= 20: # Run AI even on weak signals to let it filter them out
                     neural_res = self._neural_global_synthesis(full_telemetry, part_results, mtf_context, options_walls, math_signal, math_confidence, data)
@@ -4995,7 +5004,8 @@ class JarvisElite:
             # Light-weight (~1.1 weight) advisory check. Fail-closed: if Binance is
             # unreachable this perspective is skipped entirely and Delta remains
             # primary. Never touches execution; only adjusts confidence / vetoes.
-            if MULTI_SOURCE_DATA_AVAILABLE and _get_cross_exchange_perspective is not None:
+            if (not self.is_backtest_mode and MULTI_SOURCE_DATA_AVAILABLE
+                    and _get_cross_exchange_perspective is not None):
                 try:
                     xres = _get_cross_exchange_perspective(logic_signal)
                     detailed_scores['cross_exchange'] = {
