@@ -8,6 +8,7 @@ It has no market-data downloader, model endpoint, or trading-client code.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -37,6 +38,22 @@ SCALP_TP_PCT, SCALP_SL_PCT = 0.004, 0.002
 SWING_TP_PCT, SWING_SL_PCT = 0.020, 0.008
 
 logger = logging.getLogger("JarvisBacktest")
+
+# These are the 12 local core adapters actually wired into JarvisElite.  The
+# mapping makes the report explicit about what candle-only replay can prove.
+CORE_PART_DATA_CONTRACT = {
+    'part1_breakout': 'OHLCV', 'part2_zone': 'OHLCV', 'part3_psychology': 'OHLCV',
+    'part4_volume': 'OHLCV volume (institutional feed unavailable)',
+    'part5_ml': 'OHLCV-derived features', 'part6_trend': 'OHLCV',
+    'part7_volatility': 'OHLCV', 'part8_structure': 'OHLCV',
+    'part9_orderflow': 'OHLCV volume proxy (not tick/order-book flow)',
+    'part10_candlestats': 'OHLCV', 'part11_fusion': 'outputs of Parts 1-10',
+    'part12_confidence': 'outputs of Parts 1-11',
+}
+HISTORICAL_DATA_NOT_IN_OHLCV = (
+    'timestamp-matched options chain/OI/PCR', 'funding-rate history',
+    'order-book/tick trades', 'liquidations', 'dated cross-exchange snapshots',
+)
 
 
 class HistoricalCandleLoader:
@@ -234,6 +251,8 @@ class JarvisFullBacktester:
         self.balance = self.peak = starting_capital
         self.equity_curve: List[Dict[str, object]] = []
         self.n_no_signal = self.n_skip_gate = self.n_unaffordable = 0
+        self.part_activity = {name: {'decisions_seen': 0, 'non_neutral': 0, 'offline': 0}
+                              for name in CORE_PART_DATA_CONTRACT}
 
     def _init_jarvis(self):
         print("  Initializing JarvisElite central math/GPU decision path (isolated replay)...")
@@ -242,6 +261,34 @@ class JarvisFullBacktester:
         brain = JarvisElite(backtest_mode=True)
         brain.print_dashboard = lambda *args, **kwargs: None
         return brain
+
+    def _record_part_activity(self, brain) -> None:
+        """Keep auditable proof that each core adapter participated in replay."""
+        results = getattr(brain, 'latest_part_results', {}) or {}
+        for name in CORE_PART_DATA_CONTRACT:
+            result = results.get(name, {})
+            if not isinstance(result, dict):
+                self.part_activity[name]['offline'] += 1
+                continue
+            self.part_activity[name]['decisions_seen'] += 1
+            if str(result.get('thought', '')).lower() == 'part offline':
+                self.part_activity[name]['offline'] += 1
+            try:
+                if float(result.get('signal', 0)) != 0:
+                    self.part_activity[name]['non_neutral'] += 1
+            except (TypeError, ValueError):
+                self.part_activity[name]['offline'] += 1
+
+    def _part_coverage(self) -> dict:
+        coverage = {}
+        for name, source in CORE_PART_DATA_CONTRACT.items():
+            stats = self.part_activity[name]
+            coverage[name] = {
+                'historical_input': source,
+                **stats,
+                'active': stats['decisions_seen'] > 0 and stats['offline'] == 0,
+            }
+        return coverage
 
     def _entry_fill(self, direction: str, opening_price: float) -> float:
         adverse = self.slippage_bps / 10_000.0
@@ -287,6 +334,7 @@ class JarvisFullBacktester:
             df_win = df.iloc[ws:i].copy()  # excludes candle i: no signal lookahead
             try:
                 result = brain.analyze_trade_setup(df_win)
+                self._record_part_activity(brain)
             except Exception as exc:
                 logger.debug("analysis failure at %s: %s", dt, exc)
                 continue
@@ -366,7 +414,17 @@ class JarvisFullBacktester:
         prefix = RESULT_DIR / f"backtest_{self.symbol}_{self.timeframe}_{stamp}"
         self._csv(closed, prefix)
         self._html(prefix, closed, net, gross, fees, wr, dd, sharpe, stamp)
-        print(f"Reports: {prefix.name}.csv and {prefix.name}.html")
+        coverage = self._part_coverage()
+        coverage_path = prefix.with_name(prefix.name + '_part_coverage.json')
+        coverage_path.write_text(json.dumps({
+            'core_parts': coverage,
+            'not_replayed_without_timestamped_datasets': HISTORICAL_DATA_NOT_IN_OHLCV,
+            'options_chain_vote_included': False,
+        }, indent=2), encoding='utf-8')
+        active = sum(1 for item in coverage.values() if item['active'])
+        print(f"Core Part coverage: {active}/12 active; detailed audit: {coverage_path.name}")
+        print("Historical options/OI/funding/order-book are not in OHLCV and do not vote in this replay.")
+        print(f"Reports: {prefix.name}.csv, {prefix.name}.html and {coverage_path.name}")
 
     def _csv(self, closed: List[BacktestPosition], prefix: Path) -> None:
         rows = [{"id": t.id, "direction": t.direction, "type": t.trade_type, "confidence": t.confidence,
@@ -387,7 +445,8 @@ class JarvisFullBacktester:
 <h1>JARVIS Historical Replay</h1><p>{stamp} · {self.symbol} · {self.timeframe}</p>
 <section><h2>Results</h2><p>Net PnL: ${net:.2f}; gross PnL: ${gross:.2f}; modeled fees: ${fees:.2f}; net win rate: {wr:.1f}%; max drawdown: {dd:.2f}%; Sharpe: {sharpe:.2f}</p></section>
 <section><h2>Execution assumptions</h2><p>Conservative, user-configurable assumptions rather than exchange facts: adverse entry/exit slippage {self.slippage_bps:.2f} bps each side; round-trip trading fee {self.fee_bps:.2f} bps. Entries fill at next candle open; TP/SL use high/low; a same-candle dual touch resolves to SL first.</p></section>
-<section><h2>Decision-path parity and limitation</h2><p>Decisions use the central JarvisElite core math/GPU decision path in isolation mode. Historical options-chain and cross-exchange snapshots cannot be reproduced unless a dated historical dataset is supplied to that pipeline. These omitted live-only inputs are excluded, never neutral or positive confirmation.</p></section>
+<section><h2>Core Part coverage</h2><p>The companion <code>_part_coverage.json</code> records every one of the 12 core parts, its candle-derived input, decision count, non-neutral votes, and any offline status.</p></section>
+<section><h2>Decision-path parity and limitation</h2><p>Decisions use the central JarvisElite core math/GPU decision path in isolation mode. Historical options-chain/OI/PCR, funding, order-book, liquidation, and cross-exchange snapshots require timestamp-matched datasets. They are excluded from OHLCV-only replay and cannot vote as neutral or positive confirmation.</p></section>
 <table><thead><tr><th>#</th><th>Direction</th><th>Confidence</th><th>Entry fill</th><th>Exit fill</th><th>Reason</th><th>Net PnL</th></tr></thead><tbody>{rows}</tbody></table>
 <footer>JARVIS Backtest Engine | Core math/GPU decision path | Historical replay only</footer></body></html>"""
         prefix.with_suffix(".html").write_text(html, encoding="utf-8")
