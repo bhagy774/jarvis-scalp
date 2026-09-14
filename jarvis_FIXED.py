@@ -4365,8 +4365,11 @@ class JarvisElite:
             'part10_candlestats': Part10Candlestats(),
             'part11_fusion': Part11Fusion(),
             'part12_confidence': Part12Confidence(),
-            'part14_options_chain': Part14OptionsChain(delta_client=self.delta_data)
         }
+        # Options positioning needs a timestamp-matched historical chain. Never let
+        # a live/current chain masquerade as replay data or silently count as a vote.
+        if not self.is_backtest_mode:
+            self.parts['part14_options_chain'] = Part14OptionsChain(delta_client=self.delta_data)
         self.mtf_analyzer = DeepMTFAnalyzer(self.parts) # NEW: Deep MTF Analysis
         self.brains = {
             'neural_hud_brain': None,
@@ -4677,57 +4680,76 @@ class JarvisElite:
             # FIX #16: Reuse engine_tf_data if already computed above (avoid duplicate resampling)
             # ============================================================
             
-            import time
-            current_time = time.time()
+            # Historical replay must rebuild every timeframe from the local
+            # pre-decision window on every step. Reusing a previous cache would make
+            # higher timeframes stale; fetching a feed would contaminate the replay.
+            if self.is_backtest_mode:
+                if not isinstance(data.index, pd.DatetimeIndex):
+                    data = data.copy()
+                    data.index = pd.to_datetime(data.index)
+                ohlcv_agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+                mtf_data = {'1m': data.copy()}
+                for tf_name, tf_rule in {
+                    '3m': '3min', '5m': '5min', '15m': '15min', '30m': '30min',
+                    '1h': '1h', '2h': '2h', '4h': '4h'
+                }.items():
+                    resampled = data.resample(tf_rule).agg(ohlcv_agg).dropna()
+                    if not resampled.empty:
+                        mtf_data[tf_name] = resampled
+                self._api_mtf_cache = mtf_data
+                self.market_context['mtf_datasets'] = mtf_data
+            else:
+                import time
+                current_time = time.time()
             
-            # Fetch all TFs from API on first run OR every 5 minutes
-            if not hasattr(self, '_api_mtf_cache') or self._api_mtf_cache is None or not hasattr(self, '_last_mtf_fetch_time') or (current_time - self._last_mtf_fetch_time > 300):
-                logger.info("[MTF-API] Fetching latest timeframes (1m-4h) from Delta API...")
-                self._api_mtf_cache = self._fetch_mtf_from_api()
-                self._last_mtf_fetch_time = current_time
+                # Fetch all TFs from API on first run OR every 5 minutes
+                if not hasattr(self, '_api_mtf_cache') or self._api_mtf_cache is None or not hasattr(self, '_last_mtf_fetch_time') or (current_time - self._last_mtf_fetch_time > 300):
+                    logger.info("[MTF-API] Fetching latest timeframes (1m-4h) from Delta API...")
+                    self._api_mtf_cache = self._fetch_mtf_from_api()
+                    self._last_mtf_fetch_time = current_time
                 
-                # Fallback if API returns no data
-                if not self._api_mtf_cache:
-                    logger.warning("[MTF-API] API unavailable — falling back to resampling.")
-                    if not isinstance(data.index, pd.DatetimeIndex):
-                        data = data.copy()
-                        data.index = pd.to_datetime(data.index)
+                    # Fallback if API returns no data
+                    if not self._api_mtf_cache:
+                        logger.warning("[MTF-API] API unavailable — falling back to resampling.")
+                        if not isinstance(data.index, pd.DatetimeIndex):
+                            data = data.copy()
+                            data.index = pd.to_datetime(data.index)
                     
-                    ohlcv_agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
-                    mtf_data_fb = {'1m': data}
-                    resample_map = {
-                        '3m': '3min', '5m': '5min', '15m': '15min', '30m': '30min',
-                        '1h': '1h', '2h': '2h', '4h': '4h'
-                    }
-                    for tf_name, tf_rule in resample_map.items():
-                        try:
-                            resampled = data.resample(tf_rule).agg(ohlcv_agg).dropna()
-                            if len(resampled) >= 1:
-                                mtf_data_fb[tf_name] = resampled
-                        except Exception:
-                            pass
-                    self._api_mtf_cache = mtf_data_fb
+                        ohlcv_agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+                        mtf_data_fb = {'1m': data}
+                        resample_map = {
+                            '3m': '3min', '5m': '5min', '15m': '15min', '30m': '30min',
+                            '1h': '1h', '2h': '2h', '4h': '4h'
+                        }
+                        for tf_name, tf_rule in resample_map.items():
+                            try:
+                                resampled = data.resample(tf_rule).agg(ohlcv_agg).dropna()
+                                if len(resampled) >= 1:
+                                    mtf_data_fb[tf_name] = resampled
+                            except Exception:
+                                pass
+                        self._api_mtf_cache = mtf_data_fb
 
-            # Always update 1m with latest data
-            if '1m' in self._api_mtf_cache:
-                self._api_mtf_cache['1m'] = data  # Use live streaming 1m data
+                # Always update 1m with latest data
+                if '1m' in self._api_mtf_cache:
+                    self._api_mtf_cache['1m'] = data  # Use live streaming 1m data
                 
-            # 🎓 TEACHER FIX #5: "Live Price Sync" (The Blindness Bug)
-            # Ensure the 4h, 1h, 15m charts aren't blind to live price movements between 5-min cache fetches
-            if not data.empty:
-                live_close = float(data['close'].iloc[-1])
-                live_high = float(data['high'].iloc[-1])
-                live_low = float(data['low'].iloc[-1])
+                # 🎓 TEACHER FIX #5: "Live Price Sync" (The Blindness Bug)
+                # Ensure the 4h, 1h, 15m charts aren't blind to live price movements between 5-min cache fetches
+                if not data.empty:
+                    live_close = float(data['close'].iloc[-1])
+                    live_high = float(data['high'].iloc[-1])
+                    live_low = float(data['low'].iloc[-1])
                 
-                for tf_name, tf_df in self._api_mtf_cache.items():
-                    if tf_name != '1m' and not tf_df.empty:
-                        # Dynamically inject live price into the unfinished candle
-                        tf_df.iloc[-1, tf_df.columns.get_loc('close')] = live_close
-                        tf_df.iloc[-1, tf_df.columns.get_loc('high')] = max(float(tf_df['high'].iloc[-1]), live_high)
-                        tf_df.iloc[-1, tf_df.columns.get_loc('low')] = min(float(tf_df['low'].iloc[-1]), live_low)
+                    for tf_name, tf_df in self._api_mtf_cache.items():
+                        if tf_name != '1m' and not tf_df.empty:
+                            # Dynamically inject live price into the unfinished candle
+                            tf_df.iloc[-1, tf_df.columns.get_loc('close')] = live_close
+                            tf_df.iloc[-1, tf_df.columns.get_loc('high')] = max(float(tf_df['high'].iloc[-1]), live_high)
+                            tf_df.iloc[-1, tf_df.columns.get_loc('low')] = min(float(tf_df['low'].iloc[-1]), live_low)
             
-            mtf_data = self._api_mtf_cache
-            self.market_context['mtf_datasets'] = mtf_data
+                mtf_data = self._api_mtf_cache
+                self.market_context['mtf_datasets'] = mtf_data
             
             logger.info(f"📊 MTF Analysis: {len(mtf_data)} timeframes active: {list(mtf_data.keys())}")
             
