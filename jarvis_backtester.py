@@ -1,789 +1,417 @@
 #!/usr/bin/env python3
-"""
-JARVIS FULL-FIDELITY BACKTESTER v1.0
-Uses the REAL jarvis_FIXED.py system -- same as live trading
+"""JARVIS historical replay runner.
 
-USAGE:
-  python jarvis_backtester.py
-  python jarvis_backtester.py --tf 5m --years 3 --capital 1000 --no-hedge
+This runner feeds only locally supplied, completed OHLCV candles to the same
+``JarvisElite.analyze_trade_setup`` math/GPU decision path used by live mode.
+It has no market-data downloader, model endpoint, or trading-client code.
 """
+from __future__ import annotations
 
-import os, sys, json, math, time, argparse, logging, requests
+import argparse
+import logging
+import math
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
-from pathlib import Path
 
 if sys.platform == "win32":
-    try: sys.stdout.reconfigure(encoding="utf-8")
-    except: pass
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass
 
-os.makedirs("data/backtest_cache", exist_ok=True)
-os.makedirs("data/backtest_results", exist_ok=True)
+RESULT_DIR = Path("data/backtest_results")
+LEVERAGE = int(os.environ.get("JARVIS_LEVERAGE", "100"))
+MAX_RISK_USDT = float(os.environ.get("JARVIS_MAX_RISK_USDT", "10"))
+MAX_DAILY_LOSS_USDT = float(os.environ.get("JARVIS_MAX_DAILY_LOSS", "30"))
+MAX_OPEN_POSITIONS = int(os.environ.get("JARVIS_MAX_OPEN", "2"))
+MIN_CONFIDENCE = int(os.environ.get("JARVIS_MIN_CONFIDENCE", "70"))
+COOLDOWN_SECONDS = int(os.environ.get("JARVIS_COOLDOWN_SEC", "180"))
+CONSEC_LOSS_LIMIT = int(os.environ.get("JARVIS_CONSEC_LOSS", "3"))
+SCALP_TP_PCT, SCALP_SL_PCT = 0.004, 0.002
+SWING_TP_PCT, SWING_SL_PCT = 0.020, 0.008
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.FileHandler("data/backtest.log", mode="w", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
 logger = logging.getLogger("JarvisBacktest")
 
-R="\033[91m"; G="\033[92m"; Y="\033[93m"; C="\033[96m"; W="\033[97m"
-DG="\033[90m"; BD="\033[1m"; RST="\033[0m"
-def _p(text, *col): return "".join(col)+str(text)+RST
 
-# ── CONFIG (same as jarvis_live_trader.py) ───────────────────────────────────
-LEVERAGE            = int(os.environ.get("JARVIS_LEVERAGE",        "100"))
-MAX_RISK_USDT       = float(os.environ.get("JARVIS_MAX_RISK_USDT", "10"))
-MAX_DAILY_LOSS_USDT = float(os.environ.get("JARVIS_MAX_DAILY_LOSS","30"))
-MAX_OPEN_POSITIONS  = int(os.environ.get("JARVIS_MAX_OPEN",        "2"))
-MIN_CONFIDENCE      = int(os.environ.get("JARVIS_MIN_CONFIDENCE",  "70"))
-COOLDOWN_SECONDS    = int(os.environ.get("JARVIS_COOLDOWN_SEC",    "180"))
-CONSEC_LOSS_LIMIT   = int(os.environ.get("JARVIS_CONSEC_LOSS",     "3"))
-SCALP_TP_PCT = 0.004; SCALP_SL_PCT = 0.002
-SWING_TP_PCT = 0.020; SWING_SL_PCT = 0.008
+class HistoricalCandleLoader:
+    """Read a local, immutable historical OHLCV export; never fetches a feed."""
 
-BINANCE_BASE = "https://api.binance.com"
-CACHE_DIR    = Path("data/backtest_cache")
-RESULT_DIR   = Path("data/backtest_results")
+    REQUIRED = ("open", "high", "low", "close", "volume")
 
+    def __init__(self, source: Path):
+        self.source = source
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 0. SAMPLED OLLAMA JUDGE
-#    Calls the real Ollama (deepseek-r1 or any local model) every Nth signal.
-#    Between calls, last verdict is cached and re-applied.
-#    Falls back gracefully if Ollama is offline.
-# ═════════════════════════════════════════════════════════════════════════════
-class SampledOllamaJudge:
-    """
-    Wraps jarvis_FIXED.call_ollama() to validate signals every N trades.
-    Between calls: last verdict is cached (same logic as live gap periods).
-    """
-
-    def __init__(self, every_n: int = 10, model: str = "deepseek-r1:14b", timeout: int = 90):
-        """
-        every_n : call Ollama on every Nth qualifying signal (default=10)
-        model   : Ollama model to use (must match what jarvis_FIXED uses)
-        timeout : seconds to wait for Ollama response
-        """
-        self.every_n   = every_n
-        self.model     = model
-        self.timeout   = timeout
-        self._signal_count  = 0       # Total qualifying signals seen
-        self._ollama_calls  = 0       # How many times Ollama was actually called
-        self._ollama_ok     = 0       # Approved verdicts
-        self._ollama_veto   = 0       # Rejected verdicts
-        self._ollama_miss   = 0       # Times Ollama was offline
-        # Last cached verdict: None = not yet called
-        self._last_verdict: Optional[str] = None   # 'APPROVE' | 'REJECT' | None
-        self._last_confidence_adj: int    = 0       # Confidence adjustment from last call
-        self._ollama_available: Optional[bool] = None  # None = not yet checked
-
-    def _check_ollama_available(self) -> bool:
-        """Quick ping to see if Ollama is running."""
-        try:
-            r = requests.get("http://localhost:11434/api/tags", timeout=3)
-            return r.status_code == 200
-        except Exception:
-            return False
-
-    def _call_ollama_raw(self, prompt: str) -> Optional[str]:
-        """Call Ollama HTTP API directly (same endpoint as jarvis_FIXED.call_ollama)."""
-        try:
-            r = requests.post(
-                "http://localhost:11434/api/generate",
-                json={"model": self.model, "prompt": prompt, "stream": False},
-                timeout=self.timeout
-            )
-            if r.status_code == 200:
-                return r.json().get("response", "").strip()
-        except Exception as e:
-            logger.debug(f"[OllamaJudge] Request failed: {e}")
-        return None
-
-    def _build_prompt(self, direction: str, confidence: int, result: dict, price: float) -> str:
-        """Build the same CEO/Judge prompt used in live jarvis_FIXED.py."""
-        sig       = result.get("trade_signal", {})
-        thoughts  = result.get("intelligence_board", [])[:5]
-        mkt       = result.get("market_context", {})
-        tp1       = sig.get("take_profit_1", "N/A")
-        sl        = sig.get("stop_loss", "N/A")
-
-        return f"""You are the Supreme Commander AI (CEO) of an elite quantitative trading system.
-
-Trade Signal Summary:
-- Direction: {direction}
-- Confidence: {confidence}/100
-- Entry Price: ${price:,.2f}
-- TP1: {tp1}  |  SL: {sl}
-- Market Context: {json.dumps(mkt, default=str)}
-
-Sub-Agent Intelligence Board:
-{chr(10).join(['- ' + str(t)[:100] for t in thoughts])}
-
-Task: Validate this backtest signal.
-- If setup is strong and signals agree: issue [CEO_VERDICT: EXECUTE]
-- If signals conflict or risk is elevated: issue [CEO_VERDICT: STANDBY]
-- If trap or severe divergence: issue [CEO_VERDICT: ABORT]
-
-Respond with EXACTLY ONE tag at the start:
-[CEO_VERDICT: EXECUTE] or [CEO_VERDICT: STANDBY] or [CEO_VERDICT: ABORT]
-Then add one brief sentence of reasoning."""
-
-    def validate(self, direction: str, confidence: int, result: dict, price: float) -> Tuple[str, int, str]:
-        """
-        Returns: (final_direction, adjusted_confidence, source)
-          source = 'OLLAMA_FRESH' | 'OLLAMA_CACHED' | 'MATH_FALLBACK'
-
-        Logic:
-          - Every Nth signal: actually call Ollama → cache verdict
-          - Between calls:    use cached verdict
-          - If Ollama offline: pass-through (no change)
-        """
-        self._signal_count += 1
-
-        # First time check: is Ollama running?
-        if self._ollama_available is None:
-            self._ollama_available = self._check_ollama_available()
-            if self._ollama_available:
-                print(f"\n  🧠 [OllamaJudge] Ollama ONLINE → sampling every {self.every_n} signals")
-            else:
-                print(f"\n  ⚠️  [OllamaJudge] Ollama OFFLINE → math fallback for all signals")
-
-        # Ollama not available: just pass through
-        if not self._ollama_available:
-            self._ollama_miss += 1
-            return direction, confidence, "MATH_FALLBACK"
-
-        # Every Nth signal: call Ollama fresh
-        if self._signal_count % self.every_n == 1 or self._last_verdict is None:
-            self._ollama_calls += 1
-            prompt   = self._build_prompt(direction, confidence, result, price)
-            response = self._call_ollama_raw(prompt)
-
-            if response:
-                resp_upper = response.upper()
-                if "EXECUTE" in resp_upper:
-                    self._last_verdict = "APPROVE"
-                    self._last_confidence_adj = +5   # Slight boost for AI approval
-                    self._ollama_ok += 1
-                elif "ABORT" in resp_upper:
-                    self._last_verdict = "REJECT"
-                    self._last_confidence_adj = -100  # Will cause signal to be dropped
-                    self._ollama_veto += 1
-                else:  # STANDBY
-                    self._last_verdict = "STANDBY"
-                    self._last_confidence_adj = -10
-
-                logger.info(f"[OllamaJudge] Call #{self._ollama_calls}: {self._last_verdict} | {response[:80]}")
-                source = "OLLAMA_FRESH"
-            else:
-                # Ollama call failed: pass-through this time
-                self._ollama_miss += 1
-                self._last_verdict = None
-                logger.warning("[OllamaJudge] No response from Ollama, using math")
-                return direction, confidence, "MATH_FALLBACK"
+    def load(self) -> pd.DataFrame:
+        if not self.source.is_file():
+            raise FileNotFoundError(f"Historical data file not found: {self.source}")
+        suffix = self.source.suffix.lower()
+        if suffix in (".parquet", ".pq"):
+            df = pd.read_parquet(self.source)
+        elif suffix in (".csv", ".txt"):
+            df = pd.read_csv(self.source)
         else:
-            source = "OLLAMA_CACHED"
-
-        # Apply verdict
-        if self._last_verdict == "REJECT":
-            return "NO_TRADE", 0, source  # Drop signal
-        elif self._last_verdict == "STANDBY":
-            new_conf = max(0, confidence + self._last_confidence_adj)
-            return direction, new_conf, source
-        else:  # APPROVE
-            new_conf = min(100, confidence + self._last_confidence_adj)
-            return direction, new_conf, source
-
-    def stats(self) -> str:
-        """Human-readable stats for the report."""
-        return (f"Signals:{self._signal_count} | Ollama calls:{self._ollama_calls} | "
-                f"Approved:{self._ollama_ok} | Vetoed:{self._ollama_veto} | "
-                f"Miss/Fallback:{self._ollama_miss}")
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 1. BINANCE HISTORICAL DATA LOADER
-# ═════════════════════════════════════════════════════════════════════════════
-class BinanceHistoricalLoader:
-    """Download & cache full OHLCV history from Binance public API."""
-
-    INTERVAL_MS = {
-        "1m": 60_000, "3m": 180_000, "5m": 300_000,
-        "15m": 900_000, "30m": 1_800_000,
-        "1h": 3_600_000, "4h": 14_400_000,
-    }
-
-    def __init__(self, symbol="BTCUSDT"):
-        self.symbol = symbol.upper()
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    def load(self, interval="5m", years=3) -> pd.DataFrame:
-        cache_file = CACHE_DIR / f"{self.symbol}_{interval}_{years}y.parquet"
-        if cache_file.exists():
-            age_h = (time.time() - cache_file.stat().st_mtime) / 3600
-            if age_h < 6:
-                print(f"  📦 Cache hit: {cache_file.name} ({age_h:.1f}h old)")
-                df = pd.read_parquet(cache_file)
-                print(f"  ✅ {len(df):,} candles loaded")
-                return df
-        print(f"\n  📡 Downloading {years}y {interval} data from Binance...")
-        df = self._download(interval, years)
-        if not df.empty:
-            df.to_parquet(cache_file)
-            print(f"  💾 Cached → {cache_file.name}")
-        return df
-
-    def _download(self, interval, years) -> pd.DataFrame:
-        end_ms  = int(time.time() * 1000)
-        iv_ms   = self.INTERVAL_MS.get(interval, 300_000)
-        start   = end_ms - (years * 365 * 24 * 3600 * 1000)
-        total_expected = (end_ms - start) // iv_ms
-        print(f"  Expected ~{total_expected:,} candles")
-        all_candles: list = []
-        chunk = start
-        downloaded = 0
-        while chunk < end_ms:
-            try:
-                r = requests.get(
-                    f"{BINANCE_BASE}/api/v3/klines",
-                    params={"symbol": self.symbol, "interval": interval,
-                            "startTime": chunk, "endTime": end_ms, "limit": 1000},
-                    timeout=30)
-                if r.status_code != 200:
-                    time.sleep(2); continue
-                raw = r.json()
-                if not raw: break
-                all_candles.extend(raw)
-                downloaded += len(raw)
-                pct = downloaded / max(total_expected, 1) * 100
-                print(f"  ⬇  {downloaded:,}/{total_expected:,} ({pct:.0f}%)", end="\r")
-                chunk = int(raw[-1][0]) + iv_ms
-                time.sleep(0.12)
-            except Exception as e:
-                logger.warning(f"Chunk error: {e}"); time.sleep(3)
-        print()
-        if not all_candles:
-            return pd.DataFrame()
-        df = pd.DataFrame(all_candles,
-            columns=["time","open","high","low","close","volume",
-                     "ct","qv","trades","tb","tq","ign"])
-        df = df[["time","open","high","low","close","volume"]].copy()
-        for c in ["open","high","low","close","volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["time"] = pd.to_numeric(df["time"]) // 1000
-        df.index = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_localize(None)
-        df.drop(columns=["time"], inplace=True)
-        df.sort_index(inplace=True)
-        df.drop_duplicates(inplace=True)
-        df.dropna(subset=["open","high","low","close"], inplace=True)
-        print(f"  ✅ {len(df):,} candles ({df.index[0]} → {df.index[-1]})")
+            raise ValueError("Historical input must be CSV or Parquet")
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        time_col = next((c for c in ("timestamp", "time", "datetime", "date") if c in df.columns), None)
+        if time_col is None:
+            if not isinstance(df.index, pd.DatetimeIndex):
+                raise ValueError("Historical input needs timestamp/time/datetime/date or a DatetimeIndex")
+        else:
+            raw = df.pop(time_col)
+            # Numeric exports are conventionally seconds or milliseconds.
+            if pd.api.types.is_numeric_dtype(raw):
+                unit = "ms" if raw.dropna().abs().median() > 10_000_000_000 else "s"
+                df.index = pd.to_datetime(raw, unit=unit, utc=True).dt.tz_localize(None)
+            else:
+                df.index = pd.to_datetime(raw, utc=True).dt.tz_localize(None)
+        missing = set(self.REQUIRED) - set(df.columns)
+        if missing:
+            raise ValueError(f"Historical input missing columns: {sorted(missing)}")
+        df = df.loc[:, self.REQUIRED].copy()
+        for col in self.REQUIRED:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna().sort_index()
+        if df.index.has_duplicates:
+            raise ValueError("Historical input contains duplicate timestamps")
+        if len(df) < 2 or not df.index.is_monotonic_increasing:
+            raise ValueError("Historical input must contain ordered completed candles")
+        if (df[["open", "high", "low", "close"]] <= 0).any().any():
+            raise ValueError("OHLC prices must be positive")
+        if (df["high"] < df[["open", "close", "low"]].max(axis=1)).any() or (df["low"] > df[["open", "close", "high"]].min(axis=1)).any():
+            raise ValueError("Invalid OHLC range in historical input")
         return df
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 2. BLACK-SCHOLES OPTIONS HEDGE SIMULATOR
-# ═════════════════════════════════════════════════════════════════════════════
-class OptionsHedgeSimulator:
-    """Simulate options hedge cost & PnL with Black-Scholes."""
-
-    @staticmethod
-    def _ncdf(x):
-        import math
-        return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
-
-    def bs_premium(self, S, K, T, r, sigma, opt):
-        try:
-            if T <= 0 or sigma <= 0:
-                return max(0.0, (K-S) if opt=="PUT" else (S-K))
-            import math
-            d1 = (math.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*math.sqrt(T))
-            d2 = d1 - sigma*math.sqrt(T)
-            nc = self._ncdf
-            if opt == "CALL":
-                return S*nc(d1) - K*math.exp(-r*T)*nc(d2)
-            return K*math.exp(-r*T)*nc(-d2) - S*nc(-d1)
-        except:
-            return max(0.0, (K-S) if opt=="PUT" else (S-K))
-
-    def hedge_cost_and_pnl(self, entry, exit_p, direction, atr, ratio=0.5, size_usd=1000.0):
-        import math
-        opt = "PUT" if direction in ("CALL","BUY") else "CALL"
-        K   = (entry - atr*0.5) if opt=="PUT" else (entry + atr*0.5)
-        T   = 5 / (365*24*60)
-        r   = 0.05
-        sigma = max(0.3, min(2.0, (atr/entry)*math.sqrt(365*24*60)))
-        ppu   = self.bs_premium(entry, K, T, r, sigma, opt)
-        hc    = size_usd * ratio / entry
-        cost  = ppu * hc
-        intrinsic = max(0.0, (K-exit_p) if opt=="PUT" else (exit_p-K))
-        pnl   = intrinsic*hc - cost
-        return cost, pnl
+def extract_signal(result: dict) -> Tuple[str, int]:
+    """Parse a direction and confidence from the central decision result."""
+    signal = result.get("trade_signal", {})
+    direction = str(signal.get("direction", "NO_TRADE")).upper()
+    raw = signal.get("confidence_score", "0/100")
+    try:
+        confidence = int(float(str(raw).split("/")[0]))
+    except (TypeError, ValueError):
+        confidence = 0
+    return {"BUY": "CALL", "SELL": "PUT"}.get(direction, direction), confidence
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 3. POSITION TRACKER (mirrors JarvisAutoTrader exactly)
-# ═════════════════════════════════════════════════════════════════════════════
 class BacktestPosition:
+    """A filled futures position using deterministic OHLC execution assumptions."""
+
     _ctr = 0
 
-    def __init__(self, direction, entry_price, entry_time, contracts,
-                 trade_type="SCALP", confidence=0, hedge_cost=0.0, hedge_ratio=0.0):
+    def __init__(self, direction: str, entry_price: float, entry_time: datetime,
+                 contracts: float, trade_type: str = "SCALP", confidence: int = 0,
+                 slippage_bps: float = 5.0, fee_bps: float = 10.0):
         BacktestPosition._ctr += 1
         self.id = BacktestPosition._ctr
-        self.direction = direction; self.entry_price = entry_price
-        self.entry_time = entry_time; self.contracts = contracts
-        self.confidence = confidence; self.trade_type = trade_type
-        self.hedge_cost = hedge_cost; self.hedge_ratio = hedge_ratio
-        # TP/SL same as JarvisAutoTrader._place_trade()
-        tp_pct = SWING_TP_PCT if trade_type=="SWING" else SCALP_TP_PCT
-        sl_pct = SWING_SL_PCT if trade_type=="SWING" else SCALP_SL_PCT
-        is_c = direction in ("CALL","BUY")
-        self.tp_price = round(entry_price*(1+tp_pct) if is_c else entry_price*(1-tp_pct), 2)
-        self.sl_price = round(entry_price*(1-sl_pct) if is_c else entry_price*(1+sl_pct), 2)
-        exp_m = 5 if trade_type=="SCALP" else 60
-        self.expiry_time = entry_time + timedelta(minutes=exp_m)
-        self.status="OPEN"; self.exit_price=None; self.exit_time=None
-        self.result=None; self.close_reason=None
-        self.pnl_usdt=0.0; self.hedge_pnl=0.0
+        self.direction, self.entry_price, self.entry_time = direction, entry_price, entry_time
+        self.contracts, self.trade_type, self.confidence = contracts, trade_type, confidence
+        self.slippage_bps, self.fee_bps = slippage_bps, fee_bps
+        tp_pct = SWING_TP_PCT if trade_type == "SWING" else SCALP_TP_PCT
+        sl_pct = SWING_SL_PCT if trade_type == "SWING" else SCALP_SL_PCT
+        self.is_call = direction in ("CALL", "BUY")
+        self.tp_price = entry_price * (1 + tp_pct if self.is_call else 1 - tp_pct)
+        self.sl_price = entry_price * (1 - sl_pct if self.is_call else 1 + sl_pct)
+        self.expiry_time = entry_time + timedelta(minutes=60 if trade_type == "SWING" else 5)
+        self.status = "OPEN"
+        self.exit_price: Optional[float] = None
+        self.exit_time: Optional[datetime] = None
+        self.close_reason: Optional[str] = None
+        self.result: Optional[str] = None
+        self.gross_pnl = 0.0
+        self.fees_usdt = 0.0
+        self.pnl_usdt = 0.0
 
-    def check(self, price, dt):
-        if self.status != "OPEN": return None
-        is_c = self.direction in ("CALL","BUY")
-        if is_c and price >= self.tp_price: return "TP HIT"
-        if not is_c and price <= self.tp_price: return "TP HIT"
-        if is_c and price <= self.sl_price: return "SL HIT"
-        if not is_c and price >= self.sl_price: return "SL HIT"
+    @property
+    def slippage_rate(self) -> float:
+        return self.slippage_bps / 10_000.0
+
+    @property
+    def fee_rate(self) -> float:
+        # ``fee_bps`` is explicitly a round-trip assumption, split across fills.
+        return self.fee_bps / 20_000.0
+
+    def adverse_exit_fill(self, raw_price: float) -> float:
+        """Long exits receive less; short exits pay more."""
+        return raw_price * (1 - self.slippage_rate if self.is_call else 1 + self.slippage_rate)
+
+    def check_candle(self, candle: pd.Series, dt: datetime, at_entry: bool = False) -> Optional[Tuple[str, float]]:
+        """Return a reason/raw exit price. Same-bar TP+SL resolves to SL first."""
+        high, low, close = float(candle["high"]), float(candle["low"]), float(candle["close"])
+        tp_hit = high >= self.tp_price if self.is_call else low <= self.tp_price
+        sl_hit = low <= self.sl_price if self.is_call else high >= self.sl_price
+        if tp_hit and sl_hit:
+            return "SL HIT (same-bar conservative)", self.sl_price
+        if sl_hit:
+            return "SL HIT", self.sl_price
+        if tp_hit:
+            return "TP HIT", self.tp_price
         if dt >= self.expiry_time:
-            if is_c: return "EXPIRY WIN" if price > self.entry_price else "EXPIRY LOSS"
-            else:    return "EXPIRY WIN" if price < self.entry_price else "EXPIRY LOSS"
+            return "EXPIRY", close
         return None
 
-    def close(self, exit_price, exit_time, reason, hedge_pnl=0.0):
-        self.exit_price=exit_price; self.exit_time=exit_time
-        self.close_reason=reason; self.status="CLOSED"; self.hedge_pnl=hedge_pnl
-        move_pct = abs(exit_price - self.entry_price) / self.entry_price
-        is_win   = reason in ("TP HIT","EXPIRY WIN")
-        sign     = 1 if is_win else -1
-        futures_pnl = sign * move_pct * self.contracts * LEVERAGE
-        self.pnl_usdt = futures_pnl + hedge_pnl - self.hedge_cost
-        self.result   = "WIN" if is_win else "LOSS"
+    def close(self, raw_exit_price: float, exit_time: datetime, reason: str) -> float:
+        self.exit_price = self.adverse_exit_fill(raw_exit_price)
+        self.exit_time, self.close_reason, self.status = exit_time, reason, "CLOSED"
+        signed_move = (self.exit_price - self.entry_price) if self.is_call else (self.entry_price - self.exit_price)
+        self.gross_pnl = signed_move * self.contracts
+        self.fees_usdt = (self.entry_price + self.exit_price) * self.contracts * self.fee_rate
+        self.pnl_usdt = self.gross_pnl - self.fees_usdt
+        self.result = "WIN" if self.pnl_usdt > 0 else "LOSS"
         return self.pnl_usdt
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 4. RISK GATES (exact copy of JarvisAutoTrader._check_risk_gates)
-# ═════════════════════════════════════════════════════════════════════════════
 class BacktestRiskGate:
     def __init__(self):
-        self.daily_pnl=0.0; self.consec_losses=0
-        self.last_trade_dt: Optional[datetime]=None
-        self.open_positions: List[BacktestPosition]=[]
-        self.today_date=None
+        self.daily_pnl = 0.0
+        self.consec_losses = 0
+        self.last_trade_dt: Optional[datetime] = None
+        self.open_positions: List[BacktestPosition] = []
+        self.today_date = None
 
-    def reset_daily(self, d):
-        if d != self.today_date:
-            self.daily_pnl=0.0; self.consec_losses=0; self.today_date=d
+    def reset_daily(self, day) -> None:
+        if day != self.today_date:
+            self.daily_pnl, self.consec_losses, self.today_date = 0.0, 0, day
 
-    def can_trade(self, confidence, dt) -> Tuple[bool, str]:
+    def can_trade(self, confidence: int, dt: datetime) -> Tuple[bool, str]:
         self.reset_daily(dt.date())
-        if confidence < MIN_CONFIDENCE:   return False, f"Conf {confidence}%<{MIN_CONFIDENCE}%"
-        if self.daily_pnl <= -MAX_DAILY_LOSS_USDT: return False, f"Daily loss ${self.daily_pnl:.1f}"
-        if self.consec_losses >= CONSEC_LOSS_LIMIT: return False, f"{self.consec_losses} consec losses"
-        if len(self.open_positions) >= MAX_OPEN_POSITIONS: return False, f"Max {MAX_OPEN_POSITIONS} open"
-        if self.last_trade_dt:
-            elapsed = (dt - self.last_trade_dt).total_seconds()
-            if elapsed < COOLDOWN_SECONDS:
-                return False, f"Cooldown {int(COOLDOWN_SECONDS-elapsed)}s"
+        if confidence < MIN_CONFIDENCE:
+            return False, f"confidence {confidence}% < {MIN_CONFIDENCE}%"
+        if self.daily_pnl <= -MAX_DAILY_LOSS_USDT:
+            return False, f"daily loss ${self.daily_pnl:.2f}"
+        if self.consec_losses >= CONSEC_LOSS_LIMIT:
+            return False, f"{self.consec_losses} consecutive losses"
+        if len(self.open_positions) >= MAX_OPEN_POSITIONS:
+            return False, f"max {MAX_OPEN_POSITIONS} open positions"
+        if self.last_trade_dt and (dt - self.last_trade_dt).total_seconds() < COOLDOWN_SECONDS:
+            return False, "cooldown"
         return True, "OK"
 
-    def record_open(self, pos, dt):
-        self.open_positions.append(pos); self.last_trade_dt=dt
+    def record_open(self, position: BacktestPosition, dt: datetime) -> None:
+        self.open_positions.append(position)
+        self.last_trade_dt = dt
 
-    def record_close(self, pos):
-        if pos in self.open_positions: self.open_positions.remove(pos)
-        self.daily_pnl += pos.pnl_usdt
-        self.consec_losses = 0 if pos.result=="WIN" else self.consec_losses+1
+    def record_close(self, position: BacktestPosition) -> None:
+        if position in self.open_positions:
+            self.open_positions.remove(position)
+        self.daily_pnl += position.pnl_usdt
+        self.consec_losses = 0 if position.result == "WIN" else self.consec_losses + 1
 
-    def calc_contracts(self, price):
-        return max(1, int(MAX_RISK_USDT * LEVERAGE))
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 5. SIGNAL EXTRACTION HELPER
-# ═════════════════════════════════════════════════════════════════════════════
-def extract_signal(result: dict) -> Tuple[str, int]:
-    """Parse (direction, confidence) from jarvis.analyze_trade_setup() output."""
-    sig  = result.get("trade_signal", {})
-    direction = sig.get("direction", "NO_TRADE")
-    raw  = sig.get("confidence_score", "0/100")
-    try:
-        conf = int(float(str(raw).split("/")[0]))
-    except:
-        conf = 0
-    if direction == "BUY":  direction = "CALL"
-    elif direction == "SELL": direction = "PUT"
-    return direction, conf
+    def calc_contracts(self, entry_price: float, stop_trigger: float, direction: str,
+                       cash_balance: float, fee_bps: float, slippage_bps: float) -> float:
+        """Size base-asset quantity by worst stop loss, then cap gross exposure."""
+        if entry_price <= 0 or cash_balance <= 0:
+            return 0.0
+        is_call = direction in ("CALL", "BUY")
+        adverse_stop = stop_trigger * (1 - slippage_bps / 10_000 if is_call else 1 + slippage_bps / 10_000)
+        loss_per_unit = abs(entry_price - adverse_stop) + (entry_price + adverse_stop) * fee_bps / 20_000
+        if loss_per_unit <= 0:
+            return 0.0
+        used_notional = sum(p.entry_price * p.contracts for p in self.open_positions)
+        exposure_room = max(0.0, cash_balance * LEVERAGE - used_notional)
+        quantity = min(MAX_RISK_USDT / loss_per_unit, exposure_room / entry_price)
+        # Deterministic quantity precision without forcing an unaffordable one-unit trade.
+        return math.floor(max(0.0, quantity) * 100_000_000) / 100_000_000
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 6. MAIN BACKTESTER
-# ═════════════════════════════════════════════════════════════════════════════
 class JarvisFullBacktester:
-    """
-    Candle-by-candle backtest using real JarvisElite.analyze_trade_setup().
-    Mirrors LiveTradingEngine.start_live_trading() exactly.
-    """
+    """Historical-only replay with central math/GPU decision analysis in isolation mode."""
 
-    def __init__(self, symbol="BTCUSDT", timeframe="5m", years=3,
-                 starting_capital=1000.0, hedge_enabled=True,
-                 hedge_ratio=0.5, warmup=100, ollama_every=0,
-                 ollama_model="deepseek-r1:14b"):
-        self.symbol=symbol; self.timeframe=timeframe; self.years=years
-        self.starting_capital=starting_capital; self.hedge_enabled=hedge_enabled
-        self.hedge_ratio=hedge_ratio; self.warmup=warmup
-        self.ollama_every=0  # Backtests are always math-only; never contact Ollama.
+    def __init__(self, symbol: str = "BTCUSDT", timeframe: str = "5m", years: int = 3,
+                 starting_capital: float = 1000.0, warmup: int = 100,
+                 slippage_bps: float = 5.0, fee_bps: float = 10.0):
+        self.symbol, self.timeframe, self.years = symbol.upper(), timeframe, years
+        self.starting_capital, self.warmup = starting_capital, warmup
+        self.slippage_bps, self.fee_bps = slippage_bps, fee_bps
         self.gate = BacktestRiskGate()
-        self.hsim = OptionsHedgeSimulator()
-        # Sampled Ollama Judge (only created if ollama_every > 0)
-        self.ollama_judge: Optional[SampledOllamaJudge] = (
-            SampledOllamaJudge(every_n=ollama_every, model=ollama_model)
-            if ollama_every > 0 else None
-        )
         self.all_trades: List[BacktestPosition] = []
-        self.balance=starting_capital; self.peak=starting_capital
-        self.equity_curve: List[Dict] = []
-        self.n_no_signal=0; self.n_skip_gate=0; self.n_ollama_veto=0
+        self.balance = self.peak = starting_capital
+        self.equity_curve: List[Dict[str, object]] = []
+        self.n_no_signal = self.n_skip_gate = self.n_unaffordable = 0
 
     def _init_jarvis(self):
-        print("  🤖 Initializing JarvisElite...")
+        print("  Initializing JarvisElite central math/GPU decision path (isolated replay)...")
         from jarvis_FIXED import JarvisElite
-        # Backtest mode activates before components initialize: GPU analysis stays on; AI/live I/O stays off.
-        j = JarvisElite(backtest_mode=True)
-        j.print_dashboard = lambda *args, **kwargs: None  # Mute dashboard in backtest
-        j.deepseek_enabled = False
-        if self.ollama_judge:
-            print(f"  🧠 OllamaJudge: ENABLED — calling every {self.ollama_every} signals")
-        else:
-            print("  ✅ JarvisElite ready (math mode, no Ollama)")
-        return j
+        # This must remain true: it preserves analysis engines while blocking live-only inputs.
+        brain = JarvisElite(backtest_mode=True)
+        brain.print_dashboard = lambda *args, **kwargs: None
+        return brain
 
-    def run(self):
-        ollama_mode = f"ON (every {self.ollama_every} signals)" if self.ollama_judge else "OFF (math only)"
-        print(f"\n{'═'*70}")
-        print(f"  🚀 JARVIS FULL-FIDELITY BACKTESTER")
-        print(f"{'═'*70}")
-        print(f"  Symbol: {self.symbol}  |  TF: {self.timeframe}  |  Years: {self.years}")
-        print(f"  Capital: ${self.starting_capital:,.2f}  |  Leverage: {LEVERAGE}x  |  MinConf: {MIN_CONFIDENCE}%")
-        print(f"  Hedge: {'ON ratio='+str(self.hedge_ratio) if self.hedge_enabled else 'OFF'}  |  Ollama Judge: {ollama_mode}")
-        print(f"{'═'*70}\n")
+    def _entry_fill(self, direction: str, opening_price: float) -> float:
+        adverse = self.slippage_bps / 10_000.0
+        return opening_price * (1 + adverse if direction == "CALL" else 1 - adverse)
 
-        loader = BinanceHistoricalLoader(self.symbol)
-        df     = loader.load(self.timeframe, self.years)
-        if df.empty or len(df) < self.warmup + 50:
-            print("❌ Not enough data."); return
+    def _close_position(self, position: BacktestPosition, raw_exit: float, dt: datetime, reason: str) -> None:
+        self.balance += position.close(raw_exit, dt, reason)
+        self.peak = max(self.peak, self.balance)
+        self.gate.record_close(position)
 
-        jarvis = self._init_jarvis()
-        total  = len(df)
-        print(f"\n  📊 Backtesting {total:,} candles (warmup={self.warmup})...\n")
-        BAR = 50
+    def _check_open_positions(self, candle: pd.Series, dt: datetime) -> None:
+        for position in list(self.gate.open_positions):
+            outcome = position.check_candle(candle, dt)
+            if outcome:
+                reason, raw_exit = outcome
+                self._close_position(position, raw_exit, dt, reason)
 
-        for i in range(self.warmup, total):
-            ws = max(0, i-500)
-            df_win = df.iloc[ws:i].copy()
-            price  = float(df.iloc[i]["close"])
-            dt     = df.index[i].to_pydatetime()
+    def run(self, data_file: Path) -> None:
+        RESULT_DIR.mkdir(parents=True, exist_ok=True)
+        df = HistoricalCandleLoader(data_file).load()
+        if len(df) < self.warmup + 2:
+            raise ValueError("Not enough historical candles after warmup")
+        print("\n" + "=" * 70)
+        print("JARVIS HISTORICAL REPLAY")
+        print("=" * 70)
+        print(f"Symbol: {self.symbol} | TF label: {self.timeframe} | candles: {len(df):,}")
+        print(f"Capital: ${self.starting_capital:,.2f} | leverage cap: {LEVERAGE}x | risk budget: ${MAX_RISK_USDT:.2f}")
+        print(f"Execution assumptions (conservative, user-configurable; not exchange facts): entry/exit slippage {self.slippage_bps:.2f} bps adverse each side; round-trip fee {self.fee_bps:.2f} bps")
+        print("Data isolation: local historical input only. No live feed, client, or remote model path.")
+        print("=" * 70)
+        brain = self._init_jarvis()
 
-            # Progress
-            if (i-self.warmup) % 500 == 0 or i == total-1:
-                done  = i-self.warmup; tot2 = total-self.warmup
-                pct   = done/tot2; fill = int(BAR*pct)
-                bar   = "█"*fill + "─"*(BAR-fill)
-                ws2   = sum(1 for t in self.all_trades if t.result=="WIN")
-                nt    = len(self.all_trades)
-                wr    = ws2/nt*100 if nt else 0
-                print(f"\r  [{bar}] {pct*100:.0f}% | {i:,}/{total:,} | "
-                      f"Trades:{nt} WR:{wr:.0f}% Bal:${self.balance:,.0f}",
-                      end="", flush=True)
-
-            # Check positions
-            self._check_positions(price, dt)
-
-            # Equity snapshot
-            if (i-self.warmup) % 100 == 0:
-                self.equity_curve.append({
-                    "time": dt.isoformat(), "balance": self.balance,
-                    "price": price, "open": len(self.gate.open_positions),
-                    "trades": len(self.all_trades)
-                })
-
-            # Run JARVIS signal
+        # At i, only candles ending before i are visible to the decision. A qualifying
+        # signal then fills at candle i OPEN and faces candle i HIGH/LOW thereafter.
+        for i in range(self.warmup, len(df)):
+            dt = df.index[i].to_pydatetime()
+            candle = df.iloc[i]
+            self._check_open_positions(candle, dt)
+            self.equity_curve.append({"time": dt.isoformat(), "balance": self.balance,
+                                      "price": float(candle["close"]), "open": len(self.gate.open_positions),
+                                      "trades": len(self.all_trades)})
+            ws = max(0, i - 500)
+            df_win = df.iloc[ws:i].copy()  # excludes candle i: no signal lookahead
             try:
-                result = jarvis.analyze_trade_setup(df_win)
-            except Exception as e:
-                logger.debug(f"analyze error at {dt}: {e}"); continue
-
+                result = brain.analyze_trade_setup(df_win)
+            except Exception as exc:
+                logger.debug("analysis failure at %s: %s", dt, exc)
+                continue
             direction, confidence = extract_signal(result)
+            if direction not in ("CALL", "PUT"):
+                self.n_no_signal += 1
+                continue
+            allowed, _ = self.gate.can_trade(confidence, dt)
+            if not allowed:
+                self.n_skip_gate += 1
+                continue
+            opening_price = float(df.iloc[i]["open"])
+            entry_price = self._entry_fill(direction, opening_price)
+            trade_type = str(result.get("trade_signal", {}).get("recommended_expiry", "SCALP")).upper()
+            trade_type = "SWING" if trade_type in ("SWING", "DAY_TRADE") else "SCALP"
+            provisional = BacktestPosition(direction, entry_price, dt, 0.0, trade_type, confidence,
+                                            self.slippage_bps, self.fee_bps)
+            quantity = self.gate.calc_contracts(entry_price, provisional.sl_price, direction,
+                                                self.balance, self.fee_bps, self.slippage_bps)
+            if quantity <= 0:
+                self.n_unaffordable += 1
+                continue
+            position = BacktestPosition(direction, entry_price, dt, quantity, trade_type, confidence,
+                                        self.slippage_bps, self.fee_bps)
+            self.gate.record_open(position, dt)
+            self.all_trades.append(position)
+            # Entry is at this open, so only this candle's subsequent range can trigger it.
+            outcome = position.check_candle(candle, dt, at_entry=True)
+            if outcome:
+                reason, raw_exit = outcome
+                self._close_position(position, raw_exit, dt, reason)
 
-            if direction not in ("CALL","PUT"):
-                self.n_no_signal += 1; continue
-
-            # ── SAMPLED OLLAMA JUDGE ──────────────────────────────────────────
-            # Called every N qualifying signals; caches verdict between calls.
-            # Falls back to math if Ollama is offline.
-            if self.ollama_judge:
-                direction, confidence, ollama_src = self.ollama_judge.validate(
-                    direction, confidence, result, price)
-                if direction == "NO_TRADE":
-                    self.n_ollama_veto += 1
-                    self.n_no_signal += 1
-                    continue
-            # ─────────────────────────────────────────────────────────────────
-
-            ok, reason = self.gate.can_trade(confidence, dt)
-            if not ok:
-                self.n_skip_gate += 1; continue
-
-            contracts = self.gate.calc_contracts(price)
-            ts = result.get("trade_signal",{}).get("recommended_expiry","SCALP")
-            trade_type = "SWING" if str(ts).upper() in ("SWING","DAY_TRADE") else "SCALP"
-
-            hedge_cost = 0.0
-            if self.hedge_enabled:
-                try:
-                    atr = float((df_win["high"]-df_win["low"]).rolling(14).mean().iloc[-1])
-                    if atr > 0:
-                        hedge_cost, _ = self.hsim.hedge_cost_and_pnl(
-                            price, price, direction, atr,
-                            self.hedge_ratio, MAX_RISK_USDT*LEVERAGE)
-                except: pass
-
-            pos = BacktestPosition(direction, price, dt, contracts, trade_type,
-                                   confidence, hedge_cost, self.hedge_ratio if self.hedge_enabled else 0.0)
-            self.gate.record_open(pos, dt); self.all_trades.append(pos)
-
-        print()
-        # Force-close remaining
-        lp = float(df.iloc[-1]["close"]); lt = df.index[-1].to_pydatetime()
-        for pos in list(self.gate.open_positions):
-            is_c = pos.direction in ("CALL","BUY")
-            r = "EXPIRY WIN" if (is_c and lp>pos.entry_price) or (not is_c and lp<pos.entry_price) else "EXPIRY LOSS"
-            pnl = pos.close(lp, lt, r, 0.0)
-            self.balance += pnl; self.gate.record_close(pos)
-
+        final_dt = df.index[-1].to_pydatetime()
+        final_close = float(df.iloc[-1]["close"])
+        for position in list(self.gate.open_positions):
+            self._close_position(position, final_close, final_dt, "END OF DATA")
         self._report(df)
 
-    def _check_positions(self, price, dt):
-        for pos in list(self.gate.open_positions):
-            r = pos.check(price, dt)
-            if r:
-                hp = 0.0
-                if self.hedge_enabled and pos.hedge_ratio > 0 and pos.hedge_cost > 0:
-                    atr = pos.entry_price * 0.004
-                    _, hp = self.hsim.hedge_cost_and_pnl(pos.entry_price, price,
-                        pos.direction, atr, pos.hedge_ratio, MAX_RISK_USDT*LEVERAGE)
-                pnl = pos.close(price, dt, r, hp)
-                self.balance += pnl
-                self.peak = max(self.peak, self.balance)
-                self.gate.record_close(pos)
+    def _maxdd(self) -> float:
+        peak, worst = self.starting_capital, 0.0
+        for point in self.equity_curve:
+            peak = max(peak, float(point["balance"]))
+            worst = max(worst, (peak - float(point["balance"])) / peak * 100 if peak else 0.0)
+        return worst
 
-    def _report(self, df):
-        print(f"\n{'═'*70}")
-        closed = [t for t in self.all_trades if t.status=="CLOSED"]
-        wins   = [t for t in closed if t.result=="WIN"]
-        losses = [t for t in closed if t.result=="LOSS"]
-        nt = len(closed)
-        wr = len(wins)/nt*100 if nt else 0
-        tpnl = sum(t.pnl_usdt for t in closed)
-        aw = sum(t.pnl_usdt for t in wins)/max(1,len(wins))
-        al = sum(t.pnl_usdt for t in losses)/max(1,len(losses))
-        pf = abs(sum(t.pnl_usdt for t in wins)/sum(t.pnl_usdt for t in losses)) if losses else float("inf")
-        dd = self._maxdd(); sh = self._sharpe(closed)
-        col_wr  = BD+G if wr>=50 else BD+R
-        col_pnl = BD+G if tpnl>=0 else BD+R
-        print(f"  🏆 BACKTEST RESULTS — {self.symbol} {self.timeframe} {self.years}y")
-        print(f"{'═'*70}")
-        print(f"  Total Trades:       {nt}")
-        print(f"  Win Rate:           {_p(f'{wr:.1f}%', col_wr)}")
-        print(f"  Wins / Losses:      {len(wins)} / {len(losses)}")
-        print(f"  Avg Win / Loss:     ${aw:.2f} / ${al:.2f}")
-        print(f"  Profit Factor:      {_p(f'{pf:.2f}', BD+G if pf>1 else BD+R)}")
-        print(f"  Max Drawdown:       {_p(f'{dd:.1f}%', BD+R)}")
-        print(f"  Sharpe Ratio:       {_p(f'{sh:.2f}', BD+G if sh>1 else BD+Y)}")
-        print(f"  Starting Capital:   ${self.starting_capital:,.2f}")
-        print(f"  Final Balance:      {_p(f'${self.balance:,.2f}', col_pnl)}")
-        pnl_sign = "+" if tpnl >= 0 else ""
-        print(f"  Total PnL:          {_p(f'{pnl_sign}${tpnl:.2f}', col_pnl)}")
-        print(f"  Leverage:           {LEVERAGE}x")
-        print(f"  No-Trade Signals:   {self.n_no_signal}")
-        print(f"  Skipped (Gate):     {self.n_skip_gate}")
-        if self.ollama_judge:
-            print(f"  Ollama Judge:       {self.ollama_judge.stats()}")
-            print(f"  Ollama Vetoes:      {self.n_ollama_veto}")
-        print(f"{'═'*70}")
+    @staticmethod
+    def _sharpe(closed: List[BacktestPosition]) -> float:
+        if len(closed) < 2:
+            return 0.0
+        values = np.array([trade.pnl_usdt for trade in closed])
+        std = values.std(ddof=1)
+        return float(values.mean() / std * math.sqrt(365 * 5)) if std else 0.0
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        prefix = RESULT_DIR / f"backtest_{self.symbol}_{self.timeframe}_{self.years}y_{ts}"
+    def _report(self, df: pd.DataFrame) -> None:
+        closed = [trade for trade in self.all_trades if trade.status == "CLOSED"]
+        wins = [trade for trade in closed if trade.result == "WIN"]
+        losses = [trade for trade in closed if trade.result == "LOSS"]
+        net = sum(trade.pnl_usdt for trade in closed)
+        gross = sum(trade.gross_pnl for trade in closed)
+        fees = sum(trade.fees_usdt for trade in closed)
+        wr = 100 * len(wins) / len(closed) if closed else 0.0
+        loss_sum = sum(trade.pnl_usdt for trade in losses)
+        pf = abs(sum(trade.pnl_usdt for trade in wins) / loss_sum) if loss_sum else float("inf")
+        dd, sharpe = self._maxdd(), self._sharpe(closed)
+        print("\n" + "=" * 70)
+        print("HISTORICAL REPLAY RESULTS")
+        print("=" * 70)
+        print(f"Trades: {len(closed)} | wins/losses: {len(wins)}/{len(losses)} | net win rate: {wr:.1f}%")
+        print(f"Gross PnL: ${gross:.2f} | modeled fees: ${fees:.2f} | net PnL: ${net:.2f}")
+        print(f"Final balance: ${self.balance:.2f} | profit factor: {pf:.2f} | max drawdown: {dd:.2f}% | Sharpe: {sharpe:.2f}")
+        print(f"Signals excluded: no-decision {self.n_no_signal}; risk-gated {self.n_skip_gate}; zero-size {self.n_unaffordable}")
+        print("Parity: decisions use the central JarvisElite core math/GPU path in backtest isolation mode.")
+        print("Parity limitation: historical replay does not reproduce historical options-chain or cross-exchange snapshots unless a dated historical dataset is supplied to that decision pipeline.")
+        print("Those omitted live-only inputs are excluded; they are never treated as neutral or positive confirmation.")
+        print("=" * 70)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        prefix = RESULT_DIR / f"backtest_{self.symbol}_{self.timeframe}_{stamp}"
         self._csv(closed, prefix)
-        self._chart(prefix)
-        self._html(prefix, closed, wins, losses, nt, wr, tpnl, aw, al, pf, dd, sh, ts)
-        print(f"\n  ✅ Reports → {RESULT_DIR}/")
-        print(f"     CSV:  {prefix.name}.csv")
-        print(f"     Chart: {prefix.name}_equity.png")
-        print(f"     HTML: {prefix.name}.html\n")
+        self._html(prefix, closed, net, gross, fees, wr, dd, sharpe, stamp)
+        print(f"Reports: {prefix.name}.csv and {prefix.name}.html")
 
-    def _maxdd(self):
-        if not self.equity_curve: return 0.0
-        peak=self.starting_capital; dd=0.0
-        for e in self.equity_curve:
-            peak = max(peak, e["balance"])
-            dd   = max(dd, (peak-e["balance"])/peak*100 if peak>0 else 0)
-        return dd
-
-    def _sharpe(self, closed):
-        if len(closed)<2: return 0.0
-        pnls = [t.pnl_usdt for t in closed]
-        mu=np.mean(pnls); std=np.std(pnls, ddof=1)
-        if std==0: return 0.0
-        return float(mu/std*np.sqrt(365*5))
-
-    def _csv(self, closed, prefix):
-        rows=[{
-            "id":t.id,"direction":t.direction,"type":t.trade_type,
-            "confidence":t.confidence,"entry_time":t.entry_time,
-            "exit_time":t.exit_time,"entry":t.entry_price,"exit":t.exit_price,
-            "contracts":t.contracts,"leverage":LEVERAGE,
-            "tp":t.tp_price,"sl":t.sl_price,"reason":t.close_reason,
-            "result":t.result,"futures_pnl":round(t.pnl_usdt-t.hedge_pnl+t.hedge_cost,4),
-            "hedge_cost":round(t.hedge_cost,4),"hedge_pnl":round(t.hedge_pnl,4),
-            "net_pnl":round(t.pnl_usdt,4)
-        } for t in closed]
+    def _csv(self, closed: List[BacktestPosition], prefix: Path) -> None:
+        rows = [{"id": t.id, "direction": t.direction, "type": t.trade_type, "confidence": t.confidence,
+                 "entry_time": t.entry_time, "exit_time": t.exit_time, "entry_fill": t.entry_price,
+                 "exit_fill": t.exit_price, "quantity_base": t.contracts, "tp_trigger": t.tp_price,
+                 "sl_trigger": t.sl_price, "reason": t.close_reason, "result": t.result,
+                 "gross_pnl": round(t.gross_pnl, 8), "fees_usdt": round(t.fees_usdt, 8),
+                 "net_pnl": round(t.pnl_usdt, 8)} for t in closed]
         pd.DataFrame(rows).to_csv(f"{prefix}.csv", index=False)
 
-    def _chart(self, prefix):
-        try:
-            import matplotlib; matplotlib.use("Agg")
-            import matplotlib.pyplot as plt, matplotlib.gridspec as gs
-            eq = pd.DataFrame(self.equity_curve)
-            if eq.empty: return
-            eq["time"] = pd.to_datetime(eq["time"])
-            fig = plt.figure(figsize=(16,10), facecolor="#0d1117")
-            g = gs.GridSpec(2,1,height_ratios=[3,1],hspace=0.08)
-            ax1 = fig.add_subplot(g[0]); ax2 = fig.add_subplot(g[1], sharex=ax1)
-            ax1.plot(eq["time"],eq["balance"],color="#00ff88",lw=1.5,label="Balance")
-            ax1.axhline(self.starting_capital,color="#888",lw=0.8,ls="--",alpha=0.5)
-            ax1.fill_between(eq["time"],eq["balance"],self.starting_capital,
-                where=eq["balance"]>=self.starting_capital,alpha=0.12,color="#00ff88")
-            ax1.fill_between(eq["time"],eq["balance"],self.starting_capital,
-                where=eq["balance"]<self.starting_capital,alpha=0.12,color="#ff4444")
-            for ax in (ax1,ax2):
-                ax.set_facecolor("#0d1117"); ax.tick_params(colors="gray")
-                ax.spines[:].set_color("#333")
-            ax1.set_title(
-                f"JARVIS Backtest — {self.symbol} {self.timeframe} {self.years}y | {LEVERAGE}x | "
-                f"${self.starting_capital:,.0f}→${self.balance:,.0f}",
-                color="white",fontsize=12,pad=10)
-            ax1.set_ylabel("Balance (USDT)",color="gray")
-            ax1.legend(facecolor="#1a1a2e",edgecolor="#333",labelcolor="white",fontsize=9)
-            ax2.plot(eq["time"],eq["price"],color="#ffd700",lw=0.8,alpha=0.8)
-            ax2.set_ylabel("BTC Price",color="gray"); ax2.set_xlabel("Date",color="gray")
-            plt.setp(ax1.get_xticklabels(),visible=False)
-            plt.savefig(f"{prefix}_equity.png",dpi=150,bbox_inches="tight",facecolor="#0d1117")
-            plt.close(fig)
-        except ImportError:
-            print("  ⚠️  pip install matplotlib  (for chart)")
-        except Exception as e:
-            logger.warning(f"Chart: {e}")
-
-    def _html(self, prefix, closed, wins, losses, nt, wr, tpnl, aw, al, pf, dd, sh, ts):
-        cname=f"{prefix.name}_equity.png"; csvn=f"{prefix.name}.csv"
-        rows=""
-        for t in closed[-100:]:
-            c="#00ff88" if t.result=="WIN" else "#ff4444"
-            dc="#00ff88" if t.direction=="CALL" else "#ff4444"
-            rows+=f"<tr><td>{t.id}</td><td style='color:{dc}'>{t.direction}</td><td>{t.trade_type}</td><td>{t.confidence}%</td><td>${t.entry_price:,.2f}</td><td>${t.exit_price:,.2f}</td><td>{t.close_reason}</td><td style='color:{c}'>{t.result}</td><td style='color:{c}'>{'+' if t.pnl_usdt>=0 else ''}${t.pnl_usdt:.2f}</td></tr>"
-        wc="#00ff88" if wr>=50 else "#ff4444"
-        pc="#00ff88" if tpnl>=0 else "#ff4444"
-        html=f"""<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>
-<title>JARVIS Backtest — {self.symbol} {self.timeframe}</title>
-<style>@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&family=JetBrains+Mono&display=swap');
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:#0d1117;color:#e6edf3;font-family:'Outfit',sans-serif;padding:24px}}
-h1{{text-align:center;font-size:2rem;background:linear-gradient(135deg,#00ff88,#00bbff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:8px}}
-.sub{{text-align:center;color:#8b949e;margin-bottom:28px;font-size:.9rem}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:28px}}
-.card{{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:18px;text-align:center}}
-.card .lbl{{color:#8b949e;font-size:.75rem;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}}
-.card .val{{font-size:1.7rem;font-weight:700;font-family:'JetBrains Mono'}}
-.chart{{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:14px;margin-bottom:28px;text-align:center}}
-.chart img{{max-width:100%;border-radius:8px}}
-table{{width:100%;border-collapse:collapse;background:#161b22;border-radius:12px;overflow:hidden;border:1px solid #30363d;margin-bottom:16px}}
-th{{background:#21262d;color:#8b949e;padding:10px 14px;text-align:left;font-size:.75rem;text-transform:uppercase;letter-spacing:1px}}
-td{{padding:8px 14px;border-bottom:1px solid #21262d;font-family:'JetBrains Mono';font-size:.82rem}}
-tr:last-child td{{border-bottom:none}}tr:hover{{background:#1c2128}}
-.cfg{{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:18px;margin-bottom:28px}}
-.cfg h3{{color:#00bbff;margin-bottom:10px}}.cfg p{{color:#8b949e;font-size:.82rem;line-height:2;font-family:'JetBrains Mono'}}
-.footer{{text-align:center;color:#30363d;font-size:.78rem;margin-top:28px}}
-</style></head><body>
-<h1>🤖 JARVIS Backtest Report</h1>
-<p class='sub'>{ts} | {self.symbol} {self.timeframe} | {self.years}y | {LEVERAGE}x Leverage</p>
-<div class='cfg'><h3>⚙️ Config</h3><p>
-Symbol:{self.symbol} | TF:{self.timeframe} | Years:{self.years} | Leverage:{LEVERAGE}x | Capital:${self.starting_capital:,.0f}<br>
-MinConf:{MIN_CONFIDENCE}% | Cooldown:{COOLDOWN_SECONDS}s | MaxDailyLoss:${MAX_DAILY_LOSS_USDT} | MaxOpen:{MAX_OPEN_POSITIONS}<br>
-TP:{SCALP_TP_PCT*100:.1f}% SL:{SCALP_SL_PCT*100:.1f}% | Hedge:{'ON ratio='+str(self.hedge_ratio) if self.hedge_enabled else 'OFF'}
-</p></div>
-<div class='grid'>
-<div class='card'><div class='lbl'>Total Trades</div><div class='val' style='color:#00bbff'>{nt}</div></div>
-<div class='card'><div class='lbl'>Win Rate</div><div class='val' style='color:{wc}'>{wr:.1f}%</div></div>
-<div class='card'><div class='lbl'>Final Balance</div><div class='val' style='color:{pc}'>${self.balance:,.0f}</div></div>
-<div class='card'><div class='lbl'>Total PnL</div><div class='val' style='color:{pc}'>{'+' if tpnl>=0 else ''}${tpnl:.0f}</div></div>
-<div class='card'><div class='lbl'>Profit Factor</div><div class='val' style='color:{"#00ff88" if pf>1 else "#ff4444"}'>{pf:.2f}</div></div>
-<div class='card'><div class='lbl'>Max Drawdown</div><div class='val' style='color:#ff4444'>{dd:.1f}%</div></div>
-<div class='card'><div class='lbl'>Sharpe</div><div class='val' style='color:#ffd700'>{sh:.2f}</div></div>
-<div class='card'><div class='lbl'>Avg Win/Loss</div><div class='val' style='font-size:1rem;color:#8b949e'>+${aw:.1f} / -${abs(al):.1f}</div></div>
-</div>
-<div class='chart'><img src='{cname}' alt='Equity Curve' onerror="this.parentNode.innerHTML='<p style=color:#8b949e>Chart file: '+'{cname}'+'</p>'"></div>
-<h2 style='color:#8b949e;font-size:.85rem;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px'>📋 Last 100 Trades</h2>
-<table><thead><tr><th>#</th><th>Dir</th><th>Type</th><th>Conf</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Result</th><th>Net PnL</th></tr></thead>
-<tbody>{rows}</tbody></table>
-<p style='text-align:center;color:#8b949e;font-size:.8rem'>Full CSV: <a href='{csvn}' style='color:#00bbff'>{csvn}</a></p>
-<p class='footer'>JARVIS Backtest Engine | Real analyze_trade_setup() | No Lookahead Bias</p>
-</body></html>"""
-        with open(f"{prefix}.html","w",encoding="utf-8") as f: f.write(html)
+    def _html(self, prefix: Path, closed: List[BacktestPosition], net: float, gross: float,
+              fees: float, wr: float, dd: float, sharpe: float, stamp: str) -> None:
+        rows = "".join(
+            f"<tr><td>{t.id}</td><td>{t.direction}</td><td>{t.confidence}%</td><td>{t.entry_price:.2f}</td><td>{t.exit_price:.2f}</td><td>{t.close_reason}</td><td>{t.pnl_usdt:.4f}</td></tr>"
+            for t in closed[-100:])
+        html = f"""<!doctype html><html><head><meta charset='utf-8'><title>JARVIS historical replay</title>
+<style>body{{font-family:system-ui;background:#10151c;color:#e8edf2;margin:2rem}}section,table{{background:#19212b;padding:1rem;margin:1rem 0;border-radius:8px}}table{{border-collapse:collapse;width:100%}}td,th{{padding:.5rem;text-align:left;border-bottom:1px solid #334}}</style></head><body>
+<h1>JARVIS Historical Replay</h1><p>{stamp} · {self.symbol} · {self.timeframe}</p>
+<section><h2>Results</h2><p>Net PnL: ${net:.2f}; gross PnL: ${gross:.2f}; modeled fees: ${fees:.2f}; net win rate: {wr:.1f}%; max drawdown: {dd:.2f}%; Sharpe: {sharpe:.2f}</p></section>
+<section><h2>Execution assumptions</h2><p>Conservative, user-configurable assumptions rather than exchange facts: adverse entry/exit slippage {self.slippage_bps:.2f} bps each side; round-trip trading fee {self.fee_bps:.2f} bps. Entries fill at next candle open; TP/SL use high/low; a same-candle dual touch resolves to SL first.</p></section>
+<section><h2>Decision-path parity and limitation</h2><p>Decisions use the central JarvisElite core math/GPU decision path in isolation mode. Historical options-chain and cross-exchange snapshots cannot be reproduced unless a dated historical dataset is supplied to that pipeline. These omitted live-only inputs are excluded, never neutral or positive confirmation.</p></section>
+<table><thead><tr><th>#</th><th>Direction</th><th>Confidence</th><th>Entry fill</th><th>Exit fill</th><th>Reason</th><th>Net PnL</th></tr></thead><tbody>{rows}</tbody></table>
+<footer>JARVIS Backtest Engine | Core math/GPU decision path | Historical replay only</footer></body></html>"""
+        prefix.with_suffix(".html").write_text(html, encoding="utf-8")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 7. CLI
-# ═════════════════════════════════════════════════════════════════════════════
-def main():
-    p = argparse.ArgumentParser(
-        description="JARVIS Full-Fidelity Backtester",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Examples:
-  python jarvis_backtester.py                          # Math only (fastest)
-  python jarvis_backtester.py --symbol ETHUSDT --tf 15m --years 2
-  # Always math-only: Ollama is never contacted.
-""")
-    p.add_argument("--symbol",        default="BTCUSDT",       help="Trading pair (default: BTCUSDT)")
-    p.add_argument("--tf",            default="5m",            help="Timeframe: 1m 5m 15m 1h (default: 5m)")
-    p.add_argument("--years",         default=3,  type=int,   help="Years of history (default: 3)")
-    p.add_argument("--capital",       default=1000.0, type=float, help="Starting capital USDT (default: 1000)")
-    p.add_argument("--no-hedge",      action="store_true",     help="Disable options hedge simulation")
-    p.add_argument("--hedge-ratio",   default=0.5, type=float,help="Hedge size ratio (default: 0.5)")
-    p.add_argument("--warmup",        default=100, type=int,  help="Warmup candles (default: 100)")
-    # No Ollama switch by design: historical backtests must be deterministic.
-    args = p.parse_args()
-    os.makedirs("data", exist_ok=True)
-    bt = JarvisFullBacktester(
-        symbol=args.symbol, timeframe=args.tf, years=args.years,
-        starting_capital=args.capital, hedge_enabled=not args.no_hedge,
-        hedge_ratio=args.hedge_ratio, warmup=args.warmup, ollama_every=0)
-    bt.run()
+def main() -> None:
+    parser = argparse.ArgumentParser(description="JARVIS isolated historical replay")
+    parser.add_argument("--data-file", required=True, type=Path, help="Local completed OHLCV CSV or Parquet")
+    parser.add_argument("--symbol", default="BTCUSDT")
+    parser.add_argument("--tf", default="5m", help="Label only; input timestamps remain authoritative")
+    parser.add_argument("--years", default=3, type=int, help="Label only; local input remains authoritative")
+    parser.add_argument("--capital", default=1000.0, type=float)
+    parser.add_argument("--warmup", default=100, type=int)
+    parser.add_argument("--slippage-bps", default=5.0, type=float,
+                        help="Adverse entry and exit slippage per side; conservative assumption, default 5")
+    parser.add_argument("--fee-bps", default=10.0, type=float,
+                        help="Round-trip trading fee; conservative assumption, default 10")
+    args = parser.parse_args()
+    if args.capital <= 0 or args.warmup < 20 or args.slippage_bps < 0 or args.fee_bps < 0:
+        parser.error("capital must be positive; warmup >=20; costs must be non-negative")
+    runner = JarvisFullBacktester(args.symbol, args.tf, args.years, args.capital, args.warmup,
+                                  args.slippage_bps, args.fee_bps)
+    runner.run(args.data_file)
+
 
 if __name__ == "__main__":
     main()
