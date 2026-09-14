@@ -5011,7 +5011,13 @@ class JarvisElite:
                 score = max(0, score - penalty)
                 ai_thought += f" | ⚛️ QUANTUM DIVERGENCE (-{penalty}%)"
                 detailed_scores['quantum_penalty'] = penalty
-                logger.warning(f"⚛️ QUANTUM CONFLICT: Penalized confidence by -{penalty}%")
+                if getattr(self, 'is_backtest_mode', False):
+                    # Historical replay evaluates thousands of candles — log once, not per candle.
+                    if not getattr(self, '_quantum_conflict_noted', False):
+                        self._quantum_conflict_noted = True
+                        logger.warning("⚛️ QUANTUM CONFLICT: confidence penalty applied (repeats suppressed in backtest log)")
+                else:
+                    logger.warning(f"⚛️ QUANTUM CONFLICT: Penalized confidence by -{penalty}%")
             else:
                 logger.info("⚛️ QUANTUM NEUTRAL: No impact on confidence")
 

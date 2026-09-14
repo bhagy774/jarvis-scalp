@@ -277,5 +277,10 @@ Provide a 1-sentence decision: BUY, SELL, or NO-TRADE with reasoning.
 def init_ollama():
     _init_ollama()
 
-# Initialize on module load
-_init_ollama()
+# Initialize on module load — except in isolated historical backtest mode,
+# where Ollama must never be probed or called at all.
+if os.environ.get("JARVIS_BACKTEST_MODE", "0") == "1":
+    OLLAMA_ENABLED = False
+    logger.info("Backtest mode: Ollama initialization skipped (math/GPU-only replay)")
+else:
+    _init_ollama()
