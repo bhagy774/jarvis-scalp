@@ -447,7 +447,7 @@ class JarvisFullBacktester:
         self.symbol=symbol; self.timeframe=timeframe; self.years=years
         self.starting_capital=starting_capital; self.hedge_enabled=hedge_enabled
         self.hedge_ratio=hedge_ratio; self.warmup=warmup
-        self.ollama_every=ollama_every  # 0 = disabled
+        self.ollama_every=0  # Backtests are always math-only; never contact Ollama.
         self.gate = BacktestRiskGate()
         self.hsim = OptionsHedgeSimulator()
         # Sampled Ollama Judge (only created if ollama_every > 0)
@@ -463,11 +463,9 @@ class JarvisFullBacktester:
     def _init_jarvis(self):
         print("  🤖 Initializing JarvisElite...")
         from jarvis_FIXED import JarvisElite
-        j = JarvisElite()
+        # Backtest mode activates before components initialize: GPU analysis stays on; AI/live I/O stays off.
+        j = JarvisElite(backtest_mode=True)
         j.print_dashboard = lambda *args, **kwargs: None  # Mute dashboard in backtest
-        # Always disable Ollama INSIDE jarvis_FIXED — we manage it externally
-        # via SampledOllamaJudge so we control exactly when it's called
-        j.is_backtest_mode = True
         j.deepseek_enabled = False
         if self.ollama_judge:
             print(f"  🧠 OllamaJudge: ENABLED — calling every {self.ollama_every} signals")
@@ -768,8 +766,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   python jarvis_backtester.py                          # Math only (fastest)
-  python jarvis_backtester.py --ollama-every 10        # Ollama every 10 signals
-  python jarvis_backtester.py --ollama-every 5 --tf 15m --years 2
+  python jarvis_backtester.py --symbol ETHUSDT --tf 15m --years 2
+  # Always math-only: Ollama is never contacted.
 """)
     p.add_argument("--symbol",        default="BTCUSDT",       help="Trading pair (default: BTCUSDT)")
     p.add_argument("--tf",            default="5m",            help="Timeframe: 1m 5m 15m 1h (default: 5m)")
@@ -778,18 +776,13 @@ def main():
     p.add_argument("--no-hedge",      action="store_true",     help="Disable options hedge simulation")
     p.add_argument("--hedge-ratio",   default=0.5, type=float,help="Hedge size ratio (default: 0.5)")
     p.add_argument("--warmup",        default=100, type=int,  help="Warmup candles (default: 100)")
-    p.add_argument("--ollama-every",  default=0,  type=int,
-        help="Call Ollama judge every N signals (0=disabled, 10=recommended). "
-             "Ollama must be running at localhost:11434")
-    p.add_argument("--ollama-model",  default="deepseek-r1:14b",
-        help="Ollama model name (default: deepseek-r1:14b)")
+    # No Ollama switch by design: historical backtests must be deterministic.
     args = p.parse_args()
     os.makedirs("data", exist_ok=True)
     bt = JarvisFullBacktester(
         symbol=args.symbol, timeframe=args.tf, years=args.years,
         starting_capital=args.capital, hedge_enabled=not args.no_hedge,
-        hedge_ratio=args.hedge_ratio, warmup=args.warmup,
-        ollama_every=args.ollama_every, ollama_model=args.ollama_model)
+        hedge_ratio=args.hedge_ratio, warmup=args.warmup, ollama_every=0)
     bt.run()
 
 if __name__ == "__main__":
