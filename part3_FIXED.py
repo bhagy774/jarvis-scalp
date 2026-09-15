@@ -40,7 +40,7 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     TORCH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     TORCH_AVAILABLE = False
     
     # Comprehensive dummy torch module for fallback mode
@@ -283,8 +283,179 @@ class GPUFeatureExtractor:
 
 # Fallback component classes to guarantee no NameError issues anywhere
 class CandlePsychologyMasterGPU:
+    """
+    INSTITUTIONAL CANDLESTICK PSYCHOLOGY & PRICE ACTION ENGINE (Part 3)
+    - ATR-Relative Significance Filter (blocks micro-noise and flat-candle hallucinations)
+    - Rejection Analysis: Hammers, Shooting Stars, Pin Bars with Wick-to-Body ratio >= 2.0x
+    - Momentum Patterns: Bullish & Bearish Engulfing, Multi-bar Expansion
+    - Volume Confirmation on Reversals
+    - Strict Neutrality: Returns Signal: 0 (Neutral) on mixed/indecision candles
+    """
     def __init__(self, master=None):
         self.master = master
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        else:
+            self.device = 'cpu'
+
+    def analyze(self, data, context=None):
+        try:
+            if data is None or len(data) < 15:
+                return {"signal": 0, "thought": "Insufficient candle history (<15)", "telemetry": {}}
+
+            if isinstance(data, pd.DataFrame):
+                df = data
+            else:
+                df = pd.DataFrame(data)
+
+            highs = df['high'].tail(20).astype(float)
+            lows = df['low'].tail(20).astype(float)
+            closes = df['close'].tail(20).astype(float)
+            opens = df['open'].tail(20).astype(float)
+            volumes = df['volume'].tail(20).astype(float) if 'volume' in df.columns else pd.Series(1.0, index=df.index).tail(20)
+
+            tr = pd.concat([highs - lows, (highs - closes.shift(1)).abs(), (lows - closes.shift(1)).abs()], axis=1).max(axis=1)
+            atr = float(tr.tail(14).mean())
+            avg_vol = float(volumes.tail(14).mean()) if len(volumes) >= 14 else 1.0
+
+            c = float(closes.iloc[-1])
+            o = float(opens.iloc[-1])
+            h = float(highs.iloc[-1])
+            l = float(lows.iloc[-1])
+            v = float(volumes.iloc[-1])
+
+            rng = max(h - l, 1e-8)
+            body = abs(c - o)
+            body_ratio = body / rng
+            upper_wick = (h - max(c, o)) / rng
+            lower_wick = (min(c, o) - l) / rng
+
+            telemetry = {
+                'body_ratio': round(body_ratio, 3),
+                'upper_wick': round(upper_wick, 3),
+                'lower_wick': round(lower_wick, 3),
+                'atr': round(atr, 4),
+                'candle_range': round(rng, 4)
+            }
+
+            # 1. Micro-Noise Filter: Candle range must be meaningful compared to ATR
+            if rng < 0.55 * atr or atr == 0:
+                return {
+                    "signal": 0,
+                    "thought": f"Noise/Micro-candle ({rng:.1f} < 0.55*ATR {atr:.1f}) — Neutral",
+                    "telemetry": telemetry
+                }
+
+            prev_c = float(closes.iloc[-2])
+            prev_o = float(opens.iloc[-2])
+            prev_h = float(highs.iloc[-2])
+            prev_l = float(lows.iloc[-2])
+            prev_rng = max(prev_h - prev_l, 1e-8)
+            prev_body = abs(prev_c - prev_o)
+            prev_body_ratio = prev_body / prev_rng
+            prev_lower_wick = (min(prev_c, prev_o) - prev_l) / prev_rng
+            prev_upper_wick = (prev_h - max(prev_c, prev_o)) / prev_rng
+
+            # 2. Dragonfly Doji (Bullish Rejection at lows)
+            if lower_wick >= 0.65 and body_ratio <= 0.12 and upper_wick <= 0.10:
+                telemetry['detected_pattern'] = 'Dragonfly Doji'
+                return {"signal": 1, "thought": "Dragonfly Doji (Strong Bullish Rejection)", "confidence": 7.5, "telemetry": telemetry}
+
+            # 3. Gravestone Doji (Bearish Rejection at highs)
+            if upper_wick >= 0.65 and body_ratio <= 0.12 and lower_wick <= 0.10:
+                telemetry['detected_pattern'] = 'Gravestone Doji'
+                return {"signal": -1, "thought": "Gravestone Doji (Strong Bearish Rejection)", "confidence": 7.5, "telemetry": telemetry}
+
+            # 4. Long-Legged Doji & Standard Doji (Market Indecision)
+            if body_ratio <= 0.10:
+                telemetry['detected_pattern'] = 'Doji'
+                return {"signal": 0, "thought": "Doji / Indecision Candle — Neutral", "telemetry": telemetry}
+
+            # 5. Bullish Hammer / Pin Bar Rejection
+            if lower_wick >= 0.55 and upper_wick <= 0.22 and body_ratio <= 0.35:
+                vol_boost = v >= avg_vol * 0.9
+                conf = 7.5 if vol_boost else 6.0
+                telemetry['detected_pattern'] = 'Bullish Hammer'
+                return {"signal": 1, "thought": f"Bullish Hammer/Pin Bar (lower wick {lower_wick*100:.0f}%, body {body_ratio*100:.0f}%)", "confidence": conf, "telemetry": telemetry}
+
+            # 6. Bearish Shooting Star / Pin Bar Rejection
+            if upper_wick >= 0.55 and lower_wick <= 0.22 and body_ratio <= 0.35:
+                vol_boost = v >= avg_vol * 0.9
+                conf = 7.5 if vol_boost else 6.0
+                telemetry['detected_pattern'] = 'Bearish Shooting Star'
+                return {"signal": -1, "thought": f"Bearish Shooting Star (upper wick {upper_wick*100:.0f}%, body {body_ratio*100:.0f}%)", "confidence": conf, "telemetry": telemetry}
+
+            # 7. Bullish Marubozu (Extreme Buyer Momentum)
+            if body_ratio >= 0.85 and c > o and rng >= 0.8 * atr:
+                telemetry['detected_pattern'] = 'Bullish Marubozu'
+                return {"signal": 1, "thought": f"Bullish Marubozu Power Candle (body {body_ratio*100:.0f}%)", "confidence": 8.0, "telemetry": telemetry}
+
+            # 8. Bearish Marubozu (Extreme Seller Momentum)
+            if body_ratio >= 0.85 and c < o and rng >= 0.8 * atr:
+                telemetry['detected_pattern'] = 'Bearish Marubozu'
+                return {"signal": -1, "thought": f"Bearish Marubozu Power Candle (body {body_ratio*100:.0f}%)", "confidence": 8.0, "telemetry": telemetry}
+
+            # 9. Bullish Engulfing
+            if prev_c < prev_o and c > o and c >= prev_o and o <= prev_c and body > prev_body * 1.15 and body_ratio > 0.6:
+                telemetry['detected_pattern'] = 'Bullish Engulfing'
+                return {"signal": 1, "thought": f"Bullish Engulfing Pattern ({body:.1f} > prev {prev_body:.1f})", "confidence": 7.5, "telemetry": telemetry}
+
+            # 10. Bearish Engulfing
+            if prev_c > prev_o and c < o and c <= prev_o and o >= prev_c and body > prev_body * 1.15 and body_ratio > 0.6:
+                telemetry['detected_pattern'] = 'Bearish Engulfing'
+                return {"signal": -1, "thought": f"Bearish Engulfing Pattern ({body:.1f} > prev {prev_body:.1f})", "confidence": 7.5, "telemetry": telemetry}
+
+            # 11. Piercing Line (Bullish 2-bar reversal)
+            if prev_c < prev_o and c > o and o <= prev_l and c >= (prev_o + prev_c) / 2.0 and c < prev_o:
+                telemetry['detected_pattern'] = 'Piercing Line'
+                return {"signal": 1, "thought": "Bullish Piercing Line Reversal", "confidence": 7.0, "telemetry": telemetry}
+
+            # 12. Dark Cloud Cover (Bearish 2-bar reversal)
+            if prev_c > prev_o and c < o and o >= prev_h and c <= (prev_o + prev_c) / 2.0 and c > prev_o:
+                telemetry['detected_pattern'] = 'Dark Cloud Cover'
+                return {"signal": -1, "thought": "Bearish Dark Cloud Cover Reversal", "confidence": 7.0, "telemetry": telemetry}
+
+            # 13. Tweezer Bottoms & Tweezer Tops
+            if abs(l - prev_l) <= 0.08 * atr and lower_wick >= 0.40 and prev_lower_wick >= 0.40:
+                telemetry['detected_pattern'] = 'Tweezer Bottom'
+                return {"signal": 1, "thought": "Tweezer Bottom Support Rejection", "confidence": 7.0, "telemetry": telemetry}
+            elif abs(h - prev_h) <= 0.08 * atr and upper_wick >= 0.40 and prev_upper_wick >= 0.40:
+                telemetry['detected_pattern'] = 'Tweezer Top'
+                return {"signal": -1, "thought": "Tweezer Top Resistance Rejection", "confidence": 7.0, "telemetry": telemetry}
+
+            # 14. 3-Bar Patterns (Morning Star / Evening Star)
+            if len(df) >= 3:
+                p2_c, p2_o = float(closes.iloc[-3]), float(opens.iloc[-3])
+                p2_body = abs(p2_c - p2_o)
+                # Morning Star: Bearish -> Small Doji/Star -> Strong Bullish
+                if p2_c < p2_o and prev_body_ratio <= 0.35 and c > o and c >= (p2_o + p2_c) / 2.0:
+                    telemetry['detected_pattern'] = 'Morning Star'
+                    return {"signal": 1, "thought": "Morning Star 3-Bar Reversal Pattern", "confidence": 8.5, "telemetry": telemetry}
+                # Evening Star: Bullish -> Small Doji/Star -> Strong Bearish
+                elif p2_c > p2_o and prev_body_ratio <= 0.35 and c < o and c <= (p2_o + p2_c) / 2.0:
+                    telemetry['detected_pattern'] = 'Evening Star'
+                    return {"signal": -1, "thought": "Evening Star 3-Bar Reversal Pattern", "confidence": 8.5, "telemetry": telemetry}
+
+                # Three White Soldiers & Three Black Crows
+                if c > o and prev_c > prev_o and p2_c > p2_o and body_ratio > 0.60:
+                    if (c - p2_o) >= 1.4 * atr:
+                        telemetry['detected_pattern'] = 'Three White Soldiers'
+                        return {"signal": 1, "thought": "Three White Soldiers Momentum Continuation", "confidence": 8.0, "telemetry": telemetry}
+                elif c < o and prev_c < prev_o and p2_c < p2_o and body_ratio > 0.60:
+                    if (p2_o - c) >= 1.4 * atr:
+                        telemetry['detected_pattern'] = 'Three Black Crows'
+                        return {"signal": -1, "thought": "Three Black Crows Momentum Continuation", "confidence": 8.0, "telemetry": telemetry}
+
+            # 15. Spinning Top / High Wave (Indecision)
+            if body_ratio <= 0.30 and upper_wick >= 0.25 and lower_wick >= 0.25:
+                telemetry['detected_pattern'] = 'Spinning Top'
+                return {"signal": 0, "thought": "Spinning Top / High Wave Indecision — Neutral", "telemetry": telemetry}
+
+            return {"signal": 0, "thought": "Normal / Mixed Candles — Neutral", "telemetry": telemetry}
+
+        except Exception as e:
+            return {"signal": 0, "thought": f"Candle psychology fallback: {e}", "telemetry": {}}
+
     def analyze_candle_psychology(self, current_candle=None, prev1=None, prev2=None):
         if not current_candle or not isinstance(current_candle, dict):
             return {}
@@ -299,10 +470,10 @@ class CandlePsychologyMasterGPU:
             lower_wick = (min(c, o) - l) / rng
             
             return {
-                'is_hammer': lower_wick > 0.6 and body / rng < 0.3,
-                'is_shooting_star': upper_wick > 0.6 and body / rng < 0.3,
-                'is_bullish_engulfing': c > o and prev1 and float(prev1.get('close', 0)) < float(prev1.get('open', 0)) and c > float(prev1.get('open', 0)),
-                'is_bearish_engulfing': c < o and prev1 and float(prev1.get('close', 0)) > float(prev1.get('open', 0)) and c < float(prev1.get('open', 0)),
+                'is_hammer': lower_wick > 0.55 and body / rng < 0.35 and upper_wick < 0.22,
+                'is_shooting_star': upper_wick > 0.55 and body / rng < 0.35 and lower_wick < 0.22,
+                'is_bullish_engulfing': c > o and prev1 and float(prev1.get('close', 0)) < float(prev1.get('open', 0)) and c >= float(prev1.get('open', 0)),
+                'is_bearish_engulfing': c < o and prev1 and float(prev1.get('close', 0)) > float(prev1.get('open', 0)) and c <= float(prev1.get('open', 0)),
                 'has_strong_support': lower_wick > 0.5,
                 'has_strong_resistance': upper_wick > 0.5
             }

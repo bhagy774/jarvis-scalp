@@ -58,7 +58,7 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     TORCH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     TORCH_AVAILABLE = False
     
     class DummyTensor:
@@ -1087,6 +1087,144 @@ class RealTimePerformanceMonitor:
             'win_rate': wr,
             'total_trades': len(metrics_tensor)
         }
+
+
+# ==================== INSTITUTIONAL VOLUME PROFILE ENGINE (PART 4) ====================
+
+class VolumeProfileEngineGPU:
+    """
+    INSTITUTIONAL VOLUME PROFILE & ORDER FLOW DELTA ENGINE (Part 4)
+    - Point of Control (POC) calculation across rolling 50-bar lookback
+    - 70% Value Area (VAH / VAL) boundaries
+    - Buyer vs Seller Volume Delta over rolling 10 bars
+    - Value Area Rotation vs Breakout Detection:
+      * Inside Value Area (VAL <= Price <= VAH): Value Area Rotation -> Signal: 0 (Neutral)
+      * Above VAH + Buyer Delta > 60% + Volume > 1.2x: Strong Bullish Breakout -> Signal: +1
+      * Below VAL + Seller Delta > 60% + Volume > 1.2x: Strong Bearish Breakdown -> Signal: -1
+      * Low Volume (< 0.6x average): Dry Market / Exhaustion -> Signal: 0 (Neutral)
+    """
+    def __init__(self, master=None):
+        self.master = master
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        else:
+            self.device = 'cpu'
+
+    def analyze(self, data, context=None):
+        try:
+            if data is None or len(data) < 30:
+                return {"signal": 0, "thought": "Insufficient data for Volume Profile (<30)", "telemetry": {}}
+
+            if isinstance(data, pd.DataFrame):
+                df = data
+            else:
+                df = pd.DataFrame(data)
+
+            recent = df.tail(50).copy()
+            highs = recent['high'].astype(float)
+            lows = recent['low'].astype(float)
+            closes = recent['close'].astype(float)
+            opens = recent['open'].astype(float)
+            volumes = recent['volume'].astype(float) if 'volume' in recent.columns else pd.Series(1.0, index=recent.index)
+
+            current_close = float(closes.iloc[-1])
+            current_vol = float(volumes.iloc[-1])
+            avg_vol = float(volumes.mean())
+            vol_ratio = current_vol / max(avg_vol, 1e-8)
+
+            # 1. Volume Delta across last 10 bars
+            last10 = recent.tail(10)
+            up_vol = float(last10.loc[last10['close'] > last10['open'], 'volume'].sum())
+            down_vol = float(last10.loc[last10['close'] < last10['open'], 'volume'].sum())
+            tot_vol = up_vol + down_vol
+            buy_delta_pct = (up_vol / tot_vol) if tot_vol > 0 else 0.5
+
+            # 2. Volume Profile & POC calculation
+            min_p, max_p = float(lows.min()), float(highs.max())
+            if max_p <= min_p:
+                return {"signal": 0, "thought": "Flat price range", "telemetry": {}}
+
+            num_bins = 20
+            bin_size = (max_p - min_p) / num_bins
+            vol_bins = np.zeros(num_bins)
+
+            for _, row in recent.iterrows():
+                p = (float(row['high']) + float(row['low']) + float(row['close'])) / 3.0
+                b_idx = min(int((p - min_p) / bin_size), num_bins - 1)
+                vol_bins[b_idx] += float(row['volume']) if 'volume' in row else 1.0
+
+            poc_idx = int(np.argmax(vol_bins))
+            poc_price = min_p + (poc_idx + 0.5) * bin_size
+
+            # Value Area: 70% of total volume around POC
+            target_vol = 0.70 * vol_bins.sum()
+            va_indices = {poc_idx}
+            cur_vol = vol_bins[poc_idx]
+            up_idx = poc_idx + 1
+            dn_idx = poc_idx - 1
+
+            while cur_vol < target_vol and (up_idx < num_bins or dn_idx >= 0):
+                up_v = vol_bins[up_idx] if up_idx < num_bins else -1
+                dn_v = vol_bins[dn_idx] if dn_idx >= 0 else -1
+                if up_v >= dn_v and up_idx < num_bins:
+                    va_indices.add(up_idx)
+                    cur_vol += up_v
+                    up_idx += 1
+                elif dn_idx >= 0:
+                    va_indices.add(dn_idx)
+                    cur_vol += dn_v
+                    dn_idx -= 1
+                else:
+                    break
+
+            val_price = min_p + min(va_indices) * bin_size
+            vah_price = min_p + (max(va_indices) + 1) * bin_size
+
+            telemetry = {
+                'poc_price': round(poc_price, 2),
+                'vah_price': round(vah_price, 2),
+                'val_price': round(val_price, 2),
+                'buy_delta_pct': round(buy_delta_pct, 3),
+                'vol_ratio': round(vol_ratio, 2)
+            }
+
+            # 3. Decision Rules
+            # A. Dry Market / Low Volume Filter
+            if vol_ratio < 0.6:
+                return {"signal": 0, "thought": f"Low Volume ({vol_ratio:.1f}x < 0.6x) — Neutral", "telemetry": telemetry}
+
+            # B. Inside Value Area (Acceptance / Rotation -> Neutral)
+            if val_price <= current_close <= vah_price:
+                return {
+                    "signal": 0,
+                    "thought": f"Inside Value Area [{val_price:.0f} - {vah_price:.0f}] (POC={poc_price:.0f}) — Neutral",
+                    "telemetry": telemetry
+                }
+
+            # C. Bullish Value Area Breakout + Buyer Delta Domination
+            if current_close > vah_price and buy_delta_pct > 0.60 and vol_ratio >= 1.2:
+                confidence = min(10.0, max(5.0, buy_delta_pct * 10.0))
+                return {
+                    "signal": 1,
+                    "thought": f"Bullish VA Breakout above {vah_price:.0f} (Buyer Delta={buy_delta_pct*100:.0f}%, Vol={vol_ratio:.1f}x)",
+                    "confidence": confidence,
+                    "telemetry": telemetry
+                }
+
+            # D. Bearish Value Area Breakdown + Seller Delta Domination
+            if current_close < val_price and buy_delta_pct < 0.40 and vol_ratio >= 1.2:
+                confidence = min(10.0, max(5.0, (1.0 - buy_delta_pct) * 10.0))
+                return {
+                    "signal": -1,
+                    "thought": f"Bearish VA Breakdown below {val_price:.0f} (Seller Delta={(1.0-buy_delta_pct)*100:.0f}%, Vol={vol_ratio:.1f}x)",
+                    "confidence": confidence,
+                    "telemetry": telemetry
+                }
+
+            return {"signal": 0, "thought": f"Normal Volume Profile (POC={poc_price:.0f}) — Neutral", "telemetry": telemetry}
+
+        except Exception as e:
+            return {"signal": 0, "thought": f"Volume Profile fallback: {e}", "telemetry": {}}
 
 
 # ==================== MAIN BACKTESTING ORCHESTRATOR ====================

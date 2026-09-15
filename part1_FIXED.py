@@ -8,7 +8,7 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     TORCH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     TORCH_AVAILABLE = False
     # Dummy torch for compatibility
     class DummyTensor:
@@ -828,7 +828,9 @@ class SelfHealingBrain:
                 return {'stability_score': 0.8, 'error_rate': 0.1, 'health_index': 0.9, 'recovery_factor': 0.5, 'support_score': 0.7}
                 
             closes = torch.tensor([c['close'] for c in market_data['price_action'][-10:]], device=self.device, dtype=torch.float32)
-            price_stability = 1.0 - _safe_std(closes) * 10
+            c_mean = _safe_mean(closes)
+            c_std_pct = (_safe_std(closes) / (c_mean + 1e-8)) if c_mean > 0 else 0.0
+            price_stability = max(0.0, min(1.0, 1.0 - c_std_pct * 50))
             
             system_stability = system_metrics.get('stability', 0.8)
             error_rate = system_metrics.get('error_rate', 0.1)
@@ -942,7 +944,8 @@ class MiniR1Brain:
             
             reasoning_depth = breakout_strength * (1.0 - fakeout_prob)
             
-            volatility = _safe_std(closes)
+            c_mean = _safe_mean(closes)
+            volatility = (_safe_std(closes) / (c_mean + 1e-8)) if c_mean > 0 else 0.0
             volatility_override = 0.3 if volatility > 0.005 else 1.0
                 
             psychology_score = (1.0 - trap_probability) * reasoning_depth * volatility_override
@@ -1166,7 +1169,11 @@ class SmartBreakoutAI:
                 if current_volume > avg_volume * 1.2:
                     volume_confirmation = 0.3
                     
-            breakout_strength = min(breakout_strength + volume_confirmation, 1.0)
+            if breakout_direction != 0:
+                breakout_strength = min(breakout_strength + volume_confirmation, 1.0)
+            else:
+                breakout_strength = 0.0
+                volume_confirmation = 0.0
             
             return {
                 'breakout_detected': breakout_direction != 0,
@@ -1654,146 +1661,37 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
                         orderflow_data, regime_data, brain_support, cloud_r1_data, cloud_v3_data, liquidity_data,
                         ollama_signal=0):
         try:
-            breakout_strength = breakout_data.get('strength', 0)
-            breakout_direction = breakout_data.get('direction', 0)
-            fakeout_prob = fakeout_data.get('fakeout_probability', 0)
-            momentum_dir = momentum_data.get('momentum_direction', 0)
-            momentum_str = momentum_data.get('momentum_strength', 0)
-            orderflow_pressure = orderflow_data.get('pressure_strength', 0)
+            breakout_detected = bool(breakout_data.get('breakout_detected', False))
+            breakout_direction = int(breakout_data.get('direction', 0))
+            breakout_strength = float(breakout_data.get('strength', 0.0))
+            fakeout_prob = float(fakeout_data.get('fakeout_probability', 0.0))
+            
+            # If no breakout detected, Part 1 must be strictly neutral (0, 0.0)
+            if not breakout_detected or breakout_direction == 0:
+                return 0, 0.0
+
+            # High risk or high fakeout probability invalidates the breakout
+            risk_brain = brain_support.get('risk', {})
+            risk_score = float(risk_brain.get('risk_score', 0.5))
+            if fakeout_prob > 0.6 or risk_score > 0.8:
+                return 0, 0.0
+
+            trend_brain = brain_support.get('trend', {})
+            trend_dir = int(trend_brain.get('trend_direction', 0))
             orderflow_dir = 1 if orderflow_data.get('delta_positive', False) else -1
-            liquidity_strength = liquidity_data.get('liquidity_strength', 0)
-            sweep_detected = liquidity_data.get('sweep_detected', False)
             
-            trend_brain = brain_support['trend']
-            strength_brain = brain_support['strength']
-            risk_brain = brain_support['risk']
-            reversal_brain = brain_support['reversal']
-            deepseek_brain = brain_support['deepseek']
-            meta_fusion_brain = brain_support['meta_fusion']
-            mini_r1_brain = brain_support['mini_r1']
-            mini_v3_brain = brain_support['mini_v3']
-            
-            trend_dir = trend_brain.get('trend_direction', 0)
-            trend_str = trend_brain.get('trend_strength', 0)
-            overall_strength = strength_brain.get('overall_strength', 0)
-            risk_score = risk_brain.get('risk_score', 0.5)
-            reversal_prob = reversal_brain.get('reversal_probability', 0)
-            deepseek_support = deepseek_brain.get('support_score', 0)
-            fusion_support = meta_fusion_brain.get('support_score', 0)
-            mini_r1_support = mini_r1_brain.get('support_score', 0)
-            mini_v3_support = mini_v3_brain.get('support_score', 0)
-            
-            cloud_r1_support = cloud_r1_data.get('psychology_score', 0.5)
-            cloud_v3_support = cloud_v3_data.get('pressure_score', 0.5)
-            
-            signal_components = []
-            weights = []
-            
-            if breakout_direction != 0 and breakout_strength > 0.3:
-                signal_components.append(breakout_direction * breakout_strength)
-                weights.append(0.15)
+            conviction = breakout_strength
+            if trend_dir == breakout_direction:
+                conviction = min(1.0, conviction + 0.2)
+            if orderflow_dir == breakout_direction:
+                conviction = min(1.0, conviction + 0.1)
                 
-            if momentum_dir != 0 and momentum_str > 0.2:
-                signal_components.append(momentum_dir * momentum_str)
-                weights.append(0.12)
-                
-            if orderflow_dir != 0 and orderflow_pressure > 0.2:
-                signal_components.append(orderflow_dir * orderflow_pressure)
-                weights.append(0.10)
-                
-            if trend_dir != 0 and trend_str > 0.3:
-                signal_components.append(trend_dir * trend_str)
-                weights.append(0.10)
-                
-            if sweep_detected and liquidity_strength > 0.3:
-                signal_components.append(breakout_direction * liquidity_strength)
-                weights.append(0.08)
-                
-            safe_trend_dir = trend_dir if trend_dir != 0 else 1
-
-            signal_components.append(deepseek_support)
-            weights.append(0.12)
-            
-            signal_components.append(fusion_support)
-            weights.append(0.10)
-            
-            signal_components.append(mini_r1_support)
-            weights.append(0.08)
-            
-            signal_components.append(mini_v3_support)
-            weights.append(0.08)
-            
-            signal_components.append(cloud_r1_support * safe_trend_dir)
-            weights.append(0.04)
-            
-            signal_components.append(cloud_v3_support * safe_trend_dir)
-            weights.append(0.03)
-            
-            # Option B: Add Ollama Local AI vote as a strong brain component if available
-            if ollama_signal != 0:
-                signal_components.append(float(ollama_signal))
-                weights.append(0.20)
-            
-            if not signal_components or sum(weights) == 0:
-                return 0, 0
-
-            penalty_components = []
-            penalty_weights = []
-            
-            if fakeout_prob > 0.5:
-                penalty_components.append(-fakeout_prob)
-                penalty_weights.append(0.25)
-                
-            if risk_score > 0.7:
-                penalty_components.append(-risk_score)
-                penalty_weights.append(0.20)
-                
-            if reversal_prob > 0.6:
-                penalty_components.append(-reversal_prob)
-                penalty_weights.append(0.20)
-                
-            if breakout_direction != trend_dir and trend_str > 0.5:
-                penalty_components.append(-0.5)
-                penalty_weights.append(0.15)
-                
-            base_signal = sum(s * w for s, w in zip(signal_components, weights)) / sum(weights)
-            
-            if penalty_components and sum(penalty_weights) > 0:
-                penalty = sum(p * w for p, w in zip(penalty_components, penalty_weights)) / sum(penalty_weights)
-                base_signal += penalty
-                
-            final_signal = 1 if base_signal > 0.15 else (-1 if base_signal < -0.15 else 0)
-            
-            confidence_components = [
-                breakout_strength * 0.15,
-                momentum_str * 0.12,
-                orderflow_pressure * 0.10,
-                trend_str * 0.10,
-                overall_strength * 0.08,
-                (1.0 - risk_score) * 0.08,
-                deepseek_support * 0.12,
-                fusion_support * 0.10,
-                mini_r1_support * 0.08,
-                mini_v3_support * 0.07
-            ]
-            
-            if ollama_signal != 0:
-                confidence_components.append(abs(ollama_signal) * 0.15)
-            
-            confidence = sum(confidence_components) * 10
-            confidence = min(max(confidence, 0.0), 10.0)
-            
-            if fakeout_prob > 0.7:
-                confidence *= (1.0 - fakeout_prob)
-                
-            if reversal_prob > 0.7:
-                confidence *= (1.0 - reversal_prob)
-                
-            return final_signal, float(confidence)
+            confidence = min(max(conviction * 10.0, 1.0), 10.0)
+            return breakout_direction, float(confidence)
         except Exception as e:
             if hasattr(self, 'bus') and self.bus:
                 self.bus.report_error('Part1_Breakout', e, context='analyze')
-            return 0, 0
+            return 0, 0.0
             
     def _get_error_response(self):
         return {

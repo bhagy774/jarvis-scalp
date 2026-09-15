@@ -10,7 +10,7 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     TORCH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     TORCH_AVAILABLE = False
     # Dummy torch for compatibility
     class DummyTensor:
@@ -127,6 +127,141 @@ except ImportError:
     OLLAMA_INTEGRATION_AVAILABLE = False
     def call_ollama(prompt, model=None, timeout=10):
         return None, "ollama_integration module not found"
+
+
+# ==================== GPU-ACCELERATED ORDERFLOW & CVD DELTA ENGINE ====================
+
+class OrderflowEngineGPU:
+    """
+    JARVIS PART 9 - GPU-ACCELERATED ORDERFLOW & CUMULATIVE VOLUME DELTA (CVD) ENGINE
+    GTX 1650 CUDA & CPU Optimized.
+
+    Quantitative Orderflow Architecture:
+    1. Intra-Candle Bid-Ask Volume Delta Proxy:
+       Uses wick-body ratio and price progression to allocate buy vs sell aggressive flow.
+    2. Cumulative Volume Delta (CVD-20):
+       Aggregates directional orderflow momentum across the rolling 20-bar auction window.
+    3. Short-Term Delta Acceleration (CVD-5):
+       Measures real-time orderflow surge over the most recent 5 candles.
+    4. Orderflow Absorption Divergence:
+       - Bullish Absorption: Price falling but CVD surging positive (aggressive institutional accumulation).
+       - Bearish Absorption: Price rising but CVD surging negative (aggressive institutional distribution).
+    5. Trend Orderflow Imbalance:
+       Requires normalized CVD ratio > +0.30 (Bullish) or < -0.30 (Bearish) with EMA20 alignment.
+    6. Auction Equilibrium / Balanced Deadband:
+       When buying and selling volumes are balanced (-0.30 <= CVD <= +0.30), strictly returns 0 (Neutral).
+    """
+    def __init__(self):
+        self.device = torch.device('cuda' if (TORCH_AVAILABLE and torch.cuda.is_available()) else 'cpu')
+
+    def analyze(self, data: Any, context: Optional[Dict] = None) -> Dict[str, Any]:
+        """
+        Main orderflow analysis called by Part9Orderflow in Jarvis.
+        """
+        try:
+            if data is None or not isinstance(data, pd.DataFrame) or len(data) < 20:
+                return {"signal": 0, "confidence": 5.0, "thought": "Part9 Orderflow: Insufficient data (<20)"}
+
+            recent = data.tail(35).copy()
+            highs  = recent['high'].astype(float).values
+            lows   = recent['low'].astype(float).values
+            closes = recent['close'].astype(float).values
+            opens  = recent['open'].astype(float).values
+            vols   = recent['volume'].astype(float).values
+
+            if len(closes) < 20:
+                return {"signal": 0, "confidence": 5.0, "thought": "Part9 Orderflow: Insufficient closes"}
+
+            # 1. Intra-candle Volume Delta proxy
+            candle_ranges = np.maximum(highs - lows, 1e-8)
+            delta_ratios = (2.0 * (closes - lows) - candle_ranges) / candle_ranges
+            deltas = vols * delta_ratios
+
+            # 2. Cumulative Volume Delta (CVD-20)
+            N = 20
+            cvd_20 = float(np.sum(deltas[-N:]))
+            tot_vol_20 = float(np.sum(vols[-N:])) + 1e-8
+            cvd_ratio = cvd_20 / tot_vol_20
+
+            # Short-term CVD-5
+            cvd_5 = float(np.sum(deltas[-5:]))
+            tot_vol_5 = float(np.sum(vols[-5:])) + 1e-8
+            cvd_ratio_5 = cvd_5 / tot_vol_5
+
+            # 3. Price change and EMA
+            current_close = float(closes[-1])
+            price_chg_20 = float((current_close - closes[-N]) / max(closes[-N], 1e-8))
+            ema20 = float(pd.Series(closes).ewm(span=20).mean().iloc[-1])
+
+            # 4. Absorption Divergences
+            bullish_div = (price_chg_20 < -0.0025) and (cvd_ratio > 0.25)
+            bearish_div = (price_chg_20 > 0.0025) and (cvd_ratio < -0.25)
+
+            # 5. Trend Flow Imbalances
+            bullish_flow = (cvd_ratio > 0.30) and (cvd_ratio_5 > 0.15) and (current_close > ema20)
+            bearish_flow = (cvd_ratio < -0.30) and (cvd_ratio_5 < -0.15) and (current_close < ema20)
+
+            telemetry = {
+                "cvd_ratio": round(cvd_ratio, 3),
+                "cvd_ratio_5": round(cvd_ratio_5, 3),
+                "price_chg_20_pct": round(price_chg_20 * 100, 2),
+                "tot_vol_20": round(tot_vol_20, 1),
+                "ema20": round(ema20, 2)
+            }
+
+            # 6. Decision Gates
+            if bullish_div:
+                conf = min(85.0, 65.0 + abs(cvd_ratio) * 30.0)
+                return {
+                    "signal": 1,
+                    "confidence": round(conf, 1),
+                    "thought": f"Part9 Orderflow: Bullish Absorption Divergence (CVD={cvd_ratio*100:+.0f}%, Price-)",
+                    "telemetry": telemetry
+                }
+
+            if bearish_div:
+                conf = min(85.0, 65.0 + abs(cvd_ratio) * 30.0)
+                return {
+                    "signal": -1,
+                    "confidence": round(conf, 1),
+                    "thought": f"Part9 Orderflow: Bearish Absorption Divergence (CVD={cvd_ratio*100:+.0f}%, Price+)",
+                    "telemetry": telemetry
+                }
+
+            if bullish_flow:
+                conf = min(85.0, 60.0 + cvd_ratio * 40.0)
+                return {
+                    "signal": 1,
+                    "confidence": round(conf, 1),
+                    "thought": f"Part9 Orderflow: Bullish Volume Delta Imbalance (CVD={cvd_ratio*100:+.0f}%, 5m={cvd_ratio_5*100:+.0f}%)",
+                    "telemetry": telemetry
+                }
+
+            if bearish_flow:
+                conf = min(85.0, 60.0 + abs(cvd_ratio) * 40.0)
+                return {
+                    "signal": -1,
+                    "confidence": round(conf, 1),
+                    "thought": f"Part9 Orderflow: Bearish Volume Delta Imbalance (CVD={cvd_ratio*100:+.0f}%, 5m={cvd_ratio_5*100:+.0f}%)",
+                    "telemetry": telemetry
+                }
+
+            # Equilibrium / Balanced Orderflow -> STRICTLY 0 (Neutral)
+            return {
+                "signal": 0,
+                "confidence": 5.0,
+                "thought": f"Part9 Orderflow: Balanced Orderflow (CVD={cvd_ratio*100:+.0f}%) — Neutral",
+                "telemetry": telemetry
+            }
+
+        except Exception as e:
+            return {
+                "signal": 0,
+                "confidence": 5.0,
+                "thought": f"Part9 Orderflow: Neutral (error: {e})",
+                "telemetry": {}
+            }
+
 
 # ==================== GPU AI MEMORY MANAGER ====================
 

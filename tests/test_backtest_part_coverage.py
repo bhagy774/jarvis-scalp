@@ -2,8 +2,8 @@ import ast
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
-BACKTESTER = (HERE / 'jarvis_backtester.py').read_text()
-ENGINE = (HERE / 'jarvis_FIXED.py').read_text()
+BACKTESTER = (HERE / 'jarvis_backtester.py').read_text(encoding='utf-8', errors='ignore')
+ENGINE = (HERE / 'jarvis_FIXED.py').read_text(encoding='utf-8', errors='ignore')
 
 
 def _constant_dict(name):

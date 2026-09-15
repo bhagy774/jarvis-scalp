@@ -20,8 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-# Must be set before importing jarvis_FIXED / ollama_integration so that
-# module-level Ollama initialization is skipped in isolated replay.
+# Must be set before importing engine to ensure isolated replay mode.
 os.environ["JARVIS_BACKTEST_MODE"] = "1"
 
 if sys.platform == "win32":
@@ -38,8 +37,10 @@ MAX_OPEN_POSITIONS = int(os.environ.get("JARVIS_MAX_OPEN", "2"))
 MIN_CONFIDENCE = int(os.environ.get("JARVIS_MIN_CONFIDENCE", "70"))
 COOLDOWN_SECONDS = int(os.environ.get("JARVIS_COOLDOWN_SEC", "180"))
 CONSEC_LOSS_LIMIT = int(os.environ.get("JARVIS_CONSEC_LOSS", "3"))
-SCALP_TP_PCT, SCALP_SL_PCT = 0.004, 0.002
-SWING_TP_PCT, SWING_SL_PCT = 0.020, 0.008
+SCALP_TP_PCT = float(os.environ.get("JARVIS_SCALP_TP", "0.008"))
+SCALP_SL_PCT = float(os.environ.get("JARVIS_SCALP_SL", "0.004"))
+SWING_TP_PCT = float(os.environ.get("JARVIS_SWING_TP", "0.020"))
+SWING_SL_PCT = float(os.environ.get("JARVIS_SWING_SL", "0.008"))
 
 logger = logging.getLogger("JarvisBacktest")
 
@@ -128,18 +129,26 @@ class BacktestPosition:
 
     def __init__(self, direction: str, entry_price: float, entry_time: datetime,
                  contracts: float, trade_type: str = "SCALP", confidence: int = 0,
-                 slippage_bps: float = 5.0, fee_bps: float = 10.0):
+                 slippage_bps: float = 5.0, fee_bps: float = 10.0,
+                 part_snapshot: Optional[Dict[str, dict]] = None,
+                 scalp_tp: Optional[float] = None, scalp_sl: Optional[float] = None,
+                 swing_tp: Optional[float] = None, swing_sl: Optional[float] = None):
         BacktestPosition._ctr += 1
         self.id = BacktestPosition._ctr
         self.direction, self.entry_price, self.entry_time = direction, entry_price, entry_time
         self.contracts, self.trade_type, self.confidence = contracts, trade_type, confidence
         self.slippage_bps, self.fee_bps = slippage_bps, fee_bps
-        tp_pct = SWING_TP_PCT if trade_type == "SWING" else SCALP_TP_PCT
-        sl_pct = SWING_SL_PCT if trade_type == "SWING" else SCALP_SL_PCT
+        self.part_snapshot = part_snapshot or {}
+        tp_ref = swing_tp if swing_tp is not None else SWING_TP_PCT
+        sl_ref = swing_sl if swing_sl is not None else SWING_SL_PCT
+        s_tp_ref = scalp_tp if scalp_tp is not None else SCALP_TP_PCT
+        s_sl_ref = scalp_sl if scalp_sl is not None else SCALP_SL_PCT
+        tp_pct = tp_ref if trade_type == "SWING" else s_tp_ref
+        sl_pct = sl_ref if trade_type == "SWING" else s_sl_ref
         self.is_call = direction in ("CALL", "BUY")
         self.tp_price = entry_price * (1 + tp_pct if self.is_call else 1 - tp_pct)
         self.sl_price = entry_price * (1 - sl_pct if self.is_call else 1 + sl_pct)
-        self.expiry_time = entry_time + timedelta(minutes=60 if trade_type == "SWING" else 5)
+        self.expiry_time = entry_time + timedelta(hours=24 if trade_type == "SWING" else 1)
         self.status = "OPEN"
         self.exit_price: Optional[float] = None
         self.exit_time: Optional[datetime] = None
@@ -148,6 +157,27 @@ class BacktestPosition:
         self.gross_pnl = 0.0
         self.fees_usdt = 0.0
         self.pnl_usdt = 0.0
+
+    def get_part_attribution(self) -> Tuple[List[Tuple[str, float, str]], List[Tuple[str, float, str]], List[str]]:
+        """Return (voted_for, voted_against, neutral) parts based on trade direction."""
+        target = 1 if self.is_call else -1
+        voted_for, voted_against, neutral = [], [], []
+        for name, info in self.part_snapshot.items():
+            if not isinstance(info, dict):
+                continue
+            sig = info.get("signal", 0)
+            try:
+                sig = float(sig)
+            except (ValueError, TypeError):
+                sig = 0.0
+            thought = str(info.get("thought", "")).strip()
+            if (target > 0 and sig > 0) or (target < 0 and sig < 0):
+                voted_for.append((name, sig, thought))
+            elif (target > 0 and sig < 0) or (target < 0 and sig > 0):
+                voted_against.append((name, sig, thought))
+            else:
+                neutral.append(name)
+        return voted_for, voted_against, neutral
 
     @property
     def slippage_rate(self) -> float:
@@ -246,10 +276,16 @@ class JarvisFullBacktester:
 
     def __init__(self, symbol: str = "BTCUSDT", timeframe: str = "5m", years: int = 3,
                  starting_capital: float = 1000.0, warmup: int = 100,
-                 slippage_bps: float = 5.0, fee_bps: float = 10.0):
+                 slippage_bps: float = 5.0, fee_bps: float = 10.0,
+                 scalp_tp: float = SCALP_TP_PCT, scalp_sl: float = SCALP_SL_PCT,
+                 swing_tp: float = SWING_TP_PCT, swing_sl: float = SWING_SL_PCT,
+                 live_audit: bool = True):
         self.symbol, self.timeframe, self.years = symbol.upper(), timeframe, years
         self.starting_capital, self.warmup = starting_capital, warmup
         self.slippage_bps, self.fee_bps = slippage_bps, fee_bps
+        self.scalp_tp, self.scalp_sl = scalp_tp, scalp_sl
+        self.swing_tp, self.swing_sl = swing_tp, swing_sl
+        self.live_audit = live_audit
         self.gate = BacktestRiskGate()
         self.all_trades: List[BacktestPosition] = []
         self.balance = self.peak = starting_capital
@@ -257,13 +293,18 @@ class JarvisFullBacktester:
         self.n_no_signal = self.n_skip_gate = self.n_unaffordable = 0
         self.part_activity = {name: {'decisions_seen': 0, 'non_neutral': 0, 'offline': 0}
                               for name in CORE_PART_DATA_CONTRACT}
+        self.part_fault_tracker = {
+            name: {'total_votes': 0, 'wins': 0, 'losses': 0, 'fault_count': 0, 'correct_dissent': 0}
+            for name in CORE_PART_DATA_CONTRACT
+        }
 
     def _init_jarvis(self):
         print("  Initializing JarvisElite central math/GPU decision path (isolated replay)...")
-        from jarvis_FIXED import JarvisElite
+        from jarvis_FIXED import JarvisElite, pro_display
         # This must remain true: it preserves analysis engines while blocking live-only inputs.
         brain = JarvisElite(backtest_mode=True)
         brain.print_dashboard = lambda *args, **kwargs: None
+        pro_display.display_full_signal = lambda *args, **kwargs: None
         return brain
 
     def _record_part_activity(self, brain) -> None:
@@ -302,6 +343,46 @@ class JarvisFullBacktester:
         self.balance += position.close(raw_exit, dt, reason)
         self.peak = max(self.peak, self.balance)
         self.gate.record_close(position)
+        self._audit_trade_close(position, dt, reason)
+
+    def _audit_trade_close(self, position: BacktestPosition, dt: datetime, reason: str) -> None:
+        voted_for, voted_against, neutral = position.get_part_attribution()
+        ts = dt.strftime("%Y-%m-%d %H:%M")
+        if position.result == "WIN":
+            for name, _, _ in voted_for:
+                if name in self.part_fault_tracker:
+                    self.part_fault_tracker[name]['wins'] += 1
+                    self.part_fault_tracker[name]['total_votes'] += 1
+            if self.live_audit:
+                drivers = ", ".join(f"{p[0]}({p[1]:+.1f})" for p in voted_for[:4]) or "baseline rules"
+                print(f"\n[WIN #{position.id}] {ts} | {position.direction} ({position.trade_type}) | Exit: ${position.exit_price:,.2f} | PnL: +${position.pnl_usdt:.2f} (fees: ${position.fees_usdt:.2f}) | Balance: ${self.balance:,.2f} | Reason: {reason}", flush=True)
+                print(f"  Drivers: {drivers}", flush=True)
+        else:
+            for name, _, _ in voted_for:
+                if name in self.part_fault_tracker:
+                    self.part_fault_tracker[name]['losses'] += 1
+                    self.part_fault_tracker[name]['fault_count'] += 1
+                    self.part_fault_tracker[name]['total_votes'] += 1
+            for name, _, _ in voted_against:
+                if name in self.part_fault_tracker:
+                    self.part_fault_tracker[name]['correct_dissent'] += 1
+            if self.live_audit:
+                print(f"\n[LOSS #{position.id}] {ts} | {position.direction} ({position.trade_type}) | Exit: ${position.exit_price:,.2f} | PnL: -${abs(position.pnl_usdt):.2f} (fees: ${position.fees_usdt:.2f}) | Balance: ${self.balance:,.2f} | Reason: {reason}", flush=True)
+                print(f"  FAULT AUDIT (Kaya part no vak hato?):", flush=True)
+                if voted_for:
+                    print(f"    Parts that voted {position.direction} (Misled entry / Vak Hato):", flush=True)
+                    for name, sig, thought in voted_for:
+                        t_clean = (thought[:85] + '...') if len(thought) > 85 else thought
+                        print(f"      * [{name}] sig={sig:+.1f} | {t_clean}", flush=True)
+                else:
+                    print(f"      * (No core part gave directional vote; entered on baseline aggregate)", flush=True)
+                if voted_against:
+                    print(f"    Dissenting parts (Correctly warned opposite):", flush=True)
+                    for name, sig, thought in voted_against:
+                        t_clean = (thought[:85] + '...') if len(thought) > 85 else thought
+                        print(f"      * [{name}] sig={sig:+.1f} | {t_clean}", flush=True)
+                if neutral:
+                    print(f"    Neutral parts: {', '.join(neutral)}", flush=True)
 
     def _check_open_positions(self, candle: pd.Series, dt: datetime) -> None:
         for position in list(self.gate.open_positions):
@@ -320,14 +401,20 @@ class JarvisFullBacktester:
         print("=" * 70)
         print(f"Symbol: {self.symbol} | TF label: {self.timeframe} | candles: {len(df):,}")
         print(f"Capital: ${self.starting_capital:,.2f} | leverage cap: {LEVERAGE}x | risk budget: ${MAX_RISK_USDT:.2f}")
-        print(f"Execution assumptions (conservative, user-configurable; not exchange facts): entry/exit slippage {self.slippage_bps:.2f} bps adverse each side; round-trip fee {self.fee_bps:.2f} bps")
+        print(f"Execution assumptions: entry/exit slippage {self.slippage_bps:.2f} bps adverse each side; round-trip fee {self.fee_bps:.2f} bps")
+        print(f"Targets (Option B): Scalp TP={self.scalp_tp*100:.2f}%%, SL={self.scalp_sl*100:.2f}%% | Swing TP={self.swing_tp*100:.2f}%%, SL={self.swing_sl*100:.2f}%%")
         print("Data isolation: local historical input only. No live feed, client, or remote model path.")
         print("=" * 70)
         brain = self._init_jarvis()
 
         # At i, only candles ending before i are visible to the decision. A qualifying
         # signal then fills at candle i OPEN and faces candle i HIGH/LOW thereafter.
+        total_steps = len(df) - self.warmup
         for i in range(self.warmup, len(df)):
+            step = i - self.warmup + 1
+            if step in (1, 10, 50, 100, 250) or step % 500 == 0 or step == total_steps:
+                pct = (step / total_steps) * 100
+                print(f"  Replay progress: {step:,}/{total_steps:,} candles ({pct:.1f}%) | Open: {len(self.gate.open_positions)} | Closed: {len(self.all_trades)} | Balance: ${self.balance:,.2f}", flush=True)
             dt = df.index[i].to_pydatetime()
             candle = df.iloc[i]
             self._check_open_positions(candle, dt)
@@ -353,18 +440,32 @@ class JarvisFullBacktester:
             opening_price = float(df.iloc[i]["open"])
             entry_price = self._entry_fill(direction, opening_price)
             trade_type = str(result.get("trade_signal", {}).get("recommended_expiry", "SCALP")).upper()
-            trade_type = "SWING" if trade_type in ("SWING", "DAY_TRADE") else "SCALP"
+            if self.timeframe in ("1h", "2h", "4h", "6h", "8h", "12h", "1d"):
+                trade_type = "SWING"
+            else:
+                trade_type = "SWING" if trade_type in ("SWING", "DAY_TRADE") else "SCALP"
             provisional = BacktestPosition(direction, entry_price, dt, 0.0, trade_type, confidence,
-                                            self.slippage_bps, self.fee_bps)
+                                            self.slippage_bps, self.fee_bps,
+                                            scalp_tp=self.scalp_tp, scalp_sl=self.scalp_sl,
+                                            swing_tp=self.swing_tp, swing_sl=self.swing_sl)
             quantity = self.gate.calc_contracts(entry_price, provisional.sl_price, direction,
                                                 self.balance, self.fee_bps, self.slippage_bps)
             if quantity <= 0:
                 self.n_unaffordable += 1
                 continue
+            part_snapshot = dict(getattr(brain, 'latest_part_results', {}) or {})
             position = BacktestPosition(direction, entry_price, dt, quantity, trade_type, confidence,
-                                        self.slippage_bps, self.fee_bps)
+                                        self.slippage_bps, self.fee_bps,
+                                        part_snapshot=part_snapshot,
+                                        scalp_tp=self.scalp_tp, scalp_sl=self.scalp_sl,
+                                        swing_tp=self.swing_tp, swing_sl=self.swing_sl)
             self.gate.record_open(position, dt)
             self.all_trades.append(position)
+            if self.live_audit:
+                ts = dt.strftime("%Y-%m-%d %H:%M")
+                v_for, _, _ = position.get_part_attribution()
+                v_str = ", ".join(f"{p[0]}({p[1]:+.1f})" for p in v_for[:4]) if v_for else "baseline rules"
+                print(f"\n[ENTRY #{position.id}] {ts} | {position.direction} ({position.trade_type}) @ ${position.entry_price:,.2f} | Qty: {position.contracts:.4f} BTC | Conf: {position.confidence}% | TP: ${position.tp_price:,.2f} | SL: ${position.sl_price:,.2f} | Voted: {v_str}", flush=True)
             # Entry is at this open, so only this candle's subsequent range can trigger it.
             outcome = position.check_candle(candle, dt, at_entry=True)
             if outcome:
@@ -414,14 +515,51 @@ class JarvisFullBacktester:
         print("Parity limitation: historical replay does not reproduce historical options-chain or cross-exchange snapshots unless a dated historical dataset is supplied to that decision pipeline.")
         print("Those omitted live-only inputs are excluded; they are never treated as neutral or positive confirmation.")
         print("=" * 70)
+
+        total_losses = len(losses)
+        print("\n" + "=" * 80)
+        print("PART-BY-PART ACCURACY & FAULT SCOREBOARD (KAYA PART NO KETLO VAK HATO?)")
+        print("=" * 80)
+        print(f"{'Part Name':<20} | {'Votes':<6} | {'Wins':<5} | {'Losses':<6} | {'Win Rate':<9} | {'Fault Share':<11} | Assessment")
+        print("-" * 80)
+        fault_summary = {}
+        for name in CORE_PART_DATA_CONTRACT:
+            stats = self.part_fault_tracker.get(name, {})
+            votes = stats.get('total_votes', 0)
+            pwins = stats.get('wins', 0)
+            plosses = stats.get('losses', 0)
+            wr_part = (pwins / votes * 100) if votes > 0 else 0.0
+            fault_pct = (plosses / total_losses * 100) if total_losses > 0 else 0.0
+            if votes == 0:
+                eval_tag = "PASSIVE (No direct votes)"
+            elif wr_part >= 65.0:
+                eval_tag = "RELIABLE (Strong edge)"
+            elif wr_part >= 50.0:
+                eval_tag = "MODERATE (Acceptable balance)"
+            elif plosses >= 3:
+                eval_tag = "HIGH FAULT (Sau thi vadhu bhul)"
+            else:
+                eval_tag = "LOW SAMPLE"
+            fault_summary[name] = {
+                'total_votes': votes,
+                'wins': pwins,
+                'losses': plosses,
+                'win_rate_pct': round(wr_part, 2),
+                'fault_share_pct': round(fault_pct, 2),
+                'assessment': eval_tag,
+            }
+            print(f"{name:<20} | {votes:<6} | {pwins:<5} | {plosses:<6} | {wr_part:>7.1f}% | {fault_pct:>9.1f}% | {eval_tag}")
+        print("=" * 80)
+
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         prefix = RESULT_DIR / f"backtest_{self.symbol}_{self.timeframe}_{stamp}"
         self._csv(closed, prefix)
-        self._html(prefix, closed, net, gross, fees, wr, dd, sharpe, stamp)
+        self._html(prefix, closed, net, gross, fees, wr, dd, sharpe, stamp, fault_summary)
         coverage = self._part_coverage()
         coverage_path = prefix.with_name(prefix.name + '_part_coverage.json')
         coverage_path.write_text(json.dumps({
             'core_parts': coverage,
+            'part_fault_audit': fault_summary,
             'not_replayed_without_timestamped_datasets': HISTORICAL_DATA_NOT_IN_OHLCV,
             'options_chain_vote_included': False,
         }, indent=2), encoding='utf-8')
@@ -436,20 +574,32 @@ class JarvisFullBacktester:
                  "exit_fill": t.exit_price, "quantity_base": t.contracts, "tp_trigger": t.tp_price,
                  "sl_trigger": t.sl_price, "reason": t.close_reason, "result": t.result,
                  "gross_pnl": round(t.gross_pnl, 8), "fees_usdt": round(t.fees_usdt, 8),
-                 "net_pnl": round(t.pnl_usdt, 8)} for t in closed]
+                 "net_pnl": round(t.pnl_usdt, 8),
+                 "parts_voted_for": ", ".join(f"{p[0]}({p[1]:+.1f})" for p in t.get_part_attribution()[0]),
+                 "parts_dissenting": ", ".join(f"{p[0]}({p[1]:+.1f})" for p in t.get_part_attribution()[1]),
+                } for t in closed]
         pd.DataFrame(rows).to_csv(f"{prefix}.csv", index=False)
 
     def _html(self, prefix: Path, closed: List[BacktestPosition], net: float, gross: float,
-              fees: float, wr: float, dd: float, sharpe: float, stamp: str) -> None:
+              fees: float, wr: float, dd: float, sharpe: float, stamp: str,
+              fault_summary: Optional[dict] = None) -> None:
         rows = "".join(
             f"<tr><td>{t.id}</td><td>{t.direction}</td><td>{t.confidence}%</td><td>{t.entry_price:.2f}</td><td>{t.exit_price:.2f}</td><td>{t.close_reason}</td><td>{t.pnl_usdt:.4f}</td></tr>"
             for t in closed[-100:])
+        fault_rows = ""
+        if fault_summary:
+            fault_rows = "".join(
+                f"<tr><td>{k}</td><td>{v['total_votes']}</td><td>{v['wins']}</td><td>{v['losses']}</td><td>{v['win_rate_pct']:.1f}%</td><td>{v['fault_share_pct']:.1f}%</td><td>{v['assessment']}</td></tr>"
+                for k, v in fault_summary.items()
+            )
         html = f"""<!doctype html><html><head><meta charset='utf-8'><title>JARVIS historical replay</title>
 <style>body{{font-family:system-ui;background:#10151c;color:#e8edf2;margin:2rem}}section,table{{background:#19212b;padding:1rem;margin:1rem 0;border-radius:8px}}table{{border-collapse:collapse;width:100%}}td,th{{padding:.5rem;text-align:left;border-bottom:1px solid #334}}</style></head><body>
 <h1>JARVIS Historical Replay</h1><p>{stamp} · {self.symbol} · {self.timeframe}</p>
 <section><h2>Results</h2><p>Net PnL: ${net:.2f}; gross PnL: ${gross:.2f}; modeled fees: ${fees:.2f}; net win rate: {wr:.1f}%; max drawdown: {dd:.2f}%; Sharpe: {sharpe:.2f}</p></section>
-<section><h2>Execution assumptions</h2><p>Conservative, user-configurable assumptions rather than exchange facts: adverse entry/exit slippage {self.slippage_bps:.2f} bps each side; round-trip trading fee {self.fee_bps:.2f} bps. Entries fill at next candle open; TP/SL use high/low; a same-candle dual touch resolves to SL first.</p></section>
-<section><h2>Core Part coverage</h2><p>The companion <code>_part_coverage.json</code> records every one of the 12 core parts, its candle-derived input, decision count, non-neutral votes, and any offline status.</p></section>
+<section><h2>Execution assumptions (Option B)</h2><p>Conservative, user-configurable assumptions: adverse entry/exit slippage {self.slippage_bps:.2f} bps each side; round-trip trading fee {self.fee_bps:.2f} bps. Scalp TP: {self.scalp_tp*100:.2f}%, SL: {self.scalp_sl*100:.2f}%. Swing TP: {self.swing_tp*100:.2f}%, SL: {self.swing_sl*100:.2f}%. Entries fill at next candle open; TP/SL use high/low; same-candle dual touch resolves to SL first.</p></section>
+<section><h2>Core Part Accuracy & Fault Breakdown (Kaya Part no Vak Hato)</h2>
+<table><thead><tr><th>Part Name</th><th>Total Votes</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Fault Share</th><th>Assessment</th></tr></thead><tbody>{fault_rows}</tbody></table>
+</section>
 <section><h2>Decision-path parity and limitation</h2><p>Decisions use the central JarvisElite core math/GPU decision path in isolation mode. Historical options-chain/OI/PCR, funding, order-book, liquidation, and cross-exchange snapshots require timestamp-matched datasets. They are excluded from OHLCV-only replay and cannot vote as neutral or positive confirmation.</p></section>
 <table><thead><tr><th>#</th><th>Direction</th><th>Confidence</th><th>Entry fill</th><th>Exit fill</th><th>Reason</th><th>Net PnL</th></tr></thead><tbody>{rows}</tbody></table>
 <footer>JARVIS Backtest Engine | Core math/GPU decision path | Historical replay only</footer></body></html>"""
@@ -468,11 +618,24 @@ def main() -> None:
                         help="Adverse entry and exit slippage per side; conservative assumption, default 5")
     parser.add_argument("--fee-bps", default=10.0, type=float,
                         help="Round-trip trading fee; conservative assumption, default 10")
+    parser.add_argument("--scalp-tp", default=SCALP_TP_PCT, type=float,
+                        help="Scalp Take-Profit fraction (default 0.008 = 0.8%%)")
+    parser.add_argument("--scalp-sl", default=SCALP_SL_PCT, type=float,
+                        help="Scalp Stop-Loss fraction (default 0.004 = 0.4%%)")
+    parser.add_argument("--swing-tp", default=SWING_TP_PCT, type=float,
+                        help="Swing Take-Profit fraction (default 0.020 = 2.0%%)")
+    parser.add_argument("--swing-sl", default=SWING_SL_PCT, type=float,
+                        help="Swing Stop-Loss fraction (default 0.008 = 0.8%%)")
+    parser.add_argument("--no-audit", action="store_true", default=False,
+                        help="Disable live trade and fault audit streaming")
     args = parser.parse_args()
     if args.capital <= 0 or args.warmup < 20 or args.slippage_bps < 0 or args.fee_bps < 0:
         parser.error("capital must be positive; warmup >=20; costs must be non-negative")
     runner = JarvisFullBacktester(args.symbol, args.tf, args.years, args.capital, args.warmup,
-                                  args.slippage_bps, args.fee_bps)
+                                  args.slippage_bps, args.fee_bps,
+                                  scalp_tp=args.scalp_tp, scalp_sl=args.scalp_sl,
+                                  swing_tp=args.swing_tp, swing_sl=args.swing_sl,
+                                  live_audit=not args.no_audit)
     runner.run(args.data_file)
 
 

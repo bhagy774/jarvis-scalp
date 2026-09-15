@@ -3,6 +3,8 @@
 # LINUX UBUNTU + GTX 1650 CUDA + i5 10th Gen OPTIMIZED
 
 import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional, Any, Tuple
 import os
 # PyTorch with fallback for Windows/WSL compatibility
 try:
@@ -10,7 +12,7 @@ try:
     import torch.nn as nn  # type: ignore
     import torch.nn.functional as F  # type: ignore
     TORCH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     TORCH_AVAILABLE = False
     # Dummy torch for compatibility
     class DummyTensor:
@@ -132,6 +134,155 @@ except ImportError:
     OLLAMA_INTEGRATION_AVAILABLE = False
     def call_ollama(prompt, model=None, timeout=10):
         return None, "ollama_integration module not found"
+
+
+# ==================== GPU-ACCELERATED CANDLESTICK STATS ENGINE ====================
+
+class CandleStatsEngineGPU:
+    """
+    JARVIS PART 10 - GPU-ACCELERATED CANDLESTICK STATISTICAL & PRICE ACTION ENGINE
+    GTX 1650 CUDA & CPU Optimized.
+
+    Quantitative Candlestick Analytics Architecture:
+    1. Volatility Baseline (ATR14): Anchors all body and expansion measurements to prevent micro-noise triggers.
+    2. Body-to-Range Efficiency Ratio: Requires real bodies to exceed 50% of total candle range (eliminates wick indecision/dojis).
+    3. Multi-Bar Directional Runs (Streak): Detects consecutive higher closes (Bullish Run) or lower closes (Bearish Run).
+    4. Body Acceleration vs Baseline: Compares current 3-bar body size to 10-bar baseline, strictly scaled to ATR.
+    5. Run Statistics (10-bar Count): 6+ or 8+ green/red dominance with expansion confirmation.
+    6. Indecision & Mixed Deadband: Strictly returns 0 (Neutral) during spinning tops, micro-noise, or mixed bodies.
+    """
+    def __init__(self):
+        self.device = torch.device('cuda' if (TORCH_AVAILABLE and torch.cuda.is_available()) else 'cpu')
+
+    def analyze(self, data: Any, context: Optional[Dict] = None) -> Dict[str, Any]:
+        """
+        Main candlestick stats analysis called by Part10Candlestats in Jarvis.
+        """
+        try:
+            if data is None or not isinstance(data, pd.DataFrame) or len(data) < 20:
+                return {"signal": 0, "confidence": 5.0, "thought": "Part10 Stats: Insufficient data (<20)"}
+
+            recent = data.tail(25).copy()
+            closes = recent['close'].astype(float).values
+            opens  = recent['open'].astype(float).values
+            highs  = recent['high'].astype(float).values
+            lows   = recent['low'].astype(float).values
+
+            if len(closes) < 15:
+                return {"signal": 0, "confidence": 5.0, "thought": "Part10 Stats: Insufficient closes"}
+
+            # 1. ATR14
+            tr = np.maximum(
+                highs[1:] - lows[1:],
+                np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1]))
+            )
+            atr14 = float(np.mean(tr[-14:])) if len(tr) >= 14 else float(np.mean(highs - lows))
+
+            # 2. Last 3 candles body analysis
+            bodies = np.abs(closes[-3:] - opens[-3:])
+            avg_recent_body = float(np.mean(bodies))
+
+            # 3. Directional Body Ratio (Body vs Range)
+            ranges = np.maximum(highs[-3:] - lows[-3:], 1e-8)
+            body_ratios = bodies / ranges
+            avg_body_ratio = float(np.mean(body_ratios))
+
+            # 4. Streak Detection (3-bar consecutive directional closes)
+            is_bull_streak = all(closes[-i] > opens[-i] for i in range(1, 4)) and (closes[-1] > closes[-2] > closes[-3])
+            is_bear_streak = all(closes[-i] < opens[-i] for i in range(1, 4)) and (closes[-1] < closes[-2] < closes[-3])
+
+            # 5. Statistical Count over 10 bars
+            last10_closes = closes[-10:]
+            last10_opens  = opens[-10:]
+            bull_count = int(np.sum(last10_closes > last10_opens))
+            bear_count = 10 - bull_count
+
+            # 6. Body Acceleration relative to 10-bar baseline, anchored to ATR
+            baseline_bodies = np.abs(closes[-10:-3] - opens[-10:-3])
+            avg_baseline = float(np.mean(baseline_bodies)) if len(baseline_bodies) > 0 else avg_recent_body
+            body_accel = float(avg_recent_body / max(avg_baseline, 0.30 * atr14))
+
+            telemetry = {
+                "avg_recent_body": round(avg_recent_body, 2),
+                "avg_body_ratio": round(avg_body_ratio, 2),
+                "body_accel": round(body_accel, 2),
+                "bull_count": bull_count,
+                "bear_count": bear_count,
+                "atr14": round(atr14, 2)
+            }
+
+            # Filter 1: If recent bodies are smaller than 0.40 * ATR, it is micro-noise
+            if avg_recent_body < 0.40 * atr14:
+                return {
+                    "signal": 0,
+                    "confidence": 5.0,
+                    "thought": f"Part10 Stats: Micro-noise (body={avg_recent_body:.1f} < {0.4*atr14:.1f}) — Neutral",
+                    "telemetry": telemetry
+                }
+
+            # Filter 2: If wicks dominate (body ratio < 50%), it is indecision
+            if avg_body_ratio < 0.50:
+                return {
+                    "signal": 0,
+                    "confidence": 5.0,
+                    "thought": f"Part10 Stats: Wick Indecision (ratio={avg_body_ratio*100:.0f}%) — Neutral",
+                    "telemetry": telemetry
+                }
+
+            # Decision Gate 1: 3-bar streak with acceleration and dominance
+            if is_bull_streak and avg_body_ratio >= 0.55 and body_accel >= 1.3 and bull_count >= 6:
+                conf = min(85.0, 60.0 + (avg_body_ratio - 0.55) * 50.0 + min(body_accel, 2.5) * 5.0)
+                return {
+                    "signal": 1,
+                    "confidence": round(conf, 1),
+                    "thought": f"Part10 Stats: Bullish Candle Acceleration (streak=3, accel={body_accel:.1f}x, {bull_count}/10 green)",
+                    "telemetry": telemetry
+                }
+
+            if is_bear_streak and avg_body_ratio >= 0.55 and body_accel >= 1.3 and bear_count >= 6:
+                conf = min(85.0, 60.0 + (avg_body_ratio - 0.55) * 50.0 + min(body_accel, 2.5) * 5.0)
+                return {
+                    "signal": -1,
+                    "confidence": round(conf, 1),
+                    "thought": f"Part10 Stats: Bearish Candle Acceleration (streak=3, accel={body_accel:.1f}x, {bear_count}/10 red)",
+                    "telemetry": telemetry
+                }
+
+            # Decision Gate 2: Overwhelming run (8+ out of 10 candles with expansion)
+            if bull_count >= 8 and avg_recent_body >= 0.50 * atr14 and closes[-1] > opens[-1]:
+                conf = min(85.0, 65.0 + (bull_count - 8) * 10.0)
+                return {
+                    "signal": 1,
+                    "confidence": round(conf, 1),
+                    "thought": f"Part10 Stats: Overwhelming Bullish Run ({bull_count}/10 green)",
+                    "telemetry": telemetry
+                }
+
+            if bear_count >= 8 and avg_recent_body >= 0.50 * atr14 and closes[-1] < opens[-1]:
+                conf = min(85.0, 65.0 + (bear_count - 8) * 10.0)
+                return {
+                    "signal": -1,
+                    "confidence": round(conf, 1),
+                    "thought": f"Part10 Stats: Overwhelming Bearish Run ({bear_count}/10 red)",
+                    "telemetry": telemetry
+                }
+
+            # Mixed / Indecisive
+            return {
+                "signal": 0,
+                "confidence": 5.0,
+                "thought": f"Part10 Stats: Mixed Candles ({bull_count}G/{bear_count}R) — Neutral",
+                "telemetry": telemetry
+            }
+
+        except Exception as e:
+            return {
+                "signal": 0,
+                "confidence": 5.0,
+                "thought": f"Part10 Stats: Neutral (error: {e})",
+                "telemetry": {}
+            }
+
 
 # ==================== SYSTEM CONFIGURATION ====================
 import threading

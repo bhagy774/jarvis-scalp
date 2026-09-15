@@ -8,7 +8,7 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     TORCH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     TORCH_AVAILABLE = False
     # Dummy torch for compatibility
     class DummyTensor:
@@ -1472,6 +1472,146 @@ def setup_linux_trading_environment():
     os.environ['CUDA_LAUNCH_BLOCKING'] = '0'  # Non-blocking for execution
     
     print("OK Linux environment optimized for high-frequency trading")
+
+# ==================== GPU-OPTIMIZED PART-12: CONFIDENCE ENGINE ====================
+
+class ConfidenceEngineGPU:
+    """
+    INSTITUTIONAL QUANTITATIVE CONFIDENCE ENGINE (PART 12)
+    GTX 1650 CUDA & Multi-Factor Agreement Architecture
+    - Weighted Confluence Scoring based on Statistical Engine Edge
+    - Anchor Engine Concurrence Bonus (+5% to +10% when Trend, Structure, CVD align)
+    - Severe Dissent Penalties (-18% to -35% for contradictory anchor signals)
+    - Strict S/R Zone Conflict Penalty (-25% when trading into supply/demand walls)
+    - Quorum Filter: Enforces low baseline (10-30%) when < 3 engines agree
+    - Mathematically Clamped Confidence Range: [10, 95]
+    """
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Engine reliability weights based on quant edge
+        self.weights = {
+            'part1_breakout': 1.1,      # Volatility breakout
+            'part2_zone': 1.3,          # Supply & Demand Zone reaction
+            'part3_psychology': 1.0,    # Candlestick psychology & patterns
+            'part4_volume': 1.3,        # Volume profile (POC / Value Area)
+            'part5_ml': 1.2,            # Sharpe drift & regression t-statistic
+            'part6_trend': 1.5,         # Trend Engine (ADX + EMA spread) - Anchor
+            'part7_volatility': 1.1,    # Squeeze & Bollinger Expansion
+            'part8_structure': 1.4,     # Fractal Market Structure (BOS/CHoCH) - Anchor
+            'part9_orderflow': 1.4,     # Order Flow CVD Delta Imbalance - Anchor
+            'part10_candlestats': 1.0,  # Candle Body Acceleration & Dominance
+        }
+        self.anchors = {'part6_trend', 'part8_structure', 'part9_orderflow', 'part2_zone'}
+
+    def analyze(self, part_results: Union[Dict[str, Any], List[Any]]) -> Dict[str, Any]:
+        """
+        Calculates calibrated confidence score (10-95%) across all parts.
+        """
+        if not part_results:
+            return {"confidence": 10, "thought": "No part results available"}
+
+        if isinstance(part_results, dict):
+            items = list(part_results.items())
+        elif isinstance(part_results, list):
+            items = [(f"part_{i}", r) for i, r in enumerate(part_results)]
+        else:
+            return {"confidence": 10, "thought": "Invalid input to ConfidenceEngine"}
+
+        w_buy, w_sell = 0.0, 0.0
+        buy_engines, sell_engines = [], []
+        p2_thought = ""
+
+        for name, r in items:
+            if not isinstance(r, dict):
+                continue
+            sig = r.get('signal', 0)
+            try:
+                sig = float(sig)
+            except (ValueError, TypeError):
+                continue
+
+            w = self.weights.get(name, 1.0)
+            if 'zone' in name or 'support' in str(r.get('thought', '')).lower() or 'resistance' in str(r.get('thought', '')).lower():
+                p2_thought = str(r.get('thought', '')).lower()
+
+            if sig > 0:
+                w_buy += w * sig
+                buy_engines.append(name)
+            elif sig < 0:
+                w_sell += w * abs(sig)
+                sell_engines.append(name)
+
+        if len(buy_engines) == 0 and len(sell_engines) == 0:
+            return {
+                "confidence": 10,
+                "thought": "All parts neutral (Chop / Idle)",
+                "weighted_agree": 0.0,
+                "weighted_dissent": 0.0,
+                "confluence_ratio": 0.0
+            }
+
+        if w_buy >= w_sell:
+            majority_dir = 1
+            w_agree, w_dissent = w_buy, w_sell
+            agree_engines, dissent_engines = buy_engines, sell_engines
+        else:
+            majority_dir = -1
+            w_agree, w_dissent = w_sell, w_buy
+            agree_engines, dissent_engines = sell_engines, buy_engines
+
+        agree_count = len(agree_engines)
+        w_active = w_agree + w_dissent
+
+        # 1. Quorum check: If fewer than 3 engines or low weight, cap confidence low
+        if agree_count < 3 or w_active < 3.5:
+            conf = int(min(30, 10 + agree_count * 5 + w_agree * 3))
+            return {
+                "confidence": conf,
+                "thought": f"Low Confluence: {agree_count} engines, weight {w_agree:.1f}",
+                "weighted_agree": round(w_agree, 2),
+                "weighted_dissent": round(w_dissent, 2),
+                "confluence_ratio": round(w_agree / max(w_active, 1e-6), 2)
+            }
+
+        confluence_ratio = w_agree / w_active
+        saturation = min(1.0, w_agree / 6.0)
+        base_conf = 45.0 + (40.0 * confluence_ratio * saturation)
+
+        # 2. Anchor bonus: trend, structure, orderflow
+        aligned_anchors = [eng for eng in agree_engines if eng in self.anchors]
+        if len(aligned_anchors) >= 3:
+            base_conf += 10.0
+        elif len(aligned_anchors) == 2:
+            base_conf += 5.0
+
+        # 3. Anchor dissent penalties
+        dissenting_anchors = [eng for eng in dissent_engines if eng in self.anchors]
+        if len(dissenting_anchors) >= 2:
+            base_conf -= 35.0  # massive conflict
+        elif len(dissenting_anchors) == 1:
+            base_conf -= 18.0  # key anchor opposes
+
+        # 4. S/R Zone conflict penalty
+        if majority_dir == 1 and 'resistance zone' in p2_thought:
+            base_conf -= 25.0
+        elif majority_dir == -1 and 'support zone' in p2_thought:
+            base_conf -= 25.0
+
+        # 5. General dissent ratio penalty
+        if w_dissent > 0:
+            conflict_penalty = (w_dissent / w_agree) * 20.0
+            base_conf -= conflict_penalty
+
+        conf = int(max(10, min(95, round(base_conf))))
+        return {
+            "confidence": conf,
+            "thought": f"Confluence: {agree_count} parts ({conf}%), anchors aligned={len(aligned_anchors)}, dissenting={len(dissenting_anchors)}",
+            "weighted_agree": round(w_agree, 2),
+            "weighted_dissent": round(w_dissent, 2),
+            "confluence_ratio": round(confluence_ratio, 2)
+        }
+
 
 # ==================== MAIN EXECUTION ====================
 

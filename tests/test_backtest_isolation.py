@@ -4,9 +4,9 @@ import math
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parents[1]
 BACKTESTER_PATH = HERE / "jarvis_backtester.py"
 BRAIN_PATH = HERE / "jarvis_FIXED.py"
 BACKTESTER = BACKTESTER_PATH.read_text(encoding="utf-8")
@@ -20,12 +20,12 @@ def _isolated_classes():
     nodes = [node for node in module.body if isinstance(node, ast.ClassDef) and node.name in wanted]
     ns = {
         "math": math, "timedelta": timedelta, "datetime": datetime,
-        "List": List, "Optional": Optional, "Tuple": Tuple,
+        "List": List, "Optional": Optional, "Tuple": Tuple, "Dict": Dict,
         "pd": SimpleNamespace(Series=object),
         "LEVERAGE": 100, "MAX_RISK_USDT": 10.0,
         "MAX_DAILY_LOSS_USDT": 30.0, "MAX_OPEN_POSITIONS": 2,
         "MIN_CONFIDENCE": 70, "COOLDOWN_SECONDS": 180, "CONSEC_LOSS_LIMIT": 3,
-        "SCALP_TP_PCT": 0.004, "SCALP_SL_PCT": 0.002,
+        "SCALP_TP_PCT": 0.008, "SCALP_SL_PCT": 0.004,
         "SWING_TP_PCT": 0.020, "SWING_SL_PCT": 0.008,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(BACKTESTER_PATH), "exec"), ns)

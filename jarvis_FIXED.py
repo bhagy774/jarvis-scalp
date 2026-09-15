@@ -2449,12 +2449,17 @@ class Part1Breakout:
                 market_data = _df_to_market_data(data)
                 if len(market_data['price_action']) >= 20:
                     result = self._engine.analyze(market_data)
-                    sig = result.get('signal', 0)
                     brk = result.get('breakout', {})
+                    is_breakout = bool(brk.get('breakout_detected', False))
+                    brk_dir = int(brk.get('direction', 0))
+                    if not is_breakout or brk_dir == 0:
+                        sig = 0
+                    else:
+                        sig = result.get('signal', brk_dir)
                     lvl = result.get('levels', {})
                     thought = (
-                        f"P1-Engine: Breakout={'YES' if brk.get('breakout_detected') else 'NO'} "
-                        f"dir={brk.get('direction',0)} str={brk.get('strength',0):.2f} "
+                        f"P1-Engine: Breakout={'YES' if is_breakout else 'NO'} "
+                        f"dir={brk_dir} str={brk.get('strength',0):.2f} "
                         f"conf={result.get('confidence',0):.1f}"
                     )
                     return {"signal": sig, "thought": thought, "telemetry": {
@@ -2512,81 +2517,168 @@ class Part2Zone:
 
 class Part3Psychology:
     """Candle Psychology — backed by CandlePsychologyMasterGPU (Part3)"""
-    def analyze(self, data, context=None):
-        # ── Try institutional candle psychology from context ───────────────
-        if context and 'institutional_components' in context:
-            signals = context['institutional_components'].get('psychology', [])
-            if signals and isinstance(signals, list):
-                s = signals[-1] if isinstance(signals[-1], dict) else {}
-                if s:
-                    return {"signal": _sig_to_num(s.get('signal', 0)), "thought": f"Psych-Engine: {s.get('type')}"}
-
-        # ── Fallback: multi-candle body/wick analysis ──────────────────────
+    def __init__(self):
         try:
-            if len(data) < 3:
-                return {"signal": 0, "thought": "Insufficient data"}
-            scores = []
-            for _, row in data.tail(3).iterrows():
-                c, o = float(row['close']), float(row['open'])
-                h, l = float(row['high']),  float(row['low'])
-                body  = abs(c - o)
-                total = h - l
-                if total == 0:
-                    continue
-                body_ratio = body / total
-                upper_wick = (h - max(c, o)) / total
-                lower_wick = (min(c, o) - l) / total
-                if body_ratio > 0.6:            # strong candle
-                    scores.append(1 if c > o else -1)
-                elif lower_wick > 0.4:          # bullish hammer
-                    scores.append(1)
-                elif upper_wick > 0.4:          # bearish shooting star
-                    scores.append(-1)
-            if scores:
-                net = sum(scores)
-                if net >= 2:  return {"signal": 1,  "thought": f"Bullish Psychology x{net} (fallback)"}
-                if net <= -2: return {"signal": -1, "thought": f"Bearish Psychology x{abs(net)} (fallback)"}
+            from part3_FIXED import CandlePsychologyMasterGPU
+            self._engine = CandlePsychologyMasterGPU()
+        except Exception:
+            self._engine = None
+
+    def analyze(self, data, context=None):
+        # ── Try real Part 3 CandlePsychologyMasterGPU ─────────────────────
+        if self._engine is not None:
+            try:
+                res = self._engine.analyze(data, context=context)
+                if isinstance(res, dict):
+                    return res
+            except Exception as e:
+                logger.debug(f"Part3 CandlePsychology error: {e}")
+
+        # ── Fallback: multi-candle ATR-backed pattern analysis ────────────
+        try:
+            if len(data) < 15:
+                return {"signal": 0, "thought": "Insufficient data (<15)"}
+
+            highs = data['high'].tail(20).astype(float)
+            lows = data['low'].tail(20).astype(float)
+            closes = data['close'].tail(20).astype(float)
+            opens = data['open'].tail(20).astype(float)
+
+            tr = pd.concat([highs - lows, (highs - closes.shift(1)).abs(), (lows - closes.shift(1)).abs()], axis=1).max(axis=1)
+            atr = float(tr.tail(14).mean())
+
+            c, o, h, l = float(closes.iloc[-1]), float(opens.iloc[-1]), float(highs.iloc[-1]), float(lows.iloc[-1])
+            rng = max(h - l, 1e-8)
+            body = abs(c - o)
+            body_ratio = body / rng
+            upper_wick = (h - max(c, o)) / rng
+            lower_wick = (min(c, o) - l) / rng
+
+            # Micro-noise filter
+            if rng < 0.55 * atr or atr == 0:
+                return {"signal": 0, "thought": f"Noise/Micro-candle ({rng:.1f} < 0.55*ATR) — Neutral"}
+
+            prev_c, prev_o = float(closes.iloc[-2]), float(opens.iloc[-2])
+            prev_body = abs(prev_c - prev_o)
+
+            if lower_wick >= 0.55 and upper_wick <= 0.22 and body_ratio <= 0.35:
+                return {"signal": 1, "thought": f"Bullish Hammer/Pin Bar (lower wick {lower_wick*100:.0f}%) (fallback)"}
+            elif upper_wick >= 0.55 and lower_wick <= 0.22 and body_ratio <= 0.35:
+                return {"signal": -1, "thought": f"Bearish Shooting Star (upper wick {upper_wick*100:.0f}%) (fallback)"}
+            elif prev_c < prev_o and c > o and c >= prev_o and o <= prev_c and body > prev_body * 1.15 and body_ratio > 0.6:
+                return {"signal": 1, "thought": f"Bullish Engulfing (fallback)"}
+            elif prev_c > prev_o and c < o and c <= prev_o and o >= prev_c and body > prev_body * 1.15 and body_ratio > 0.6:
+                return {"signal": -1, "thought": f"Bearish Engulfing (fallback)"}
         except Exception:
             pass
         return {"signal": 0, "thought": "Neutral Psychology (fallback)"}
 
 
 class Part4Volume:
-    """Volume Profile Analysis — backed by VolumeProfileBrainGPU (Part2)"""
-    def analyze(self, data, context=None):
-        # ── Try institutional volume from context ──────────────────────────
-        if context and 'institutional_components' in context:
-            signals = context['institutional_components'].get('volume', [])
-            if signals and isinstance(signals, list) and len(signals) > 0:
-                s = signals[-1] if isinstance(signals[-1], dict) else {}
-                if s:
-                    return {"signal": _sig_to_num(s.get('signal', 0)), "thought": f"Vol-Engine: {s.get('type')}"}
-
-        # ── Fallback: multi-period volume analysis ─────────────────────────
+    """Volume Profile Analysis — backed by VolumeProfileEngineGPU (Part4)"""
+    def __init__(self):
         try:
-            if len(data) < 20:
-                return {"signal": 0, "thought": "Insufficient data"}
-            vol5  = float(data['volume'].tail(5).mean())
-            vol20 = float(data['volume'].tail(20).mean())
-            if vol20 == 0:
-                return {"signal": 0, "thought": "No volume"}
-            vol_ratio = vol5 / vol20
-            price_chg = (float(data['close'].iloc[-1]) - float(data['close'].iloc[-5])) / max(float(data['close'].iloc[-5]), 1)
-            if vol_ratio > 1.8 and price_chg > 0.002:
-                return {"signal": 1,  "thought": f"Strong Buy Volume {vol_ratio:.1f}x (fallback)"}
-            elif vol_ratio > 1.8 and price_chg < -0.002:
-                return {"signal": -1, "thought": f"Strong Sell Volume {vol_ratio:.1f}x (fallback)"}
-            elif vol_ratio < 0.5:
-                return {"signal": 0,  "thought": f"Low Volume {vol_ratio:.1f}x - caution (fallback)"}
+            from part4_FIXED import VolumeProfileEngineGPU
+            self._engine = VolumeProfileEngineGPU()
+        except Exception:
+            self._engine = None
+
+    def analyze(self, data, context=None):
+        # ── Try real Part 4 VolumeProfileEngineGPU ────────────────────────
+        if self._engine is not None:
+            try:
+                res = self._engine.analyze(data, context=context)
+                if isinstance(res, dict):
+                    return res
+            except Exception as e:
+                logger.debug(f"Part4 VolumeProfile error: {e}")
+
+        # ── Fallback: POC & Value Area (70%) analysis ──────────────────────
+        try:
+            if len(data) < 30:
+                return {"signal": 0, "thought": "Insufficient data (<30)"}
+
+            recent = data.tail(50).copy()
+            highs = recent['high'].astype(float)
+            lows = recent['low'].astype(float)
+            closes = recent['close'].astype(float)
+            volumes = recent['volume'].astype(float)
+
+            current_close = float(closes.iloc[-1])
+            current_vol = float(volumes.iloc[-1])
+            avg_vol = float(volumes.mean())
+            vol_ratio = current_vol / max(avg_vol, 1e-8)
+
+            last10 = recent.tail(10)
+            up_vol = float(last10.loc[last10['close'] > last10['open'], 'volume'].sum())
+            down_vol = float(last10.loc[last10['close'] < last10['open'], 'volume'].sum())
+            tot_vol = up_vol + down_vol
+            buy_delta_pct = (up_vol / tot_vol) if tot_vol > 0 else 0.5
+
+            min_p, max_p = float(lows.min()), float(highs.max())
+            if max_p <= min_p:
+                return {"signal": 0, "thought": "Flat price range"}
+
+            num_bins = 20
+            bin_size = (max_p - min_p) / num_bins
+            vol_bins = np.zeros(num_bins)
+            for _, row in recent.iterrows():
+                p = (float(row['high']) + float(row['low']) + float(row['close'])) / 3.0
+                b_idx = min(int((p - min_p) / bin_size), num_bins - 1)
+                vol_bins[b_idx] += float(row['volume'])
+
+            poc_idx = int(np.argmax(vol_bins))
+            poc_price = min_p + (poc_idx + 0.5) * bin_size
+
+            target_vol = 0.70 * vol_bins.sum()
+            va_indices = {poc_idx}
+            cur_vol = vol_bins[poc_idx]
+            up_idx, dn_idx = poc_idx + 1, poc_idx - 1
+            while cur_vol < target_vol and (up_idx < num_bins or dn_idx >= 0):
+                up_v = vol_bins[up_idx] if up_idx < num_bins else -1
+                dn_v = vol_bins[dn_idx] if dn_idx >= 0 else -1
+                if up_v >= dn_v and up_idx < num_bins:
+                    va_indices.add(up_idx); cur_vol += up_v; up_idx += 1
+                elif dn_idx >= 0:
+                    va_indices.add(dn_idx); cur_vol += dn_v; dn_idx -= 1
+                else: break
+
+            val_price = min_p + min(va_indices) * bin_size
+            vah_price = min_p + (max(va_indices) + 1) * bin_size
+
+            if vol_ratio < 0.6:
+                return {"signal": 0, "thought": f"Low Volume ({vol_ratio:.1f}x) — Neutral (fallback)"}
+            if val_price <= current_close <= vah_price:
+                return {"signal": 0, "thought": f"Inside Value Area (POC={poc_price:.0f}) — Neutral (fallback)"}
+            if current_close > vah_price and buy_delta_pct > 0.60 and vol_ratio >= 1.2:
+                return {"signal": 1, "thought": f"Bullish VA Breakout above {vah_price:.0f} (fallback)"}
+            if current_close < val_price and buy_delta_pct < 0.40 and vol_ratio >= 1.2:
+                return {"signal": -1, "thought": f"Bearish VA Breakdown below {val_price:.0f} (fallback)"}
         except Exception:
             pass
         return {"signal": 0, "thought": "Normal Volume (fallback)"}
 
 
 class Part5ML:
-    """ML Predictions — backed by NeuralNetworkManager (Part2)"""
+    """ML Predictions — backed by MLEngineGPU (Part5)"""
+    def __init__(self):
+        try:
+            from part5_FIXED import MLEngineGPU
+            self._engine = MLEngineGPU()
+        except Exception:
+            self._engine = None
+
     def analyze(self, data, context=None):
-        # ── Try neural predictions from context ───────────────────────────
+        # ── 1. Try real Part 5 MLEngineGPU ────────────────────────────────
+        if self._engine is not None:
+            try:
+                res = self._engine.analyze(data, context=context)
+                if isinstance(res, dict):
+                    return res
+            except Exception as e:
+                logger.debug(f"Part5 MLEngine error: {e}")
+
+        # ── 2. Try neural predictions from context ────────────────────────
         if context and 'neural_prediction' in context:
             preds = context.get('neural_prediction')
             if preds and isinstance(preds, dict):
@@ -2604,207 +2696,624 @@ class Part5ML:
                 except Exception:
                     pass
 
-        # ── Fallback: RandomForest-style feature check ─────────────────────
+        # ── 3. Fallback: High-Conviction Statistical Feature Check ─────────
         try:
-            if len(data) >= 20:
-                closes = data['close'].tail(20).astype(float).values
-                ret1  = (closes[-1] - closes[-2]) / closes[-2]
-                ret5  = (closes[-1] - closes[-5]) / closes[-5]
-                ret20 = (closes[-1] - closes[0])  / closes[0]
-                momentum_score = ret1 * 0.5 + ret5 * 0.3 + ret20 * 0.2
-                if momentum_score > 0.003:
-                    return {"signal": 1,  "thought": f"ML Momentum Bullish {momentum_score*100:.2f}% (fallback)"}
-                elif momentum_score < -0.003:
-                    return {"signal": -1, "thought": f"ML Momentum Bearish {momentum_score*100:.2f}% (fallback)"}
+            if len(data) >= 30:
+                closes = data['close'].tail(30).astype(float).values
+                vols = data['volume'].tail(30).astype(float).values
+
+                # Volatility-normalized Sharpe drift
+                rets = np.diff(closes) / np.maximum(closes[:-1], 1e-8)
+                ret_mean = float(np.mean(rets[-20:]))
+                ret_std = float(np.std(rets[-20:])) + 1e-8
+                sharpe_drift = ret_mean / ret_std
+
+                # Linear regression t-statistic (20 bars)
+                N = 20
+                x = np.arange(N, dtype=np.float64)
+                y_raw = closes[-N:]
+                y_std = float(np.std(y_raw)) + 1e-8
+                y = (y_raw - float(np.mean(y_raw))) / y_std
+                x_mean = float(np.mean(x))
+                x_dev = x - x_mean
+                ss_x = float(np.sum(x_dev ** 2)) + 1e-8
+                beta = float(np.sum(x_dev * y)) / ss_x
+                residuals = y - beta * x_dev
+                s_err = np.sqrt(float(np.sum(residuals ** 2)) / max(N - 2, 1)) / np.sqrt(ss_x)
+                t_stat = beta / (s_err + 1e-8)
+
+                # Volume & EMA
+                vol_curr = float(vols[-1])
+                vol_mean = float(np.mean(vols[-20:])) + 1e-8
+                vol_ratio = vol_curr / vol_mean
+                ema8 = float(pd.Series(closes).ewm(span=8).mean().iloc[-1])
+                ema21 = float(pd.Series(closes).ewm(span=21).mean().iloc[-1])
+
+                # RSI-14
+                diffs = np.diff(closes[-15:])
+                gains = np.where(diffs > 0, diffs, 0.0)
+                losses = np.where(diffs < 0, -diffs, 0.0)
+                avg_gain = float(np.mean(gains)) + 1e-8
+                avg_loss = float(np.mean(losses)) + 1e-8
+                rs = avg_gain / avg_loss
+                rsi = 100.0 - (100.0 / (1.0 + rs))
+                rsi_norm = (rsi - 50.0) / 25.0
+
+                composite = 0.35 * float(np.clip(sharpe_drift, -2.0, 2.0)) + \
+                            0.35 * float(np.clip(t_stat / 2.0, -2.0, 2.0)) + \
+                            0.30 * float(np.clip(rsi_norm, -2.0, 2.0))
+
+                if composite >= 0.50 and t_stat >= 2.0 and ema8 > ema21 and vol_ratio >= 0.8:
+                    return {"signal": 1,  "thought": f"ML Momentum Bullish Edge (comp={composite:.2f}, t={t_stat:.1f}, fallback)"}
+                elif composite <= -0.50 and t_stat <= -2.0 and ema8 < ema21 and vol_ratio >= 0.8:
+                    return {"signal": -1, "thought": f"ML Momentum Bearish Edge (comp={composite:.2f}, t={t_stat:.1f}, fallback)"}
         except Exception:
             pass
         return {"signal": 0, "thought": "ML Neutral (fallback)"}
 
 
 class Part6Trend:
-    """Trend Analysis — backed by TrendAnalysisBrainGPU via Part1 TrendBrain"""
-    def analyze(self, data, context=None):
-        # ── Try institutional trend signals from context ───────────────────
-        if context and 'institutional_components' in context:
-            signals = context['institutional_components'].get('trend', [])
-            if signals and isinstance(signals[-1], dict):
-                s = signals[-1]
-                return {"signal": _sig_to_num(s.get('signal', 0)), "thought": f"Trend-Engine: {s.get('type')}"}
+    """Trend Analysis — backed by TrendEngineGPU (Part6)"""
+    def __init__(self):
+        try:
+            from part6_FIXED import TrendEngineGPU
+            self._engine = TrendEngineGPU()
+        except Exception:
+            self._engine = None
 
-        # ── Fallback: multi-EMA trend detection ───────────────────────────
+    def analyze(self, data, context=None):
+        # ── Try real Part 6 TrendEngineGPU ────────────────────────────────
+        if self._engine is not None:
+            try:
+                res = self._engine.analyze(data, context=context)
+                if isinstance(res, dict):
+                    return res
+            except Exception as e:
+                logger.debug(f"Part6 TrendEngine error: {e}")
+
+        # ── Fallback: multi-EMA + ADX chop filter ─────────────────────────
         try:
             if len(data) >= 50:
                 closes = data['close'].tail(50).astype(float)
-                ema8   = closes.ewm(span=8).mean().iloc[-1]
-                ema21  = closes.ewm(span=21).mean().iloc[-1]
-                ema50  = closes.ewm(span=50).mean().iloc[-1]
+                highs  = data['high'].tail(50).astype(float)
+                lows   = data['low'].tail(50).astype(float)
+
                 current = float(closes.iloc[-1])
+                ema8   = float(closes.ewm(span=8).mean().iloc[-1])
+                ema21  = float(closes.ewm(span=21).mean().iloc[-1])
+                ema50  = float(closes.ewm(span=50).mean().iloc[-1])
+
+                spread = abs(ema8 - ema21) / max(ema21, 1.0)
+                
+                # ADX 14-period approximation
+                tr = pd.concat([highs - lows, (highs - closes.shift(1)).abs(), (lows - closes.shift(1)).abs()], axis=1).max(axis=1)
+                atr14 = float(tr.rolling(14).mean().iloc[-1])
+                up_move = highs.diff()
+                down_move = -lows.diff()
+                plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+                minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+                plus_di = 100.0 * float(pd.Series(plus_dm, index=highs.index).rolling(14).mean().iloc[-1] / max(atr14, 1e-8))
+                minus_di = 100.0 * float(pd.Series(minus_dm, index=lows.index).rolling(14).mean().iloc[-1] / max(atr14, 1e-8))
+                dx = 100.0 * abs(plus_di - minus_di) / max(plus_di + minus_di, 1e-8)
+
+                # Chop Filter: if spread < 0.08% or DX < 20, market is in CHOP / RANGE
+                if spread < 0.0008 or dx < 20.0:
+                    return {"signal": 0, "thought": f"Chop/Rangebound (DX={dx:.1f}, spread={spread*100:.3f}%) — Neutral"}
+
                 # Strong trend: price > ema8 > ema21 > ema50
-                if current > ema8 > ema21 > ema50:
-                    return {"signal": 1,  "thought": f"Strong Uptrend EMA8>{ema21:.0f}>{ema50:.0f} (fallback)"}
-                elif current < ema8 < ema21 < ema50:
-                    return {"signal": -1, "thought": f"Strong Downtrend EMA8<{ema21:.0f}<{ema50:.0f} (fallback)"}
-                elif ema8 > ema21:
-                    return {"signal": 1,  "thought": f"Mild Uptrend EMA8>{ema21:.0f} (fallback)"}
-                elif ema8 < ema21:
-                    return {"signal": -1, "thought": f"Mild Downtrend EMA8<{ema21:.0f} (fallback)"}
+                if current > ema8 > ema21 > ema50 and plus_di > minus_di:
+                    return {"signal": 1,  "thought": f"Strong Uptrend EMA8>{ema21:.0f}>{ema50:.0f} (DX={dx:.1f})"}
+                elif current < ema8 < ema21 < ema50 and minus_di > plus_di:
+                    return {"signal": -1, "thought": f"Strong Downtrend EMA8<{ema21:.0f}<{ema50:.0f} (DX={dx:.1f})"}
+                elif ema8 > ema21 and current > ema21 and plus_di > minus_di and spread >= 0.0012:
+                    return {"signal": 1,  "thought": f"Moderate Uptrend EMA8>{ema21:.0f} (DX={dx:.1f})"}
+                elif ema8 < ema21 and current < ema21 and minus_di > plus_di and spread >= 0.0012:
+                    return {"signal": -1, "thought": f"Moderate Downtrend EMA8<{ema21:.0f} (DX={dx:.1f})"}
         except Exception:
             pass
         return {"signal": 0, "thought": "No Clear Trend (fallback)"}
 
 
 class Part7Volatility:
-    """Volatility/ATR Analysis — backed by VolatilityRegimeBrainGPU (Part2)"""
-    def analyze(self, data, context=None):
+    """Volatility/ATR Analysis — backed by VolatilityEngineGPU (Part7)"""
+    def __init__(self):
         try:
-            # ── Check regime from context ──────────────────────────────────
-            regime = 'NEUTRAL'
-            if context:
-                regime = context.get('institutional_components', {}).get('regime', 'NEUTRAL')
-            if 'VOLATILE' in str(regime):
-                return {"signal": 0, "thought": f"High Volatility Regime ({regime}) — No trade"}
+            from part7_FIXED import VolatilityEngineGPU
+            self._engine = VolatilityEngineGPU()
+        except Exception:
+            self._engine = None
 
-            # ── ATR-based regime detection ─────────────────────────────────
-            if len(data) >= 14:
-                highs  = data['high'].tail(14).astype(float)
-                lows   = data['low'].tail(14).astype(float)
-                closes = data['close'].tail(14).astype(float)
-                tr     = (highs - lows).mean()
-                atr_pct = tr / float(closes.iloc[-1])
-                # High ATR = high vol = caution; Low ATR = trending
-                if atr_pct > 0.015:   # > 1.5% per candle = very high vol
-                    return {"signal": 0,  "thought": f"ATR Regime HIGH {atr_pct*100:.2f}% — no trade (fallback)"}
-                price_chg = (float(closes.iloc[-1]) - float(closes.iloc[-10])) / float(closes.iloc[-10])
-                if price_chg > 0.005:
-                    return {"signal": 1,  "thought": f"Bullish Momentum ATR {atr_pct*100:.2f}% (fallback)"}
-                elif price_chg < -0.005:
-                    return {"signal": -1, "thought": f"Bearish Momentum ATR {atr_pct*100:.2f}% (fallback)"}
+    def analyze(self, data, context=None):
+        # ── 1. Try real Part 7 VolatilityEngineGPU ────────────────────────
+        if self._engine is not None:
+            try:
+                res = self._engine.analyze(data, context=context)
+                if isinstance(res, dict):
+                    return res
+            except Exception as e:
+                logger.debug(f"Part7 VolatilityEngine error: {e}")
+
+        # ── 2. Fallback: Quantitative Volatility & Regime Check ───────────
+        try:
+            if context:
+                regime = str(context.get('institutional_components', {}).get('regime', 'NEUTRAL')).upper()
+                if 'VOLATILE' in regime or 'PANIC' in regime:
+                    return {"signal": 0, "thought": f"High Volatility Regime ({regime}) — No trade (fallback)"}
+
+            if len(data) >= 30:
+                closes = data['close'].tail(50).astype(float)
+                highs  = data['high'].tail(50).astype(float)
+                lows   = data['low'].tail(50).astype(float)
+                current_close = float(closes.iloc[-1])
+
+                sma20 = float(closes.tail(20).mean())
+                std20 = float(closes.tail(20).std()) + 1e-8
+                upper_bb = sma20 + 2.0 * std20
+                lower_bb = sma20 - 2.0 * std20
+                pct_b = (current_close - lower_bb) / (upper_bb - lower_bb + 1e-8)
+
+                tr = pd.concat([
+                    highs - lows,
+                    (highs - closes.shift(1)).abs(),
+                    (lows - closes.shift(1)).abs()
+                ], axis=1).max(axis=1)
+                atr14 = float(tr.tail(14).mean())
+                atr50 = float(tr.tail(50).mean()) if len(tr) >= 50 else atr14
+                ema20 = float(closes.ewm(span=20).mean().iloc[-1])
+
+                upper_kc = ema20 + 1.5 * atr14
+                lower_kc = ema20 - 1.5 * atr14
+                is_squeeze = (upper_bb < upper_kc) and (lower_bb > lower_kc)
+                vol_ratio = atr14 / (atr50 + 1e-8)
+                norm_atr = atr14 / max(current_close, 1.0)
+
+                if vol_ratio > 2.8 or norm_atr > 0.015:
+                    return {"signal": 0, "thought": f"ATR Regime Extreme {norm_atr*100:.2f}% — no trade (fallback)"}
+
+                if is_squeeze:
+                    return {"signal": 0, "thought": "TTM Squeeze Coiling — Neutral (fallback)"}
+
+                if pct_b >= 0.85 and current_close > upper_bb and vol_ratio >= 1.0:
+                    return {"signal": 1, "thought": f"Bullish Volatility Expansion %B={pct_b:.2f} (fallback)"}
+                elif pct_b <= 0.15 and current_close < lower_bb and vol_ratio >= 1.0:
+                    return {"signal": -1, "thought": f"Bearish Volatility Breakdown %B={pct_b:.2f} (fallback)"}
         except Exception:
             pass
         return {"signal": 0, "thought": "Stable Volatility (fallback)"}
 
 
 class Part8Structure:
-    """Market Structure — backed by MarketStructureBrainGPU (Part2) + PatternEngine (Part8)"""
+    """Market Structure — backed by MarketStructureEngineGPU (Part8)"""
+    def __init__(self):
+        try:
+            from part8_FIXED import MarketStructureEngineGPU
+            self._engine = MarketStructureEngineGPU()
+        except Exception:
+            self._engine = None
+
     def analyze(self, data, context=None):
+        # ── 1. Try real Part 8 MarketStructureEngineGPU ────────────────────
+        if self._engine is not None:
+            try:
+                res = self._engine.analyze(data, context=context)
+                if isinstance(res, dict):
+                    return res
+            except Exception as e:
+                logger.debug(f"Part8 MarketStructureEngine error: {e}")
+
+        # ── 2. Fallback: Quantitative Fractal BOS / CHoCH Check ───────────
         try:
             if len(data) >= 30:
-                highs = data['high'].tail(30).astype(float).values
-                lows  = data['low'].tail(30).astype(float).values
-                # Last 5 vs prior 10 bars
-                recent_high  = max(highs[-5:])
-                prior_high   = max(highs[-20:-5])
-                recent_low   = min(lows[-5:])
-                prior_low    = min(lows[-20:-5])
-                # Double check with mid-section
-                mid_high = max(highs[-15:-5])
-                mid_low  = min(lows[-15:-5])
+                recent = data.tail(50).copy()
+                highs  = recent['high'].astype(float).values
+                lows   = recent['low'].astype(float).values
+                closes = recent['close'].astype(float).values
+                vols   = recent['volume'].astype(float).values
+                current_close = float(closes[-1])
 
-                if recent_high > prior_high and recent_low > prior_low:
-                    return {"signal": 1,  "thought": "HH+HL Bullish Structure (Part8 engine)"}
-                elif recent_high < prior_high and recent_low < prior_low:
-                    return {"signal": -1, "thought": "LH+LL Bearish Structure (Part8 engine)"}
-                elif recent_high > mid_high:
-                    return {"signal": 1,  "thought": "Breaking structure UP (Part8 engine)"}
-                elif recent_low < mid_low:
-                    return {"signal": -1, "thought": "Breaking structure DOWN (Part8 engine)"}
+                tr = np.maximum(
+                    highs[1:] - lows[1:],
+                    np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1]))
+                )
+                atr14 = float(np.mean(tr[-14:])) if len(tr) >= 14 else float(highs[-1] - lows[-1])
+                noise_buffer = 0.20 * atr14
+
+                k = 2
+                lookback = min(len(recent) - k, 45)
+                swing_highs = []
+                swing_lows  = []
+
+                for idx in range(len(recent) - lookback, len(recent) - k):
+                    h = highs[idx]
+                    l = lows[idx]
+                    if all(h > highs[idx - i] for i in range(1, k + 1)) and all(h >= highs[idx + i] for i in range(1, k + 1)):
+                        swing_highs.append((idx, float(h)))
+                    if all(l < lows[idx - i] for i in range(1, k + 1)) and all(l <= lows[idx + i] for i in range(1, k + 1)):
+                        swing_lows.append((idx, float(l)))
+
+                if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+                    last_sh = swing_highs[-1][1]
+                    prev_sh = swing_highs[-2][1]
+                    last_sl = swing_lows[-1][1]
+                    prev_sl = swing_lows[-2][1]
+
+                    bullish_bos = current_close > (last_sh + noise_buffer)
+                    bearish_bos = current_close < (last_sl - noise_buffer)
+                    bullish_choch = (last_sh < prev_sh) and (current_close > last_sh + noise_buffer)
+                    bearish_choch = (last_sl > prev_sl) and (current_close < last_sl - noise_buffer)
+
+                    ema20 = float(pd.Series(closes).ewm(span=20).mean().iloc[-1])
+                    vol_curr = float(vols[-1])
+                    vol_mean = float(np.mean(vols[-20:])) + 1e-8
+                    vol_ok = (vol_curr / vol_mean) >= 0.75
+
+                    if (bullish_bos or bullish_choch) and current_close > ema20 and vol_ok:
+                        label = 'CHoCH' if bullish_choch else 'BOS'
+                        return {"signal": 1,  "thought": f"Bullish Structure {label} above {last_sh:.1f} (fallback)"}
+                    if (bearish_bos or bearish_choch) and current_close < ema20 and vol_ok:
+                        label = 'CHoCH' if bearish_choch else 'BOS'
+                        return {"signal": -1, "thought": f"Bearish Structure {label} below {last_sl:.1f} (fallback)"}
         except Exception:
             pass
-        return {"signal": 0, "thought": "No Clear Structure (fallback)"}
+        return {"signal": 0, "thought": "Structure Consolidation / Neutral (fallback)"}
 
 
 class Part9Orderflow:
-    """Orderflow/Delta — backed by OrderFlowBrainGPU (Part2)"""
-    def analyze(self, data, context=None):
+    """Orderflow/Delta — backed by OrderflowEngineGPU (Part9)"""
+    def __init__(self):
         try:
-            if len(data) >= 10:
-                last10 = data.tail(10)
-                closes  = last10['close'].astype(float)
-                volumes = last10['volume'].astype(float)
-                opens   = last10['open'].astype(float)
-                # Approximate buy/sell volume per candle
-                buy_vol  = float((volumes * (closes > opens)).sum())
-                sell_vol = float((volumes * (closes < opens)).sum())
-                total_vol = buy_vol + sell_vol
-                if total_vol > 0:
-                    buy_pct = buy_vol / total_vol
-                    price_chg = (float(closes.iloc[-1]) - float(closes.iloc[0])) / max(float(closes.iloc[0]), 1)
-                    # Divergence: price up but seller dominated
-                    if price_chg > 0.002 and buy_pct < 0.35:
-                        return {"signal": -1, "thought": f"Bearish Orderflow Div (buy={buy_pct*100:.0f}%, price+) (fallback)"}
-                    elif price_chg < -0.002 and buy_pct > 0.65:
-                        return {"signal": 1,  "thought": f"Bullish Orderflow Div (buy={buy_pct*100:.0f}%, price-) (fallback)"}
-                    elif buy_pct > 0.65 and price_chg > 0:
-                        return {"signal": 1,  "thought": f"Bullish Flow {buy_pct*100:.0f}% buys (fallback)"}
-                    elif buy_pct < 0.35 and price_chg < 0:
-                        return {"signal": -1, "thought": f"Bearish Flow {(1-buy_pct)*100:.0f}% sells (fallback)"}
+            from part9_FIXED import OrderflowEngineGPU
+            self._engine = OrderflowEngineGPU()
+        except Exception:
+            self._engine = None
+
+    def analyze(self, data, context=None):
+        # ── 1. Try real Part 9 OrderflowEngineGPU ──────────────────────────
+        if self._engine is not None:
+            try:
+                res = self._engine.analyze(data, context=context)
+                if isinstance(res, dict):
+                    return res
+            except Exception as e:
+                logger.debug(f"Part9 OrderflowEngine error: {e}")
+
+        # ── 2. Fallback: Quantitative CVD & Volume Delta Analysis ──────────
+        try:
+            if len(data) >= 20:
+                recent = data.tail(35).copy()
+                highs  = recent['high'].astype(float).values
+                lows   = recent['low'].astype(float).values
+                closes = recent['close'].astype(float).values
+                vols   = recent['volume'].astype(float).values
+
+                candle_ranges = np.maximum(highs - lows, 1e-8)
+                delta_ratios = (2.0 * (closes - lows) - candle_ranges) / candle_ranges
+                deltas = vols * delta_ratios
+
+                N = 20
+                cvd_20 = float(np.sum(deltas[-N:]))
+                tot_vol_20 = float(np.sum(vols[-N:])) + 1e-8
+                cvd_ratio = cvd_20 / tot_vol_20
+
+                cvd_5 = float(np.sum(deltas[-5:]))
+                tot_vol_5 = float(np.sum(vols[-5:])) + 1e-8
+                cvd_ratio_5 = cvd_5 / tot_vol_5
+
+                current_close = float(closes[-1])
+                price_chg_20 = float((current_close - closes[-N]) / max(closes[-N], 1e-8))
+                ema20 = float(pd.Series(closes).ewm(span=20).mean().iloc[-1])
+
+                bullish_div = (price_chg_20 < -0.0025) and (cvd_ratio > 0.25)
+                bearish_div = (price_chg_20 > 0.0025) and (cvd_ratio < -0.25)
+
+                bullish_flow = (cvd_ratio > 0.30) and (cvd_ratio_5 > 0.15) and (current_close > ema20)
+                bearish_flow = (cvd_ratio < -0.30) and (cvd_ratio_5 < -0.15) and (current_close < ema20)
+
+                if bullish_div:
+                    return {"signal": 1,  "thought": f"Bullish Absorption Divergence (CVD={cvd_ratio*100:+.0f}%, Price-) (fallback)"}
+                if bearish_div:
+                    return {"signal": -1, "thought": f"Bearish Absorption Divergence (CVD={cvd_ratio*100:+.0f}%, Price+) (fallback)"}
+                if bullish_flow:
+                    return {"signal": 1,  "thought": f"Bullish Volume Delta Imbalance (CVD={cvd_ratio*100:+.0f}%) (fallback)"}
+                if bearish_flow:
+                    return {"signal": -1, "thought": f"Bearish Volume Delta Imbalance (CVD={cvd_ratio*100:+.0f}%) (fallback)"}
         except Exception:
             pass
-        return {"signal": 0, "thought": "No Clear Orderflow (fallback)"}
+        return {"signal": 0, "thought": "Balanced Orderflow / Neutral (fallback)"}
 
 
 class Part10Candlestats:
-    """Multi-candle Statistical Analysis — backed by PriceActionBrainGPU (Part2)"""
-    def analyze(self, data, context=None):
+    """Multi-candle Statistical Analysis — backed by CandleStatsEngineGPU (Part10)"""
+    def __init__(self):
         try:
-            if len(data) >= 10:
-                last10 = data.tail(10)
-                bull_count = sum(1 for _, r in last10.iterrows() if float(r['close']) > float(r['open']))
+            from part10_FIXED import CandleStatsEngineGPU
+            self._engine = CandleStatsEngineGPU()
+        except Exception:
+            self._engine = None
+
+    def analyze(self, data, context=None):
+        # ── 1. Try real Part 10 CandleStatsEngineGPU ───────────────────────
+        if self._engine is not None:
+            try:
+                res = self._engine.analyze(data, context=context)
+                if isinstance(res, dict):
+                    return res
+            except Exception as e:
+                logger.debug(f"Part10 CandleStatsEngine error: {e}")
+
+        # ── 2. Fallback: Quantitative Multi-bar Candle Analytics ───────────
+        try:
+            if len(data) >= 20:
+                recent = data.tail(25).copy()
+                closes = recent['close'].astype(float).values
+                opens  = recent['open'].astype(float).values
+                highs  = recent['high'].astype(float).values
+                lows   = recent['low'].astype(float).values
+
+                tr = np.maximum(
+                    highs[1:] - lows[1:],
+                    np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1]))
+                )
+                atr14 = float(np.mean(tr[-14:])) if len(tr) >= 14 else float(np.mean(highs - lows))
+
+                bodies = np.abs(closes[-3:] - opens[-3:])
+                avg_recent_body = float(np.mean(bodies))
+
+                ranges = np.maximum(highs[-3:] - lows[-3:], 1e-8)
+                body_ratios = bodies / ranges
+                avg_body_ratio = float(np.mean(body_ratios))
+
+                if avg_recent_body < 0.40 * atr14 or avg_body_ratio < 0.50:
+                    return {"signal": 0, "thought": "Micro-noise / Indecisive Bodies (fallback)"}
+
+                is_bull_streak = all(closes[-i] > opens[-i] for i in range(1, 4)) and (closes[-1] > closes[-2] > closes[-3])
+                is_bear_streak = all(closes[-i] < opens[-i] for i in range(1, 4)) and (closes[-1] < closes[-2] < closes[-3])
+
+                last10_closes = closes[-10:]
+                last10_opens  = opens[-10:]
+                bull_count = int(np.sum(last10_closes > last10_opens))
                 bear_count = 10 - bull_count
-                # Candle run signal
-                if bear_count >= 7:
-                    return {"signal": -1, "thought": f"Bearish Candle Run {bear_count}/10 red (Part10)"}
-                elif bull_count >= 7:
-                    return {"signal": 1,  "thought": f"Bullish Candle Run {bull_count}/10 green (Part10)"}
-                # Momentum via body size trend
-                recent_bodies = [abs(float(r['close'])-float(r['open'])) for _, r in last10.tail(3).iterrows()]
-                prior_bodies  = [abs(float(r['close'])-float(r['open'])) for _, r in last10.head(7).iterrows()]
-                if prior_bodies:
-                    body_accel = sum(recent_bodies)/3 / (sum(prior_bodies)/7 + 1e-8)
-                    if body_accel > 1.5:
-                        dir_sig = 1 if bull_count > bear_count else -1
-                        return {"signal": dir_sig, "thought": f"Accelerating candle bodies {body_accel:.1f}x (Part10)"}
+
+                baseline_bodies = np.abs(closes[-10:-3] - opens[-10:-3])
+                avg_baseline = float(np.mean(baseline_bodies)) if len(baseline_bodies) > 0 else avg_recent_body
+                body_accel = float(avg_recent_body / max(avg_baseline, 0.30 * atr14))
+
+                if is_bull_streak and avg_body_ratio >= 0.55 and body_accel >= 1.3 and bull_count >= 6:
+                    return {"signal": 1,  "thought": f"Bullish Candle Run Streak=3 Accel={body_accel:.1f}x (fallback)"}
+                if is_bear_streak and avg_body_ratio >= 0.55 and body_accel >= 1.3 and bear_count >= 6:
+                    return {"signal": -1, "thought": f"Bearish Candle Run Streak=3 Accel={body_accel:.1f}x (fallback)"}
+                if bull_count >= 8 and avg_recent_body >= 0.50 * atr14 and closes[-1] > opens[-1]:
+                    return {"signal": 1,  "thought": f"Overwhelming Bullish Run {bull_count}/10 green (fallback)"}
+                if bear_count >= 8 and avg_recent_body >= 0.50 * atr14 and closes[-1] < opens[-1]:
+                    return {"signal": -1, "thought": f"Overwhelming Bearish Run {bear_count}/10 red (fallback)"}
         except Exception:
             pass
-        return {"signal": 0, "thought": "Mixed Candles (fallback)"}
+        return {"signal": 0, "thought": "Mixed / Indecisive Candles (fallback)"}
 
 
 class Part11Fusion:
-    """Fusion — proportional voting across all active part results"""
+    """Fusion — Institutional Weighted Voting & Multi-Engine Confluence with Zone Veto Protection"""
+    def __init__(self):
+        self._engine = None
+        try:
+            from part11_FIXED import SignalFusionEngineGPU
+            self._engine = SignalFusionEngineGPU()
+        except Exception:
+            self._engine = None
+
     def analyze(self, part_results):
-        buy_votes  = sum(1 for r in part_results if isinstance(r, dict) and r.get('signal', 0) > 0)
-        sell_votes = sum(1 for r in part_results if isinstance(r, dict) and r.get('signal', 0) < 0)
-        total_active = buy_votes + sell_votes
-        if total_active == 0:
-            return {"signal": 0, "thought": "No active votes"}
-        buy_pct  = buy_votes  / total_active
-        sell_pct = sell_votes / total_active
-        if buy_pct >= 0.6:
-            return {"signal": 1,  "thought": f"Fusion: {buy_votes} BUY vs {sell_votes} SELL ({buy_pct*100:.0f}% majority)"}
-        elif sell_pct >= 0.6:
-            return {"signal": -1, "thought": f"Fusion: {sell_votes} SELL vs {buy_votes} BUY ({sell_pct*100:.0f}% majority)"}
-        return {"signal": 0, "thought": f"Fusion Split: {buy_votes} BUY vs {sell_votes} SELL (no majority)"}
+        if self._engine is not None:
+            try:
+                res = self._engine.analyze(part_results)
+                if isinstance(res, dict) and 'signal' in res:
+                    return res
+            except Exception:
+                pass
+
+        # Fallback: Institutional Weighted Voting & Confluence Consensus
+        if isinstance(part_results, dict):
+            results_dict = part_results
+            p2 = part_results.get('part2_zone', {})
+        elif isinstance(part_results, list):
+            results_dict = {f"part_{i}": r for i, r in enumerate(part_results)}
+            p2 = next((r for r in part_results if isinstance(r, dict) and ('support zone' in r.get('thought', '').lower() or 'resistance zone' in r.get('thought', '').lower())), {})
+        else:
+            return {"signal": 0, "thought": "Invalid input"}
+
+        weights = {
+            'part1_breakout': 1.1,
+            'part2_zone': 1.3,
+            'part3_psychology': 1.0,
+            'part4_volume': 1.3,
+            'part5_ml': 1.2,
+            'part6_trend': 1.5,
+            'part7_volatility': 1.1,
+            'part8_structure': 1.4,
+            'part9_orderflow': 1.4,
+            'part10_candlestats': 1.0,
+        }
+
+        weighted_buy = 0.0
+        weighted_sell = 0.0
+        active_buy_engines = []
+        active_sell_engines = []
+
+        for name, r in results_dict.items():
+            if not isinstance(r, dict):
+                continue
+            sig = r.get('signal', 0)
+            try:
+                sig = float(sig)
+            except (ValueError, TypeError):
+                continue
+
+            w = weights.get(name, 1.0)
+            if sig > 0:
+                weighted_buy += w * sig
+                active_buy_engines.append(name)
+            elif sig < 0:
+                weighted_sell += w * abs(sig)
+                active_sell_engines.append(name)
+
+        total_weight = weighted_buy + weighted_sell
+        total_active_engines = len(active_buy_engines) + len(active_sell_engines)
+
+        # Quorum & Confluence Threshold: Minimum 3 active engines & 3.5 total weight
+        if total_active_engines < 3 or total_weight < 3.5:
+            return {"signal": 0, "thought": f"Fusion Neutral: Insufficient confluence ({total_active_engines}/3 engines, weight {total_weight:.1f}/3.5)"}
+
+        buy_ratio = weighted_buy / total_weight
+        sell_ratio = weighted_sell / total_weight
+
+        p2_thought = str(p2.get('thought', '')).lower()
+        p2_sig = p2.get('signal', 0)
+
+        # 🛡️ ZONE VETO: If at Support Zone bottom, strictly VETO all SELL/PUT trades!
+        # If at Resistance Zone top, strictly VETO all BUY/CALL trades!
+        if buy_ratio >= 0.65:
+            if p2_sig == -1 or 'resistance zone' in p2_thought:
+                return {"signal": 0, "thought": f"Zone Veto: BUY blocked at Resistance Zone ({p2.get('thought')})"}
+            strong_opponents = [eng for eng in active_sell_engines if eng in ('part6_trend', 'part8_structure', 'part9_orderflow')]
+            if len(strong_opponents) >= 2:
+                return {"signal": 0, "thought": f"Fusion Dissent Veto: BUY opposed by key anchors {strong_opponents}"}
+            return {"signal": 1,  "thought": f"Fusion Bullish: {len(active_buy_engines)} engines ({buy_ratio*100:.0f}% weighted consensus, score={weighted_buy:.1f})"}
+
+        elif sell_ratio >= 0.65:
+            if p2_sig == 1 or 'support zone' in p2_thought:
+                return {"signal": 0, "thought": f"Zone Veto: SELL blocked at Support Zone ({p2.get('thought')})"}
+            strong_opponents = [eng for eng in active_buy_engines if eng in ('part6_trend', 'part8_structure', 'part9_orderflow')]
+            if len(strong_opponents) >= 2:
+                return {"signal": 0, "thought": f"Fusion Dissent Veto: SELL opposed by key anchors {strong_opponents}"}
+            return {"signal": -1, "thought": f"Fusion Bearish: {len(active_sell_engines)} engines ({sell_ratio*100:.0f}% weighted consensus, score={weighted_sell:.1f})"}
+
+        return {"signal": 0, "thought": f"Fusion Split: Conflict between Bull ({weighted_buy:.1f}) and Bear ({weighted_sell:.1f})"}
 
 
 class Part12Confidence:
-    """Confidence Score — based on agreement strength across all parts"""
+    """Confidence Score — Institutional Weighted Confluence across all active parts"""
+    def __init__(self):
+        self._engine = None
+        try:
+            from part12_FIXED import ConfidenceEngineGPU
+            self._engine = ConfidenceEngineGPU()
+        except Exception:
+            self._engine = None
+
     def analyze(self, part_results):
+        if self._engine is not None:
+            try:
+                res = self._engine.analyze(part_results)
+                if isinstance(res, dict) and 'confidence' in res:
+                    return res
+            except Exception:
+                pass
+
+        # Fallback: Institutional Weighted Confluence Calculation
         if not part_results:
-            return {"confidence": 10}
-        valid = [r for r in part_results if isinstance(r, dict)]
-        total = len(valid)
-        if total == 0:
-            return {"confidence": 10}
-        buy  = sum(1 for r in valid if r.get('signal', 0) > 0)
-        sell = sum(1 for r in valid if r.get('signal', 0) < 0)
-        majority    = max(buy, sell)
-        agree_pct   = majority / total
-        confidence  = int(agree_pct * 90)   # max 90 from parts alone
-        # Penalise split decisions
-        if buy > 0 and sell > 0:
-            conflict_ratio = min(buy, sell) / max(buy, sell)
-            confidence = int(confidence * (1 - conflict_ratio * 0.5))
-        return {"confidence": max(10, min(90, confidence))}
+            return {"confidence": 10, "thought": "No data"}
+            
+        if isinstance(part_results, dict):
+            items = list(part_results.items())
+        elif isinstance(part_results, list):
+            items = [(f"part_{i}", r) for i, r in enumerate(part_results)]
+        else:
+            return {"confidence": 10, "thought": "Invalid input"}
+
+        weights = {
+            'part1_breakout': 1.1,
+            'part2_zone': 1.3,
+            'part3_psychology': 1.0,
+            'part4_volume': 1.3,
+            'part5_ml': 1.2,
+            'part6_trend': 1.5,
+            'part7_volatility': 1.1,
+            'part8_structure': 1.4,
+            'part9_orderflow': 1.4,
+            'part10_candlestats': 1.0,
+        }
+        anchors = {'part6_trend', 'part8_structure', 'part9_orderflow', 'part2_zone'}
+
+        w_buy, w_sell = 0.0, 0.0
+        buy_engines, sell_engines = [], []
+        p2_thought = ""
+
+        for name, r in items:
+            if not isinstance(r, dict):
+                continue
+            sig = r.get('signal', 0)
+            try:
+                sig = float(sig)
+            except (ValueError, TypeError):
+                continue
+
+            w = weights.get(name, 1.0)
+            if 'zone' in name or 'support' in str(r.get('thought', '')).lower() or 'resistance' in str(r.get('thought', '')).lower():
+                p2_thought = str(r.get('thought', '')).lower()
+
+            if sig > 0:
+                w_buy += w * sig
+                buy_engines.append(name)
+            elif sig < 0:
+                w_sell += w * abs(sig)
+                sell_engines.append(name)
+
+        if len(buy_engines) == 0 and len(sell_engines) == 0:
+            return {"confidence": 10, "thought": "All parts neutral"}
+
+        if w_buy >= w_sell:
+            majority_dir = 1
+            w_agree, w_dissent = w_buy, w_sell
+            agree_engines, dissent_engines = buy_engines, sell_engines
+        else:
+            majority_dir = -1
+            w_agree, w_dissent = w_sell, w_buy
+            agree_engines, dissent_engines = sell_engines, buy_engines
+
+        agree_count = len(agree_engines)
+        w_active = w_agree + w_dissent
+
+        if agree_count < 3 or w_active < 3.5:
+            conf = int(min(30, 10 + agree_count * 5 + w_agree * 3))
+            return {
+                "confidence": conf,
+                "thought": f"Low Confluence: {agree_count} engines, weight {w_agree:.1f}",
+                "weighted_agree": round(w_agree, 2),
+                "weighted_dissent": round(w_dissent, 2),
+            }
+
+        confluence_ratio = w_agree / w_active
+        saturation = min(1.0, w_agree / 6.0)
+        base_conf = 45.0 + (40.0 * confluence_ratio * saturation)
+
+        aligned_anchors = [eng for eng in agree_engines if eng in anchors]
+        if len(aligned_anchors) >= 3:
+            base_conf += 10.0
+        elif len(aligned_anchors) == 2:
+            base_conf += 5.0
+
+        dissenting_anchors = [eng for eng in dissent_engines if eng in anchors]
+        if len(dissenting_anchors) >= 2:
+            base_conf -= 35.0
+        elif len(dissenting_anchors) == 1:
+            base_conf -= 18.0
+
+        if majority_dir == 1 and 'resistance zone' in p2_thought:
+            base_conf -= 25.0
+        elif majority_dir == -1 and 'support zone' in p2_thought:
+            base_conf -= 25.0
+
+        if w_dissent > 0:
+            conflict_penalty = (w_dissent / w_agree) * 20.0
+            base_conf -= conflict_penalty
+
+        conf = int(max(10, min(95, round(base_conf))))
+        return {
+            "confidence": conf,
+            "thought": f"Confluence: {agree_count} parts ({conf}%), anchors aligned={len(aligned_anchors)}, dissenting={len(dissenting_anchors)}",
+            "weighted_agree": round(w_agree, 2),
+            "weighted_dissent": round(w_dissent, 2),
+            "confluence_ratio": round(confluence_ratio, 2)
+        }
 
 
 
@@ -3083,23 +3592,8 @@ class QuantumV5:
         Returns:
             Dict with independent + validated results (if context provided)
         """
-        try:
-            if len(data) < 10: 
-                return {"signal": 0, "thought": "Gathering quantum paths...", "mode": "independent"}
-            
-            # STEP 1: ALWAYS calculate independent physics first
-            independent_result = self._pure_physics_simulation(data)
-            
-            # STEP 2: If Parts context provided, validate
-            if parts_context:
-                validated_result = self._validate_with_parts(independent_result, parts_context)
-                return validated_result
-            else:
-                # Backward compatible - return independent only
-                return independent_result
-                
-        except Exception as e:
-            return {"signal": 0, "thought": f"Quantum simulation offline: {e}", "mode": "error"}
+        # Quantum simulation disabled
+        return {"signal": 0, "thought": "Quantum disabled", "mode": "disabled", "confidence": 0}
     
     def _pure_physics_simulation(self, data):
         """Independent physics-only simulation (no Parts influence)"""
@@ -4908,7 +5402,7 @@ class JarvisElite:
             self.last_dual_intel = {'delta': intel_delta, 'deribit': intel_deribit}
 
             # --- MATHEMATICAL ANALYST OPINION (First) ---
-            math_res = self.parts['part11_fusion'].analyze(list(part_results.values()))
+            math_res = self.parts['part11_fusion'].analyze(part_results)
             math_conf_res = self.parts['part12_confidence'].analyze(list(part_results.values()))
             
             math_signal = math_res.get('signal', 0)
@@ -4982,44 +5476,9 @@ class JarvisElite:
                     detailed_scores['universal_mtf_confluence'] = confluence_score
                     detailed_scores['mtf_matrix'] = mtf_context
             
-            # --- QUANTUM V5 PROBABILITY BOOST (PHASE 16) ---
-            # Quantum was already run inside _neural_global_synthesis, extract result
-            if neural_res:
-                quantum_res = neural_res.get('quantum_data', {})
-            elif hasattr(self, 'brains') and 'quantum_v5' in getattr(self, 'brains', {}):
-                quantum_res = self.brains['quantum_v5'].simulate(data)
-            else:
-                quantum_res = {'signal': 0, 'thought': 'Quantum unavailable'}
-            q_sig = quantum_res.get('signal', 0) if isinstance(quantum_res, dict) else 0
-            q_thought = quantum_res.get('thought', 'Quantum idle') if isinstance(quantum_res, dict) else 'Quantum idle'
-            
-            # Store Quantum activity for visibility
-            detailed_scores['quantum_signal'] = q_sig
-            detailed_scores['quantum_thought'] = q_thought
-            logger.info(f"⚛️ QUANTUM V5: {q_thought}")
-            
-            if q_sig == logic_signal and logic_signal != 0:
-                # Boost confidence by 15% if Quantum agrees
-                boost = 15
-                score = min(100, score + boost)
-                ai_thought += f" | ⚛️ QUANTUM BOOST (+{boost}%)"
-                detailed_scores['quantum_boost'] = boost
-                logger.info(f"⚛️ QUANTUM ALIGNED: Boosted confidence by +{boost}%")
-            elif q_sig == -logic_signal and logic_signal != 0:
-                 # Penalty if Quantum disagrees (reduced)
-                penalty = 5
-                score = max(0, score - penalty)
-                ai_thought += f" | ⚛️ QUANTUM DIVERGENCE (-{penalty}%)"
-                detailed_scores['quantum_penalty'] = penalty
-                if getattr(self, 'is_backtest_mode', False):
-                    # Historical replay evaluates thousands of candles — log once, not per candle.
-                    if not getattr(self, '_quantum_conflict_noted', False):
-                        self._quantum_conflict_noted = True
-                        logger.warning("⚛️ QUANTUM CONFLICT: confidence penalty applied (repeats suppressed in backtest log)")
-                else:
-                    logger.warning(f"⚛️ QUANTUM CONFLICT: Penalized confidence by -{penalty}%")
-            else:
-                logger.info("⚛️ QUANTUM NEUTRAL: No impact on confidence")
+            # --- QUANTUM V5 (DISABLED) ---
+            detailed_scores['quantum_signal'] = 0
+            detailed_scores['quantum_thought'] = "Quantum disabled"
 
             # ---------------------------
             # PHASE 3 FIX: Wire sleeping brains into decision flow
@@ -5640,11 +6099,12 @@ Follow the tag with a 1-sentence CEO executive directive.
         # Pass real part_results for 12-engine display
         real_part_results = getattr(self, 'latest_part_results', {})
 
-        pro_display.display_full_signal(
-            unified_signal_data,
-            current_price=signal['trade_signal'].get('entry_price', 0),
-            part_results=real_part_results,
-        )
+        if not self.is_backtest_mode:
+            pro_display.display_full_signal(
+                unified_signal_data,
+                current_price=signal['trade_signal'].get('entry_price', 0),
+                part_results=real_part_results,
+            )
 
         return signal
 

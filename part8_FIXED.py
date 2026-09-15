@@ -8,7 +8,7 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     TORCH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     TORCH_AVAILABLE = False
     # Dummy torch for compatibility
     class DummyTensor:
@@ -245,6 +245,137 @@ class EnhancedPatternGPUMemoryManager:
 
         # Clear pattern cache
         self.pattern_cache.clear()
+
+
+# ==================== GPU-ACCELERATED MARKET STRUCTURE & SMC ENGINE ====================
+
+class MarketStructureEngineGPU:
+    """
+    JARVIS PART 8 - GPU-ACCELERATED MARKET STRUCTURE & SMART MONEY CONCEPTS (SMC) ENGINE
+    GTX 1650 CUDA & CPU Optimized.
+
+    Quantitative Market Structure Architecture:
+    1. Multi-Bar Fractal Pivots (order k=2): Validates true Swing Highs and Swing Lows.
+    2. Break of Structure (BOS): Decisive close beyond swing pivot with ATR threshold buffer.
+    3. Change of Character (CHoCH): Trend reversal shift (Higher Low broken or Lower High overtaken).
+    4. EMA20 Alignment & Volume Filter: Eliminates low-liquidity wick traps and false breakouts.
+    5. Range Consolidation / Equilibrium Deadband: Strictly signals 0 (Neutral) while price is oscillating inside the range.
+    """
+    def __init__(self):
+        self.device = torch.device('cuda' if (TORCH_AVAILABLE and torch.cuda.is_available()) else 'cpu')
+
+    def analyze(self, data: Any, context: Optional[Dict] = None) -> Dict[str, Any]:
+        """
+        Main market structure analysis called by Part8Structure in Jarvis.
+        """
+        try:
+            if data is None or not isinstance(data, pd.DataFrame) or len(data) < 30:
+                return {"signal": 0, "confidence": 5.0, "thought": "Part8 Structure: Insufficient data (<30)"}
+
+            recent = data.tail(50).copy()
+            highs  = recent['high'].astype(float).values
+            lows   = recent['low'].astype(float).values
+            closes = recent['close'].astype(float).values
+            vols   = recent['volume'].astype(float).values
+
+            if len(closes) < 25:
+                return {"signal": 0, "confidence": 5.0, "thought": "Part8 Structure: Insufficient closes"}
+
+            current_close = float(closes[-1])
+
+            # 1. ATR14 for noise threshold buffer
+            tr = np.maximum(
+                highs[1:] - lows[1:],
+                np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1]))
+            )
+            atr14 = float(np.mean(tr[-14:])) if len(tr) >= 14 else float(highs[-1] - lows[-1])
+            noise_buffer = 0.20 * atr14
+
+            # 2. Fractal Swing Pivots (order k=2)
+            k = 2
+            lookback = min(len(recent) - k, 45)
+            swing_highs = []
+            swing_lows  = []
+
+            for idx in range(len(recent) - lookback, len(recent) - k):
+                h = highs[idx]
+                l = lows[idx]
+                if all(h > highs[idx - i] for i in range(1, k + 1)) and all(h >= highs[idx + i] for i in range(1, k + 1)):
+                    swing_highs.append((idx, float(h)))
+                if all(l < lows[idx - i] for i in range(1, k + 1)) and all(l <= lows[idx + i] for i in range(1, k + 1)):
+                    swing_lows.append((idx, float(l)))
+
+            if len(swing_highs) < 2 or len(swing_lows) < 2:
+                return {"signal": 0, "confidence": 5.0, "thought": "Part8 Structure: Insufficient swing pivots (Neutral)"}
+
+            last_sh = swing_highs[-1][1]
+            prev_sh = swing_highs[-2][1]
+            last_sl = swing_lows[-1][1]
+            prev_sl = swing_lows[-2][1]
+            swing_range = max(last_sh - last_sl, atr14)
+
+            # 3. BOS & CHoCH Detection
+            bullish_bos = current_close > (last_sh + noise_buffer)
+            bearish_bos = current_close < (last_sl - noise_buffer)
+            bullish_choch = (last_sh < prev_sh) and (current_close > last_sh + noise_buffer)
+            bearish_choch = (last_sl > prev_sl) and (current_close < last_sl - noise_buffer)
+
+            # 4. Volume & EMA confirmation
+            ema20 = float(pd.Series(closes).ewm(span=20).mean().iloc[-1])
+            vol_curr = float(vols[-1])
+            vol_mean = float(np.mean(vols[-20:])) + 1e-8
+            vol_ratio = vol_curr / vol_mean
+            vol_ok = vol_ratio >= 0.75
+
+            telemetry = {
+                "last_sh": round(last_sh, 2),
+                "last_sl": round(last_sl, 2),
+                "prev_sh": round(prev_sh, 2),
+                "prev_sl": round(prev_sl, 2),
+                "swing_range": round(swing_range, 2),
+                "vol_ratio": round(vol_ratio, 2),
+                "ema20": round(ema20, 2)
+            }
+
+            # 5. Decision Gates
+            if (bullish_bos or bullish_choch) and current_close > ema20 and vol_ok:
+                label = 'CHoCH Reversal' if bullish_choch else 'BOS Breakout'
+                breakout_dist = current_close - last_sh
+                conf = min(85.0, 60.0 + min((breakout_dist / atr14) * 15.0, 20.0) + min(vol_ratio, 2.0) * 5.0)
+                return {
+                    "signal": 1,
+                    "confidence": round(conf, 1),
+                    "thought": f"Part8 Structure: Bullish {label} above {last_sh:.1f} (vol={vol_ratio:.1f}x)",
+                    "telemetry": telemetry
+                }
+
+            if (bearish_bos or bearish_choch) and current_close < ema20 and vol_ok:
+                label = 'CHoCH Reversal' if bearish_choch else 'BOS Breakdown'
+                breakdown_dist = last_sl - current_close
+                conf = min(85.0, 60.0 + min((breakdown_dist / atr14) * 15.0, 20.0) + min(vol_ratio, 2.0) * 5.0)
+                return {
+                    "signal": -1,
+                    "confidence": round(conf, 1),
+                    "thought": f"Part8 Structure: Bearish {label} below {last_sl:.1f} (vol={vol_ratio:.1f}x)",
+                    "telemetry": telemetry
+                }
+
+            # Equilibrium / Range Consolidation -> STRICTLY 0 (Neutral)
+            return {
+                "signal": 0,
+                "confidence": 5.0,
+                "thought": f"Part8 Structure: Range Consolidation (SH={last_sh:.1f}, SL={last_sl:.1f}) — Neutral",
+                "telemetry": telemetry
+            }
+
+        except Exception as e:
+            return {
+                "signal": 0,
+                "confidence": 5.0,
+                "thought": f"Part8 Structure: Neutral (error: {e})",
+                "telemetry": {}
+            }
+
 
 # ==================== ENHANCED GPU-ACCELERATED PATTERN RECOGNITION ENGINE ====================
 
@@ -535,7 +666,7 @@ class EnhancedGPUPatternRecognitionEngine:
             if all_patterns:
                 total = sum(len(p) for p in all_patterns.values())
                 msg = f"Pattern MTF: Detected {total} patterns across {list(all_patterns.keys())}"
-                print(f"  🎯 {msg}")
+                # print(f"  🎯 {msg}")
                 if hasattr(self, 'bus') and self.bus:
                     self.bus.publish('THOUGHTS', 'Part8_Pattern', msg)
             

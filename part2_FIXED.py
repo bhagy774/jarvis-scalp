@@ -5,7 +5,7 @@ try:
     import torch.nn.functional as F
     import torch.optim as optim
     TORCH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     TORCH_AVAILABLE = False
     import numpy as np
     class DummyTensor:

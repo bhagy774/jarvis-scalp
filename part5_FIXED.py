@@ -41,7 +41,7 @@ try:
     import torch.nn.functional as F
     import torch.optim as optim
     TORCH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     TORCH_AVAILABLE = False
     
     class DummyTensor:
@@ -260,6 +260,136 @@ class GPUMemoryManager:
             except Exception:
                 pass
         gc.collect()
+
+
+# ==================== GPU-ACCELERATED ML PREDICTION ENGINE ====================
+
+class MLEngineGPU:
+    """
+    JARVIS PART 5 - GPU-ACCELERATED MACHINE LEARNING PREDICTION ENGINE
+    GTX 1650 CUDA & CPU Optimized.
+
+    Extracts statistical features from multi-timeframe OHLCV:
+    1. Volatility-Normalized Drift (Sharpe Z-score over last 20 candles)
+    2. Linear Regression Trend t-statistic (Statistical Significance of Slope, p < 0.05)
+    3. Multi-EMA Alignment (EMA8 vs EMA21)
+    4. Normalized RSI-14 Momentum Delta
+    5. Volume-Price Confirmation Ratio (>= 0.8x 20-period avg volume)
+    6. Strict Chop / Random Walk Deadband Filter (Signals 0 in noise)
+    """
+    def __init__(self):
+        self.device = torch.device('cuda' if (TORCH_AVAILABLE and torch.cuda.is_available()) else 'cpu')
+        self.gpu_manager = GPUMemoryManager()
+
+    def analyze(self, data: Any, context: Optional[Dict] = None) -> Dict[str, Any]:
+        """
+        Main analysis method called by Part5ML adapter in Jarvis.
+        Returns:
+            dict with 'signal' (-1, 0, 1), 'confidence' (0-100), 'thought', and 'telemetry'.
+        """
+        try:
+            if data is None or not isinstance(data, pd.DataFrame) or len(data) < 30:
+                return {"signal": 0, "confidence": 5.0, "thought": "Part5 ML: Insufficient data (<30)"}
+
+            recent = data.tail(40).copy()
+            closes = recent['close'].astype(float).values
+            vols = recent['volume'].astype(float).values
+
+            if len(closes) < 30:
+                return {"signal": 0, "confidence": 5.0, "thought": "Part5 ML: Insufficient closes"}
+
+            # 1. Volatility-Normalized Drift (Sharpe Z-score over last 20 bars)
+            rets = np.diff(closes) / np.maximum(closes[:-1], 1e-8)
+            ret_mean = float(np.mean(rets[-20:]))
+            ret_std = float(np.std(rets[-20:])) + 1e-8
+            sharpe_drift = ret_mean / ret_std
+
+            # 2. Linear Regression Trend t-statistic (20 bars)
+            N = 20
+            x = np.arange(N, dtype=np.float64)
+            y_raw = closes[-N:]
+            y_std = float(np.std(y_raw)) + 1e-8
+            y = (y_raw - float(np.mean(y_raw))) / y_std
+            x_mean = float(np.mean(x))
+            x_dev = x - x_mean
+            ss_x = float(np.sum(x_dev ** 2)) + 1e-8
+            beta = float(np.sum(x_dev * y)) / ss_x
+            residuals = y - beta * x_dev
+            s_err = np.sqrt(float(np.sum(residuals ** 2)) / max(N - 2, 1)) / np.sqrt(ss_x)
+            t_stat = beta / (s_err + 1e-8)
+
+            # 3. Volume-Price Confirmation Ratio
+            vol_curr = float(vols[-1])
+            vol_mean = float(np.mean(vols[-20:])) + 1e-8
+            vol_ratio = vol_curr / vol_mean
+
+            # 4. Multi-EMA Alignment
+            ema8 = float(pd.Series(closes).ewm(span=8).mean().iloc[-1])
+            ema21 = float(pd.Series(closes).ewm(span=21).mean().iloc[-1])
+
+            # 5. Normalized RSI-14
+            diffs = np.diff(closes[-15:])
+            gains = np.where(diffs > 0, diffs, 0.0)
+            losses = np.where(diffs < 0, -diffs, 0.0)
+            avg_gain = float(np.mean(gains)) + 1e-8
+            avg_loss = float(np.mean(losses)) + 1e-8
+            rs = avg_gain / avg_loss
+            rsi = 100.0 - (100.0 / (1.0 + rs))
+            rsi_norm = (rsi - 50.0) / 25.0
+
+            # 6. Composite Score
+            composite = 0.35 * float(np.clip(sharpe_drift, -2.0, 2.0)) + \
+                        0.35 * float(np.clip(t_stat / 2.0, -2.0, 2.0)) + \
+                        0.30 * float(np.clip(rsi_norm, -2.0, 2.0))
+
+            telemetry = {
+                "sharpe_drift": round(sharpe_drift, 3),
+                "t_stat": round(t_stat, 2),
+                "composite": round(composite, 3),
+                "vol_ratio": round(vol_ratio, 2),
+                "rsi": round(rsi, 1),
+                "ema_spread_pct": round((ema8 - ema21) / ema21 * 100, 3)
+            }
+
+            # 7. Decision Gates (Require Statistical Significance & Alignment)
+            # Statistical criteria for high-conviction ML prediction:
+            # - composite >= 0.50
+            # - t_stat >= 2.0 (p < 0.05 vs random walk)
+            # - EMA8 > EMA21
+            # - Volume ratio >= 0.8x
+            if composite >= 0.50 and t_stat >= 2.0 and ema8 > ema21 and vol_ratio >= 0.8:
+                conf = min(85.0, 55.0 + abs(composite) * 20.0 + min(abs(t_stat), 3.0) * 5.0)
+                return {
+                    "signal": 1,
+                    "confidence": round(conf, 1),
+                    "thought": f"ML Bullish Edge (comp={composite:.2f}, t={t_stat:.1f}, vol={vol_ratio:.1f}x, RSI={rsi:.0f})",
+                    "telemetry": telemetry
+                }
+
+            if composite <= -0.50 and t_stat <= -2.0 and ema8 < ema21 and vol_ratio >= 0.8:
+                conf = min(85.0, 55.0 + abs(composite) * 20.0 + min(abs(t_stat), 3.0) * 5.0)
+                return {
+                    "signal": -1,
+                    "confidence": round(conf, 1),
+                    "thought": f"ML Bearish Edge (comp={composite:.2f}, t={t_stat:.1f}, vol={vol_ratio:.1f}x, RSI={rsi:.0f})",
+                    "telemetry": telemetry
+                }
+
+            # In noise / chop / low volume / random walk: STAY STRICTLY NEUTRAL (0)
+            return {
+                "signal": 0,
+                "confidence": 5.0,
+                "thought": f"ML Neutral/Random-Walk (comp={composite:.2f}, t={t_stat:.1f}, vol={vol_ratio:.1f}x)",
+                "telemetry": telemetry
+            }
+
+        except Exception as e:
+            return {
+                "signal": 0,
+                "confidence": 5.0,
+                "thought": f"ML Neutral (error: {e})",
+                "telemetry": {}
+            }
 
 
 # ==================== GPU-ACCELERATED FUSION ENGINE ====================

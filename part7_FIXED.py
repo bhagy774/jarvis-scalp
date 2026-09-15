@@ -1,6 +1,8 @@
 # ---- Helpers inserted for Part-7 Fix ----
 from collections import deque
-
+from typing import Dict, List, Optional, Any, Tuple
+import numpy as np
+import pandas as pd
 
 # PyTorch with fallback for Windows/WSL compatibility
 try:
@@ -8,7 +10,7 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     TORCH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     TORCH_AVAILABLE = False
     # Dummy torch for compatibility
     class DummyTensor:
@@ -360,6 +362,148 @@ def _cuda_guard(device):
         def __enter__(self): return self
         def __exit__(self, *a): pass
     return torch.cuda.device(device) if device.type == 'cuda' else _NullCtx()
+
+
+# ==================== GPU-ACCELERATED VOLATILITY & REGIME ENGINE ====================
+
+class VolatilityEngineGPU:
+    """
+    JARVIS PART 7 - GPU-ACCELERATED VOLATILITY & REGIME ENGINE
+    GTX 1650 CUDA & CPU Optimized.
+
+    Quantitative Volatility Architecture:
+    1. Bollinger Bands (20-period SMA, 2.0 Std Dev) & Bandwidth
+    2. Keltner Channels (20-period EMA, 1.5 * ATR14)
+    3. John Carter TTM Squeeze Detection (Bollinger Bands compressing inside Keltner Channel)
+    4. Volatility Expansion / Breakout Direction (%B >= 0.85 with expanding ATR)
+    5. Volatility Breakdown Direction (%B <= 0.15 with expanding ATR)
+    6. Extreme Volatility / Panic Spike Risk Veto (ATR ratio > 2.8x or ATR% > 1.5% -> Veto)
+    7. Stable Rotation / Mean-Reverting Chop Deadband (Signals 0 during normal vol)
+    """
+    def __init__(self):
+        self.device = torch.device('cuda' if (TORCH_AVAILABLE and torch.cuda.is_available()) else 'cpu')
+
+    def analyze(self, data: Any, context: Optional[Dict] = None) -> Dict[str, Any]:
+        """
+        Main volatility analysis called by Part7Volatility in Jarvis.
+        """
+        try:
+            if data is None or not isinstance(data, pd.DataFrame) or len(data) < 30:
+                return {"signal": 0, "confidence": 5.0, "thought": "Part7 Vol: Insufficient data (<30)"}
+
+            # ── Check regime override from context ────────────────────────
+            if context:
+                regime = str(context.get('institutional_components', {}).get('regime', 'NEUTRAL')).upper()
+                if 'VOLATILE' in regime or 'PANIC' in regime:
+                    return {
+                        "signal": 0,
+                        "confidence": 5.0,
+                        "thought": f"Part7 Vol: High Volatility Regime ({regime}) — No trade veto",
+                        "telemetry": {"regime": regime}
+                    }
+
+            recent = data.tail(50).copy()
+            closes = recent['close'].astype(float)
+            highs  = recent['high'].astype(float)
+            lows   = recent['low'].astype(float)
+
+            if len(closes) < 20:
+                return {"signal": 0, "confidence": 5.0, "thought": "Part7 Vol: Insufficient closes"}
+
+            current_close = float(closes.iloc[-1])
+
+            # 1. Bollinger Bands (20-period SMA, 2.0 std)
+            sma20 = float(closes.tail(20).mean())
+            std20 = float(closes.tail(20).std()) + 1e-8
+            upper_bb = sma20 + 2.0 * std20
+            lower_bb = sma20 - 2.0 * std20
+            bb_width = (upper_bb - lower_bb) / max(sma20, 1.0)
+            pct_b = (current_close - lower_bb) / (upper_bb - lower_bb + 1e-8)
+
+            # 2. True Range & ATR(14), ATR(50)
+            tr = pd.concat([
+                highs - lows,
+                (highs - closes.shift(1)).abs(),
+                (lows - closes.shift(1)).abs()
+            ], axis=1).max(axis=1)
+            atr14 = float(tr.tail(14).mean())
+            atr50 = float(tr.tail(50).mean()) if len(tr) >= 50 else atr14
+            ema20 = float(closes.ewm(span=20).mean().iloc[-1])
+
+            # 3. Keltner Channel (20 EMA, 1.5 * ATR14)
+            upper_kc = ema20 + 1.5 * atr14
+            lower_kc = ema20 - 1.5 * atr14
+
+            # 4. TTM Squeeze Detection (BB inside KC)
+            is_squeeze = (upper_bb < upper_kc) and (lower_bb > lower_kc)
+
+            # 5. Volatility Expansion Ratio (Short-term ATR vs Long-term ATR)
+            vol_ratio = atr14 / (atr50 + 1e-8)
+            norm_atr = atr14 / max(current_close, 1.0)
+
+            telemetry = {
+                "bb_width_pct": round(bb_width * 100, 2),
+                "pct_b": round(pct_b, 3),
+                "atr14": round(atr14, 2),
+                "vol_ratio": round(vol_ratio, 2),
+                "is_squeeze": is_squeeze,
+                "norm_atr_pct": round(norm_atr * 100, 3)
+            }
+
+            # 6. Extreme Volatility Spike Risk Gate (> 2.8x vol expansion or > 1.5% candle ATR)
+            if vol_ratio > 2.8 or norm_atr > 0.015:
+                return {
+                    "signal": 0,
+                    "confidence": 5.0,
+                    "thought": f"Part7 Vol: Extreme Volatility Spike ({vol_ratio:.1f}x, ATR={norm_atr*100:.2f}%) — Risk Veto",
+                    "telemetry": telemetry
+                }
+
+            # 7. Squeeze Compression Coiling (Pre-Breakout Consolidation)
+            if is_squeeze:
+                return {
+                    "signal": 0,
+                    "confidence": 5.0,
+                    "thought": f"Part7 Vol: TTM Squeeze Coiling (BBw={bb_width*100:.2f}%) — Neutral",
+                    "telemetry": telemetry
+                }
+
+            # 8. Directional Volatility Expansion (Breakout above Upper BB with expanding ATR)
+            if pct_b >= 0.85 and current_close > upper_bb and vol_ratio >= 1.0:
+                conf = min(85.0, 60.0 + (pct_b - 0.85) * 100.0 + min(vol_ratio, 2.0) * 5.0)
+                return {
+                    "signal": 1,
+                    "confidence": round(conf, 1),
+                    "thought": f"Part7 Vol: Bullish Volatility Expansion (%B={pct_b:.2f}, VolRatio={vol_ratio:.2f})",
+                    "telemetry": telemetry
+                }
+
+            # 9. Directional Volatility Breakdown (Breakdown below Lower BB with expanding ATR)
+            if pct_b <= 0.15 and current_close < lower_bb and vol_ratio >= 1.0:
+                conf = min(85.0, 60.0 + (0.15 - pct_b) * 100.0 + min(vol_ratio, 2.0) * 5.0)
+                return {
+                    "signal": -1,
+                    "confidence": round(conf, 1),
+                    "thought": f"Part7 Vol: Bearish Volatility Breakdown (%B={pct_b:.2f}, VolRatio={vol_ratio:.2f})",
+                    "telemetry": telemetry
+                }
+
+            # 10. Normal / Sideways Volatility (Mean Reversion / Chop) -> Strictly 0 (Neutral)
+            return {
+                "signal": 0,
+                "confidence": 5.0,
+                "thought": f"Part7 Vol: Stable Volatility (%B={pct_b:.2f}, BBw={bb_width*100:.2f}%) — Neutral",
+                "telemetry": telemetry
+            }
+
+        except Exception as e:
+            return {
+                "signal": 0,
+                "confidence": 5.0,
+                "thought": f"Part7 Vol: Neutral (error: {e})",
+                "telemetry": {}
+            }
+
 
 class EnhancedGPULiveDataEngine:
     """
