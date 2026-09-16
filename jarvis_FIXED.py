@@ -1514,7 +1514,7 @@ class LiveTradingEngine:
             logger.debug('[OPTIONS] confirmation skipped: %s', options_error)
         return result
 
-    def _print_live_signal(self, result, current_price, symbol='BTCUSDT'):
+    def _print_live_signal(self, result, current_price, symbol='BTCUSDT', df=None):
         """Print live signal in professional format"""
         signal = result.get('trade_signal', {})
         direction = signal.get('direction', 'NO_TRADE')
@@ -1535,6 +1535,15 @@ class LiveTradingEngine:
 
         # ── SMART ENTRY: Compute optimal limit entry based on ATR ──
         entry_price, entry_type = self._calculate_smart_entry(direction, current_price, result)
+
+        # ── 1M ENTRY REFINEMENT: HTF decision stays; 1m swing SL + confirmation ──
+        self.last_1m_entry = None
+        if direction in ('CALL', 'PUT'):
+            entry_price, sl, confirmed_1m, note_1m = self._refine_entry_with_1m(
+                direction, entry_price, sl, df, current_price
+            )
+            if note_1m not in ('1M-OFF', 'N/A', '1M-FALLBACK'):
+                entry_type = f'{entry_type} | 1m: {note_1m}'
 
         now = datetime.now().strftime('%H:%M:%S')
 
@@ -1620,6 +1629,96 @@ class LiveTradingEngine:
         except Exception as e:
             logger.debug(f"[SMART ENTRY] Fallback to market: {e}")
             return current_price, 'MARKET'
+
+    def _refine_entry_with_1m(self, direction, entry_price, sl, df, current_price):
+        """
+        1-MINUTE ENTRY REFINEMENT (HTF decision + LTF execution).
+
+        JARVIS no final BUY/SELL decision higher-timeframe analysis (Part 1-12)
+        par j based rahe chhe. Aa method fakt EXECUTION improve kare chhe:
+
+          1. SL TIGHTENING: Recent 1m swing low (CALL) / swing high (PUT)
+             par stop-loss move kare chhe — same risk, better R:R.
+             Fakt TIGHTEN kare chhe; kadi WIDEN nathi kartu.
+             Bounds: entry thi 0.10% thi 1.20% distance. Out-of-range hoy
+             to original HTF SL j rehse (fail-open).
+
+          2. 1M CONFIRMATION: Last CLOSED 1m candle signal direction sathe
+             match karvu joie (CALL = bullish close, PUT = bearish close).
+             Match na kare to confirmed=False — e cycle ma trade skip thase
+             ane next cycle ma fari try thase (entry timing wait).
+
+        Env controls:
+          JARVIS_ENTRY_1M=0        -> full feature off (original behaviour)
+          JARVIS_ENTRY_1M_CONFIRM=0 -> confirmation off, fakt SL tightening
+
+        Returns: (entry_price, sl, confirmed, note)
+        Koi pan error/failure par original values + confirmed=True (fail-open),
+        etle existing behaviour kadi break nathi thatu.
+        """
+        self.last_1m_entry = None
+        try:
+            if os.getenv('JARVIS_ENTRY_1M', '1').lower() in ('0', 'false', 'off'):
+                return entry_price, sl, True, '1M-OFF'
+            if direction not in ('CALL', 'PUT') or not entry_price or not current_price:
+                return entry_price, sl, True, 'N/A'
+            if df is None or len(df) < 15:
+                return entry_price, sl, True, 'NO-1M-DATA'
+
+            lookback = int(os.getenv('JARVIS_ENTRY_1M_LOOKBACK', '12'))
+            # Last candle haji close na thayeli hoy sake — swing mate exclude kariye
+            win = df.iloc[-(lookback + 1):-1]
+            if len(win) < 5:
+                return entry_price, sl, True, 'NO-1M-DATA'
+
+            buffer_pct = 0.0003   # 0.03% swing buffer
+            min_dist   = 0.0010   # SL entry thi ochho ma ochho 0.10% dur
+            max_dist   = 0.0120   # SL entry thi vadhu ma vadhu 1.20% dur
+
+            note_parts = []
+            refined_sl = sl
+            if direction == 'CALL':
+                swing = float(win['low'].min()) * (1.0 - buffer_pct)
+                # Tighten only: 1m swing SL original SL karta UP j hoy to j use
+                if swing < entry_price and (sl is None or swing > sl):
+                    dist = (entry_price - swing) / entry_price
+                    if min_dist <= dist <= max_dist:
+                        refined_sl = round(swing, 2)
+                        note_parts.append(f'SL 1m-swing ${refined_sl:,.2f} ({dist*100:.2f}%)')
+            else:  # PUT
+                swing = float(win['high'].max()) * (1.0 + buffer_pct)
+                # Tighten only: 1m swing SL original SL karta NICHE j hoy to j use
+                if swing > entry_price and (sl is None or swing < sl):
+                    dist = (swing - entry_price) / entry_price
+                    if min_dist <= dist <= max_dist:
+                        refined_sl = round(swing, 2)
+                        note_parts.append(f'SL 1m-swing ${refined_sl:,.2f} ({dist*100:.2f}%)')
+
+            # 1m direction confirmation (last CLOSED candle)
+            confirmed = True
+            if os.getenv('JARVIS_ENTRY_1M_CONFIRM', '1').lower() not in ('0', 'false', 'off'):
+                last = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+                candle_bull = float(last['close']) > float(last['open'])
+                if direction == 'CALL' and not candle_bull:
+                    confirmed = False
+                    note_parts.append('1m confirm wait (bearish candle)')
+                elif direction == 'PUT' and candle_bull:
+                    confirmed = False
+                    note_parts.append('1m confirm wait (bullish candle)')
+
+            note = ' + '.join(note_parts) if note_parts else '1m OK'
+            self.last_1m_entry = {
+                'confirmed': confirmed,
+                'refined_sl': refined_sl,
+                'original_sl': sl,
+                'note': note,
+            }
+            logger.info('[1M-ENTRY] %s | confirmed=%s | %s', direction, confirmed, note)
+            return entry_price, refined_sl, confirmed, note
+
+        except Exception as e:
+            logger.debug(f"[1M-ENTRY] fail-open fallback: {e}")
+            return entry_price, sl, True, '1M-FALLBACK'
 
     def _print_compact_status(self, current_price=None):
         """Clean mode: ek j line ma system status (dashaarath FULL dashboard nathi)."""
@@ -2048,8 +2147,17 @@ class LiveTradingEngine:
                             # the displayed final decision and any order path.
                             result = self._apply_options_confirmation(result, symbol)
                             direction, confidence, entry_price, tp1, tp2, sl, expiry = \
-                                self._print_live_signal(result, current_price, symbol=symbol)
-                            
+                                self._print_live_signal(result, current_price, symbol=symbol, df=df)
+
+                            # 1M ENTRY CONFIRMATION GATE: HTF decision valid,
+                            # pan 1m candle confirm na kare to aa cycle ma entry skip.
+                            # Next cycle ma fari evaluate thase (entry timing wait).
+                            entry_gate_1m = getattr(self, 'last_1m_entry', None)
+                            if entry_gate_1m and not entry_gate_1m.get('confirmed', True) \
+                                    and direction in ('CALL', 'PUT'):
+                                print(f"  ⏳ 1M ENTRY WAIT: {direction} signal valid, pan 1m candle confirm pending — next cycle ma retry")
+                                direction = 'NO_TRADE'
+
                             # 6. AUTO-TRADE: Execute on Delta Exchange if enabled
                             if self.auto_trader and direction in ('CALL', 'PUT'):
                                 try:
