@@ -958,7 +958,7 @@ Analyze the following backtest performance metrics:
 
 Task: Provide a concise 2-sentence executive summary of the backtest performance and your top recommendation for live deployment."""
             
-            resp, err = call_ollama(prompt, model="phi3.5:3.8b", timeout=10)
+            resp, err = call_ollama(prompt, model=__import__('os').environ.get('OLLAMA_MODEL', 'deepseek-r1:14b'), timeout=10)
             if resp:
                 insight = resp.strip()
                 print(f"\n[PART 4 OLLAMA BACKTEST INSIGHTS] 🧠\n{insight}\n")

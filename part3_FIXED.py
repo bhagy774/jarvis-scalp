@@ -674,7 +674,7 @@ Provide a concise 1-2 sentence institutional analysis, then end your response wi
             if OLLAMA_INTEGRATION_AVAILABLE:
                 try:
                     prompt = self._generate_ollama_prompt(current_price, current_regime, components)
-                    resp, err = call_ollama(prompt, model="phi3.5:3.8b", timeout=10)
+                    resp, err = call_ollama(prompt, model=__import__('os').environ.get('OLLAMA_MODEL', 'deepseek-r1:14b'), timeout=10)
                     if resp:
                         ollama_reasoning = resp.strip()
                         resp_upper = resp.upper()

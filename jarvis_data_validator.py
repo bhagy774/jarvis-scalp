@@ -171,7 +171,8 @@ class JarvisDataValidator:
             return VALID(source)
 
     def validate_dataframe(self, df, source: str = "unknown",
-                           now: Optional[float] = None) -> ValidationResult:
+                           now: Optional[float] = None,
+                           symbol: Optional[str] = None) -> ValidationResult:
         """
         Validate a pandas DataFrame with OHLCV columns.
         Checks the LAST row (most recent candle) for completeness/sanity/staleness.
@@ -200,6 +201,14 @@ class JarvisDataValidator:
                 if col in df.columns:
                     val = last_row.get(col) if hasattr(last_row, 'get') else getattr(last_row, col, None)
                     candle[col] = val
+
+            # --- FIX: inject symbol so price spike key is source:symbol not just source ---
+            if symbol:
+                candle["symbol"] = symbol
+            elif "symbol" in df.columns:
+                _sym = last_row.get("symbol") if hasattr(last_row, 'get') else getattr(last_row, "symbol", None)
+                if _sym:
+                    candle["symbol"] = str(_sym)
 
             # Try to extract timestamp from index or column
             ts = None

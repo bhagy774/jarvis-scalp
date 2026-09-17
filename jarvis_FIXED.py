@@ -5192,7 +5192,13 @@ class JarvisElite:
                     and _get_data_validator is not None):
                 try:
                     _dv = _get_data_validator()
-                    _dv_result = _dv.validate_dataframe(data, source="delta")
+                    # Pass active symbol so each coin has independent price cache
+                    _active_sym = (
+                        getattr(self, 'active_symbol', None)
+                        or getattr(self, 'symbol', None)
+                        or getattr(self, 'current_coin', None)
+                    )
+                    _dv_result = _dv.validate_dataframe(data, source="delta", symbol=_active_sym)
                     if not _dv_result.ok:
                         logger.warning(
                             "🛡️ DATA-VALIDATOR GATE: %s — %s",

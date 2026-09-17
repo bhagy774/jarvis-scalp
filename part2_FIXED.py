@@ -81,6 +81,8 @@ except (ImportError, OSError):
             LSTM = DummyModule
             GRU = DummyModule
             Transformer = DummyModule
+            TransformerEncoderLayer = DummyModule
+            TransformerEncoder = DummyModule
             Dropout = DummyModule
             BatchNorm1d = DummyModule
             LayerNorm = DummyModule
@@ -107,6 +109,10 @@ except (ImportError, OSError):
             @staticmethod
             def get_device_name(idx=0): return 'CPU'
 
+        class no_grad:
+            def __enter__(self): pass
+            def __exit__(self, exc_type, exc_val, exc_tb): pass
+
         @staticmethod
         def tensor(data, **kwargs): return DummyTensor(data)
         @staticmethod
@@ -115,6 +121,18 @@ except (ImportError, OSError):
         def randn(*args, **kwargs): return DummyTensor()
         @staticmethod
         def cat(tensors, dim=0): return DummyTensor()
+        @staticmethod
+        def abs(input): return input
+        @staticmethod
+        def arange(*args, **kwargs): return DummyTensor([0])
+        @staticmethod
+        def max(*args, **kwargs): return DummyTensor()
+        @staticmethod
+        def min(*args, **kwargs): return DummyTensor()
+        @staticmethod
+        def all(*args, **kwargs): return DummyTensor([True])
+        @staticmethod
+        def sum(*args, **kwargs): return DummyTensor([0])
         @staticmethod
         def stack(tensors, dim=0): return DummyTensor()
         @staticmethod
@@ -4251,7 +4269,7 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
             # 17. Ollama Local AI Reasoning (Option C: Final Validator)
             if OLLAMA_INTEGRATION_AVAILABLE:
                 prompt = self._generate_ollama_prompt(self.current_context, ai_enhanced_signals)
-                resp, err = call_ollama(prompt, model="phi3.5:3.8b", timeout=10)
+                resp, err = call_ollama(prompt, model=__import__('os').environ.get('OLLAMA_MODEL', 'deepseek-r1:14b'), timeout=10)
                 if resp:
                     ollama_reasoning = resp.strip()
                     resp_upper = resp.upper()

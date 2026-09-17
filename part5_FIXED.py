@@ -500,7 +500,7 @@ Current Fused Signal: {fused_signal} (Confidence: {confidence:.2f})
 
 Respond in 1 short sentence validating or questioning this fused signal. State [BUY], [SELL], or [NO-TRADE] at the beginning."""
             
-            resp, err = call_ollama(prompt, model="phi3.5:3.8b", timeout=10)
+            resp, err = call_ollama(prompt, model=__import__('os').environ.get('OLLAMA_MODEL', 'deepseek-r1:14b'), timeout=10)
             if resp:
                 clean_resp = resp.strip()
                 print(f"\n[PART 5 OLLAMA FUSION THOUGHTS] 🧠\n{clean_resp}\n")

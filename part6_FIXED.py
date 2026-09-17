@@ -844,7 +844,7 @@ Backtest Metrics:
 
 Provide a 2-sentence executive summary and verdict (APPROVED FOR LIVE / REQUIRES OPTIMIZATION)."""
                     
-                    resp, err = call_ollama(prompt, model="phi3.5:3.8b", timeout=10)
+                    resp, err = call_ollama(prompt, model=__import__('os').environ.get('OLLAMA_MODEL', 'deepseek-r1:14b'), timeout=10)
                     if resp:
                         clean_resp = resp.strip()
                         print(f"\n[PART 6 OLLAMA BACKTEST EVALUATION] 🧠\n{clean_resp}\n")
