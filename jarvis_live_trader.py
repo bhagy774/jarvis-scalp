@@ -3,7 +3,7 @@
 JARVIS Live Auto-Trader
 ======================
 Auto-executes CALL/PUT trades on Delta Exchange with:
-  - 100x leverage (minimum, can be raised)
+  - leverage derived per trade from available collateral, margin and stop risk
   - Dual-leg execution: Futures scalp + Options hedge
   - 3-tier safety gates before any real order
   - Real-time position monitor (TP/SL/expiry)
@@ -13,7 +13,7 @@ USAGE:
   Set in .env:
     DELTA_USE_MAINNET=true      # false = testnet
     JARVIS_AUTO_TRADE=true      # false = paper only
-    JARVIS_LEVERAGE=100         # 100-200x
+    JARVIS_MAX_LEVERAGE=20      # hard safety cap; operating leverage is derived
     JARVIS_MAX_RISK_USDT=10     # max $ at risk per trade
     JARVIS_MAX_DAILY_LOSS=30    # stop after -$30/day
 """
@@ -52,7 +52,8 @@ def _box(msg, col=C): print(f"{col}  ▶  {RST}{msg}")
 # ══════════════════════════════════════════════════════════════════
 #  RISK CONFIGURATION  (override via .env)
 # ══════════════════════════════════════════════════════════════════
-LEVERAGE            = int(os.environ.get("JARVIS_LEVERAGE",        "100"))
+from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
+LEVERAGE_CAP        = MAX_LEVERAGE_CAP  # policy cap; not a user-selected leverage
 MAX_RISK_USDT       = float(os.environ.get("JARVIS_MAX_RISK_USDT", "10"))
 MAX_DAILY_LOSS_USDT = float(os.environ.get("JARVIS_MAX_DAILY_LOSS","30"))
 MAX_OPEN_POSITIONS  = int(os.environ.get("JARVIS_MAX_OPEN",        "2"))
@@ -272,7 +273,7 @@ class JarvisAutoTrader:
         net  = _p("MAINNET", BD+R) if os.environ.get("DELTA_USE_MAINNET","false").lower()=="true" else _p("TESTNET", BD+Y)
         return (
             f"  {_p('AUTO-TRADER:', DG)} {mode} {_p('│',DG)} {net} "
-            f"{_p('│',DG)} {_p(f'Lev: {LEVERAGE}x', BD+C)} "
+            f"{_p('│',DG)} {_p('Lev: AUTO', BD+C)} "
             f"{_p('│',DG)} Open: {_p(len(self.open_positions),W)}/{MAX_OPEN_POSITIONS} "
             f"{_p('│',DG)} Daily P&L: {_p(f'{self.daily_pnl:+.2f}$', G if self.daily_pnl>=0 else R)} "
             f"{_p('│',DG)} Losses: {_p(self.consec_losses,R)}/{CONSEC_LOSS_LIMIT}"
@@ -337,7 +338,7 @@ class JarvisAutoTrader:
                 pass
 
             atr = price * 0.004  # default 0.4% ATR
-            expected_profit = price * SCALP_TP_PCT * (MAX_RISK_USDT * LEVERAGE / price)
+            expected_profit = (MAX_RISK_USDT / max(SCALP_SL_PCT, 1e-9)) * SCALP_TP_PCT
 
             result = self.hedge_advisor.evaluate_hedge_setup(
                 signal_direction=direction,
@@ -381,7 +382,31 @@ class JarvisAutoTrader:
         # The caller owns routing.  Do not read the scanner again here: a
         # second scan could turn an ETH analysis into a SOL order.
 
-        # ── Calculate position size via Dynamic Sizer ────────────
+        # ── Derive size and leverage from collateral + stop risk ───────
+        tp_pct    = SWING_TP_PCT if trade_type == "SWING" else SCALP_TP_PCT
+        sl_pct    = SWING_SL_PCT if trade_type == "SWING" else SCALP_SL_PCT
+        tp_price  = round(price * (1 + tp_pct) if is_call else price * (1 - tp_pct), 2)
+        sl_price  = round(price * (1 - sl_pct) if is_call else price * (1 + sl_pct), 2)
+        product = None
+        product_max_leverage = None
+        if self.is_enabled:
+            get_metadata = getattr(self.delta, "get_product_metadata", None)
+            if not callable(get_metadata):
+                return {"success": False, "reason": "Product metadata unavailable"}
+            try:
+                product = get_metadata(symbol)
+            except Exception as exc:
+                return {"success": False, "reason": "Product metadata unavailable", "error": str(exc)}
+            if not isinstance(product, dict) or not product.get("id"):
+                return {"success": False, "reason": "Product metadata unavailable"}
+            for key in ("max_leverage", "max_leverage_allowed", "leverage_max"):
+                if product.get(key) is not None:
+                    try:
+                        product_max_leverage = float(product[key])
+                    except (TypeError, ValueError):
+                        return {"success": False, "reason": "Invalid product leverage metadata"}
+                    break
+
         try:
             balance = float(self.delta.get_wallet_balance())
         except Exception:
@@ -394,20 +419,25 @@ class JarvisAutoTrader:
             sizer.set_compound_pool(
                 getattr(_get_position_manager(), "compounded_balance", 0)
             )
-            size_info = sizer.calculate_size(confidence, symbol, force_balance=balance)
-            margin = min(float(size_info.get("margin_usdt", 0)), balance, MAX_RISK_USDT)
-            contracts = int(margin * LEVERAGE)
+            size_info = sizer.calculate_size(
+                confidence, symbol, force_balance=balance,
+                stop_distance_pct=sl_pct,
+                max_trade_risk_usdt=MAX_RISK_USDT,
+                product_max_leverage=product_max_leverage,
+            )
         else:
-            margin = min(balance, MAX_RISK_USDT)
-            contracts = self._calc_contracts(price, margin)
-            size_info = None
-        if margin <= 0 or contracts <= 0:
+            size_info = calculate_trade_size(
+                balance, confidence, sl_pct,
+                max_trade_risk_usdt=MAX_RISK_USDT,
+                product_max_leverage=product_max_leverage,
+            )
+        if not size_info.get("ok"):
+            return {"success": False, "reason": size_info.get("reason", "Risk sizing blocked")}
+        margin = float(size_info.get("margin_usdt", 0.0))
+        contracts = int(size_info.get("contracts", 0))
+        leverage = int(size_info.get("leverage", 0))
+        if margin <= 0 or contracts <= 0 or leverage <= 0:
             return {"success": False, "reason": "Risk budget cannot fund one contract"}
-
-        tp_pct    = SWING_TP_PCT if trade_type == "SWING" else SCALP_TP_PCT
-        sl_pct    = SWING_SL_PCT if trade_type == "SWING" else SCALP_SL_PCT
-        tp_price  = round(price * (1 + tp_pct) if is_call else price * (1 - tp_pct), 2)
-        sl_price  = round(price * (1 - sl_pct) if is_call else price * (1 + sl_pct), 2)
 
         # ── Dynamic Oracle TP/SL Enhancement ────────────────────
         oracle_gate = self._oracle_gate or _get_oracle_gate()
@@ -420,39 +450,23 @@ class JarvisAutoTrader:
                 sl_price = oracle_plan["sl_price"]
                 hold_minutes = oracle_plan.get("hold_minutes", hold_minutes)
 
-        # ── Print pre-trade summary ──────────────────────────────
-        print(f"\n{'═'*70}")
-        print(f"{_p('  🚀 JARVIS AUTO-TRADER — EXECUTING', BD+C)}")
-        print(f"{'─'*70}")
-        print(f"  {_p('Direction:', DG)} {_p(direction, BD+(G if is_call else R))}"
-              f"   {_p('Type:', DG)} {trade_type}"
-              f"   {_p('Confidence:', DG)} {_p(f'{confidence}%', BD+G)}")
-        print(f"  {_p('Price:', DG)} ${price:,.2f}"
-              f"   {_p('Leverage:', DG)} {_p(f'{LEVERAGE}x', BD+Y)}"
-              f"   {_p('Contracts:', DG)} {contracts}")
-        tp_note = f" (Oracle)" if (oracle_plan and oracle_plan.get("use_oracle")) else ""
-        print(f"  {_p('TP:', DG)} {_p(f'${tp_price:,.2f}{tp_note}', BD+G)}"
-              f"   {_p('SL:', DG)} {_p(f'${sl_price:,.2f}{tp_note}', BD+R)}"
-              f"   {_p('Hold:', DG)} {hold_minutes}m")
-        if oracle_plan and oracle_plan.get("use_oracle"):
-            print(f"  {_p('Oracle Target:', DG)} {_p(oracle_plan.get('reason',''), BD+C)}")
-        if hedge_plan.get("do_hedge"):
-            print(f"  {_p('Hedge:', DG)} {_p('YES', BD+G)} "
-                  f"→ {hedge_plan.get('option_type')} @ {hedge_plan.get('strike','?')}")
-        print(f"{'─'*70}")
+        # The caller's unified dashboard owns terminal presentation.  Keep
+        # execution detail in logs so one cycle does not emit scattered blocks.
+        logger.info("[EXECUTION] %s %s %s contracts at %sx AUTO; TP=%s SL=%s hold=%sm",
+                    direction, symbol, contracts, leverage, tp_price, sl_price, hold_minutes)
 
         # ─ LEG 0: Set leverage only for deliberately enabled live execution.
         # Paper execution must never alter an exchange account.
         if self.is_enabled:
             try:
-                lev_ok = bool(self.delta.set_leverage(symbol, LEVERAGE))
+                lev_ok = bool(self.delta.set_leverage(symbol, leverage))
             except Exception as e:
                 return {"success": False, "reason": "Leverage setup failed", "error": str(e)}
             if not lev_ok:
                 return {"success": False, "reason": "Leverage setup failed"}
-            print(f"  {_p('LEG 0:', DG)} Leverage {LEVERAGE}x → {_p('✅ SET', BD+G)}")
+            logger.info('[EXECUTION] leverage %sx AUTO applied for %s', leverage, symbol)
         else:
-            print(f"  {_p('LEG 0:', DG)} Paper mode — no leverage API call")
+            logger.info('[EXECUTION] paper mode: venue leverage unchanged')
 
         # ─ LEG 1: Futures scalp ──────────────────────────────────
         futures_result = {"success": False, "error": "not attempted"}
@@ -477,13 +491,9 @@ class JarvisAutoTrader:
 
         if futures_result.get("success"):
             order_id = futures_result.get("order_id", "?")
-            print(f"  {_p('LEG 1:', DG)} {_p('✅ FILLED', BD+G)}"
-                  f" | {futures_side.upper()} {contracts}x {symbol}"
-                  f" | Order #{order_id}")
+            logger.info('[EXECUTION] futures filled: %s %s %s order=%s', futures_side.upper(), contracts, symbol, order_id)
         else:
-            print(f"  {_p('LEG 1:', DG)} {_p('❌ FAILED', BD+R)}"
-                  f" | {futures_result.get('error','unknown')}")
-            print(f"{'═'*70}\n")
+            logger.error('[EXECUTION] futures order failed: %s', futures_result.get('error', 'unknown'))
             return {"success": False, "reason": "Futures order failed",
                     "error": futures_result.get("error")}
 
@@ -505,11 +515,10 @@ class JarvisAutoTrader:
                     hedge_result = self.delta.place_option_order(opt_symbol, "buy", 1)
                     if not hedge_result or not hedge_result.get("success"):
                         raise RuntimeError((hedge_result or {}).get("error", "Hedge order failed"))
-                    print(f"  {_p('LEG 2:', DG)} {_p('✅ HEDGE', BD+G)}"
-                          f" | {opt_type} {opt_strike} | #{hedge_result.get('order_id','?')}")
+                    logger.info('[EXECUTION] hedge filled: %s %s order=%s', opt_type, opt_strike, hedge_result.get('order_id', '?'))
                 else:
                     hedge_result = {"success": True, "paper": True}
-                    print(f"  {_p('LEG 2:', DG)} Paper hedge simulated")
+                    logger.info('[EXECUTION] paper hedge simulated')
             except Exception as e:
                 if self.is_enabled:
                     compensation = self._close_position_market({
@@ -534,7 +543,7 @@ class JarvisAutoTrader:
             "symbol":      symbol,
             "trade_type":  trade_type,
             "confidence":  confidence,
-            "leverage":    LEVERAGE,
+            "leverage":    leverage,
             "open_time":   datetime.now().isoformat(),
             "expiry_time": (datetime.now() + timedelta(minutes=hold_minutes)).isoformat(),
             "hedge_id":    (hedge_result or {}).get("order_id"),
@@ -549,20 +558,12 @@ class JarvisAutoTrader:
         # This trader owns the position lifecycle.  Registering the same live
         # position in a second monitor can submit duplicate closing orders.
 
-        # ─ Estimated P&L ─────────────────────────────────────────
-        # Repository convention: one Delta perp contract is one USD notional.
+        # ─ Estimated P&L (dashboard presents these fields) ─────────────
         notional    = contracts
         risk_usdt   = notional * sl_pct
         reward_usdt = notional * tp_pct
-        print(f"{'─'*70}")
-        print(f"  {_p('RISK:', DG)}   ${risk_usdt:.2f}"
-              f"   {_p('REWARD:', DG)} ${reward_usdt:.2f}"
-              f"   {_p('R:R =', DG)} {_p(f'1:{reward_usdt/max(risk_usdt,0.01):.1f}', BD+G)}")
-        if sizer:
-            sizer.print_sizing(size_info)
-        print(f"  Position ID: {_p(pos['id'], C)}")
-        print(f"{'═'*70}\n")
-
+        logger.info('[EXECUTION] risk=$%.4f reward=$%.4f leverage=%sx position=%s',
+                    risk_usdt, reward_usdt, leverage, pos['id'])
         return {"success": True, "position": pos, "hedge": hedge_result}
 
     # ──────────────────────────────────────────────────────────────
@@ -857,7 +858,7 @@ class JarvisAutoTrader:
         if margin_budget <= 0:
             return 0
         # Repository convention: one perp contract is one USD notional.
-        return max(0, int(margin_budget * LEVERAGE))
+        return max(0, int(margin_budget))
 
     def _get_price(self) -> Optional[float]:
         """Get live BTC price."""
@@ -919,7 +920,7 @@ class JarvisAutoTrader:
         mode  = "🔴 LIVE MAINNET" if (self.is_enabled and os.environ.get("DELTA_USE_MAINNET","false").lower()=="true") else "🟡 TESTNET/PAPER"
         print(f"\n{'═'*70}")
         print(f"  {_p('🤖 JARVIS AUTO-TRADER INITIALIZED', BD+C)}")
-        print(f"  Mode: {_p(mode, BD+Y)}  │  Leverage: {_p(f'{LEVERAGE}x', BD+R)}  │  Risk: {_p(f'${MAX_RISK_USDT}/trade', BD+W)}")
+        print(f"  Mode: {_p(mode, BD+Y)}  │  Leverage: {_p('AUTO', BD+R)}  │  Risk: {_p(f'${MAX_RISK_USDT}/trade', BD+W)}")
         print(f"  Daily Loss Limit: ${MAX_DAILY_LOSS_USDT}  │  Min Confidence: {MIN_CONFIDENCE}%  │  Cooldown: {COOLDOWN_SECONDS}s")
         print(f"  Hedge: {'✅ ON' if HEDGE_ENABLED else '❌ OFF'}  │  Max Positions: {MAX_OPEN_POSITIONS}")
         if self.is_enabled and os.environ.get("DELTA_USE_MAINNET","false").lower()=="true":

@@ -688,10 +688,23 @@ class DeltaExchangeData:
         except (KeyError, TypeError):
             return None
 
-    def set_leverage(self, symbol: str, leverage: int = 200) -> bool:
-        """
-        Force Leverage to 200x (User Request).
-        Warning: High Risk.
+    def get_product_metadata(self, symbol: str) -> Optional[Dict]:
+        """Return validated venue product metadata for risk/execution callers."""
+        product = self._resolve_product(symbol)
+        if not isinstance(product, dict):
+            return None
+        try:
+            if int(product["id"]) <= 0 or not str(product.get("symbol", "")).strip():
+                return None
+        except (KeyError, TypeError, ValueError):
+            return None
+        return dict(product)
+
+    def set_leverage(self, symbol: str, leverage: int = None) -> bool:
+        """Apply a caller-computed leverage only when live execution is enabled.
+
+        There is intentionally no venue default: callers must derive leverage
+        from balance, margin and stop-loss risk and pass a positive integer.
         """
         if os.environ.get("DELTA_ORDER_EXECUTION_ENABLED", "false").lower() != "true":
             logger.warning("[RISK] Leverage change blocked: order execution is disabled")

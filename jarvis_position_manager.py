@@ -39,7 +39,8 @@ TRAIL_ACTIVATE   = float(os.environ.get("PM_TRAIL_ACTIVATE",  "0.003"))
 TRAIL_STEP       = float(os.environ.get("PM_TRAIL_STEP",      "0.001"))
 BREAK_EVEN_AT    = float(os.environ.get("PM_BREAKEVEN_AT",    "0.002"))
 MONITOR_INTERVAL = int(os.environ.get("PM_MONITOR_SEC",       "5"))
-LEVERAGE         = int(os.environ.get("JARVIS_LEVERAGE",      "100"))
+from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
+LEVERAGE_CAP     = MAX_LEVERAGE_CAP  # policy cap only; leverage is derived per trade
 COMPOUND_ENABLED = os.environ.get("PM_COMPOUND", "true").lower() == "true"
 MIN_MARGIN       = float(os.environ.get("PM_MIN_MARGIN",      "0.05"))
 MAX_MARGIN_PCT   = float(os.environ.get("PM_MAX_MARGIN_PCT",  "0.05"))
@@ -171,38 +172,13 @@ class JarvisPositionManager:
 
     def get_sizing_for_coin(self, balance: float, confidence: int,
                             symbol: str = "BTCUSDT") -> Dict:
-        """Dynamic sizing: confidence + compounding, never above collateral cap."""
-        try:
-            balance = float(balance)
-            confidence = int(confidence)
-        except (TypeError, ValueError):
-            balance, confidence = 0.0, 0
-        if balance <= 0:
-            return {"margin_usdt": 0.0, "contracts": 0, "notional_usdt": 0.0,
-                    "confidence": confidence, "multiplier": 0.0, "compound_bonus": 0.0}
-        base_margin = balance * 0.02
-
-        if confidence >= 95:    mult = 2.5
-        elif confidence >= 90:  mult = 2.0
-        elif confidence >= 80:  mult = 1.5
-        elif confidence >= 70:  mult = 1.0
-        else:                   mult = 0.5
-
-        compound_bonus = max(0.0, self.compounded_balance) * 0.5 if COMPOUND_ENABLED else 0.0
-        max_margin = max(0.0, balance * MAX_MARGIN_PCT)
-        # MIN_MARGIN is a target, not permission to exceed a tiny balance.
-        effective_margin = min(max_margin, max(MIN_MARGIN, base_margin * mult + compound_bonus))
-        notional = effective_margin * LEVERAGE
-        contracts = int(notional)
-
-        return {
-            "margin_usdt":    round(effective_margin, 4),
-            "contracts":      contracts,
-            "notional_usdt":  round(notional, 2),
-            "confidence":     confidence,
-            "multiplier":     mult,
-            "compound_bonus": round(compound_bonus, 4),
-        }
+        """Use the same risk/margin-aware sizing policy as live and paper paths."""
+        result = calculate_trade_size(
+            balance, confidence, SL_PCT,
+            compound_pool=self.compounded_balance if COMPOUND_ENABLED else 0.0,
+        )
+        result.setdefault("symbol", symbol)
+        return result
 
     # --- Internal Monitor ---
 

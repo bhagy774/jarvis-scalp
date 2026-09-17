@@ -1,161 +1,73 @@
 #!/usr/bin/env python3
-"""
-JARVIS Dynamic Trade Sizer
-===========================
-Sizes positions based on AI confidence + account balance + compounding pool.
-Hard cap: never exceed 5% of balance per trade.
-
-Confidence -> Multiplier:
-  60-69% -> 0.5x  (risky, small)
-  70-79% -> 1.0x  (normal)
-  80-89% -> 1.5x  (good setup)
-  90-94% -> 2.0x  (excellent)
-  95%+   -> 2.5x  (maximum!)
-"""
-import os
+"""Shared balance/risk/margin-aware position sizing for JARVIS."""
 import logging
 from typing import Dict, Optional
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+from jarvis_risk import (
+    BASE_RISK_PCT, MAX_RISK_PCT, MIN_MARGIN_USDT, COMPOUND_RATIO,
+    MAX_LEVERAGE_CAP, CONF_MULTIPLIERS, calculate_trade_size,
+)
 
 logger = logging.getLogger("JarvisSizer")
-
-LEVERAGE        = int(os.environ.get("JARVIS_LEVERAGE",      "100"))
-BASE_RISK_PCT   = float(os.environ.get("SIZER_BASE_RISK_PCT", "0.02"))
-MAX_RISK_PCT    = float(os.environ.get("SIZER_MAX_RISK_PCT",  "0.05"))
-MIN_MARGIN_USDT = float(os.environ.get("SIZER_MIN_MARGIN",    "0.05"))
-COMPOUND_RATIO  = float(os.environ.get("SIZER_COMPOUND_RATIO","0.5"))
-
-# Confidence threshold -> multiplier (checked in order, first match wins)
-CONF_MULTIPLIERS = [
-    (95, 2.5),
-    (90, 2.0),
-    (80, 1.5),
-    (70, 1.0),
-    (60, 0.5),
-    (0,  0.25),
-]
-
+# Compatibility name: this is a policy cap, never an operating leverage value.
+LEVERAGE_CAP = MAX_LEVERAGE_CAP
 
 class JarvisSizer:
-    """
-    Professional trade sizing engine.
-    Integrates with Delta Exchange balance and Position Manager compounding.
-    """
-
     def __init__(self, delta_client):
         self.delta = delta_client
         self._cached_balance: float = 0.0
-        self._compound_pool:  float = 0.0
+        self._compound_pool: float = 0.0
 
     def set_compound_pool(self, amount: float):
-        """Update compounding pool from Position Manager."""
         try:
             self._compound_pool = max(0.0, float(amount))
         except (TypeError, ValueError):
             self._compound_pool = 0.0
 
     def get_live_balance(self) -> float:
-        """Fetch real balance from Delta Exchange."""
         try:
             bal = self.delta.get_wallet_balance()
-            if bal and bal > 0:
-                self._cached_balance = bal
-                return bal
+            if bal is not None and float(bal) > 0:
+                self._cached_balance = float(bal)
+                return self._cached_balance
         except Exception as e:
             logger.warning("[Sizer] Balance fetch failed: %s", e)
         return self._cached_balance
 
     def calculate_size(self, confidence: int, symbol: str = "BTCUSDT",
-                       force_balance: float = None) -> Dict:
-        """
-        Calculate position size for a trade.
-
-        Returns dict with:
-          margin_usdt   : actual margin to use
-          contracts     : number of Delta contracts
-          notional_usdt : total notional value
-          multiplier    : confidence multiplier applied
-          balance       : current balance used for calc
-          compound_used : compound pool contribution
-          sizing_note   : human-readable explanation
-        """
+                       force_balance: float = None, stop_distance_pct: float = 0.002,
+                       max_trade_risk_usdt: float = None,
+                       product_max_leverage: float = None) -> Dict:
         balance = force_balance if force_balance is not None else self.get_live_balance()
-        try:
-            balance = float(balance)
-            confidence = int(confidence)
-        except (TypeError, ValueError):
-            balance, confidence = 0.0, 0
-        if balance <= 0:
-            return {
-                "margin_usdt": 0.0, "contracts": 0, "notional_usdt": 0.0,
-                "confidence": confidence, "multiplier": 0.0, "balance": 0.0,
-                "compound_used": 0.0, "sizing_note": "No available collateral; no position sized",
-            }
-
-        # Get multiplier from confidence table
-        multiplier = 0.25
-        for threshold, mult in CONF_MULTIPLIERS:
-            if confidence >= threshold:
-                multiplier = mult
-                break
-
-        base_margin = balance * BASE_RISK_PCT * multiplier
-        compound_use = min(self._compound_pool * COMPOUND_RATIO, balance * 0.02)
-        max_margin = max(0.0, balance * MAX_RISK_PCT)
-        # The minimum is only a target; it can never exceed the hard cap.
-        effective_margin = min(max_margin, max(MIN_MARGIN_USDT, base_margin + compound_use))
-
-        notional = effective_margin * LEVERAGE
-        contracts = int(notional)
-
-        note = (
-            f"Balance=${balance:.4f} | Conf={confidence}% -> {multiplier}x"
-            f" | Margin=${effective_margin:.4f} | {contracts} contracts"
+        result = calculate_trade_size(
+            balance, confidence, stop_distance_pct,
+            max_trade_risk_usdt=max_trade_risk_usdt,
+            compound_pool=self._compound_pool,
+            product_max_leverage=product_max_leverage,
         )
-        if compound_use > 0:
-            note += f" (+${compound_use:.4f} compound)"
-
-        return {
-            "margin_usdt":   round(effective_margin, 6),
-            "contracts":     contracts,
-            "notional_usdt": round(notional, 2),
-            "confidence":    confidence,
-            "multiplier":    multiplier,
-            "balance":       round(balance, 6),
-            "compound_used": round(compound_use, 6),
-            "sizing_note":   note,
-        }
+        result.setdefault("balance", float(balance or 0))
+        result.setdefault("symbol", symbol)
+        result.setdefault("compound_used", 0.0)
+        result.setdefault("multiplier", 0.0)
+        result.setdefault("margin_usdt", 0.0)
+        result.setdefault("notional_usdt", 0.0)
+        result.setdefault("contracts", 0)
+        result.setdefault("leverage", 0)
+        result.setdefault("confidence", int(confidence) if str(confidence).lstrip('-').isdigit() else 0)
+        if not result.get("ok"):
+            result.setdefault("sizing_note", result.get("reason", "Sizing blocked"))
+        return result
 
     def print_sizing(self, result: Dict):
-        """Pretty print sizing decision."""
-        R   = "\033[91m"
-        G   = "\033[92m"
-        Y   = "\033[93m"
-        W   = "\033[97m"
-        DG  = "\033[90m"
-        BD  = "\033[1m"
-        RST = "\033[0m"
-        mult      = result["multiplier"]
-        mult_col  = G if mult >= 1.5 else (Y if mult >= 1.0 else R)
         print(
-            f"  {DG}SIZER:{RST} Conf={W}{result['confidence']}%{RST}"
-            f" -> {BD}{mult_col}{mult}x{RST}"
-            f" | Margin={W}${result['margin_usdt']:.4f}{RST}"
-            f" | {W}{result['contracts']} contracts{RST}"
-            f" ({result['notional_usdt']:.1f} notional @ {LEVERAGE}x)"
+            f"  SIZER: Conf={result.get('confidence', 0)}% | "
+            f"Margin=${result.get('margin_usdt', 0):.4f} | "
+            f"{result.get('contracts', 0)} contracts | "
+            f"Notional=${result.get('notional_usdt', 0):.2f} | "
+            f"Auto leverage={result.get('leverage', 0)}x"
         )
-        if result.get("compound_used", 0) > 0:
-            print(f"  {DG}  + Compound bonus: ${result['compound_used']:.4f}{RST}")
 
-
-# ── Singleton ──────────────────────────────────────────────────
 _sizer_instance: Optional[JarvisSizer] = None
-
 
 def get_sizer(delta_client=None) -> Optional[JarvisSizer]:
     global _sizer_instance
@@ -163,17 +75,5 @@ def get_sizer(delta_client=None) -> Optional[JarvisSizer]:
         _sizer_instance = JarvisSizer(delta_client)
     return _sizer_instance
 
-
 if __name__ == "__main__":
-    print("JarvisSizer module loaded OK")
-    print("Confidence Table (example $6 balance):")
-    for conf in [65, 72, 82, 91, 96]:
-        mult = 0.25
-        for t, m in CONF_MULTIPLIERS:
-            if conf >= t:
-                mult = m
-                break
-        margin    = 6.0 * BASE_RISK_PCT * mult
-        margin    = max(MIN_MARGIN_USDT, min(margin, 6.0 * MAX_RISK_PCT))
-        contracts = max(1, int(margin * LEVERAGE))
-        print(f"  Conf={conf}% -> {mult}x -> Margin=${margin:.4f} -> {contracts} contracts")
+    print("JarvisSizer module loaded OK; leverage is derived per trade")

@@ -19,6 +19,8 @@ import subprocess
 import numpy as np
 import pandas as pd
 from professional_display import ProfessionalSignalDisplay
+from jarvis_dashboard import UnifiedDashboard
+from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
 pro_display = ProfessionalSignalDisplay()
 import warnings
 from collections import deque, defaultdict
@@ -1066,6 +1068,13 @@ class LiveTradingEngine:
         self.last_consensus = {}
         self.last_hedged_result = {}
         self.engine_start_time = time.time()
+        self.dashboard = UnifiedDashboard(
+            clear=os.getenv("JARVIS_DASHBOARD_CLEAR", "1").lower() not in ("0", "false", "off")
+        )
+        self._dashboard_events = []
+        self._dashboard_signal = {}
+        self._dashboard_plan = {}
+        self._dashboard_account = {}
         self.performance_stats = {
             'total_trades': 0,
             'winning_trades': 0,
@@ -1209,6 +1218,71 @@ class LiveTradingEngine:
             logger.error(f"Failed to load Hedged Engine: {e}")
             self.hedged_engine = None
         
+    def _delta_available_balance(self):
+        """Read Delta available collateral once for the dashboard, fail closed."""
+        try:
+            client = getattr(self.jarvis, 'delta_data', None)
+            if client and callable(getattr(client, 'get_wallet_balance', None)):
+                value = float(client.get_wallet_balance())
+                if value > 0:
+                    return value, 'OK'
+                return 0.0, 'unavailable/zero'
+        except Exception:
+            pass
+        return 0.0, 'unavailable'
+
+    def _paper_size(self, confidence, entry_price, sl, direction):
+        try:
+            stop_pct = abs(float(entry_price) - float(sl)) / float(entry_price) if sl else 0.002
+            return calculate_trade_size(
+                self.paper_balance, confidence, max(stop_pct, 0.0001),
+                max_trade_risk_usdt=float(os.getenv('JARVIS_MAX_RISK_USDT', '10')),
+            )
+        except Exception:
+            return {'ok': False, 'reason': 'paper risk sizing failed', 'contracts': 0}
+
+    def _render_unified_dashboard(self, symbol=None, current_price=None, action=None, gate_reason=None):
+        """Publish one state snapshot; signal/reason/plan/risk never use separate blocks."""
+        try:
+            result = self.last_jarvis_result or {}
+            signal = self._dashboard_signal or result.get('trade_signal', {}) or {}
+            plan = dict(self._dashboard_plan or {})
+            if action:
+                plan['action'] = action
+            if gate_reason:
+                plan['gates'] = gate_reason
+            delta_balance, delta_status = self._delta_available_balance()
+            total = self.paper_wins + self.paper_losses + self.paper_breakeven
+            uptime = str(timedelta(seconds=int(time.time() - self.engine_start_time)))
+            account = dict(self._dashboard_account or {})
+            account.update({
+                'delta_available': delta_balance,
+                'delta_status': delta_status,
+                'paper_balance': self.paper_balance,
+                'max_leverage_cap': MAX_LEVERAGE_CAP,
+                'max_risk': float(os.getenv('JARVIS_MAX_RISK_USDT', '10')),
+            })
+            status = {
+                'mode': 'LIVE-EXECUTION' if getattr(self, 'auto_trader', None) and self.auto_trader.is_enabled else 'PAPER',
+                'open_trades': len(self.paper_open_trades),
+                'pending': sum(1 for t in self.paper_open_trades if t.get('status') == 'PENDING_LIMIT'),
+                'uptime': uptime,
+            }
+            self.dashboard.update(
+                timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                symbol=symbol or self.active_symbol,
+                price=f"${float(current_price):,.2f}" if current_price else '—',
+                signal={'direction': signal.get('direction', 'NO_TRADE'), 'confidence': signal.get('confidence_score', signal.get('confidence', 0))},
+                reasons=(result.get('intelligence_board', []) or [])[:3] or [result.get('no_trade_reason', 'Awaiting analysis')],
+                plan=plan,
+                status=status,
+                account=account,
+                events=self._dashboard_events[-3:],
+            )
+            self.dashboard.render()
+        except Exception as e:
+            logger.debug('[DASHBOARD] render failed: %s', e)
+
     def _print_professional_signal(self, part_details):
         """Print signals in professional format"""
         self.candle_count += 1
@@ -1254,14 +1328,14 @@ class LiveTradingEngine:
             action = decision.get('action', 'pass')
             if action == 'veto':
                 self.presim_stats['vetoes'] += 1
-                print(f"  [PRESIM] VETO: {decision.get('reason', '')}")
+                self._dashboard_events.append(f"PreSim veto: {decision.get('reason', '')}")
                 logger.info(f"[PRESIM] VETO {direction}: {decision.get('reason', '')}")
                 return None, confidence
             if action == 'adjust':
                 self.presim_stats['adjustments'] += 1
                 delta = max(-10, min(10, int(decision.get('confidence_delta', 0))))
                 confidence = max(0, min(100, confidence + delta))
-                print(f"  [PRESIM] ADJUST {delta:+d} → conf {confidence}%: {decision.get('reason', '')}")
+                self._dashboard_events.append(f"PreSim adjust {delta:+d}: {decision.get('reason', '')}")
                 logger.info(f"[PRESIM] ADJUST {delta:+d}: {decision.get('reason', '')}")
             return direction, confidence
         except Exception as e:
@@ -1288,7 +1362,7 @@ class LiveTradingEngine:
                 slippage_bps=float(os.getenv('JARVIS_SCEN_SLIPPAGE_BPS', '5')),
             )
             if verdict.get('action') == 'veto':
-                print(f"  🛡️ SCENARIO VETO: {verdict.get('passed')}/{verdict.get('total')} pass — {verdict.get('reason')}")
+                self._dashboard_events.append(f"Scenario veto: {verdict.get('reason', 'stress gate')}")
                 logger.info(f"[SCENARIO] VETO {direction} {symbol}: {verdict.get('reason')}")
                 return 'NO_TRADE'
             if verdict.get('total'):
@@ -1323,6 +1397,27 @@ class LiveTradingEngine:
             'result': None,
             'pnl_dollar': 0.0,
             'close_reason': None,
+        }
+        sizing = self._paper_size(confidence, entry_price, sl, direction)
+        if not sizing.get('ok'):
+            self._dashboard_events.append('paper entry blocked: ' + str(sizing.get('reason', 'risk sizing failed')))
+            return None
+        trade.update({
+            'contracts': int(sizing.get('contracts', 0)),
+            'margin_usdt': float(sizing.get('margin_usdt', 0.0)),
+            'notional_usdt': float(sizing.get('notional_usdt', 0.0)),
+            'leverage': int(sizing.get('leverage', 0)),
+            'trade_risk_usdt': float(sizing.get('trade_risk_usdt', 0.0)),
+        })
+        if trade['contracts'] <= 0:
+            self._dashboard_events.append('paper entry blocked: no whole contract within risk budget')
+            return None
+        self._dashboard_account = {
+            'trade_risk': trade['trade_risk_usdt'],
+            'margin': trade['margin_usdt'],
+            'contracts': trade['contracts'],
+            'notional': trade['notional_usdt'],
+            'leverage': trade['leverage'],
         }
         self.paper_open_trades.append(trade)
 
@@ -1367,13 +1462,13 @@ class LiveTradingEngine:
                     trade['entry_time'] = datetime.now().isoformat()
                     expiry_min = self.PAPER_CONFIG['expiry_map'].get(trade['expiry_name'], 3)
                     trade['expiry_time'] = (datetime.now() + timedelta(minutes=expiry_min)).isoformat()
-                    print(f"  ⚡ LIMIT FILLED: {trade['direction']} @ {trade['entry_price']}")
+                    self._dashboard_events.append(f"Limit filled: {trade['direction']} @ {trade['entry_price']}")
                 elif trade['direction'] == 'PUT' and current_price >= trade['entry_price']:
                     trade['status'] = 'OPEN'
                     trade['entry_time'] = datetime.now().isoformat()
                     expiry_min = self.PAPER_CONFIG['expiry_map'].get(trade['expiry_name'], 3)
                     trade['expiry_time'] = (datetime.now() + timedelta(minutes=expiry_min)).isoformat()
-                    print(f"  ⚡ LIMIT FILLED: {trade['direction']} @ {trade['entry_price']}")
+                    self._dashboard_events.append(f"Limit filled: {trade['direction']} @ {trade['entry_price']}")
                 else:
                     still_open.append(trade)
                     continue
@@ -1426,18 +1521,17 @@ class LiveTradingEngine:
             
             if closed:
                 trade['exit_price'] = current_price
-                risk_amt = self.paper_balance * self.PAPER_CONFIG['risk_per_trade_pct']
-                position_size = risk_amt / self.PAPER_CONFIG['risk_per_trade_pct']  # Full position base
-                
+                # One contract is one USD notional in the repository convention;
+                # leverage only determines required margin, never gets multiplied
+                # into P&L a second time.
+                position_size = float(trade.get('notional_usdt', 0.0))
+                price_move_pct = abs(current_price - entry) / entry if entry else 0.0
                 if trade['result'] == 'WIN':
-                    # Calculate actual P&L from % move
-                    price_move_pct = abs(current_price - entry) / entry
-                    trade['pnl_dollar'] = position_size * price_move_pct * 10  # Assume 10x leverage
+                    trade['pnl_dollar'] = position_size * price_move_pct
                     self.paper_balance += trade['pnl_dollar']
                     self.paper_wins += 1
                 elif trade['result'] == 'LOSS':
-                    price_move_pct = abs(current_price - entry) / entry
-                    trade['pnl_dollar'] = -(position_size * price_move_pct * 10)  # Assume 10x leverage
+                    trade['pnl_dollar'] = -(position_size * price_move_pct)
                     self.paper_balance += trade['pnl_dollar']
                     self.paper_losses += 1
                 else:
@@ -1497,12 +1591,9 @@ class LiveTradingEngine:
         for t in newly_closed:
             emoji = '✅' if t['result'] == 'WIN' else ('❌' if t['result'] == 'LOSS' else '➖')
             pnl_str = f"+${t['pnl_dollar']:.2f}" if t['pnl_dollar'] >= 0 else f"-${abs(t['pnl_dollar']):.2f}"
-            print(f"\n{'═' * 60}")
-            print(f"  {emoji} PAPER TRADE CLOSED - #{t['id']}")
-            print(f"  {t['direction']} | Entry: ${t['entry_price']:,.2f} → Exit: ${t['exit_price']:,.2f}")
-            print(f"  Result: {t['result']} | {t['close_reason']}")
-            print(f"  P&L: {pnl_str} | 💰 Balance: ${self.paper_balance:,.2f}")
-            print(f"{'═' * 60}")
+            self._dashboard_events.append(
+                f"Paper closed #{t['id']} {t['result']} {pnl_str} | balance ${self.paper_balance:,.2f}"
+            )
 
             # ── TELEGRAM: Notify trade closed ──
             try:
@@ -1577,32 +1668,22 @@ class LiveTradingEngine:
             if note_1m not in ('1M-OFF', 'N/A', '1M-FALLBACK'):
                 entry_type = f'{entry_type} | 1m: {note_1m}'
 
-        now = datetime.now().strftime('%H:%M:%S')
-
-        print(f"\n{'─' * 60}")
-        print(f"  ⏰ [{now}] LIVE SIGNAL | {symbol}: ${current_price:,.2f}" if current_price else f"  ⏰ [{now}] LIVE SIGNAL | {symbol}")
-        print(f"{'─' * 60}")
-
-        if direction == 'NO_TRADE':
-            reason = result.get('no_trade_reason', 'No clear setup')
-            print(f"  ⏸️  Signal: NO TRADE | Confidence: {confidence}%")
-            print(f"  💭 Reason: {reason}")
-            return direction, confidence, raw_entry, tp1, tp2, sl, expiry
-
-        emoji = "🟢" if direction == "CALL" else "🔴"
-        print(f"  {emoji} Signal: {direction} | Confidence: {confidence}%")
-        print(f"  💰 Market:  ${current_price:,.2f}")
-        print(f"  🎯 Entry:   ${entry_price:,.2f} ({entry_type})")
-        if tp1: print(f"  ✅ TP1: ${tp1:,.2f}")
-        if tp2: print(f"  ✅ TP2: ${tp2:,.2f}")
-        if sl:  print(f"  ❌ SL:  ${sl:,.2f}")
-        print(f"  ⏱️  Expiry: {expiry} | 📈 Vol: {market_ctx.get('volatility', 'N/A')}")
-
-        if thoughts:
-            print(f"  🧠 AI:")
-            for t in thoughts[:3]:
-                print(f"     → {str(t)[:75]}")
-
+        self._dashboard_signal = {
+            'direction': direction,
+            'confidence_score': confidence,
+            'entry_price': entry_price,
+            'take_profit_1': tp1,
+            'take_profit_2': tp2,
+            'stop_loss': sl,
+        }
+        self._dashboard_plan = {
+            'entry': f"${entry_price:,.2f}" if entry_price else '—',
+            'tp1': f"${tp1:,.2f}" if tp1 else '—',
+            'sl': f"${sl:,.2f}" if sl else '—',
+            'expiry': expiry,
+            'action': 'WAIT' if direction == 'NO_TRADE' else direction,
+            'gates': 'analysis complete',
+        }
         return direction, confidence, entry_price, tp1, tp2, sl, expiry
     
     def _calculate_smart_entry(self, direction: str, current_price: float, result: dict):
@@ -1753,171 +1834,11 @@ class LiveTradingEngine:
             return entry_price, sl, True, '1M-FALLBACK'
 
     def _print_compact_status(self, current_price=None):
-        """Clean mode: ek j line ma system status (dashaarath FULL dashboard nathi)."""
-        try:
-            total = self.paper_wins + self.paper_losses + self.paper_breakeven
-            wr = (self.paper_wins / total * 100) if total > 0 else 0
-            profit = self.paper_balance - self.PAPER_CONFIG['initial_balance']
-            uptime = str(timedelta(seconds=int(time.time() - self.engine_start_time)))
-            now = datetime.now().strftime('%H:%M:%S')
-            price_str = f"BTC ${current_price:,.2f}" if current_price else "BTC --"
-            ps = getattr(self, 'presim_stats', {}) or {}
-            presim_str = f" | PreSim: {ps.get('vetoes', 0)}V/{ps.get('adjustments', 0)}A" if (ps.get('vetoes') or ps.get('adjustments')) else ""
-            dv_str = ""
-            if DATA_VALIDATOR_AVAILABLE and _get_data_validator is not None:
-                try:
-                    _dv_s = _get_data_validator().get_stats()
-                    _dv_rej = _dv_s.get('rejected', 0)
-                    _dv_wrn = _dv_s.get('warnings', 0)
-                    if _dv_rej or _dv_wrn:
-                        dv_str = f" | DV: {_dv_rej}R/{_dv_wrn}W"
-                except Exception:
-                    pass
-            print(f"  \U0001F4CA [{now}] {price_str} | \U0001F4B0 ${self.paper_balance:,.2f} ({'+' if profit >= 0 else ''}${profit:,.2f}) | "
-                  f"\U0001F3C6 {wr:.0f}% | \U0001F4C2 Open: {len(self.paper_open_trades)} | \u23F1\uFE0F {uptime}{presim_str}{dv_str}")
-        except Exception as e:
-            logger.debug(f"[COMPACT STATUS] failed: {e}")
+        self._render_unified_dashboard(current_price=current_price)
 
     def _print_paper_dashboard(self):
-        """Print God-Mode Paper Trading Dashboard"""
-        import os
-        import platform
-        if platform.system() == 'Windows':
-            os.system('cls')
-        else:
-            os.system('clear')
+        self._render_unified_dashboard(current_price=getattr(self, '_last_current_price', None))
 
-        total = self.paper_wins + self.paper_losses + self.paper_breakeven
-        wr = (self.paper_wins / total * 100) if total > 0 else 0
-        profit = self.paper_balance - self.PAPER_CONFIG['initial_balance']
-        pct = (profit / self.PAPER_CONFIG['initial_balance']) * 100
-        dd = ((self.paper_peak_balance - self.paper_balance) / self.paper_peak_balance * 100) if self.paper_peak_balance > 0 else 0
-        uptime = str(timedelta(seconds=int(time.time() - self.engine_start_time)))
-        
-        # Safe extraction of GPU stats
-        try:
-            import torch
-            vram_gb = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
-            gpu_str = f"RTX Series (VRAM: {vram_gb:.1f}GB)" if torch.cuda.is_available() else "CPU Mode"
-        except:
-            gpu_str = "CPU Mode"
-
-        print("="*100)
-        print("                        🚀 JARVIS QUANTUM ELITE - GOD MODE TERMINAL 🚀")
-        print("="*100)
-        print(f"[⚡ SYSTEM KERNEL] 🟢 ACTIVE | 🧠 Mode: PAPER | ⏱️ Uptime: {uptime} | 🛡️ Risk: SAFE")
-        print(f"[🎮 GPU ENGINE] {gpu_str} | ⚡ API Latency: ~42ms | 🕒 Next Cycle: 2.1s")
-        print("-" * 100)
-        
-        # Try to extract sub-part status from last result
-        res = self.last_jarvis_result or {}
-        market_ctx = res.get('market_context', {})
-        signal = res.get('trade_signal', {})
-        parts = res.get('parts_data', {})
-        
-        p1 = parts.get('part1_breakout', {}).get('signal', 0)
-        p2 = parts.get('part2_cnn', {}).get('signal', 0)
-        p3 = parts.get('part3_whale', {}).get('signal', 0)
-        p4 = "VALID" # Mock backtest validation
-        p5 = f"VIX: 14.2 | Delta: {signal.get('confidence', 50)/100:.2f}"
-        p6 = parts.get('part6_quant', {}).get('signal', 0)
-        p7 = "SYNCED"
-        p8 = parts.get('part8_mtf', {}).get('signal', 0)
-        p9 = "LEARNING"
-        p11_conf = signal.get('confidence', 0)
-        p12 = "READY"
-        
-        def s_str(val): return "BULLISH" if val > 0 else "BEARISH" if val < 0 else "NEUTRAL"
-        
-        print(f"[1] 📈 SMART BREAKOUT (Part 1) : [ {s_str(p1):7} ] - Context Active")
-        print(f"[2] 🧠 NEURAL NET (Part 2)     : [ {s_str(p2):7} ] - Pattern Analyzed")
-        print(f"[3] 🐋 WHALE TRACKER (Part 3)  : [ {s_str(p3):7} ] - Orderflow Scanned")
-        print(f"[4] ⏪ BACKTEST ORACLE (Part 4): [ VALID   ] - Historical Setup Verified")
-        print(f"[5] 📉 OPTIONS GREEKS (Part 5) : [ STABLE  ] - {p5}")
-        print(f"[6] 🌊 QUANT STREAM (Part 6)   : [ {s_str(p6):7} ] - Momentum Tracked")
-        print(f"[7] 📡 DATA ENGINE (Part 7)    : [ {p7:7} ] - Live Tickers Synced")
-        print(f"[8] ⏳ MTF MATRIX (Part 8)     : [ {s_str(p8):7} ] - Aligning Timeframes")
-        print(f"[9] 🧬 ADAPTIVE AI (Part 9)    : [ LEARNING] - Weights Optimized")
-        print(f"[11] 🌌 QUANTUM FUSION (Part 11): [ {'STRONG BUY' if p11_conf > 75 else 'STRONG SELL' if p11_conf < 25 else 'NEUTRAL'} ] - Aggregated Confidence: {p11_conf}%")
-        print(f"[12] 🎯 EXECUTION (Part 12)    : [ {p12:7} ] - Spreads Optimal")
-        print("-" * 100)
-        
-        # Hedge Advisor
-        hr = self.last_hedged_result
-        h_status = hr.get('status', 'STANDBY')
-        h_ratio = hr.get('hedge_ratio', 0.0)
-        print("[🔒 HEDGE ADVISOR]")
-        print(f"🛡️ Action  : [ {h_status} ] -> {hr.get('reason', 'Awaiting clear setup')}")
-        print(f"💰 Details : Hedge Ratio: {h_ratio:.2f} | Premium Auth: {self.PAPER_CONFIG['risk_per_trade_pct']*100}% Risk")
-        print("-" * 100)
-        
-        # Consensus & Output
-        c = self.last_consensus
-        c_vd = c.get('final_verdict', signal.get('direction', 'NO_TRADE'))
-        c_conf = c.get('agreement_pct', p11_conf)
-        commentary = c.get('chairman_summary', 'Awaiting deep consensus analysis...')
-        
-        print("[🎯 FINAL TRADING DECISION]")
-        print(f"🔥 ACTION: [ {c_vd} ] | 🧠 Consensus: {c_conf}%")
-        if self.paper_open_trades:
-            last_t = self.paper_open_trades[-1]
-            print(f"📍 Entry: ${last_t['entry_price']:.2f} | 🛡️ SL: ${last_t['sl_price']:.2f} | 💰 TP: ${last_t['tp1_price']:.2f}")
-        else:
-            print("📍 Waiting for optimal entry zone...")
-            
-        print("🧠 AI REASONING & COMMENTARY:")
-        import textwrap
-        wrapped_commentary = textwrap.fill(commentary, width=90, initial_indent="   \"", subsequent_indent="    ")
-        print(f"{wrapped_commentary}\"")
-        print("-" * 100)
-        
-        # Portfolio
-        print("[📊 LIVE PAPER PORTFOLIO]")
-        print(f"💰 Balance : ${self.paper_balance:,.2f} ({'+'if profit>=0 else ''}{pct:.1f}%) | 📈 P&L: {'+'if profit>=0 else ''}${profit:,.2f}")
-        print(f"🏆 Win Rate: {wr:.0f}% ({self.paper_wins}W / {self.paper_losses}L) | 📂 Open: {len(self.paper_open_trades)}")
-        print("-" * 100)
-        
-        # Health (Mocked compact display, actual health monitor prints below)
-        print("[🏥 COGNITIVE BUS STATUS]")
-        if hasattr(self.jarvis, 'bus') and self.jarvis.bus:
-            print("✅ Diagnostics Running (Full health report below)")
-        else:
-            print("✅ All Systems Nominal")
-        # Auto-trader status
-        if hasattr(self, 'auto_trader') and self.auto_trader:
-            print(self.auto_trader.status_line())
-            
-        # --- WIRING FIX PHASE 2: DASHBOARD METRICS & AI INSIGHTS ---
-        if hasattr(self.jarvis, 'engines'):
-            if 'backtest' in self.jarvis.engines:
-                try:
-                    dash_data = self.jarvis.engines['backtest'].get_live_dashboard_data()
-                    if dash_data:
-                        print(f"[📈 LIVE METRICS] Sharpe: {dash_data.get('sharpe','N/A')} | WR: {dash_data.get('win_rate','N/A')}% | Max DD: {dash_data.get('max_drawdown','N/A')}%")
-                except Exception:
-                    pass
-                    
-            self.dashboard_cycles = getattr(self, 'dashboard_cycles', 0) + 1
-            if self.dashboard_cycles % 10 == 0:
-                print("-" * 100)
-                if 'adaptive' in self.jarvis.engines:
-                    try:
-                        insights = self.jarvis.engines['adaptive'].get_learning_insights()
-                        if insights and not insights.get('error') and insights != {}:
-                            print(f"[🧠 AI INSIGHTS] {str(insights)[:150]}...")
-                    except Exception:
-                        pass
-                if 'confidence' in self.jarvis.engines:
-                    try:
-                        c_insights = self.jarvis.engines['confidence'].get_confidence_insights()
-                        if c_insights and not c_insights.get('error') and c_insights != {}:
-                            print(f"[🛡️ CONFIDENCE] {str(c_insights)[:150]}...")
-                    except Exception:
-                        pass
-        # -----------------------------------------------------------
-        
-        print("="*100)
-    
     def _save_paper_state(self):
         """Save paper trading state"""
         try:
@@ -2081,6 +2002,8 @@ class LiveTradingEngine:
                         
                     cycle_count[0] += 1
                     current_price = None
+                    direction = 'NO_TRADE'
+                    confidence = 0
 
                     # 1. Select a verified crypto contract before collecting any
                     # data. A route is locked for the entire life of an open
@@ -2116,6 +2039,7 @@ class LiveTradingEngine:
                         pass
 
                     if current_price:
+                        self._last_current_price = current_price
                         self._check_paper_trades(current_price)
 
                     # 3. Fetch the selected symbol's live candles for analysis.
@@ -2135,17 +2059,6 @@ class LiveTradingEngine:
                             elif not isinstance(df.index, pd.DatetimeIndex):
                                 df.index = pd.date_range(end=pd.Timestamp.now(), periods=len(df), freq='1min')
                             
-                            # 7. Dashboard + AI Health Report every 5 cycles
-                            if cycle_count[0] % 5 == 0:
-                                if JARVIS_VERBOSE:
-                                    self._print_paper_dashboard()
-                                    if hasattr(self.jarvis, 'bus') and self.jarvis.bus:
-                                        self.jarvis.bus.print_health_report()
-                                    if hasattr(self, 'market_oracle') and self.market_oracle:
-                                        self.market_oracle.print_market_map()
-                                else:
-                                    self._print_compact_status(current_price)
-
                             if current_price is None and len(df) > 0:
                                 current_price = float(df['close'].iloc[-1])
                             
@@ -2194,7 +2107,7 @@ class LiveTradingEngine:
                             entry_gate_1m = getattr(self, 'last_1m_entry', None)
                             if entry_gate_1m and not entry_gate_1m.get('confirmed', True) \
                                     and direction in ('CALL', 'PUT'):
-                                print(f"  ⏳ 1M ENTRY WAIT: {direction} signal valid, pan 1m candle confirm pending — next cycle ma retry")
+                                self._dashboard_events.append(f"1M entry wait: {direction} confirmation pending")
                                 direction = 'NO_TRADE'
 
                             # SCENARIO SIMULATOR GATE: trade pehla future stress
@@ -2225,9 +2138,18 @@ class LiveTradingEngine:
                                     )
                                     if at_result.get('success'):
                                         pos = at_result.get('position', {})
-                                        print(f"  🚀 AUTO-TRADE PLACED #{pos.get('id','?')} | {direction} | {pos.get('contracts')}x @ ${current_price:,.2f}")
+                                        self._dashboard_account = {
+                                            'trade_risk': pos.get('contracts', 0) * (0.008 if trade_type == 'SWING' else 0.002),
+                                            'margin': pos.get('contracts', 0) / max(pos.get('leverage', 1), 1),
+                                            'contracts': pos.get('contracts', 0),
+                                            'notional': pos.get('contracts', 0),
+                                            'leverage': pos.get('leverage', 'AUTO'),
+                                        }
+                                        self._dashboard_events.append(f"Auto-trade placed #{pos.get('id','?')} ({direction})")
+                                    else:
+                                        self._dashboard_events.append(f"Auto-trade blocked: {at_result.get('reason', 'gate failed')}")
                                 except Exception as at_err:
-                                    print(f"  ⚠️  AutoTrader error: {at_err}")
+                                    self._dashboard_events.append(f"AutoTrader error: {at_err}")
                             elif direction in ('CALL', 'PUT') and self.can_trade():
                                 # --- PRE-TRADE SIMULATOR (fail-open; JARVIS_PRESIM=0 disables) ---
                                 direction, confidence = self._presim_gate(
@@ -2256,7 +2178,7 @@ class LiveTradingEngine:
                                             jarvis_result=result
                                         )
                                         self.last_hedged_result = hedged_result
-                                        print(f"\n  ✅ HEDGED SCALP | Status: {hedged_result.get('status')} | Hedged: {hedged_result.get('hedge_applied')}")
+                                        self._dashboard_events.append(f"Hedge: {hedged_result.get('status')} / applied={hedged_result.get('hedge_applied')}")
                                     
                                     # Always open paper trade to track P&L
                                     trade = self._open_paper_trade(
@@ -2265,13 +2187,12 @@ class LiveTradingEngine:
                                         symbol=symbol
                                     )
                                     if trade:
-                                        risk_amt = self.paper_balance * self.PAPER_CONFIG['risk_per_trade_pct']
-                                        print(f"\n  ✅ PAPER TRADE LOGGED #{trade['id']} [{trade['status']}]")
-                                        print(f"     {direction} @ ${trade['entry_price']:,.2f} | Risk: ${risk_amt:.2f}")
-                                        exp_dt = datetime.fromisoformat(trade['expiry_time'])
-                                        print(f"     Expires: {exp_dt.strftime('%H:%M:%S')}")
+                                        self._dashboard_events.append(
+                                            f"Paper trade #{trade['id']} {trade['status']} | "
+                                            f"margin ${trade['margin_usdt']:.2f} @ {trade['leverage']}x"
+                                        )
                                     else:
-                                        print(f"  ⚠️  Max open trades reached")
+                                        self._dashboard_events.append("Paper entry blocked (max open or risk budget)")
                                 elif direction in ('CALL', 'PUT'):
                                     print(f"  ⚠️  PAPER: Skipped (Conf {confidence}% < {self.PAPER_CONFIG['min_confidence']}%)")
                                 
@@ -2282,10 +2203,12 @@ class LiveTradingEngine:
                     else:
                         logger.warning("[LIVE] No delta_data available")
                     
-                    # 7. Dashboard every 5 cycles
-                    if cycle_count[0] % 5 == 0:
-                        self._print_paper_dashboard()
-                    
+                    self._render_unified_dashboard(
+                        symbol=symbol, current_price=current_price,
+                        action=direction if 'direction' in locals() else 'WAIT',
+                        gate_reason='risk/venue gates passed' if 'direction' in locals() and direction in ('CALL', 'PUT') else 'no eligible entry',
+                    )
+                    self._dashboard_events = []
                     time.sleep(60)  # Poll every 60 seconds (1 candle)
                     
                 except Exception as e:
