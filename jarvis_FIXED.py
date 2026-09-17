@@ -2335,7 +2335,8 @@ class LiveTradingEngine:
         current_hour = datetime.now().hour
         session_quality = self._get_session_quality(current_hour)
         if session_quality == 'LOW':
-            logger.warning("Low quality trading session - trading anyway")
+            pass
+            # logger.warning("Low quality trading session - trading anyway")
             # return False
             
         return True
@@ -2596,8 +2597,11 @@ class Part1Breakout:
     """Breakout Analysis — backed by SmartBreakoutAI (13 brains, Part1)"""
     def __init__(self):
         try:
-            self._engine = SmartBreakoutAI() if SmartBreakoutAI else None
-        except Exception:
+            from part1_FIXED import SmartBreakoutAI
+            self._engine = SmartBreakoutAI()
+        except Exception as e:
+            import logging
+            logging.getLogger().debug(f"Part1 import error: {e}")
             self._engine = None
 
     def analyze(self, data, context=None):
@@ -2644,30 +2648,60 @@ class Part1Breakout:
 
 
 class Part2Zone:
-    """Supply/Demand Zone Analysis — backed by InstitutionalTradingEngineGPU (Part3)"""
-    def analyze(self, data, context=None):
-        # ── Try institutional engine zone signals from context ─────────────
-        if context and 'institutional_components' in context:
-            signals = context['institutional_components'].get('zone', [])
-            if signals:
-                s = sorted(signals, key=lambda x: abs(_sig_to_num(x.get('signal', 0))), reverse=True)[0]
-                return {"signal": _sig_to_num(s.get('signal', 0)), "thought": f"Zone-Engine: {s.get('type')}"}
+    """Supply/Demand Zone Analysis — backed by AdvancedAnalysisSystem (Part2)"""
+    def __init__(self):
+        try:
+            from part2_FIXED import AdvancedAnalysisSystem
+            self._engine = AdvancedAnalysisSystem()
+        except Exception as e:
+            print(f"Part2 import error: {e}")
+            import logging
+            logging.getLogger().debug(f"Part2 import error: {e}")
+            self._engine = None
 
-        # ── Fallback: proximity to 20-bar range extremes ───────────────────
+    def analyze(self, data, context=None):
+        # ── Try real Part2 engine (16-brain AdvancedAnalysisSystem) ──────────────
+        if self._engine is not None and context and 'mtf_datasets' in context:
+            try:
+                mtf = context['mtf_datasets']
+                df_1m = mtf.get('1m', data)
+                df_5m = mtf.get('5m', data)
+                df_15m = mtf.get('15m', data)
+                
+                if len(df_1m) > 0:
+                    current_candle = df_1m.iloc[-1].to_dict()
+                    signals = self._engine.process_market_data(df_1m, df_5m, df_15m, current_candle)
+                    
+                    if signals and isinstance(signals, list):
+                        # Filter out invalid tuples
+                        valid = [s for s in signals if isinstance(s, tuple) and len(s) >= 3]
+                        if valid:
+                            # Pick strongest confidence signal
+                            best = max(valid, key=lambda x: x[1])
+                            sig_dir = 1 if str(best[0]).upper() in ['CALL', 'BUY', 'LONG'] else -1
+                            return {"signal": sig_dir, "thought": f"Part2: {best[2]}"}
+            except Exception as e:
+                import logging
+                logging.getLogger().debug(f"Part2 execution error: {e}")
+
+        # ── Fallback: proximity to multi-lookback range extremes (20, 60, 100 bars) ──────
         try:
             if len(data) < 20:
                 return {"signal": 0, "thought": "Insufficient data"}
             current = float(data['close'].iloc[-1])
-            high_20 = float(data['high'].tail(20).max())
-            low_20  = float(data['low'].tail(20).min())
-            rng     = high_20 - low_20
-            if rng == 0:
-                return {"signal": 0, "thought": "Flat market"}
-            pct = (current - low_20) / rng   # 0=at support, 1=at resistance
-            if pct >= 0.92:
-                return {"signal": -1, "thought": f"Resistance Zone top {pct*100:.0f}% (fallback)"}
-            elif pct <= 0.08:
-                return {"signal": 1,  "thought": f"Support Zone bottom {pct*100:.0f}% (fallback)"}
+            for lookback in [20, 60, 100]:
+                if len(data) < lookback:
+                    continue
+                h = float(data['high'].tail(lookback).max())
+                l = float(data['low'].tail(lookback).min())
+                rng = h - l
+                if rng <= 0:
+                    continue
+                pct = (current - l) / rng   # 0=at support, 1=at resistance
+                if pct >= 0.92:
+                    return {"signal": -1, "thought": f"Resistance Zone top {pct*100:.0f}% ({lookback}-bar)"}
+                elif pct <= 0.08:
+                    return {"signal": 1,  "thought": f"Support Zone bottom {pct*100:.0f}% ({lookback}-bar)"}
         except Exception:
             pass
         return {"signal": 0, "thought": "No Zones (fallback)"}
@@ -4598,7 +4632,8 @@ class TradeManager:
         current_hour = datetime.now().hour
         session_quality = self._get_session_quality(current_hour)
         if session_quality == 'LOW':
-            logger.warning("Low quality trading session - trading anyway")
+            pass
+            # logger.warning("Low quality trading session - trading anyway")
             # return False
             
         return True
@@ -4967,33 +5002,56 @@ class JarvisElite:
                 # --- NEW WIRING: Start dormant engines ---
                 if not self.is_backtest_mode and 'adaptive' in self.engines:
                     try:
-                        self.engines['adaptive'].start_ai_learning()
-                        logger.info("✅ [ADAPTIVE] AI Learning Engine STARTED")
-                    except Exception as e:
-                        logger.warning(f"⚠️ [ADAPTIVE] start_ai_learning failed: {e}")
-                        
-                if not self.is_backtest_mode and 'confidence' in self.engines:
-                    try:
-                        engine = self.engines['confidence']
-                        if hasattr(engine, 'start_confidence_monitoring'):
-                            import asyncio
-                            import inspect
-                            method = engine.start_confidence_monitoring
-                            if inspect.iscoroutinefunction(method):
-                                # async method — schedule it safely
+                        import asyncio, inspect
+                        adaptive_eng = self.engines['adaptive']
+                        # GPUAIAdaptiveLearningEngine uses start_learning_engine (async)
+                        if hasattr(adaptive_eng, 'start_learning_engine'):
+                            _method = adaptive_eng.start_learning_engine
+                        elif hasattr(adaptive_eng, 'start_ai_learning'):
+                            _method = adaptive_eng.start_ai_learning
+                        else:
+                            _method = None
+                        if _method:
+                            if inspect.iscoroutinefunction(_method):
                                 try:
                                     loop = asyncio.get_event_loop()
                                     if loop.is_running():
-                                        asyncio.ensure_future(method())
+                                        asyncio.ensure_future(_method())
                                     else:
-                                        loop.run_until_complete(method())
+                                        loop.run_until_complete(_method())
                                 except RuntimeError:
-                                    asyncio.run(method())
+                                    asyncio.run(_method())
                             else:
-                                method()
-                            logger.info("✅ [CONFIDENCE] Enhanced Confidence Monitor STARTED")
+                                _method()
+                            logger.info("✅ [ADAPTIVE] AI Learning Engine STARTED")
                         else:
-                            logger.warning("⚠️ [CONFIDENCE] start_confidence_monitoring not found on engine")
+                            logger.info("ℹ️ [ADAPTIVE] No start method found — engine self-manages")
+                    except Exception as e:
+                        logger.warning(f"⚠️ [ADAPTIVE] start failed: {e}")
+                        
+                if not self.is_backtest_mode and 'confidence' in self.engines:
+                    try:
+                        import asyncio, inspect
+                        conf_eng = self.engines['confidence']
+                        # Try known start method names
+                        for _mname in ('start_confidence_monitoring', 'start_monitoring', 'start'):
+                            if hasattr(conf_eng, _mname):
+                                _cm = getattr(conf_eng, _mname)
+                                if inspect.iscoroutinefunction(_cm):
+                                    try:
+                                        loop = asyncio.get_event_loop()
+                                        if loop.is_running():
+                                            asyncio.ensure_future(_cm())
+                                        else:
+                                            loop.run_until_complete(_cm())
+                                    except RuntimeError:
+                                        asyncio.run(_cm())
+                                else:
+                                    _cm()
+                                logger.info(f"✅ [CONFIDENCE] Monitor STARTED via {_mname}()")
+                                break
+                        else:
+                            logger.info("ℹ️ [CONFIDENCE] Engine active — no explicit start needed")
                     except Exception as e:
                         logger.warning(f"⚠️ [CONFIDENCE] start failed: {e}")
                 # ----------------------------------------
@@ -5210,10 +5268,16 @@ class JarvisElite:
                     for tf_name, tf_rule in resample_rules.items():
                         try:
                             resampled = data.resample(tf_rule).agg(ohlcv_agg).dropna()
-                            if len(resampled) >= 1:
+                            if len(resampled) >= 20:
                                 engine_tf_data[tf_name] = resampled
                         except Exception:
                             pass
+                            
+                    # OPTIMIZATION: Truncate all timeframes to max 500 rows
+                    # Generating 4h candles required 5000 rows of 1m data, but engines only need the recent candles
+                    for k in list(engine_tf_data.keys()):
+                        if len(engine_tf_data[k]) > 500:
+                            engine_tf_data[k] = engine_tf_data[k].iloc[-500:]
                     
                     # Store MTF data for all engines to use
                     self.market_context['mtf_datasets'] = engine_tf_data
@@ -5347,8 +5411,14 @@ class JarvisElite:
                     '1h': '1h', '2h': '2h', '4h': '4h'
                 }.items():
                     resampled = data.resample(tf_rule).agg(ohlcv_agg).dropna()
-                    if not resampled.empty:
+                    if len(resampled) >= 20:
                         mtf_data[tf_name] = resampled
+                
+                # OPTIMIZATION: Truncate to 500 rows to prevent massive slowdown in backtest
+                for k in list(mtf_data.keys()):
+                    if len(mtf_data[k]) > 500:
+                        mtf_data[k] = mtf_data[k].iloc[-500:]
+                        
                 self._api_mtf_cache = mtf_data
                 self.market_context['mtf_datasets'] = mtf_data
             else:
@@ -5377,7 +5447,7 @@ class JarvisElite:
                         for tf_name, tf_rule in resample_map.items():
                             try:
                                 resampled = data.resample(tf_rule).agg(ohlcv_agg).dropna()
-                                if len(resampled) >= 1:
+                                if len(resampled) >= 20:
                                     mtf_data_fb[tf_name] = resampled
                             except Exception:
                                 pass
@@ -5476,48 +5546,80 @@ class JarvisElite:
                 
                 mtf_breakdown[tf_name] = tf_results
             
-            # Build final part_results with weighted MTF consensus
+            # Build final part_results with MTF confirmation & veto protection
             for name, part in self.parts.items():
                 if name in ['part11_fusion', 'part12_confidence']:
                     continue
                 
-                if name in weighted_signals and weight_totals[name] > 0:
-                    weighted_avg = weighted_signals[name] / weight_totals[name]
-                    
-                    # Convert weighted average to signal (-1, 0, 1)
-                    if weighted_avg > 0.15:
-                        final_signal = 1
-                    elif weighted_avg < -0.15:
-                        final_signal = -1
-                    else:
-                        final_signal = 0
-                    
-                    # 🎓 TEACHER FIX #2: MTF Amnesia
-                    # Provide the strongest timeframe thought, instead of just defaulting to 1m
-                    valid_tfs = [tf for tf in tf_weights.keys() if tf in mtf_breakdown]
-                    macro_tf = valid_tfs[-1] if valid_tfs else '1m'
-                    macro_result = mtf_breakdown.get(macro_tf, {}).get(name, {})
-                    macro_thought = macro_result.get('thought', 'No macro thought')
-                    
-                    base_result = mtf_breakdown.get('1m', {}).get(name, {})
-                    base_thought = base_result.get('thought', 'No thought')
-                    
-                    final_thought = f"{base_thought} (Macro {macro_tf}: {macro_thought})"
-                    # Count TF agreement
-                    tf_agree = sum(1 for tf in mtf_breakdown if name in mtf_breakdown[tf] 
-                                  and mtf_breakdown[tf][name].get('signal', 0) == final_signal and final_signal != 0)
-                    
-                    part_results[name] = {
-                        'signal': final_signal,
-                        'thought': f"{final_thought} | MTF: {tf_agree}/{len(mtf_data)} TFs agree",
-                        'weighted_avg': round(weighted_avg, 3),
-                        'tf_agreement': tf_agree
-                    }
-                    
-                    if final_signal != 0:
-                        logger.debug(f"🔍 MTF TRACER: {name} signal={final_signal} weighted={weighted_avg:.3f} TFs={tf_agree}/{len(mtf_data)}")
-                else:
+                primary_tf = '1m' if '1m' in mtf_breakdown else (list(mtf_breakdown.keys())[0] if mtf_breakdown else '1m')
+                base_result = mtf_breakdown.get(primary_tf, {}).get(name, {})
+                if not base_result:
                     part_results[name] = {'signal': 0, 'thought': 'Part offline'}
+                    continue
+
+                base_sig_raw = base_result.get('signal', 0)
+                try:
+                    base_sig = int(float(base_sig_raw))
+                except (ValueError, TypeError):
+                    base_sig = 0
+                base_thought = str(base_result.get('thought', 'No thought')).strip()
+                
+                # HTF confluence / veto calculation across higher timeframes
+                htf_weighted_sum = 0.0
+                htf_total_weight = 0.0
+                for tf_name in mtf_data.keys():
+                    if tf_name == primary_tf:
+                        continue
+                    tf_res = mtf_breakdown.get(tf_name, {}).get(name, {})
+                    try:
+                        s = float(tf_res.get('signal', 0))
+                    except (ValueError, TypeError):
+                        s = 0.0
+                    w = tf_weights.get(tf_name, 1.0)
+                    htf_weighted_sum += s * w
+                    htf_total_weight += w
+                
+                htf_avg = (htf_weighted_sum / htf_total_weight) if htf_total_weight > 0 else 0.0
+                
+                # ── RULE 1: PRIMARY TIMEFRAME (1m) INTEGRITY ──────────────────────
+                # If 1m is Neutral (0), the part MUST remain Neutral (0).
+                # Higher timeframes CANNOT manufacture an entry out of flat consolidation!
+                if base_sig == 0:
+                    final_signal = 0
+                    final_thought = base_thought
+                else:
+                    # ── RULE 2: HIGHER TIMEFRAME CONFIRMATION & VETO ──────────────
+                    # If 1m signals +1 or -1:
+                    # Check if valid higher timeframes strongly oppose:
+                    # e.g., 1m is +1 (BUY) but HTF is strongly negative (htf_avg <= -0.25)
+                    if (base_sig > 0 and htf_avg <= -0.25) or (base_sig < 0 and htf_avg >= 0.25):
+                        final_signal = 0  # HTF Veto: block counter-trend trade!
+                        final_thought = f"{base_thought} | VETOED by HTF opposition (HTF avg: {htf_avg:+.2f})"
+                    else:
+                        # 1m is valid and confirmed / not opposed by HTF
+                        final_signal = base_sig
+                        tf_agree = sum(
+                            1 for tf in mtf_breakdown 
+                            if name in mtf_breakdown[tf] 
+                            and mtf_breakdown[tf][name].get('signal', 0) == final_signal
+                        )
+                        final_thought = f"{base_thought} | MTF: {tf_agree}/{len(mtf_data)} TFs agree"
+                
+                tf_agree_cnt = sum(
+                    1 for tf in mtf_breakdown 
+                    if name in mtf_breakdown[tf] 
+                    and mtf_breakdown[tf][name].get('signal', 0) == final_signal and final_signal != 0
+                )
+                
+                part_results[name] = {
+                    'signal': final_signal,
+                    'thought': final_thought,
+                    'weighted_avg': round(htf_avg, 3),
+                    'tf_agreement': tf_agree_cnt
+                }
+                
+                if final_signal != 0:
+                    logger.debug(f"🔍 MTF TRACER: {name} signal={final_signal} base={base_sig} HTF={htf_avg:.3f}")
             
             # Log MTF summary
             buy_parts = sum(1 for r in part_results.values() if r.get('signal', 0) > 0)
