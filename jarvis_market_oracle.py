@@ -980,8 +980,8 @@ Provide JSON market forecast for ALL timeframes matching the requested schema.
         sl_val = fc.get("stop_loss", 0)
 
         sugg_col = G if trade_sugg == "CALL" else (R if trade_sugg == "PUT" else Y)
-        print(f"  {BD}ORACLE TRADE PLAN:{RST} {sugg_col}{BD}[{trade_sugg}]{RST} | Entry: ${ez_from:,.0f}-${ez_to:,.0f} | TP: ${tp_val:,.0f} | SL: ${sl_val:,.0f}")
-        print(f"\n  {M}{BD}AI ORACLE SAYS:{RST} \"{W}{summary}{RST}\"")
+        print(f"  {BD}BTC MACRO TREND:{RST} {sugg_col}{BD}[{trade_sugg}]{RST} | Focus Zone: ${ez_from:,.0f}-${ez_to:,.0f} | Key Res: ${tp_val:,.0f} | Key Sup: ${sl_val:,.0f}")
+        print(f"\n  {M}{BD}MACRO AI SAYS:{RST} \"{W}{summary}{RST}\"")
 
         # ── Indian Market Context (Upstox) ──────────────────────────────
         upstox_data = self.last_raw_data.get("upstox", {})
