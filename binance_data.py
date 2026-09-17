@@ -64,13 +64,18 @@ class BinanceData:
     def get_live_price(self, symbol: str = "BTCUSDT") -> float:
         """
         Fetch real-time last traded price from Binance.
-        Cached for 3s to avoid hammering the API.
+        Cached per-symbol for 3s to avoid hammering the API.
         """
         now = time.time()
-        if self._last_price > 0 and (now - self._last_price_ts) < self._price_ttl:
-            return self._last_price  # return cached
-
         sym = symbol.upper().replace("USD", "USDT") if "USDT" not in symbol.upper() else symbol.upper()
+
+        # --- FIX: per-symbol cache (old code used single _last_price for ALL symbols) ---
+        if not hasattr(self, '_price_cache'):
+            self._price_cache = {}  # {sym: (price, ts)}
+        cached = self._price_cache.get(sym)
+        if cached and cached[0] > 0 and (now - cached[1]) < self._price_ttl:
+            return cached[0]  # return cached price for THIS symbol
+
         try:
             resp = self.session.get(
                 f"{BINANCE_BASE_URL}/api/v3/ticker/price",
@@ -80,7 +85,8 @@ class BinanceData:
             if resp.status_code == 200:
                 price = float(resp.json().get("price", 0))
                 if price > 0:
-                    self._last_price = price
+                    self._price_cache[sym] = (price, now)
+                    self._last_price = price  # keep for backward compat
                     self._last_price_ts = now
                     logger.debug(f"[BINANCE PRICE] {sym} = ${price:,.2f}")
                     return price
@@ -89,7 +95,8 @@ class BinanceData:
         except Exception as e:
             logger.warning(f"[BINANCE PRICE] Error: {e}")
 
-        return self._last_price  # return last known price as fallback
+        # Return last known price for THIS symbol only (not another symbol's price)
+        return cached[0] if cached else 0.0
 
     # ─────────────────────────────────────────────
     # 2. HISTORICAL CANDLES (OHLCV)
