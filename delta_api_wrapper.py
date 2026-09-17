@@ -581,8 +581,26 @@ class DeltaExchangeData:
         return 0.0
 
     def get_open_positions(self, symbol: str = "BTCUSDT") -> List[Dict]:
-        """Get all currently open positions on Delta Exchange."""
-        res = self._request("GET", "/v2/positions", authorized=True)
+        """Get open positions, scoping the private request to one product.
+
+        Delta's positions endpoint uses ``product_id`` for this filter. Resolve
+        the caller-facing symbol through the existing product lookup rather
+        than sending an unsupported ``symbol`` query parameter or making a
+        broad positions request.
+        """
+        params = None
+        if symbol:
+            product_id = self.get_product_id(symbol)
+            if product_id is None:
+                logger.error("[DELTA API] Product ID not found for requested positions")
+                return []
+            try:
+                params = {"product_id": int(product_id)}
+            except (TypeError, ValueError):
+                logger.error("[DELTA API] Invalid product ID for requested positions")
+                return []
+
+        res = self._request("GET", "/v2/positions", params, authorized=True)
         if res["success"]:
             try:
                 positions = res["data"].get("result", [])
