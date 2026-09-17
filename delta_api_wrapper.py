@@ -589,14 +589,16 @@ class DeltaExchangeData:
         broad positions request.
         """
         params = None
+        resolved_symbol = symbol
         if symbol:
-            product_id = self.get_product_id(symbol)
-            if product_id is None:
+            product = self._resolve_product(symbol)
+            if product is None:
                 logger.error("[DELTA API] Product ID not found for requested positions")
                 return []
+            resolved_symbol = product.get("symbol", symbol)
             try:
-                params = {"product_id": int(product_id)}
-            except (TypeError, ValueError):
+                params = {"product_id": int(product["id"])}
+            except (KeyError, TypeError, ValueError):
                 logger.error("[DELTA API] Invalid product ID for requested positions")
                 return []
 
@@ -604,10 +606,10 @@ class DeltaExchangeData:
         if res["success"]:
             try:
                 positions = res["data"].get("result", [])
-                if symbol:
+                if resolved_symbol:
                     positions = [p for p in positions
-                                 if p.get("product", {}).get("symbol") == symbol
-                                 or p.get("symbol") == symbol]
+                                 if p.get("product", {}).get("symbol") == resolved_symbol
+                                 or p.get("symbol") == resolved_symbol]
                 return positions
             except Exception:
                 return []
@@ -638,16 +640,53 @@ class DeltaExchangeData:
             logger.warning(f"[EMERGENCY] Closed {size}x {symbol}: {res}")
         return results
 
+    def _resolve_product(self, symbol: str) -> Optional[Dict]:
+        """Resolve a caller-facing symbol to the matching Delta product.
+
+        Scanners and defaults typically emit ``XXXUSDT`` while Delta India
+        lists perps as ``XXXUSD``. Try the exact symbol first, then the
+        alternate quote (USDT<->USD) so callers get the product they mean
+        instead of a failed lookup.  The product list is cached briefly to
+        avoid re-downloading the full catalogue on every call.
+        Returns the raw product dict, or None when nothing matches.
+        """
+        if not isinstance(symbol, str) or not symbol.strip():
+            return None
+        symbol = symbol.strip().upper()
+
+        now = time.time()
+        cache = getattr(self, "_products_cache", None)
+        if not cache or now - cache.get("ts", 0) > 300:
+            # CRITICAL FIX: Use authorized=True to force lookup on Testnet
+            # (Private URL). Mainnet Product IDs are invalid on Testnet.
+            res = self._request("GET", "/v2/products", authorized=True)
+            if not res["success"]:
+                return None
+            products = res["data"].get("result", []) or []
+            self._products_cache = {"ts": now, "products": products}
+        products = self._products_cache["products"]
+
+        candidates = [symbol]
+        if symbol.endswith("USDT"):
+            candidates.append(symbol[:-4] + "USD")
+        elif symbol.endswith("USD"):
+            candidates.append(symbol[:-3] + "USDT")
+
+        for candidate in candidates:
+            for p in products:
+                if p.get("symbol") == candidate:
+                    return p
+        return None
+
     def get_product_id(self, symbol: str) -> Optional[str]:
         """Fetch Product ID for a given Symbol (required for Leverage)."""
-        # CRITICAL FIX: Use authorized=True to force lookup on Testnet (Private URL)
-        # Mainnet Product IDs are invalid on Testnet.
-        res = self._request("GET", "/v2/products", authorized=True)
-        if res["success"]:
-            for p in res["data"].get("result", []):
-                if p["symbol"] == symbol:
-                    return str(p["id"])
-        return None
+        product = self._resolve_product(symbol)
+        if product is None:
+            return None
+        try:
+            return str(product["id"])
+        except (KeyError, TypeError):
+            return None
 
     def set_leverage(self, symbol: str, leverage: int = 200) -> bool:
         """
