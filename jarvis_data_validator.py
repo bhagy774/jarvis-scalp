@@ -433,9 +433,13 @@ class JarvisDataValidator:
         if failures:
             return failures
 
+        # --- FIX: include symbol in cache key so BTC price doesn't pollute NEAR etc ---
+        symbol = candle.get("symbol", candle.get("instrument", ""))
+        price_key = f"{source}:{symbol}" if symbol else source
+
         # Spike detection vs last known price
         with self._lock:
-            last = self._last_prices.get(source)
+            last = self._last_prices.get(price_key)
 
         if last is not None and last > 0:
             change_pct = abs(close - last) / last * 100.0
@@ -449,7 +453,7 @@ class JarvisDataValidator:
 
         # Update last known good price
         with self._lock:
-            self._last_prices[source] = close
+            self._last_prices[price_key] = close
 
         return failures
 
