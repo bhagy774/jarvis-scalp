@@ -6371,6 +6371,7 @@ Follow the tag with a 1-sentence CEO executive directive.
                 unified_signal_data,
                 current_price=signal['trade_signal'].get('entry_price', 0),
                 part_results=real_part_results,
+                symbol=getattr(self, 'active_symbol', None)
             )
 
         return signal

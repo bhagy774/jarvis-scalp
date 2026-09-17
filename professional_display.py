@@ -104,13 +104,16 @@ class ProfessionalSignalDisplay:
         return self._row('')
 
     # ─── main display ───────────────────────────────────────────────────────
-    def display_full_signal(self, signal_data, current_price=None, part_results=None):
+    def display_full_signal(self, signal_data, current_price=None, part_results=None,
+                            symbol=None, model_name=None):
         """
         Render the full JARVIS god-mode terminal display.
 
         signal_data  – dict with direction, confidence, ai_reason, entry_price …
-        current_price – live BTC price (float)
+        current_price – live price (float)
         part_results  – dict  {part_name: {signal: -1/0/1, thought: str, …}}
+        symbol        – active trading symbol (e.g. 'NEARUSD', 'BTCUSDT')
+        model_name    – active Ollama model name
         """
         self._cycle += 1
 
@@ -189,17 +192,20 @@ class ProfessionalSignalDisplay:
         date_str = datetime.now().strftime('%d %b %Y')
 
         ap(self._top())
+        # Use active symbol from param; fallback to env var or BTC/USDT
+        _sym = symbol or __import__('os').environ.get('JARVIS_DEFAULT_SYMBOL', 'BTC/USDT')
+        _model = model_name or __import__('os').environ.get('OLLAMA_MODEL', 'deepseek-r1:14b')
         header = (
             _clr('  🤖 JARVIS', BD + C) +
             _clr(' NEURAL CORTEX', C) +
             _clr('  │  ', DG) +
-            _clr('BTC/USDT', BD + W) +
+            _clr(_sym, BD + W) +
             _clr('  │  ', DG) +
             _clr(date_str, DG) +
             '  ' +
             _clr(now_str, BD + Y) +
             _clr('  │  ', DG) +
-            _clr('deepseek-r1:14b', M) +
+            _clr(_model, M) +
             _clr(f'  │  Cycle #{self._cycle}', DG)
         )
         ap(self._row(header))
