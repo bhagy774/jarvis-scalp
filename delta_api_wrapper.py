@@ -20,6 +20,7 @@ import hashlib
 import requests
 import logging
 import json
+import re
 from urllib.parse import urlencode
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
@@ -89,6 +90,25 @@ class DeltaExchangeData:
         ).hexdigest()
         return {"api-key": self.api_key, "timestamp": timestamp, "signature": signature}
 
+    @staticmethod
+    def _diagnostic_error(response) -> str:
+        """Return only a bounded, structured, non-secret API diagnostic.
+
+        Response bodies are never logged or echoed: even an error body can
+        reflect credentials. Only a strict, short machine error code is safe.
+        """
+        safe_code = None
+        try:
+            body = response.json()
+            candidate = body.get("error") if isinstance(body, dict) else None
+            if isinstance(candidate, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,31}", candidate):
+                safe_code = candidate
+        except (ValueError, TypeError, AttributeError):
+            pass
+        if safe_code:
+            return f"HTTP {response.status_code}: {safe_code}"
+        return f"HTTP {response.status_code}"
+
     def _request(self, method: str, endpoint: str, payload: Dict = None, authorized: bool = False) -> Dict:
         """
         Unified Request Handler.
@@ -127,8 +147,8 @@ class DeltaExchangeData:
                     logger.debug(f"[DELTA API] {method} {endpoint} took {elapsed:.2f}s")
                     if 200 <= response.status_code < 300:
                         return {"success": True, "data": response.json()}
-                    logger.error("[DELTA API] Error status %s", response.status_code)
-                    return {"success": False, "error": f"HTTP {response.status_code}"}
+                    logger.error("[DELTA API] %s %s status=%s", method, endpoint.split("?", 1)[0], response.status_code)
+                    return {"success": False, "error": self._diagnostic_error(response)}
 
                 else:
                     # authorized GET with no payload
@@ -149,8 +169,8 @@ class DeltaExchangeData:
 
             if 200 <= response.status_code < 300:
                 return {"success": True, "data": response.json()}
-            logger.error("[DELTA API] Error status %s", response.status_code)
-            return {"success": False, "error": f"HTTP {response.status_code}"}
+            logger.error("[DELTA API] %s %s status=%s", method, endpoint.split("?", 1)[0], response.status_code)
+            return {"success": False, "error": self._diagnostic_error(response)}
 
         except Exception as e:
             logger.error("[DELTA API] Connection failed: %s", type(e).__name__)

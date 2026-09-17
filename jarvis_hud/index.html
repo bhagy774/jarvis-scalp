@@ -319,6 +319,7 @@
 <div id="conn-overlay" style="position:fixed;inset:0;background:#000;z-index:999;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--cyan);font-family:'Orbitron',sans-serif;">
   <h1 style="letter-spacing:10px;animation:pulse 2s infinite;">JARVIS</h1>
   <p style="font-family:'Share Tech Mono',monospace;margin-top:20px;" id="conn-status">Connecting to core...</p>
+  <p style="color:var(--gold);font-family:'Share Tech Mono',monospace;margin-top:10px;">Simulation display · Live executor status not verified here</p>
 </div>
 
 <!-- UI LAYER -->
@@ -707,10 +708,12 @@ function updateUI(data) {
       const fill  = document.getElementById(`pfill-${name}`);
       const confT = document.getElementById(`pconf-${name}`);
       
-      const dir = pdata.direction || 'NEUTRAL';
-      const conf = pdata.confidence || 0;
+      const rawDir = pdata.direction || 'NEUTRAL';
+      const conf = Number(pdata.confidence) || 0;
+      // Never render a directional recommendation without confidence.
+      const dir = conf > 0 ? rawDir : 'NEUTRAL';
       
-      badge.textContent = dir;
+      badge.textContent = conf > 0 ? dir : 'NO SIGNAL';
       badge.className = `part-badge b-${dir.substring(0,4).toLowerCase()}`;
       fill.style.width = `${conf}%`;
       confT.textContent = `${conf.toFixed(0)}%`;
