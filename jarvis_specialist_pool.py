@@ -30,10 +30,10 @@ logger = logging.getLogger("SpecialistPool")
 # Risk      → qwen2.5:14b      (same model as Validator — saves ~7.5 GB VRAM)
 # Chairman  → qwen2.5:14b      (quick final synthesis)
 # Override any model via environment variable.
-MODEL_ANALYST   = os.environ.get("MODEL_ANALYST",   "deepseek-r1:14b")
-MODEL_VALIDATOR = os.environ.get("MODEL_VALIDATOR", "qwen2.5:14b")
-MODEL_RISK      = os.environ.get("MODEL_RISK",      "qwen2.5:14b")     # shares VRAM with Validator
-MODEL_CHAIRMAN  = os.environ.get("MODEL_CHAIRMAN",  "qwen2.5:14b")     # fast synthesis
+MODEL_ANALYST   = os.environ.get("MODEL_ANALYST",   "deepseek-r1:14b")  # deep reasoning
+MODEL_VALIDATOR = os.environ.get("MODEL_VALIDATOR", "qwen2.5:14b")      # structure validation
+MODEL_RISK      = os.environ.get("MODEL_RISK",      "mistral-nemo:12b") # risk assessment
+MODEL_CHAIRMAN  = os.environ.get("MODEL_CHAIRMAN",  "mistral-nemo:12b") # fast synthesis
 
 class SpecialistPool:
     def __init__(self, max_workers: int = 3):
@@ -50,7 +50,7 @@ Role: {role}
 Instruction: {prompt_instruction}
 """
         logger.debug(f"Calling specialist {role} ({model})...")
-        response, err = call_ollama(full_prompt, model=model, timeout=90)
+        response, err = call_ollama(full_prompt, model=model, timeout=180)  # 3min for 14B models
         
         if response and not err:
             return response.strip()
@@ -91,8 +91,8 @@ Instruction: {prompt_instruction}
         
         opinions = {}
         
-        # Wait for results (timeout 95 seconds just in case)
-        for future in concurrent.futures.as_completed(future_to_role, timeout=95):
+        # Wait for results (timeout 185 seconds — 14B model can take ~2-3min on first load)
+        for future in concurrent.futures.as_completed(future_to_role, timeout=185):
             role = future_to_role[future]
             try:
                 result = future.result()
@@ -127,7 +127,7 @@ Instructions:
 - Start your response with EXACTLY ONE of: [CONSENSUS_EXECUTE] or [CONSENSUS_REJECT]
 - Follow with a 1-sentence board summary.
 """
-        chairman_verdict, err = call_ollama(chairman_prompt, model=MODEL_CHAIRMAN, timeout=120)
+        chairman_verdict, err = call_ollama(chairman_prompt, model=MODEL_CHAIRMAN, timeout=180)
         
         if not chairman_verdict or err:
             chairman_verdict = f"[CONSENSUS_REJECT] Chairman unavailable: {err}"
