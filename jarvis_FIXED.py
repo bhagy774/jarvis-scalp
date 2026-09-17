@@ -1183,6 +1183,8 @@ class LiveTradingEngine:
         # The route is chosen before data is fetched and remains locked while a
         # position is open.  Every downstream crypto value must use this symbol.
         self.market_router = None
+        self.active_symbol = os.getenv('JARVIS_DEFAULT_SYMBOL', 'BTCUSDT')
+        self.active_base_asset = 'BTC'
         if MARKET_ROUTER_AVAILABLE and MarketRouter is not None:
             self.market_router = MarketRouter(
                 scanner=getattr(self.jarvis, 'coin_scanner', None),
@@ -2096,6 +2098,13 @@ class LiveTradingEngine:
                             continue
                     symbol = route.symbol if route else os.getenv('JARVIS_DEFAULT_SYMBOL', 'BTCUSDT')
                     base_asset = route.base_asset if route else 'BTC'
+                    # Let the brain know which symbol is being analysed so that
+                    # cross-source checks compare the SAME asset (not BTC).
+                    try:
+                        self.jarvis.active_symbol = symbol
+                        self.jarvis.active_base_asset = base_asset
+                    except Exception:
+                        pass
 
                     # 2. Get price and check open paper trades for this exact symbol.
                     try:
@@ -5137,7 +5146,8 @@ class JarvisElite:
                     # Cross-source: Delta vs Binance price divergence
                     if self.binance_data is not None:
                         try:
-                            _bn_price = self.binance_data.get_live_price()
+                            _xs_base = getattr(self, 'active_base_asset', None) or 'BTC'
+                            _bn_price = self.binance_data.get_live_price(symbol=f"{_xs_base}USDT")
                             if _bn_price and _bn_price > 0:
                                 _delta_price = float(data['close'].iloc[-1])
                                 _xs_result = _dv.cross_source_check(

@@ -3,7 +3,7 @@
 All tests are fully offline (no network). Covers:
   - Completeness: missing/NaN/Inf OHLC fields rejected
   - Price sanity: zero/negative prices rejected, 20%+ spikes rejected
-  - Staleness: data > 30s old rejected, future timestamps rejected
+  - Staleness: data older than MAX_STALE_SECONDS rejected, future rejected
   - Cross-source: > 1% divergence warns, > 3% divergence blocks
   - Multi-source combined validation
   - Spike filter does NOT update last price (so recovery works)
@@ -169,15 +169,19 @@ class TestStaleness:
         r = validator.validate_candle(_candle(ts=now - 5), source="test", now=now)
         assert r.ok is True
 
-    def test_stale_data_30s_fails(self, validator):
+    def test_stale_data_beyond_limit_fails(self, validator):
+        import jarvis_data_validator as dv
         now = time.time()
-        r = validator.validate_candle(_candle(ts=now - 35), source="test", now=now)
+        r = validator.validate_candle(
+            _candle(ts=now - dv.MAX_STALE_SECONDS - 5), source="test", now=now)
         assert r.ok is False
         assert any("stale" in f.lower() for f in r.failures)
 
-    def test_exactly_30s_passes(self, validator):
+    def test_within_limit_passes(self, validator):
+        import jarvis_data_validator as dv
         now = time.time()
-        r = validator.validate_candle(_candle(ts=now - 30), source="test", now=now)
+        r = validator.validate_candle(
+            _candle(ts=now - (dv.MAX_STALE_SECONDS - 5)), source="test", now=now)
         assert r.ok is True
 
     def test_millisecond_timestamp_auto_converted(self, validator):
@@ -189,7 +193,7 @@ class TestStaleness:
 
     def test_future_timestamp_fails(self, validator):
         now = time.time()
-        r = validator.validate_candle(_candle(ts=now + 60), source="test", now=now)
+        r = validator.validate_candle(_candle(ts=now + 400), source="test", now=now)
         assert r.ok is False
         assert any("future" in f.lower() for f in r.failures)
 
@@ -253,7 +257,7 @@ class TestMultiSource:
         now = time.time()
         sources = {
             "delta": _candle(close=100.0, ts=now - 2),
-            "binance": _candle(close=100.3, ts=now - 60),  # stale
+            "binance": _candle(close=100.3, ts=now - 400),  # stale
         }
         r = validator.validate_multi_source(sources, now=now)
         assert r.ok is False
@@ -315,14 +319,14 @@ class TestDataFrame:
     def test_df_with_datetime_index_staleness(self, validator):
         import pandas as pd
         now = time.time()
-        ts = pd.Timestamp.now() - pd.Timedelta(seconds=60)
+        ts = pd.Timestamp.now() - pd.Timedelta(seconds=400)
         df = pd.DataFrame(
             {"open": [100.0], "high": [101.0], "low": [99.0],
              "close": [100.5], "volume": [1000.0]},
             index=pd.DatetimeIndex([ts])
         )
         r = validator.validate_dataframe(df, source="test", now=now)
-        assert r.ok is False  # 60s old > 30s limit
+        assert r.ok is False  # older than staleness limit
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -353,7 +357,7 @@ class TestStats:
 
     def test_reject_reason_tracked(self, validator):
         now = time.time()
-        validator.validate_candle(_candle(ts=now - 60), source="test", now=now)
+        validator.validate_candle(_candle(ts=now - 400), source="test", now=now)
         stats = validator.get_stats()
         assert stats["rejects_by_reason"]["staleness"] >= 1
 
