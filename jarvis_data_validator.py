@@ -53,7 +53,9 @@ VALIDATOR_ENABLED = os.environ.get("JARVIS_DATA_VALIDATOR", "1") != "0"
 MAX_SPIKE_PCT = 20.0        # reject if price jumps > 20% from last known
 
 # Staleness
-MAX_STALE_SECONDS = 30.0    # data older than 30s is stale
+# Candle data: a forming 1m candle can legitimately be up to ~60s old
+# (open timestamp) plus fetch latency. 120s default still catches dead feeds.
+MAX_STALE_SECONDS = float(os.getenv("JARVIS_MAX_STALE_SEC", "120"))
 
 # Cross-source divergence
 CROSS_SOURCE_WARN_PCT = 1.0   # > 1% divergence → warning
