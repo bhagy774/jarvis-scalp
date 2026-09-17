@@ -95,8 +95,8 @@ def resolve_ollama_model(force_refresh: bool = False):
 
 def preload_committee_models():
     """
-    Pre-load all committee models into VRAM with keep_alive=-1 (indefinite)
-    so they are instantly available when trading.
+    Optionally pre-load committee models into VRAM with bounded keep_alive.
+    This is disabled by default and requires OLLAMA_PRELOAD_COMMITTEE=1.
     """
     if not OLLAMA_ENABLED or os.environ.get("OLLAMA_PRELOAD_COMMITTEE", "0") != "1":
         # Large models are loaded lazily by call_ollama; opt in explicitly to
