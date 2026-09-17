@@ -98,9 +98,11 @@ def preload_committee_models():
     Pre-load all committee models into VRAM with keep_alive=-1 (indefinite)
     so they are instantly available when trading.
     """
-    if not OLLAMA_ENABLED:
+    if not OLLAMA_ENABLED or os.environ.get("OLLAMA_PRELOAD_COMMITTEE", "0") != "1":
+        # Large models are loaded lazily by call_ollama; opt in explicitly to
+        # warm-loading because three resident models can exhaust a 24 GB GPU.
         return
-        
+
     models = [
         os.environ.get("MODEL_ANALYST", "deepseek-r1:14b"),
         os.environ.get("MODEL_VALIDATOR", "qwen2.5:14b"),
@@ -131,7 +133,7 @@ def preload_committee_models():
             logger.info(f"Pre-loading {model}...")
             resp = requests.post(
                 f"{OLLAMA_BASE_URL}/api/generate",
-                json={"model": model, "prompt": "", "keep_alive": -1},
+                json={"model": model, "prompt": "", "keep_alive": int(os.environ.get("OLLAMA_KEEP_ALIVE", "300"))},
                 timeout=60
             )
             if resp.status_code == 200:

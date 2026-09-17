@@ -89,6 +89,17 @@ class DeltaExchangeData:
         ).hexdigest()
         return {"api-key": self.api_key, "timestamp": timestamp, "signature": signature}
 
+    @staticmethod
+    def _diagnostic_error(response) -> str:
+        """Return actionable, non-secret API diagnostics without echoing credentials."""
+        try:
+            body = response.json()
+            detail = body.get("error") or body.get("message") or body.get("reason") if isinstance(body, dict) else None
+        except (ValueError, TypeError):
+            detail = None
+        detail = str(detail or response.text[:240]).replace("\n", " ")
+        return f"HTTP {response.status_code}: {detail[:240]}"
+
     def _request(self, method: str, endpoint: str, payload: Dict = None, authorized: bool = False) -> Dict:
         """
         Unified Request Handler.
@@ -127,8 +138,8 @@ class DeltaExchangeData:
                     logger.debug(f"[DELTA API] {method} {endpoint} took {elapsed:.2f}s")
                     if 200 <= response.status_code < 300:
                         return {"success": True, "data": response.json()}
-                    logger.error("[DELTA API] Error status %s", response.status_code)
-                    return {"success": False, "error": f"HTTP {response.status_code}"}
+                    logger.error("[DELTA API] %s %s status=%s body=%s", method, endpoint, response.status_code, response.text[:240])
+                    return {"success": False, "error": self._diagnostic_error(response)}
 
                 else:
                     # authorized GET with no payload
@@ -149,8 +160,8 @@ class DeltaExchangeData:
 
             if 200 <= response.status_code < 300:
                 return {"success": True, "data": response.json()}
-            logger.error("[DELTA API] Error status %s", response.status_code)
-            return {"success": False, "error": f"HTTP {response.status_code}"}
+            logger.error("[DELTA API] %s %s status=%s body=%s", method, endpoint, response.status_code, response.text[:240])
+            return {"success": False, "error": self._diagnostic_error(response)}
 
         except Exception as e:
             logger.error("[DELTA API] Connection failed: %s", type(e).__name__)
