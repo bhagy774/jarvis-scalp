@@ -918,10 +918,16 @@ class RealTimeLearningScheduler:
 # Try importing from wherever it lives, otherwise provide a safe placeholder
 try:
     from gpu_rl_learner import GPUReinforcementLearner  # adjust path as needed
-
-
-except Exception as e:
-    pass
+except Exception:
+    class GPUReinforcementLearner:  # safe fallback when gpu_rl_learner is absent
+        """Minimal no-op RL learner: keeps Part 7/9 loading; learning degrades
+        gracefully to a neutral policy instead of crashing the engine."""
+        def __init__(self, gpu_manager=None, *a, **kw):
+            self.gpu_manager = gpu_manager
+        def __getattr__(self, name):
+            def _noop(*a, **kw):
+                return None
+            return _noop
 
 class GPUAIAdaptiveLearningEngine:
     """

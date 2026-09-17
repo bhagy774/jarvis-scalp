@@ -97,7 +97,20 @@ class MarketRouter:
         except Exception as exc:
             return self._blocked(f"Delta product lookup failed: {type(exc).__name__}")
         if candidate not in available:
-            return self._blocked(f"Selected symbol {candidate} is not tradeable on Delta")
+            # Quote-currency fallback: Delta India lists perps as XXXUSD while
+            # scanners typically emit XXXUSDT. Try the alternate quote before
+            # declaring the symbol untradeable.
+            alt = None
+            if candidate.endswith("USDT"):
+                alt = candidate[:-4] + "USD"
+            elif candidate.endswith("USD"):
+                alt = candidate[:-3] + "USDT"
+            if alt and alt in available:
+                import logging
+                logging.getLogger(__name__).info("[MARKET-ROUTER] Mapped %s -> %s (Delta quote format)", candidate, alt)
+                candidate = alt
+            else:
+                return self._blocked(f"Selected symbol {candidate} is not tradeable on Delta")
 
         base = self._base_asset(candidate)
         options_available = False

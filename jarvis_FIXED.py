@@ -6928,16 +6928,19 @@ def main():
     logger.info("==========================================")
     
     # --- AUTO START UI & HUD SERVER ---
-    logger.info("🌐 Launching JARVIS Live UI & HUD Server (start_ui.ps1)...")
-    try:
-        subprocess.Popen(
-            ["powershell", "-ExecutionPolicy", "Bypass", "-File", "start_ui.ps1"],
-            cwd="c:\\jarvis",
-            creationflags=subprocess.CREATE_NEW_CONSOLE
-        )
-        logger.info("✅ UI Server spawned in background. (React @ 5173, HUD @ 7788)")
-    except Exception as e:
-        logger.error(f"⚠️ Failed to auto-start UI: {e}")
+    if os.name == "nt":
+        logger.info("🌐 Launching JARVIS Live UI & HUD Server (start_ui.ps1)...")
+        try:
+            subprocess.Popen(
+                ["powershell", "-ExecutionPolicy", "Bypass", "-File", "start_ui.ps1"],
+                cwd="c:\\jarvis",
+                creationflags=subprocess.CREATE_NEW_CONSOLE
+            )
+            logger.info("✅ UI Server spawned in background. (React @ 5173, HUD @ 7788)")
+        except Exception as e:
+            logger.error(f"⚠️ Failed to auto-start UI: {e}")
+    else:
+        logger.info("🌐 Linux detected — start HUD manually if needed: python3 jarvis_hud_server.py")
     # ----------------------------------
 
     # Initialize the complete trade system
