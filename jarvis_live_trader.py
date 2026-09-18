@@ -52,7 +52,8 @@ def _box(msg, col=C): print(f"{col}  ▶  {RST}{msg}")
 # ══════════════════════════════════════════════════════════════════
 #  RISK CONFIGURATION  (override via .env)
 # ══════════════════════════════════════════════════════════════════
-from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
+from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP, contract_quote_value_usdt
+from jarvis_decision import normalize_confidence, build_final_decision
 LEVERAGE_CAP        = MAX_LEVERAGE_CAP  # policy cap; not a user-selected leverage
 MAX_RISK_USDT       = float(os.environ.get("JARVIS_MAX_RISK_USDT", "10"))
 MAX_DAILY_LOSS_USDT = float(os.environ.get("JARVIS_MAX_DAILY_LOSS","30"))
@@ -171,12 +172,12 @@ class JarvisAutoTrader:
         if not isinstance(direction, str) or direction.upper() not in ("CALL", "PUT", "BUY", "SELL"):
             return self._skip("Invalid trade direction")
         direction = direction.upper()
+        confidence = normalize_confidence(confidence)
         try:
-            confidence = int(confidence)
             current_price = float(current_price)
         except (TypeError, ValueError):
             return self._skip("Invalid confidence or price")
-        if not 0 <= confidence <= 100 or current_price <= 0:
+        if confidence is None or not 0 <= confidence <= 100 or current_price <= 0:
             return self._skip("Invalid confidence or price")
         if trade_type not in ("SCALP", "SWING"):
             return self._skip("Invalid trade type")
@@ -198,11 +199,11 @@ class JarvisAutoTrader:
         # ─ Gate 0.5: JARVIS Market Oracle Gate ───────────────────
         oracle_gate = self._oracle_gate or _get_oracle_gate()
         if oracle_gate:
-            aligned, align_reason = oracle_gate.is_trade_aligned(direction)
+            aligned, align_reason = oracle_gate.is_trade_aligned(direction, symbol=symbol)
             if not aligned:
                 return self._skip(f"Gate0.5 ORACLE ALIGNMENT: {align_reason}")
 
-            in_zone, zone_reason = oracle_gate.is_price_in_entry_zone(current_price)
+            in_zone, zone_reason = oracle_gate.is_price_in_entry_zone(current_price, symbol=symbol)
             if not in_zone:
                 return self._skip(f"Gate0.5 ORACLE ENTRY ZONE: {zone_reason}")
 
@@ -389,6 +390,7 @@ class JarvisAutoTrader:
         sl_price  = round(price * (1 - sl_pct) if is_call else price * (1 + sl_pct), 2)
         product = None
         product_max_leverage = None
+        contract_value_usdt = None
         if self.is_enabled:
             get_metadata = getattr(self.delta, "get_product_metadata", None)
             if not callable(get_metadata):
@@ -406,6 +408,9 @@ class JarvisAutoTrader:
                     except (TypeError, ValueError):
                         return {"success": False, "reason": "Invalid product leverage metadata"}
                     break
+            contract_value_usdt = contract_quote_value_usdt(product, price)
+            if contract_value_usdt is None:
+                return {"success": False, "reason": "Unrecognized or missing contract value metadata; live sizing blocked"}
 
         try:
             balance = float(self.delta.get_wallet_balance())
@@ -424,12 +429,16 @@ class JarvisAutoTrader:
                 stop_distance_pct=sl_pct,
                 max_trade_risk_usdt=MAX_RISK_USDT,
                 product_max_leverage=product_max_leverage,
+                contract_value_usdt=contract_value_usdt,
+                require_contract_value=self.is_enabled,
             )
         else:
             size_info = calculate_trade_size(
                 balance, confidence, sl_pct,
                 max_trade_risk_usdt=MAX_RISK_USDT,
                 product_max_leverage=product_max_leverage,
+                contract_value_usdt=contract_value_usdt,
+                require_contract_value=self.is_enabled,
             )
         if not size_info.get("ok"):
             return {"success": False, "reason": size_info.get("reason", "Risk sizing blocked")}
@@ -540,6 +549,10 @@ class JarvisAutoTrader:
             "tp_price":    tp_price,
             "sl_price":    sl_price,
             "contracts":   contracts,
+            "contract_value_usdt": float(size_info.get("contract_value_usdt", contract_value_usdt or 1.0)),
+            "notional_usdt": float(size_info.get("notional_usdt", contracts * (contract_value_usdt or 1.0))),
+            "margin_usdt": margin,
+            "trade_risk_usdt": float(size_info.get("trade_risk_usdt", 0.0)),
             "symbol":      symbol,
             "trade_type":  trade_type,
             "confidence":  confidence,
@@ -559,8 +572,8 @@ class JarvisAutoTrader:
         # position in a second monitor can submit duplicate closing orders.
 
         # ─ Estimated P&L (dashboard presents these fields) ─────────────
-        notional    = contracts
-        risk_usdt   = notional * sl_pct
+        notional    = float(pos.get("notional_usdt", contracts * (contract_value_usdt or 1.0)))
+        risk_usdt   = float(pos.get("trade_risk_usdt", notional * sl_pct))
         reward_usdt = notional * tp_pct
         logger.info('[EXECUTION] risk=$%.4f reward=$%.4f leverage=%sx position=%s',
                     risk_usdt, reward_usdt, leverage, pos['id'])
@@ -579,23 +592,43 @@ class JarvisAutoTrader:
         logger.info("[MONITOR] Position monitor started")
 
     def _monitor_loop(self):
-        """Check all open positions every 5 seconds. Also runs reversal logic."""
+        """Check each open position using its own symbol price every 5 seconds."""
         while self._monitor_running:
             try:
-                current_price = self._get_price()
-                if current_price and self.open_positions:
-                    self._check_positions(current_price)
-                    # Smart reversal: re-evaluate signals mid-trade
+                prices = {}
+                for pos in list(self.open_positions):
+                    symbol = str(pos.get("symbol", "BTCUSDT")).upper()
+                    price = self._get_price(symbol)
+                    if price and price > 0:
+                        prices[symbol] = price
+                if prices and self.open_positions:
+                    self._check_positions(prices)
+                    # Smart reversal: re-evaluate signals using the same route
+                    # symbol as each position, never the first position's price.
                     if REVERSAL_ENABLED and self._jarvis_ref and self._df_ref is not None:
-                        self._check_reversals(current_price)
+                        self._check_reversals(prices)
             except Exception as e:
                 logger.debug(f"[MONITOR] Tick error: {e}")
             time.sleep(5)
 
-    def _check_positions(self, current_price: float):
-        """Check TP / SL / expiry for each open position."""
+    def _check_positions(self, current_price):
+        """Check TP / SL / expiry for each position's symbol-specific price.
+
+        A scalar is retained for compatibility with older offline callers; new
+        monitor calls pass ``{symbol: price}`` and skip positions whose own
+        price is unavailable rather than applying another asset's price.
+        """
         still_open = []
         for pos in self.open_positions:
+            if isinstance(current_price, dict):
+                pos_symbol = str(pos.get("symbol", "BTCUSDT")).upper()
+                pos_price = current_price.get(pos_symbol)
+                if not pos_price or float(pos_price) <= 0:
+                    still_open.append(pos)
+                    continue
+                price_for_position = float(pos_price)
+            else:
+                price_for_position = float(current_price)
             if pos.get("status") == "CLOSE_UNKNOWN":
                 # Do not blindly retry an ambiguous close; reconcile venue state first.
                 still_open.append(pos)
@@ -607,22 +640,22 @@ class JarvisAutoTrader:
             exp = datetime.fromisoformat(pos["expiry_time"])
 
             if is_call:
-                if current_price >= tp:
+                if price_for_position >= tp:
                     closed, result, reason = True, "WIN",  "✅ Take Profit"
-                elif current_price <= sl:
+                elif price_for_position <= sl:
                     closed, result, reason = True, "LOSS", "❌ Stop Loss"
             else:
-                if current_price <= tp:
+                if price_for_position <= tp:
                     closed, result, reason = True, "WIN",  "✅ Take Profit"
-                elif current_price >= sl:
+                elif price_for_position >= sl:
                     closed, result, reason = True, "LOSS", "❌ Stop Loss"
 
             if not closed and datetime.now() >= exp:
                 if is_call:
-                    result = "WIN" if current_price > pos["entry_price"] else "LOSS"
+                    result = "WIN" if price_for_position > pos["entry_price"] else "LOSS"
                 else:
-                    result = "WIN" if current_price < pos["entry_price"] else "LOSS"
-                reason = f"⏱️ Expiry ({'up' if current_price > pos['entry_price'] else 'down'})"
+                    result = "WIN" if price_for_position < pos["entry_price"] else "LOSS"
+                reason = f"⏱️ Expiry ({'up' if price_for_position > pos['entry_price'] else 'down'})"
                 closed = True
 
             if closed:
@@ -636,16 +669,17 @@ class JarvisAutoTrader:
                     still_open.append(pos)
                     logger.error("[MONITOR] Close unconfirmed for %s", pos.get("id"))
                     continue
-                pos["exit_price"]  = current_price
+                pos["exit_price"]  = price_for_position
                 pos["result"]      = result
                 pos["close_reason"]= reason
                 pos["close_time"]  = datetime.now().isoformat()
                 pos["status"]      = "CLOSED"
 
-                # One contract is treated as one USD notional throughout this module.
-                move_pct = abs(current_price - pos["entry_price"]) / pos["entry_price"]
+                # P&L is based on the recorded venue notional, never an
+                # implicit one-USDT-per-contract convention.
+                move_pct = abs(price_for_position - pos["entry_price"]) / pos["entry_price"]
                 pnl_sign = 1 if result == "WIN" else -1
-                pnl_usdt = pnl_sign * move_pct * pos["contracts"]
+                pnl_usdt = pnl_sign * move_pct * float(pos.get("notional_usdt", 0.0))
                 pos["pnl_usdt"] = round(pnl_usdt, 3)
 
                 self.daily_pnl   += pnl_usdt
@@ -661,7 +695,7 @@ class JarvisAutoTrader:
                 print(f"\n{'─'*60}")
                 print(f"  {_p(result + ' — Trade Closed', col)}")
                 print(f"  #{pos['id']} | {pos['direction']} | {reason}")
-                print(f"  Entry: ${pos['entry_price']:,.2f} → Exit: ${current_price:,.2f}")
+                print(f"  Entry: ${pos['entry_price']:,.2f} → Exit: ${price_for_position:,.2f}")
                 pnl_str = f"{'+' if pnl_usdt>=0 else ''}{pnl_usdt:.3f}"
                 print(f"  P&L: {_p(pnl_str+' USD', col)} | Daily: {_p(f'{self.daily_pnl:+.2f}$', G if self.daily_pnl>=0 else R)}")
                 print(f"{'─'*60}\n")
@@ -701,15 +735,19 @@ class JarvisAutoTrader:
             if secs_left < 1200: return 180  # Last 20 min: every 3 min
             return REVERSAL_CHECK_SEC_SWING   # Early: every 5 min
 
-    def _check_reversals(self, current_price: float):
-        """
-        For each open position: if enough time has passed since last check,
-        run JARVIS signal again. If signal flips with high confidence → reverse.
-        """
+    def _check_reversals(self, current_price):
+        """Re-check each position using its own symbol-specific price."""
         now = datetime.now()
         for pos in list(self.open_positions):
             if pos.get("status") != "OPEN":
                 continue
+            if isinstance(current_price, dict):
+                position_price = current_price.get(str(pos.get("symbol", "BTCUSDT")).upper())
+                if not position_price or float(position_price) <= 0:
+                    continue
+                position_price = float(position_price)
+            else:
+                position_price = float(current_price)
 
             # Check if it's time to re-evaluate this position
             last_check = pos.get("_last_reversal_check")
@@ -721,17 +759,25 @@ class JarvisAutoTrader:
 
             # Run JARVIS signal analysis
             try:
-                result = self._jarvis_ref.analyze_trade_setup(self._df_ref)
-                sig    = result.get("trade_signal", {})
-                new_dir = sig.get("direction", "NO_TRADE")
-                # Normalize direction
-                if new_dir == "BUY":  new_dir = "CALL"
-                elif new_dir == "SELL": new_dir = "PUT"
-                raw_conf = sig.get("confidence_score", "0/100")
-                try:
-                    new_conf = int(float(str(raw_conf).split("/")[0]))
-                except Exception:
-                    new_conf = 0
+                result = self._jarvis_ref.analyze_trade_setup(
+                    self._df_ref, symbol=pos.get("symbol")
+                )
+                sig = result.get("trade_signal", {})
+                selected_symbol = str(pos.get("symbol", "")).upper()
+                selected_ctx = (result.get("market_context", {}) or {}).get("options_context", {})
+                reversal_decision = build_final_decision(
+                    sig,
+                    symbol=selected_symbol,
+                    price=position_price,
+                    opinions=result.get("decision_opinions", []) or [],
+                    options_context=selected_ctx,
+                    require_options=bool(self.is_enabled),
+                )
+                if not reversal_decision.get("execution_allowed"):
+                    logger.info("[REVERSAL] blocked by canonical decision: %s", reversal_decision.get("reasons"))
+                    continue
+                new_dir = reversal_decision.get("execution_direction")
+                new_conf = reversal_decision.get("confidence")
             except Exception as e:
                 logger.debug(f"[REVERSAL] Signal check failed: {e}")
                 continue
@@ -747,42 +793,41 @@ class JarvisAutoTrader:
                 continue  # Same direction, hold
 
             # Confidence must be strong enough for reversal
+            if new_conf is None:
+                logger.debug("[REVERSAL] Signal flipped but confidence is unavailable")
+                continue
             if new_conf < REVERSAL_MIN_CONFIDENCE:
                 logger.debug(f"[REVERSAL] Signal flipped but conf {new_conf}% < {REVERSAL_MIN_CONFIDENCE}% threshold")
                 continue
 
             # Optional: only reverse if already in some profit (not from a losing position)
-            move_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
+            move_pct = (position_price - pos["entry_price"]) / pos["entry_price"]
             in_profit = (move_pct > REVERSAL_MIN_PROFIT_PCT and is_call) or \
                         (-move_pct > REVERSAL_MIN_PROFIT_PCT and not is_call)
 
-            print(f"\n{'═'*70}")
-            print(f"  {_p('🔄 REVERSAL SIGNAL DETECTED', BD+Y)}")
-            print(f"  Position #{pos['id']}: {_p(old_dir, BD+(G if is_call else R))} "
-                  f"→ Signal flipped to {_p(new_dir, BD+(R if is_call else G))}")
-            print(f"  New Confidence: {_p(f'{new_conf}%', BD+G)} | "
-                  f"In Profit: {_p('YES', BD+G) if in_profit else _p('NO', BD+R)}")
+            logger.info(
+                "[REVERSAL] position=%s %s -> %s confidence=%s in_profit=%s",
+                pos.get('id'), old_dir, new_dir, new_conf, in_profit,
+            )
 
             if not in_profit:
-                print(f"  {_p('⚠️  Skipping reversal — position not in profit yet', Y)}")
-                print(f"{'═'*70}\n")
+                logger.info("[REVERSAL] skipped: position is not in profit")
                 continue
 
             # Execute reversal
-            self._execute_reversal(pos, new_dir, new_conf, current_price)
+            self._execute_reversal(pos, new_dir, new_conf, position_price)
 
     def _execute_reversal(self, pos: Dict, new_dir: str, confidence: int, price: float):
         """
         1. Close current position at market
         2. Open new position in opposite direction
         """
-        print(f"  {_p('⚡ EXECUTING REVERSAL...', BD+C)}")
+        logger.info("[REVERSAL] executing position=%s direction=%s", pos.get('id'), new_dir)
 
         # Step 1: Close current position
         close_result = self._close_position_market(pos)
         if not close_result.get("success"):
-            print(f"  {_p('❌ Reversal FAILED — could not close current position', BD+R)}")
-            print(f"{'═'*70}\n")
+            logger.error("[REVERSAL] failed: could not close current position %s", pos.get('id'))
             return
 
         # Calculate P&L of closed position
@@ -791,7 +836,7 @@ class JarvisAutoTrader:
         is_win   = (price > pos["entry_price"] and is_old_call) or \
                    (price < pos["entry_price"] and not is_old_call)
         pnl_sign = 1 if is_win else -1
-        pnl_usdt = pnl_sign * move_pct * pos["contracts"]
+        pnl_usdt = pnl_sign * move_pct * float(pos.get("notional_usdt", 0.0))
 
         pos["exit_price"]   = price
         pos["result"]       = "WIN" if is_win else "LOSS"
@@ -810,27 +855,23 @@ class JarvisAutoTrader:
         else:
             self.consec_losses += 1
 
-        col = BD+G if is_win else BD+Y
-        print(f"  {_p('Position Closed:', DG)} {_p(pos['result'], col)} | "
-              f"Entry ${pos['entry_price']:,.2f} → Exit ${price:,.2f} | "
-              f"PnL: {_p(f'{pnl_usdt:+.3f}$', col)}")
+        logger.info(
+            "[REVERSAL] position closed id=%s result=%s entry=%.8f exit=%.8f pnl=%+.3f",
+            pos.get('id'), pos.get('result'), pos['entry_price'], price, pnl_usdt,
+        )
 
         # Step 2: Check daily limits before opening reverse trade
         if self.daily_pnl <= -MAX_DAILY_LOSS_USDT:
-            print(f"  {_p('⛔ Daily loss limit hit — not opening reverse trade', BD+R)}")
-            print(f"{'═'*70}\n")
+            logger.warning("[REVERSAL] daily loss limit hit; no reverse trade")
             self.trigger_emergency_stop()
             return
 
         if self.consec_losses >= CONSEC_LOSS_LIMIT:
-            print(f"  {_p(f'⛔ {self.consec_losses} consecutive losses — not reversing', BD+R)}")
-            print(f"{'═'*70}\n")
+            logger.warning("[REVERSAL] consecutive loss limit hit; no reverse trade")
             return
 
-        # Step 3: Open new reverse trade
-        print(f"  {_p('Opening REVERSE trade:', DG)} {_p(new_dir, BD+(G if new_dir in ('CALL','BUY') else R))} "
-              f"@ {_p(f'{confidence}%', BD+G)} confidence")
-        print(f"{'─'*70}")
+        # Step 3: Open new reverse trade; execution details remain in logs.
+        logger.info("[REVERSAL] opening reverse trade direction=%s confidence=%s", new_dir, confidence)
 
         # Brief delay to let market settle
         time.sleep(1)
@@ -843,10 +884,9 @@ class JarvisAutoTrader:
         )
 
         if result.get("success"):
-            print(f"  {_p('✅ Reverse trade OPENED', BD+G)}")
+            logger.info("[REVERSAL] reverse trade opened id=%s", (result.get('position') or {}).get('id'))
         else:
-            print(f"  {_p('⚠️  Reverse trade failed:', Y)} {result.get('reason', 'unknown')}")
-        print(f"{'═'*70}\n")
+            logger.warning("[REVERSAL] reverse trade failed: %s", result.get('reason', 'unknown'))
 
 
     def _calc_contracts(self, price: float, margin_budget: float) -> int:
@@ -857,13 +897,14 @@ class JarvisAutoTrader:
             return 0
         if margin_budget <= 0:
             return 0
-        # Repository convention: one perp contract is one USD notional.
+        # Legacy helper retained for compatibility; live execution uses the
+        # metadata-aware sizer above and does not call this approximation.
         return max(0, int(margin_budget))
 
-    def _get_price(self) -> Optional[float]:
-        """Get live BTC price."""
+    def _get_price(self, symbol: str = "BTCUSDT") -> Optional[float]:
+        """Get live price for the position's locked symbol."""
         try:
-            p = self.delta.get_live_price("BTCUSDT")
+            p = self.delta.get_live_price(symbol)
             if p and float(p) > 1000:
                 return float(p)
         except Exception:
@@ -913,7 +954,8 @@ class JarvisAutoTrader:
         logger.info("[TRADER] Daily stats reset at midnight")
 
     def _skip(self, reason: str) -> Dict:
-        print(f"  {_p('⏸  AUTO-TRADE SKIPPED:', DG)} {reason}")
+        # Terminal output is owned by the unified dashboard; keep gate detail in logs.
+        logger.info("[AUTO-TRADE] skipped: %s", reason)
         return {"success": False, "skipped": True, "reason": reason}
 
     def _print_banner(self):

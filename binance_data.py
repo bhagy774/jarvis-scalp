@@ -86,13 +86,21 @@ class BinanceData:
         # Apply proxy if configured
         if _PROXY:
             self.session.proxies = {"http": _PROXY, "https": _PROXY}
-            logger.info(f"[BINANCE] Using proxy: {_PROXY}")
+            # Never log credentials embedded in a proxy URL.
+            from urllib.parse import urlsplit
+            _parts = urlsplit(_PROXY)
+            _proxy_label = f"{_parts.scheme}://{_parts.hostname or 'configured-proxy'}"
+            if _parts.port:
+                _proxy_label += f":{_parts.port}"
+            logger.info("[BINANCE] Using configured proxy: %s", _proxy_label)
 
         self._last_price: float = 0.0
         self._last_price_ts: float = 0.0
         self._price_ttl: float = 3.0  # cache live price for 3 seconds max
         self._active_base_url: str = BINANCE_BASE_URLS[0]
         self._active_fapi_url: str = BINANCE_FAPI_URLS[0]
+        self._last_source: str = "binance_spot"
+        self._last_market_semantics: str = "spot"
 
         # Geo-block cache: if ALL Binance endpoints return 451, skip them for
         # _GEO_BLOCK_TTL seconds and go straight to Bybit / Delta fallback.
@@ -130,8 +138,15 @@ class BinanceData:
             try:
                 url = f"{base_url}{path}"
                 resp = self.session.get(url, params=params, timeout=timeout)
+                # Retry every mirror for geo blocks, rate limits, and transient
+                # server responses. Returning a 429/5xx here used to force an
+                # unnecessary venue switch to Bybit.
+                if resp.status_code in {429, 500, 502, 503, 504}:
+                    logger.debug("[BINANCE] HTTP %s on %s — trying next mirror...", resp.status_code, base_url)
+                    all_451 = False
+                    continue
                 if resp.status_code == 451:
-                    logger.debug(f"[BINANCE] HTTP 451 on {base_url} — trying next mirror...")
+                    logger.debug("[BINANCE] HTTP 451 on %s — trying next mirror...", base_url)
                     continue
                 all_451 = False
                 # Update active URL to the one that worked
@@ -174,7 +189,9 @@ class BinanceData:
                 if items:
                     price = float(items[0].get("lastPrice", 0))
                     if price > 0:
-                        logger.info(f"[BYBIT FALLBACK] {sym} = ${price:,.2f}")
+                        self._last_source = "bybit_linear_perpetual"
+                        self._last_market_semantics = "linear_perpetual"
+                        logger.info("[BYBIT FALLBACK] %s = $%,.2f (linear perpetual; not Binance spot)", sym, price)
                         return price
         except Exception as e:
             logger.warning(f"[BYBIT FALLBACK] Price error: {e}")
@@ -206,7 +223,12 @@ class BinanceData:
                         "close":  float(k[4]),
                         "volume": float(k[5]),
                     })
-                logger.info(f"[BYBIT FALLBACK] {sym} {interval}: {len(candles)} candles fetched")
+                self._last_source = "bybit_linear_perpetual"
+                self._last_market_semantics = "linear_perpetual"
+                for candle in candles:
+                    candle["source"] = self._last_source
+                    candle["market_semantics"] = self._last_market_semantics
+                logger.info("[BYBIT FALLBACK] %s %s: %s candles (linear perpetual; not Binance spot)", sym, interval, len(candles))
                 return candles
         except Exception as e:
             logger.warning(f"[BYBIT FALLBACK] Candles error: {e}")
@@ -239,7 +261,9 @@ class BinanceData:
                     self._price_cache[sym] = (price, now)
                     self._last_price = price  # keep for backward compat
                     self._last_price_ts = now
-                    logger.debug(f"[BINANCE PRICE] {sym} = ${price:,.2f}")
+                    self._last_source = "binance_spot"
+                    self._last_market_semantics = "spot"
+                    logger.debug("[BINANCE PRICE] %s = $%,.2f (spot)", sym, price)
                     return price
             elif resp is not None:
                 logger.warning(f"[BINANCE PRICE] HTTP {resp.status_code}: {resp.text[:80]}")
@@ -256,6 +280,18 @@ class BinanceData:
 
         # Return last known price for THIS symbol only (not another symbol's price)
         return cached[0] if cached else 0.0
+
+    def get_last_source(self) -> Dict[str, str]:
+        """Describe the venue/market semantics of the latest successful fetch."""
+        return {"source": self._last_source, "market_semantics": self._last_market_semantics}
+
+    def _tag_result(self, payload: Dict, source: Optional[str] = None,
+                    market_semantics: Optional[str] = None) -> Dict:
+        """Attach explicit venue semantics to every dict-shaped result."""
+        result = dict(payload or {})
+        result['source'] = source or self._last_source
+        result['market_semantics'] = market_semantics or self._last_market_semantics
+        return result
 
     # ─────────────────────────────────────────────
     # 2. HISTORICAL CANDLES (OHLCV)
@@ -292,7 +328,12 @@ class BinanceData:
                         "close":  float(k[4]),
                         "volume": float(k[5]),
                     })
-                logger.info(f"[BINANCE] {sym} {interval}: {len(candles)} candles fetched")
+                self._last_source = "binance_spot"
+                self._last_market_semantics = "spot"
+                for candle in candles:
+                    candle["source"] = self._last_source
+                    candle["market_semantics"] = self._last_market_semantics
+                logger.info("[BINANCE] %s %s: %s candles (spot)", sym, interval, len(candles))
                 return candles
             elif resp is not None:
                 logger.warning(f"[BINANCE CANDLES] HTTP {resp.status_code}: {resp.text[:100]}")
@@ -322,7 +363,9 @@ class BinanceData:
                 ask = float(data.get("askPrice", 0))
                 spread = round(ask - bid, 2)
                 logger.debug(f"[BINANCE BID/ASK] Bid: ${bid:,.2f} | Ask: ${ask:,.2f} | Spread: ${spread}")
-                return {"bid": bid, "ask": ask, "spread": spread}
+                self._last_source = "binance_spot"
+                self._last_market_semantics = "spot"
+                return self._tag_result({"bid": bid, "ask": ask, "spread": spread})
             elif resp is not None:
                 logger.warning(f"[BINANCE BID/ASK] HTTP {resp.status_code}")
         except Exception as e:
@@ -330,7 +373,7 @@ class BinanceData:
 
         # Fallback: use live price as both bid and ask
         price = self.get_live_price(symbol)
-        return {"bid": price, "ask": price, "spread": 0.0}
+        return self._tag_result({"bid": price, "ask": price, "spread": 0.0})
 
     # ─────────────────────────────────────────────
     # 4. MULTI-TIMEFRAME FETCH (MTF)
@@ -380,7 +423,9 @@ class BinanceData:
                 minutes = (countdown_sec % 3600) // 60
 
                 sentiment = "BULLISH" if rate > 0.0001 else ("BEARISH" if rate < -0.0001 else "NEUTRAL")
-                return {
+                self._last_source = "binance_futures"
+                self._last_market_semantics = "perpetual"
+                return self._tag_result({
                     "funding_rate": rate,
                     "funding_rate_pct": round(rate * 100, 4),
                     "next_funding_time": next_time_ms,
@@ -388,18 +433,18 @@ class BinanceData:
                     "mark_price": mark_price,
                     "sentiment": sentiment,
                     "description": f"{rate * 100:+.4f}% ({sentiment})"
-                }
+                })
         except Exception as e:
             logger.warning(f"[BINANCE FUNDING] Error: {e}")
 
-        return {
+        return self._tag_result({
             "funding_rate": 0.0001,
             "funding_rate_pct": 0.01,
             "countdown_str": "unknown",
             "mark_price": self._last_price,
             "sentiment": "NEUTRAL",
             "description": "+0.0100% (NEUTRAL)"
-        }
+        }, source="unavailable", market_semantics="unavailable")
 
     def get_open_interest(self, symbol: str = "BTCUSDT") -> Dict:
         """
@@ -412,15 +457,17 @@ class BinanceData:
             if resp is not None and resp.status_code == 200:
                 data = resp.json()
                 oi_contracts = float(data.get("openInterest", 0.0))
-                return {
+                self._last_source = "binance_futures"
+                self._last_market_semantics = "perpetual"
+                return self._tag_result({
                     "open_interest": oi_contracts,
                     "symbol": sym,
                     "timestamp": int(data.get("time", time.time() * 1000))
-                }
+                })
         except Exception as e:
             logger.warning(f"[BINANCE OI] Error: {e}")
 
-        return {"open_interest": 0.0, "symbol": sym, "timestamp": int(time.time() * 1000)}
+        return self._tag_result({"open_interest": 0.0, "symbol": sym, "timestamp": int(time.time() * 1000)}, source="unavailable", market_semantics="unavailable")
 
     def get_order_book_depth(self, symbol: str = "BTCUSDT", limit: int = 50) -> Dict:
         """
@@ -446,7 +493,9 @@ class BinanceData:
                 max_bid = max(bids, key=lambda x: float(x[1])) if bids else [0, 0]
                 max_ask = max(asks, key=lambda x: float(x[1])) if asks else [0, 0]
 
-                return {
+                self._last_source = "binance_spot"
+                self._last_market_semantics = "spot"
+                return self._tag_result({
                     "imbalance_pct": imbalance_pct,
                     "total_bid_vol": round(total_bid_vol, 2),
                     "total_ask_vol": round(total_ask_vol, 2),
@@ -455,11 +504,11 @@ class BinanceData:
                     "major_bid_wall": {"price": float(max_bid[0]), "qty": float(max_bid[1])},
                     "major_ask_wall": {"price": float(max_ask[0]), "qty": float(max_ask[1])},
                     "bias": "BULLISH" if imbalance_pct > 5 else ("BEARISH" if imbalance_pct < -5 else "NEUTRAL")
-                }
+                })
         except Exception as e:
             logger.warning(f"[BINANCE DEPTH] Error: {e}")
 
-        return {
+        return self._tag_result({
             "imbalance_pct": 0.0,
             "total_bid_vol": 0.0,
             "total_ask_vol": 0.0,
@@ -468,7 +517,7 @@ class BinanceData:
             "major_bid_wall": {"price": 0.0, "qty": 0.0},
             "major_ask_wall": {"price": 0.0, "qty": 0.0},
             "bias": "NEUTRAL"
-        }
+        }, source="unavailable", market_semantics="unavailable")
 
     def get_24h_stats(self, symbol: str = "BTCUSDT") -> Dict:
         """
@@ -479,23 +528,25 @@ class BinanceData:
             resp = self._get("/api/v3/ticker/24hr", params={"symbol": sym}, timeout=5)
             if resp is not None and resp.status_code == 200:
                 data = resp.json()
-                return {
+                self._last_source = "binance_spot"
+                self._last_market_semantics = "spot"
+                return self._tag_result({
                     "price_change_pct": float(data.get("priceChangePercent", 0.0)),
                     "volume_24h_btc": float(data.get("volume", 0.0)),
                     "volume_24h_usdt": float(data.get("quoteVolume", 0.0)),
                     "high_24h": float(data.get("highPrice", 0.0)),
                     "low_24h": float(data.get("lowPrice", 0.0)),
-                }
+                })
         except Exception as e:
             logger.warning(f"[BINANCE 24H] Error: {e}")
 
-        return {
+        return self._tag_result({
             "price_change_pct": 0.0,
             "volume_24h_btc": 0.0,
             "volume_24h_usdt": 0.0,
             "high_24h": self._last_price,
             "low_24h": self._last_price,
-        }
+        }, source="unavailable", market_semantics="unavailable")
 
 
 # ─────────────────────────────────────────────

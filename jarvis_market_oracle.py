@@ -879,6 +879,10 @@ Provide JSON market forecast for ALL timeframes matching the requested schema.
         forecast = self._call_ollama_oracle(data, board)
 
         # Store spot & raw meta in forecast for display
+        # This service currently collects BTC-only derivatives context. Keep
+        # the scope explicit so callers cannot mistake it for an altcoin map.
+        forecast["asset"] = "BTC"
+        forecast["market_scope"] = "btc_macro_only"
         forecast["btc_spot"] = data.get("btc_spot", 0.0)
         forecast["cycle_number"] = self.cycle_count + 1
         forecast["duration_sec"] = round(time.time() - start_time, 2)
@@ -1037,6 +1041,8 @@ Provide JSON market forecast for ALL timeframes matching the requested schema.
             "stop_loss": 0,
             "hold_minutes": 15,
             "gemini_summary": "JARVIS Market Oracle initializing first cycle...",
+            "asset": "BTC",
+            "market_scope": "btc_macro_only",
             "btc_spot": 0.0,
             "model_used": "startup_default"
         }

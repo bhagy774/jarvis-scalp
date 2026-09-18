@@ -6,7 +6,8 @@ Every 5 minutes, scans perpetual futures on Binance/Delta India.
 Scores each coin: Volume(25pts) + Momentum(25pts) + RSI(20pts)
                 + Volatility(20pts) + FundingRate(10pts) = 100pts max.
 Picks BEST coin for Oracle/Advisor/Trader.
-Coin switch ONLY when NO position is open. Fallback = BTC.
+Coin switch ONLY when NO position is open. If no candidate passes the data-quality/volume filter, the result is empty and
+must be blocked by the market router; BTC is never silently substituted.
 """
 import os
 import time
@@ -58,9 +59,9 @@ class JarvisCoinScanner:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._best_coin    = "BTC"
-        self._best_symbol  = "BTCUSDT"
-        self._delta_symbol = "BTCUSDT"
+        self._best_coin    = ""
+        self._best_symbol  = ""
+        self._delta_symbol = ""
         self._all_scores: Dict[str, Dict] = {}
         self._last_scan_ts: Optional[datetime] = None
         self._scan_count = 0
@@ -157,8 +158,8 @@ class JarvisCoinScanner:
         }
 
         if not valid_coins:
-            logger.warning("[CoinScanner] No coins passed volume filter - using BTC")
-            best_coin = "BTC"
+            logger.warning("[CoinScanner] No coins passed volume/data-quality filter - route blocked")
+            best_coin = ""
         else:
             best_coin = max(valid_coins, key=lambda c: valid_coins[c].get("total", 0))
 
@@ -176,8 +177,8 @@ class JarvisCoinScanner:
             old_coin = self._best_coin
             if can_switch:
                 self._best_coin    = best_coin
-                self._best_symbol  = BINANCE_SYMBOL_MAP.get(best_coin, "BTCUSDT")
-                self._delta_symbol = DELTA_SYMBOL_MAP.get(best_coin, "BTCUSDT")
+                self._best_symbol  = BINANCE_SYMBOL_MAP.get(best_coin, "")
+                self._delta_symbol = DELTA_SYMBOL_MAP.get(best_coin, "")
             else:
                 best_coin = self._best_coin
 

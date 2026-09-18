@@ -1,0 +1,157 @@
+"""Canonical decision and confidence contracts for JARVIS.
+
+The live loop, dashboard, and executor must consume the same immutable-ish
+plain snapshot.  This module is intentionally dependency-free for offline
+regression tests.
+"""
+from __future__ import annotations
+
+import re
+import numbers
+from typing import Any, Dict, Iterable, Optional
+
+
+_NA = {"", "N/A", "NA", "NONE", "NULL", "UNKNOWN", "UNAVAILABLE", "MISSING", "REJECTED"}
+
+
+def normalize_confidence(raw: Any, default: Optional[int] = None) -> Optional[int]:
+    """Normalize common confidence forms to 0..100, preserving absent as None.
+
+    Accepted forms include ``85``, ``85%``, ``85/100`` and
+    ``85/100 (Autonomy)``.  Values explicitly marked unavailable/rejected are
+    not converted to zero, so callers can fail closed rather than inventing
+    confidence.
+    """
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return default
+    if isinstance(raw, numbers.Real):
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return default
+        if 0 <= value <= 1 and value != 0:
+            value *= 100
+        if value < 0 or value > 100:
+            return default
+        return int(round(value))
+    text = str(raw).strip()
+    if text.upper() in _NA:
+        return default
+    # Prefer numerator/denominator when present; do not accidentally parse a
+    # later parenthetical score before the actual percentage.
+    fraction = re.search(r"([-+]?\d+(?:\.\d+)?)\s*/\s*([-+]?\d+(?:\.\d+)?)", text)
+    try:
+        if fraction:
+            numerator = float(fraction.group(1))
+            denominator = float(fraction.group(2))
+            if denominator <= 0:
+                return default
+            value = numerator / denominator * 100
+        else:
+            percent = re.search(r"([-+]?\d+(?:\.\d+)?)\s*%", text)
+            number = percent or re.search(r"[-+]?\d+(?:\.\d+)?", text)
+            if not number:
+                return default
+            value = float(number.group(1))
+            if not percent and 0 < value <= 1:
+                value *= 100
+    except (TypeError, ValueError):
+        return default
+    if not 0 <= value <= 100:
+        return default
+    return int(round(value))
+
+
+def confidence_text(raw: Any, default: Optional[int] = None) -> str:
+    value = normalize_confidence(raw, default=default)
+    return "N/A" if value is None else str(value)
+
+
+def canonical_direction(raw: Any) -> str:
+    value = str(raw or "").strip().upper().replace("-", "_")
+    if value in {"BUY", "CALL", "LONG", "BULLISH"}:
+        return "BUY"
+    if value in {"SELL", "PUT", "SHORT", "BEARISH"}:
+        return "SELL"
+    if value in {"WAIT", "PENDING", "STANDBY"}:
+        return "WAIT"
+    return "NO_TRADE"
+
+
+def execution_direction(raw: Any) -> Optional[str]:
+    direction = canonical_direction(raw)
+    return {"BUY": "CALL", "SELL": "PUT"}.get(direction)
+
+
+def _opinion_direction(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        value = value.get("direction", value.get("signal", value.get("bias", value.get("verdict"))))
+    direction = canonical_direction(value)
+    return direction if direction in {"BUY", "SELL"} else None
+
+
+def build_final_decision(
+    signal: Dict[str, Any] | None,
+    *,
+    symbol: str,
+    price: Any = None,
+    reasons: Iterable[Any] = (),
+    opinions: Iterable[Any] = (),
+    options_context: Dict[str, Any] | None = None,
+    require_options: bool = False,
+    gate_reason: str = "",
+    blocking_reasons: Iterable[Any] = (),
+    plan: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Produce the one authoritative decision snapshot consumed downstream."""
+    signal = signal if isinstance(signal, dict) else {}
+    direction = canonical_direction(signal.get("direction"))
+    confidence = normalize_confidence(signal.get("confidence_score", signal.get("confidence")))
+    clean_reasons = [str(x) for x in reasons if x not in (None, "")]
+    conflict = False
+    votes = {_opinion_direction(op) for op in opinions}
+    votes.discard(None)
+    if len(votes) > 1:
+        conflict = True
+        direction = "NO_TRADE"
+        clean_reasons.append("Unresolved BUY/SELL opinions; consensus required")
+    if confidence is None and direction in {"BUY", "SELL"}:
+        direction = "NO_TRADE"
+        clean_reasons.append("Confidence unavailable")
+    context = options_context if isinstance(options_context, dict) else {}
+    if require_options and direction in {"BUY", "SELL"} and (
+        not context.get("available", False) or context.get("role") != "asset_primary"
+    ):
+        direction = "NO_TRADE"
+        clean_reasons.append("Required selected-asset options context unavailable or non-primary")
+    blockers = [str(x) for x in blocking_reasons if x not in (None, "")]
+    if blockers and direction in {"BUY", "SELL"}:
+        direction = "NO_TRADE"
+    clean_reasons.extend(blockers)
+    if gate_reason and direction in {"BUY", "SELL"}:
+        direction = "NO_TRADE"
+        clean_reasons.append(str(gate_reason))
+    if direction == "NO_TRADE" and gate_reason:
+        clean_reasons.append(str(gate_reason))
+    unique_reasons = list(dict.fromkeys(clean_reasons))
+    p = plan if isinstance(plan, dict) else {}
+    allowed = direction in {"BUY", "SELL"} and confidence is not None and not conflict
+    return {
+        "direction": direction,
+        "execution_direction": execution_direction(direction) if allowed else None,
+        "confidence": confidence,
+        "confidence_display": confidence_text(confidence),
+        "symbol": str(symbol or "").upper().replace("-", "").replace("_", ""),
+        "price": float(price) if isinstance(price, (int, float)) and float(price) > 0 else None,
+        "entry": p.get("entry", signal.get("entry_price")),
+        "tp1": p.get("tp1", signal.get("take_profit_1")),
+        "tp2": p.get("tp2", signal.get("take_profit_2")),
+        "sl": p.get("sl", signal.get("stop_loss")),
+        "expiry": p.get("expiry", signal.get("recommended_expiry", "N/A")),
+        "reasons": unique_reasons,
+        "options_context": context,
+        "status": "READY" if allowed else ("CONFLICT" if conflict else "WAIT"),
+        "execution_allowed": allowed,
+    }
