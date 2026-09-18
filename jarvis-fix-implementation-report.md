@@ -19,7 +19,7 @@ Base: `main` at `fad84180b5ff22edb90ce7550e0581c9660eaff8`
 
 Safe offline staged copy (network/order flags disabled, `JARVIS_DEVICE=cpu`, `JARVIS_BACKTEST_MODE=1`, `OLLAMA_PRELOAD_COMMITTEE=0`):
 
-- `pytest -q`: **198 passed, 2 warnings**, 17.83 s.
+- `pytest -q`: **198 passed, 2 warnings**, 17.33 s.
 - `python -m compileall -q .`: passed across staged source.
 - Focused synthetic selected-symbol test: all 12 adapters returned dictionaries; bounded ETHUSDT snapshot and validated WAIT advisory completed.
 - Focused close tests cover ownership, timeout/remaining exposure, symbol mismatch, malformed state, reduce-only, and client-order-ID payloads.
