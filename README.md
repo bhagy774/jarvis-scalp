@@ -157,6 +157,14 @@ A comprehensive performance report is sent to Telegram daily at a configured tim
 
 Python trading/analysis modules with a React/Vite dashboard and a local FastAPI HUD. This repository is experimental, not production-ready trading software. Offline tests do not establish profitability, exchange compatibility, or live safety.
 
+## Runtime, GPU, Ollama, and safety boundaries
+
+- `jarvis_runtime.py` is the single local backend detector. `JARVIS_DEVICE=auto` (default) selects supported CUDA, then Apple MPS, then CPU; `cuda`, `mps`, and `cpu` are explicit requests. An unavailable accelerator is never faked: the dashboard reports the selected backend, device name, memory when available, and fallback reason. This describes the Python process only; it does not prove that a remote Ollama server or every optional native engine uses the same device.
+- Ollama context is one bounded, same-symbol JSON snapshot (`jarvis_ollama_context.py`) containing freshness, market/data quality, Parts 1–12, fusion/confidence, MTF/options where available, read-only risk/account/position/order state, runtime metadata, and safety gates. Secrets are redacted and invalid/unavailable model responses become advisory `WAIT`; local risk and safety gates remain authoritative. `/api/ps` metadata is queried separately when available to report remote model residency; no models are downloaded or implicitly preloaded.
+- Committee warm-loading is opt-in only: set `OLLAMA_PRELOAD_COMMITTEE=1`. Keep it unset for normal startup so large models are not loaded implicitly.
+- Paper/live analysis exposes bounded readiness states (`STARTING`, `READY`, `NOT_READY`, `STOPPING`, `STOPPED`) and `stop_live_trading()` provides a bounded shutdown request. Unavailable venue routes remain `NOT_READY` and retry; no order is submitted without the independent execution flags.
+- Position closes use venue `reduce_only` plus a stable `client_order_id` and a process-local single-close claim. Timeout, malformed, partial, or symbol-mismatched reconciliation remains `CLOSE_UNKNOWN`; the system does not blindly retry or book P&L.
+
 ## Safe installation and tests
 
 Use Python 3.12+ and Node.js 22+.

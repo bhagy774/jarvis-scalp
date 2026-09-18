@@ -40,6 +40,7 @@ TRAIL_STEP       = float(os.environ.get("PM_TRAIL_STEP",      "0.001"))
 BREAK_EVEN_AT    = float(os.environ.get("PM_BREAKEVEN_AT",    "0.002"))
 MONITOR_INTERVAL = int(os.environ.get("PM_MONITOR_SEC",       "5"))
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
+from jarvis_close_coordinator import claim_close, release_close, reconcile_close
 LEVERAGE_CAP     = MAX_LEVERAGE_CAP  # policy cap only; leverage is derived per trade
 COMPOUND_ENABLED = os.environ.get("PM_COMPOUND", "true").lower() == "true"
 MIN_MARGIN       = float(os.environ.get("PM_MIN_MARGIN",      "0.05"))
@@ -274,17 +275,32 @@ class JarvisPositionManager:
             self._close_position(pos, current_price, close_reason)
 
     def _close_position(self, pos: PositionRecord, exit_price: float, reason: str) -> bool:
-        """Close at the venue before changing local accounting state."""
+        """Close safely before accounting: one owner, reduce-only, no blind retry."""
+        symbol = pos.coin + "USDT"
+        close_side = "sell" if pos.is_call else "buy"
+        if not claim_close(symbol, pos.id, owner="JarvisPositionManager"):
+            pos.status = "CLOSE_UNKNOWN"
+            logger.error("[PM] Close already claimed for %s; reconciliation required", pos.id)
+            return False
         try:
-            close_side = "sell" if pos.is_call else "buy"
-            venue_result = self.delta.place_order(pos.coin + "USDT", close_side, pos.contracts, "market")
-            if not isinstance(venue_result, dict) or not venue_result.get("success"):
-                pos.status = "CLOSE_UNKNOWN"
-                logger.error("[PM] Exchange close unconfirmed for %s", pos.id)
-                return False
+            client_order_id = f"jarvis-close-{symbol}-{pos.id}"[:64]
+            venue_result = self.delta.place_order(
+                symbol, close_side, pos.contracts, "market",
+                reduce_only=True, client_order_id=client_order_id,
+            )
+            if isinstance(venue_result, dict) and venue_result.get("success"):
+                release_close(symbol, pos.id)
+            else:
+                recon = reconcile_close(self.delta, symbol, close_side, pos.contracts)
+                if recon.get("confirmed"):
+                    release_close(symbol, pos.id)
+                else:
+                    pos.status = "CLOSE_UNKNOWN"
+                    logger.error("[PM] Exchange close unconfirmed for %s; no retry: %s", pos.id, recon.get("reason"))
+                    return False
         except Exception as e:
             pos.status = "CLOSE_UNKNOWN"
-            logger.error("[PM] Exchange close failed: %s", type(e).__name__)
+            logger.error("[PM] Exchange close failed; no retry: %s", type(e).__name__)
             return False
 
         pnl_pct = pos.current_pnl_pct(exit_price)

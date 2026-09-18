@@ -245,34 +245,52 @@ class DeltaExchangeData:
     # 2. HISTORICAL DATA (Replaces Binance)
     # ==========================================
 
-    def get_historical_candles(self, symbol: str = "BTCUSD", resolution: str = "5m", limit: int = 100) -> List[Dict]:
-        """Fetch OHLCV candles — uses Binance (primary, high volume), falls back to Delta."""
-        # ── PRIMARY: Binance candles (high volume, accurate, no API key) ──
+    def get_historical_candles_with_metadata(
+        self, symbol: str = "BTCUSD", resolution: str = "5m", limit: int = 100
+    ) -> Dict[str, Any]:
+        """Fetch candles with explicit same-instrument source provenance.
+
+        The legacy method below remains list-shaped for existing callers.  Live
+        analysis uses this metadata form so Binance/Bybit/Delta fallback is
+        visible and cannot overwrite another source's cache entry silently.
+        """
+        requested_symbol = str(symbol)
+        # ── PRIMARY: Binance (which may itself use explicit Bybit fallback) ──
         if self._binance:
             try:
                 candles = self._binance.get_historical_candles(symbol, resolution, limit)
                 if candles and len(candles) > 0:
-                    return candles
+                    source = getattr(self._binance, "last_candle_source", None) or "binance"
+                    return {"candles": candles, "source": source, "symbol": requested_symbol}
             except Exception as e:
                 logger.warning(f"[BINANCE CANDLES] Failed: {e}")
 
-        # ── FALLBACK: Delta Exchange candles ──
+        # ── FALLBACK: Delta Exchange candles, same requested instrument ──
         end_time = int(time.time())
-        multipliers = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
-        seconds = multipliers.get(resolution, 300)
-        start_time = end_time - (limit * seconds)
-        query_sym = symbol
-        if query_sym in ("BTCUSD", "BTCUSDT", "BTC_USDT"):
+        multipliers = {
+            "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+            "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400,
+        }
+        if resolution not in multipliers:
+            logger.warning("[DELTA CANDLES] Unsupported native resolution: %s", resolution)
+            return {"candles": [], "source": "delta", "symbol": requested_symbol}
+        start_time = end_time - (limit * multipliers[resolution])
+        query_sym = requested_symbol
+        if query_sym.upper() in ("BTCUSD", "BTCUSDT", "BTC_USDT"):
             query_sym = "BTCUSDT"
         params = {"symbol": query_sym, "resolution": resolution, "start": start_time, "end": end_time}
         res = self._request("GET", "/v2/history/candles", params)
-        if res["success"]:
-            results = res["data"].get("result", [])
-            for r in results:
-                if r.get('volume') is None:
-                    r['volume'] = 0.0
-            return results
-        return []
+        if res.get("success"):
+            results = res.get("data", {}).get("result", [])
+            for row in results:
+                if row.get("volume") is None:
+                    row["volume"] = 0.0
+            return {"candles": results, "source": "delta", "symbol": requested_symbol}
+        return {"candles": [], "source": "delta", "symbol": requested_symbol}
+
+    def get_historical_candles(self, symbol: str = "BTCUSD", resolution: str = "5m", limit: int = 100) -> List[Dict]:
+        """Legacy list-shaped wrapper around metadata-bearing candle fetch."""
+        return self.get_historical_candles_with_metadata(symbol, resolution, limit).get("candles", [])
 
     def fetch_deep_history(self, symbol: str, days: int = 30, resolution: str = "1h") -> List[Dict]:
         """
@@ -635,9 +653,31 @@ class DeltaExchangeData:
                 continue
             # If long (size > 0) → sell to close. If short → buy to close.
             close_side = "sell" if raw_size > 0 else "buy"
-            res = self.place_order(symbol, close_side, size, order_type="market")
-            results.append(res)
-            logger.warning(f"[EMERGENCY] Closed {size}x {symbol}: {res}")
+            # Emergency close shares the same process-local ownership guard as
+            # normal monitors. A timeout remains claimed until an operator or
+            # reconciliation confirms that the venue position is flat.
+            try:
+                from jarvis_close_coordinator import claim_close, release_close, reconcile_close
+                position_id = pos.get("id") or pos.get("position_id") or "position"
+                if not claim_close(symbol, position_id, owner="DeltaEmergencyClose"):
+                    results.append({"success": False, "error": "close already claimed"})
+                    continue
+                client_id = f"jarvis-emergency-close-{symbol}-{position_id}"[:64]
+                res = self.place_order(symbol, close_side, size, order_type="market",
+                                       reduce_only=True, client_order_id=client_id)
+                if isinstance(res, dict) and res.get("success"):
+                    release_close(symbol, position_id)
+                else:
+                    recon = reconcile_close(self, symbol, close_side, size)
+                    if recon.get("confirmed"):
+                        release_close(symbol, position_id)
+                    elif isinstance(res, dict):
+                        res = dict(res, error="close unconfirmed; operator reconciliation required",
+                                   reconciliation=recon)
+                results.append(res)
+                logger.warning(f"[EMERGENCY] Closed {size}x {symbol}: {res}")
+            except Exception as exc:
+                results.append({"success": False, "error": f"close unconfirmed: {type(exc).__name__}"})
         return results
 
     def _resolve_product(self, symbol: str) -> Optional[Dict]:
@@ -734,12 +774,14 @@ class DeltaExchangeData:
             logger.error(f"[RISK] Failed to set leverage: {res.get('error')}")
             return False
 
-    def place_order(self, symbol: str, side: str, size: int, order_type: str = "market", limit_price: float = 0) -> Dict:
+    def place_order(self, symbol: str, side: str, size: int, order_type: str = "market", limit_price: float = 0,
+                    reduce_only: bool = False, client_order_id: str = None) -> Dict:
         """
         Execute Trade (Live or Paper).
-        side: "buy" or "sell"
-        size: number of contracts
-        order_type: "market", "limit", "market_order", or "limit_order" — all handled
+
+        Delta supports ``reduce_only`` and ``client_order_id`` on order payloads.
+        Close paths must set both so a retry cannot intentionally reverse a
+        position and the venue can deduplicate a stable close identity.
         """
         # An explicit process-level opt-in is required even on testnet.  This
         # prevents a caller or configuration mistake from turning analysis into
@@ -784,8 +826,14 @@ class DeltaExchangeData:
 
         if ot == "limit" and limit_price > 0:
             payload["limit_price"] = str(limit_price)
+        if reduce_only:
+            payload["reduce_only"] = True
+        if client_order_id:
+            client_order_id = str(client_order_id).strip()[:64]
+            if client_order_id:
+                payload["client_order_id"] = client_order_id
 
-        logger.warning(f"[EXECUTION] Placing {side.upper()} {final_type} for {size} {symbol}...")
+        logger.warning(f"[EXECUTION] Placing {side.upper()} {final_type} for {size} {symbol} (reduce_only={bool(reduce_only)})...")
         res = self._request("POST", "/v2/orders", payload, authorized=True)
 
         if res["success"]:
@@ -823,6 +871,12 @@ class DeltaExchangeData:
         """Place a limit order (wrapper for place_order)"""
         return self.place_order(symbol, side, quantity, order_type="limit_order", limit_price=price)
     
+    def get_order(self, order_id: str) -> Dict:
+        """Read one order for operator reconciliation; never retries or mutates."""
+        if not order_id:
+            return {"success": False, "error": "Invalid order id"}
+        return self._request("GET", f"/v2/orders/{str(order_id)}", authorized=True)
+
     def cancel_order(self, order_id: str) -> Dict:
         """Cancel an open order"""
         payload = {"id": order_id}

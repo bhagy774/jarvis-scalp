@@ -115,6 +115,9 @@ def test_preload_skips_missing_models(monkeypatch):
     monkeypatch.setenv("MODEL_ANALYST", "deepseek-r1:14b")
     monkeypatch.setenv("MODEL_VALIDATOR", "qwen2.5:14b")
     monkeypatch.delenv("MODEL_RISK", raising=False)
+    # Committee warm-loading is explicitly opt-in; do not make startup load
+    # large models implicitly.
+    monkeypatch.setenv("OLLAMA_PRELOAD_COMMITTEE", "1")
     monkeypatch.setattr(oi.requests, "get",
                         lambda *a, **k: _tags_response(["qwen2.5:14b"]))
     loaded = []

@@ -276,6 +276,7 @@ class BinanceData:
         interval = RESOLUTION_MAP.get(resolution, resolution)
         limit = min(limit, 1000)  # Binance max per request = 1000
 
+        self.last_candle_source = None
         try:
             resp = self._get("/api/v3/klines",
                              params={"symbol": sym, "interval": interval, "limit": limit},
@@ -292,6 +293,7 @@ class BinanceData:
                         "close":  float(k[4]),
                         "volume": float(k[5]),
                     })
+                self.last_candle_source = "binance"
                 logger.info(f"[BINANCE] {sym} {interval}: {len(candles)} candles fetched")
                 return candles
             elif resp is not None:
@@ -299,8 +301,11 @@ class BinanceData:
         except Exception as e:
             logger.warning(f"[BINANCE CANDLES] Error: {e}")
 
-        # Binance fully blocked — try Bybit
-        return self._bybit_get_candles(symbol, resolution, limit)
+        # Binance fully blocked — try Bybit.  Keep provenance explicit so a
+        # same-symbol fallback cannot masquerade as the primary source.
+        candles = self._bybit_get_candles(symbol, resolution, limit)
+        self.last_candle_source = "bybit" if candles else None
+        return candles
 
     # ─────────────────────────────────────────────
     # 3. BID / ASK PRICE (for Part 12)
