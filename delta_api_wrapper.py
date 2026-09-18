@@ -245,34 +245,52 @@ class DeltaExchangeData:
     # 2. HISTORICAL DATA (Replaces Binance)
     # ==========================================
 
-    def get_historical_candles(self, symbol: str = "BTCUSD", resolution: str = "5m", limit: int = 100) -> List[Dict]:
-        """Fetch OHLCV candles — uses Binance (primary, high volume), falls back to Delta."""
-        # ── PRIMARY: Binance candles (high volume, accurate, no API key) ──
+    def get_historical_candles_with_metadata(
+        self, symbol: str = "BTCUSD", resolution: str = "5m", limit: int = 100
+    ) -> Dict[str, Any]:
+        """Fetch candles with explicit same-instrument source provenance.
+
+        The legacy method below remains list-shaped for existing callers.  Live
+        analysis uses this metadata form so Binance/Bybit/Delta fallback is
+        visible and cannot overwrite another source's cache entry silently.
+        """
+        requested_symbol = str(symbol)
+        # ── PRIMARY: Binance (which may itself use explicit Bybit fallback) ──
         if self._binance:
             try:
                 candles = self._binance.get_historical_candles(symbol, resolution, limit)
                 if candles and len(candles) > 0:
-                    return candles
+                    source = getattr(self._binance, "last_candle_source", None) or "binance"
+                    return {"candles": candles, "source": source, "symbol": requested_symbol}
             except Exception as e:
                 logger.warning(f"[BINANCE CANDLES] Failed: {e}")
 
-        # ── FALLBACK: Delta Exchange candles ──
+        # ── FALLBACK: Delta Exchange candles, same requested instrument ──
         end_time = int(time.time())
-        multipliers = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
-        seconds = multipliers.get(resolution, 300)
-        start_time = end_time - (limit * seconds)
-        query_sym = symbol
-        if query_sym in ("BTCUSD", "BTCUSDT", "BTC_USDT"):
+        multipliers = {
+            "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+            "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400,
+        }
+        if resolution not in multipliers:
+            logger.warning("[DELTA CANDLES] Unsupported native resolution: %s", resolution)
+            return {"candles": [], "source": "delta", "symbol": requested_symbol}
+        start_time = end_time - (limit * multipliers[resolution])
+        query_sym = requested_symbol
+        if query_sym.upper() in ("BTCUSD", "BTCUSDT", "BTC_USDT"):
             query_sym = "BTCUSDT"
         params = {"symbol": query_sym, "resolution": resolution, "start": start_time, "end": end_time}
         res = self._request("GET", "/v2/history/candles", params)
-        if res["success"]:
-            results = res["data"].get("result", [])
-            for r in results:
-                if r.get('volume') is None:
-                    r['volume'] = 0.0
-            return results
-        return []
+        if res.get("success"):
+            results = res.get("data", {}).get("result", [])
+            for row in results:
+                if row.get("volume") is None:
+                    row["volume"] = 0.0
+            return {"candles": results, "source": "delta", "symbol": requested_symbol}
+        return {"candles": [], "source": "delta", "symbol": requested_symbol}
+
+    def get_historical_candles(self, symbol: str = "BTCUSD", resolution: str = "5m", limit: int = 100) -> List[Dict]:
+        """Legacy list-shaped wrapper around metadata-bearing candle fetch."""
+        return self.get_historical_candles_with_metadata(symbol, resolution, limit).get("candles", [])
 
     def fetch_deep_history(self, symbol: str, days: int = 30, resolution: str = "1h") -> List[Dict]:
         """

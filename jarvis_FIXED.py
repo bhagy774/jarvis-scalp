@@ -141,6 +141,14 @@ except Exception:
     _get_data_validator = None
     DATA_VALIDATOR_AVAILABLE = False
 try:
+    from direct_candle_cache import DirectCandleCache, CandleDataError, LIVE_TIMEFRAMES
+    DIRECT_CANDLE_CACHE_AVAILABLE = True
+except Exception:
+    DirectCandleCache = None
+    CandleDataError = ValueError
+    LIVE_TIMEFRAMES = ()
+    DIRECT_CANDLE_CACHE_AVAILABLE = False
+try:
     from jarvis_backtester import JarvisFullBacktester as _JarvisFullBacktester
     BACKTESTER_AVAILABLE = True
 except Exception:
@@ -2117,163 +2125,167 @@ class LiveTradingEngine:
                         self._last_current_price = current_price
                         self._check_paper_trades(current_price)
 
-                    # 3. Fetch the selected symbol's live candles for analysis.
-                    if hasattr(self.jarvis, 'delta_data') and self.jarvis.delta_data:
-                        candles = self.jarvis.delta_data.get_historical_candles(
-                            symbol=symbol, resolution="1m", limit=500
+                    # 3. Fetch one direct native-interval snapshot for the
+                    # selected coin.  It contains 500 CLOSED candles per
+                    # interval plus a separate unconfirmed forming candle.
+                    snapshot = None
+                    if getattr(self.jarvis, 'direct_candle_cache', None) is not None:
+                        try:
+                            snapshot = self.jarvis.direct_candle_cache.refresh(symbol)
+                        except Exception as candle_error:
+                            self._set_readiness('NOT_READY', f'candle feed rejected: {candle_error}')
+                            logger.warning('[CANDLES] Cycle blocked for %s: %s', symbol, candle_error)
+                            time.sleep(float(os.getenv('JARVIS_ROUTE_RETRY_SECONDS', '5')))
+                            continue
+                    if snapshot is not None and '1m' in snapshot.frames:
+                        self._set_readiness('READY', f'verified route {symbol}; direct native candles available')
+                        self.jarvis._active_candle_snapshot = snapshot
+                        df = snapshot.frames['1m'].closed.copy()
+                        # The forming candle is deliberately not appended to df.
+                        # It is carried as metadata for display/current price only.
+                        current_candle = snapshot.frames['1m'].current
+                        if current_price is None and current_candle is not None:
+                            current_price = float(current_candle['close'])
+
+                        # 4. Run full AI analysis on CLOSED candles only.
+                        result = _run_quietly(
+                            self.jarvis.analyze_trade_setup, df,
+                            candle_snapshot=snapshot,
                         )
-                        if candles:
-                            self._set_readiness('READY', f'verified route {symbol}; market data available')
-                            df = pd.DataFrame(candles)
-                            for col in ['open', 'high', 'low', 'close', 'volume']:
-                                if col in df.columns:
-                                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                            if 'time' in df.columns:
-                                df.index = pd.to_datetime(df['time'], unit='s')
-                                df = df.sort_index()
-                                df = df.drop(columns=['time'], errors='ignore')
-                            elif not isinstance(df.index, pd.DatetimeIndex):
-                                df.index = pd.date_range(end=pd.Timestamp.now(), periods=len(df), freq='1min')
-                            
-                            if current_price is None and len(df) > 0:
-                                current_price = float(df['close'].iloc[-1])
-                            
-                            # 4. Run full AI analysis
-                            result = _run_quietly(self.jarvis.analyze_trade_setup, df)
-                            self.last_jarvis_result = result
-                            # Keep auto_trader updated with latest live data for reversal checks
-                            if self.auto_trader:
-                                self.auto_trader._df_ref = df.copy()
+                        self.last_jarvis_result = result
+                        # Keep auto_trader updated with latest live data for reversal checks
+                        if self.auto_trader:
+                            self.auto_trader._df_ref = df.copy()
 
-                            # 4b. Multi-AI Consensus (DeepSeek + Qwen + Mistral roundtable)
-                            # FIX BUG 3: Run in background thread to prevent live loop freezing
-                            if cycle_count[0] % 5 == 0:
-                                def _run_consensus_bg():
-                                    try:
-                                        from multi_ai_consensus import run_ai_roundtable
-                                        market_ctx = result.get('market_context', {})
-                                        signal_data = result.get('trade_signal', {})
-                                        consensus = run_ai_roundtable(
-                                            market_context={
-                                                'symbol': f'{symbol[:-4]}/USDT' if symbol.endswith('USDT') else symbol,
-                                                'current_price': current_price,
-                                                'trend': market_ctx.get('trend', 'NEUTRAL'),
-                                                'volatility': market_ctx.get('volatility', 'MEDIUM'),
-                                            },
-                                            signal_data=signal_data
-                                        )
-                                        if consensus and consensus.get('final_verdict'):
-                                            self.last_consensus = consensus
-                                            logger.info(f"[CONSENSUS] {consensus.get('final_verdict','?')} | Agree: {consensus.get('agreement_pct','?')}%")
-                                    except Exception as ce:
-                                        logger.debug(f"[CONSENSUS] Skipped: {ce}")
-                                
-                                import threading
-                                threading.Thread(target=_run_consensus_bg, daemon=True).start()
-                            
-                            # 5. Apply selected-asset options intelligence before
-                            # the displayed final decision and any order path.
-                            result = self._apply_options_confirmation(result, symbol)
-                            direction, confidence, entry_price, tp1, tp2, sl, expiry = \
-                                self._print_live_signal(result, current_price, symbol=symbol, df=df)
-
-                            # 1M ENTRY CONFIRMATION GATE: HTF decision valid,
-                            # pan 1m candle confirm na kare to aa cycle ma entry skip.
-                            # Next cycle ma fari evaluate thase (entry timing wait).
-                            entry_gate_1m = getattr(self, 'last_1m_entry', None)
-                            if entry_gate_1m and not entry_gate_1m.get('confirmed', True) \
-                                    and direction in ('CALL', 'PUT'):
-                                self._dashboard_events.append(f"1M entry wait: {direction} confirmation pending")
-                                direction = 'NO_TRADE'
-
-                            # SCENARIO SIMULATOR GATE: trade pehla future stress
-                            # scenarios simulate kare; worst-case fail -> entry skip.
-                            # Fail-open; JARVIS_SCEN_SIM=0 thi off.
-                            if direction in ('CALL', 'PUT'):
-                                direction = self._scenario_gate(
-                                    direction,
-                                    entry_price=entry_price or current_price,
-                                    sl=sl, tp=tp2 or tp1,
-                                    df=df, symbol=symbol,
-                                )
-
-                            # 6. AUTO-TRADE: Execute on Delta Exchange if enabled
-                            if self.auto_trader and direction in ('CALL', 'PUT'):
+                        # 4b. Multi-AI Consensus (DeepSeek + Qwen + Mistral roundtable)
+                        # FIX BUG 3: Run in background thread to prevent live loop freezing
+                        if cycle_count[0] % 5 == 0:
+                            def _run_consensus_bg():
                                 try:
-                                    trade_type = 'SCALP'  # default
-                                    # Use SWING if expiry suggests longer hold
-                                    if expiry and str(expiry).upper() in ('DAY_TRADE', 'SWING', '15M', '30M'):
-                                        trade_type = 'SWING'
-                                    at_result = self.auto_trader.execute(
-                                        direction=direction,
-                                        confidence=confidence,
-                                        current_price=current_price or 0,
-                                        symbol=symbol,
-                                        part_results=getattr(self.jarvis, 'latest_part_results', {}),
-                                        trade_type=trade_type,
+                                    from multi_ai_consensus import run_ai_roundtable
+                                    market_ctx = result.get('market_context', {})
+                                    signal_data = result.get('trade_signal', {})
+                                    consensus = run_ai_roundtable(
+                                        market_context={
+                                            'symbol': f'{symbol[:-4]}/USDT' if symbol.endswith('USDT') else symbol,
+                                            'current_price': current_price,
+                                            'trend': market_ctx.get('trend', 'NEUTRAL'),
+                                            'volatility': market_ctx.get('volatility', 'MEDIUM'),
+                                        },
+                                        signal_data=signal_data
                                     )
-                                    if at_result.get('success'):
-                                        pos = at_result.get('position', {})
-                                        self._dashboard_account = {
-                                            'trade_risk': pos.get('contracts', 0) * (0.008 if trade_type == 'SWING' else 0.002),
-                                            'margin': pos.get('contracts', 0) / max(pos.get('leverage', 1), 1),
-                                            'contracts': pos.get('contracts', 0),
-                                            'notional': pos.get('contracts', 0),
-                                            'leverage': pos.get('leverage', 'AUTO'),
-                                        }
-                                        self._dashboard_events.append(f"Auto-trade placed #{pos.get('id','?')} ({direction})")
-                                    else:
-                                        self._dashboard_events.append(f"Auto-trade blocked: {at_result.get('reason', 'gate failed')}")
-                                except Exception as at_err:
-                                    self._dashboard_events.append(f"AutoTrader error: {at_err}")
-                            elif direction in ('CALL', 'PUT') and self.can_trade():
-                                # --- PRE-TRADE SIMULATOR (fail-open; JARVIS_PRESIM=0 disables) ---
-                                direction, confidence = self._presim_gate(
-                                    direction, confidence, entry_price,
-                                    result=result, df=df, current_price=current_price, symbol=symbol
-                                )
-                                if direction in ('CALL', 'PUT') and confidence >= self.PAPER_CONFIG['min_confidence']:
-                                    # Compute ATR for hedge advisor
-                                    try:
-                                        atr = float((df['high'] - df['low']).rolling(14).mean().iloc[-1])
-                                    except Exception:
-                                        atr = current_price * 0.005  # Fallback ATR (0.5%)
-
-                                    if hasattr(self, 'hedged_engine') and self.hedged_engine:
-                                        # Use AI Options Hedged Scalp Engine
-                                        try:
-                                            options_chain = self.jarvis.delta_data.get_options_chain(base_asset) \
-                                                if hasattr(self.jarvis.delta_data, 'get_options_chain') else {}
-                                        except Exception:
-                                            options_chain = {}
-                                        hedged_result = self.hedged_engine.execute_hedged_scalp(
-                                            signal={'direction': direction, 'confidence': confidence},
-                                            current_price=current_price,
-                                            atr=atr,
-                                            options_chain=options_chain,
-                                            jarvis_result=result
-                                        )
-                                        self.last_hedged_result = hedged_result
-                                        self._dashboard_events.append(f"Hedge: {hedged_result.get('status')} / applied={hedged_result.get('hedge_applied')}")
-                                    
-                                    # Always open paper trade to track P&L
-                                    trade = self._open_paper_trade(
-                                        direction, entry_price or current_price,
-                                        confidence, expiry, tp1, tp2, sl, current_price=current_price,
-                                        symbol=symbol
-                                    )
-                                    if trade:
-                                        self._dashboard_events.append(
-                                            f"Paper trade #{trade['id']} {trade['status']} | "
-                                            f"margin ${trade['margin_usdt']:.2f} @ {trade['leverage']}x"
-                                        )
-                                    else:
-                                        self._dashboard_events.append("Paper entry blocked (max open or risk budget)")
-                                elif direction in ('CALL', 'PUT'):
-                                    print(f"  ⚠️  PAPER: Skipped (Conf {confidence}% < {self.PAPER_CONFIG['min_confidence']}%)")
-                                
-                                # FIX BUG 1: PENDING record_trade removed to fix Consecutive Loss Circuit Breaker
+                                    if consensus and consensus.get('final_verdict'):
+                                        self.last_consensus = consensus
+                                        logger.info(f"[CONSENSUS] {consensus.get('final_verdict','?')} | Agree: {consensus.get('agreement_pct','?')}%")
+                                except Exception as ce:
+                                    logger.debug(f"[CONSENSUS] Skipped: {ce}")
                             
+                            import threading
+                            threading.Thread(target=_run_consensus_bg, daemon=True).start()
+                        
+                        # 5. Apply selected-asset options intelligence before
+                        # the displayed final decision and any order path.
+                        result = self._apply_options_confirmation(result, symbol)
+                        direction, confidence, entry_price, tp1, tp2, sl, expiry = \
+                            self._print_live_signal(result, current_price, symbol=symbol, df=df)
+
+                        # 1M ENTRY CONFIRMATION GATE: HTF decision valid,
+                        # pan 1m candle confirm na kare to aa cycle ma entry skip.
+                        # Next cycle ma fari evaluate thase (entry timing wait).
+                        entry_gate_1m = getattr(self, 'last_1m_entry', None)
+                        if entry_gate_1m and not entry_gate_1m.get('confirmed', True) \
+                                and direction in ('CALL', 'PUT'):
+                            self._dashboard_events.append(f"1M entry wait: {direction} confirmation pending")
+                            direction = 'NO_TRADE'
+
+                        # SCENARIO SIMULATOR GATE: trade pehla future stress
+                        # scenarios simulate kare; worst-case fail -> entry skip.
+                        # Fail-open; JARVIS_SCEN_SIM=0 thi off.
+                        if direction in ('CALL', 'PUT'):
+                            direction = self._scenario_gate(
+                                direction,
+                                entry_price=entry_price or current_price,
+                                sl=sl, tp=tp2 or tp1,
+                                df=df, symbol=symbol,
+                            )
+
+                        # 6. AUTO-TRADE: Execute on Delta Exchange if enabled
+                        if self.auto_trader and direction in ('CALL', 'PUT'):
+                            try:
+                                trade_type = 'SCALP'  # default
+                                # Use SWING if expiry suggests longer hold
+                                if expiry and str(expiry).upper() in ('DAY_TRADE', 'SWING', '15M', '30M'):
+                                    trade_type = 'SWING'
+                                at_result = self.auto_trader.execute(
+                                    direction=direction,
+                                    confidence=confidence,
+                                    current_price=current_price or 0,
+                                    symbol=symbol,
+                                    part_results=getattr(self.jarvis, 'latest_part_results', {}),
+                                    trade_type=trade_type,
+                                )
+                                if at_result.get('success'):
+                                    pos = at_result.get('position', {})
+                                    self._dashboard_account = {
+                                        'trade_risk': pos.get('contracts', 0) * (0.008 if trade_type == 'SWING' else 0.002),
+                                        'margin': pos.get('contracts', 0) / max(pos.get('leverage', 1), 1),
+                                        'contracts': pos.get('contracts', 0),
+                                        'notional': pos.get('contracts', 0),
+                                        'leverage': pos.get('leverage', 'AUTO'),
+                                    }
+                                    self._dashboard_events.append(f"Auto-trade placed #{pos.get('id','?')} ({direction})")
+                                else:
+                                    self._dashboard_events.append(f"Auto-trade blocked: {at_result.get('reason', 'gate failed')}")
+                            except Exception as at_err:
+                                self._dashboard_events.append(f"AutoTrader error: {at_err}")
+                        elif direction in ('CALL', 'PUT') and self.can_trade():
+                            # --- PRE-TRADE SIMULATOR (fail-open; JARVIS_PRESIM=0 disables) ---
+                            direction, confidence = self._presim_gate(
+                                direction, confidence, entry_price,
+                                result=result, df=df, current_price=current_price, symbol=symbol
+                            )
+                            if direction in ('CALL', 'PUT') and confidence >= self.PAPER_CONFIG['min_confidence']:
+                                # Compute ATR for hedge advisor
+                                try:
+                                    atr = float((df['high'] - df['low']).rolling(14).mean().iloc[-1])
+                                except Exception:
+                                    atr = current_price * 0.005  # Fallback ATR (0.5%)
+
+                                if hasattr(self, 'hedged_engine') and self.hedged_engine:
+                                    # Use AI Options Hedged Scalp Engine
+                                    try:
+                                        options_chain = self.jarvis.delta_data.get_options_chain(base_asset) \
+                                            if hasattr(self.jarvis.delta_data, 'get_options_chain') else {}
+                                    except Exception:
+                                        options_chain = {}
+                                    hedged_result = self.hedged_engine.execute_hedged_scalp(
+                                        signal={'direction': direction, 'confidence': confidence},
+                                        current_price=current_price,
+                                        atr=atr,
+                                        options_chain=options_chain,
+                                        jarvis_result=result
+                                    )
+                                    self.last_hedged_result = hedged_result
+                                    self._dashboard_events.append(f"Hedge: {hedged_result.get('status')} / applied={hedged_result.get('hedge_applied')}")
+                                
+                                # Always open paper trade to track P&L
+                                trade = self._open_paper_trade(
+                                    direction, entry_price or current_price,
+                                    confidence, expiry, tp1, tp2, sl, current_price=current_price,
+                                    symbol=symbol
+                                )
+                                if trade:
+                                    self._dashboard_events.append(
+                                        f"Paper trade #{trade['id']} {trade['status']} | "
+                                        f"margin ${trade['margin_usdt']:.2f} @ {trade['leverage']}x"
+                                    )
+                                else:
+                                    self._dashboard_events.append("Paper entry blocked (max open or risk budget)")
+                            elif direction in ('CALL', 'PUT'):
+                                print(f"  ⚠️  PAPER: Skipped (Conf {confidence}% < {self.PAPER_CONFIG['min_confidence']}%)")
+                            
+                            # FIX BUG 1: PENDING record_trade removed to fix Consecutive Loss Circuit Breaker
+                        
                         else:
                             logger.debug("[LIVE] No candle data received")
                     else:
@@ -4869,6 +4881,20 @@ class JarvisElite:
             self.delta_data = None
             self.delta_client = None
 
+        # Live analysis uses one bounded native-interval snapshot for the
+        # selected symbol.  The cache key includes symbol/source/timeframe;
+        # it never resamples or pads data and fails closed on a bad feed.
+        self.direct_candle_cache = None
+        self._active_candle_snapshot = None
+        if self.delta_data is not None and DIRECT_CANDLE_CACHE_AVAILABLE:
+            try:
+                self.direct_candle_cache = DirectCandleCache(
+                    self.delta_data,
+                    ttl_seconds=float(os.getenv('JARVIS_CANDLE_REFRESH_SECONDS', '45')),
+                )
+            except Exception as _cache_error:
+                logger.warning("Direct candle cache unavailable: %s", _cache_error)
+
         # Optional wiring: keep supplemental sources and utilities discoverable,
         # but do not start scanners, model calls, backtests, or another position
         # monitor as a side effect of starting the brain.
@@ -5175,52 +5201,41 @@ class JarvisElite:
             return self.kie_gpt6_client_class(**kwargs)
         return self.integration_sources.get(key)
     
-    def _fetch_mtf_from_api(self):
-        """Fetch live MTF data only outside isolated historical backtests."""
-        if self.is_backtest_mode:
-            return {}  # Caller resamples only the supplied historical window.
-        import pandas as pd
-        
-        # Map our timeframe names to Delta API resolution strings
-        tf_config = {
-            '1m':  {'resolution': '1m',  'limit': 500},
-            '5m':  {'resolution': '5m',  'limit': 500},
-            '15m': {'resolution': '15m', 'limit': 500},
-            '1h':  {'resolution': '1h',  'limit': 500},
-            '4h':  {'resolution': '4h',  'limit': 500},
-        }
-        
-        mtf_datasets = {}
-        symbol = "BTCUSDT"
-        
-        for tf_name, cfg in tf_config.items():
-            try:
-                candles = self.delta_client.get_historical_candles(
-                    symbol=symbol,
-                    resolution=cfg['resolution'],
-                    limit=cfg['limit']
-                )
-                if candles and len(candles) >= 1:
-                    df = pd.DataFrame(candles)
-                    # Delta returns: time, open, high, low, close, volume
-                    df.rename(columns={'time': 'timestamp'}, inplace=True)
-                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-                    df.set_index('timestamp', inplace=True)
-                    df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
-                    df.sort_index(inplace=True)
-                    mtf_datasets[tf_name] = df
-                    logger.info(f"[MTF-API] {tf_name}: {len(df)} candles fetched from Delta Exchange")
-                else:
-                    logger.warning(f"[MTF-API] {tf_name}: No data returned, will skip")
-            except Exception as e:
-                logger.warning(f"[MTF-API] {tf_name} fetch failed: {e}")
-        
-        logger.info(f"[MTF-API] Fetched {len(mtf_datasets)} timeframes: {list(mtf_datasets.keys())}")
-        return mtf_datasets
-
-    def analyze_trade_setup(self, data, mtf_context=None):
-        """Complete trade trading analysis with MTF support"""
+    def _fetch_mtf_from_api(self, symbol=None):
+        """Return direct native live frames; never resample or substitute BTC."""
+        if self.is_backtest_mode or self.direct_candle_cache is None:
+            return {}
+        symbol = symbol or getattr(self, 'active_symbol', None)
+        if not symbol:
+            logger.warning('[MTF-API] No active symbol; refusing candle fetch')
+            return {}
         try:
+            snapshot = self._active_candle_snapshot
+            if snapshot is None or snapshot.symbol != str(symbol).upper().replace('/', '').replace('-', '').replace('_', ''):
+                snapshot = self.direct_candle_cache.refresh(symbol)
+                self._active_candle_snapshot = snapshot
+            if set(snapshot.frames) != set(LIVE_TIMEFRAMES):
+                logger.warning('[MTF-API] Incomplete direct snapshot; refusing analysis')
+                return {}
+            frames = snapshot.analysis_frames()
+            logger.info('[MTF-API] Direct %s: %s', symbol, {tf: len(df) for tf, df in frames.items()})
+            return frames
+        except Exception as error:
+            logger.warning('[MTF-API] Direct native fetch rejected: %s', error)
+            return {}
+
+    def analyze_trade_setup(self, data, mtf_context=None, candle_snapshot=None):
+        """Analyze verified closed native candles; current candle stays metadata-only."""
+        try:
+            if candle_snapshot is not None:
+                self._active_candle_snapshot = candle_snapshot
+                if not self.is_backtest_mode:
+                    snapshot_symbol = str(candle_snapshot.symbol)
+                    active_symbol = str(getattr(self, 'active_symbol', '') or '')
+                    if active_symbol and snapshot_symbol != active_symbol.upper().replace('/', '').replace('-', '').replace('_', ''):
+                        return self._get_no_trade_signal('WAIT/NO-DATA: candle symbol mismatch')
+            elif not self.is_backtest_mode and self._active_candle_snapshot is None:
+                return self._get_no_trade_signal('WAIT/NO-DATA: no direct candle snapshot')
             # Auto-start Double-Brain AI Chain on first run
             # DISABLED for Performance: Prevents resource contention with Trading Judge
             # if not self.ai_chain_brain.is_running:
@@ -5305,35 +5320,23 @@ class JarvisElite:
             
             if EXTERNAL_ENGINES_AVAILABLE and self.engines:
                 try:
-                    # Ensure DatetimeIndex for resampling
-                    if not isinstance(data.index, pd.DatetimeIndex):
-                        data = data.copy()
-                        data.index = pd.to_datetime(data.index)
-                    
-                    # Build ALL timeframe datasets for GPU engines
-                    ohlcv_agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
-                    engine_tf_data = {'1m': data}
-                    resample_rules = {
-                        '3m': '3min', '5m': '5min', '15m': '15min', '30m': '30min',
-                        '1h': '1h', '2h': '2h', '4h': '4h'
-                    }
-                    for tf_name, tf_rule in resample_rules.items():
-                        try:
-                            resampled = data.resample(tf_rule).agg(ohlcv_agg).dropna()
-                            if len(resampled) >= 20:
-                                engine_tf_data[tf_name] = resampled
-                        except Exception:
-                            pass
-                            
-                    # OPTIMIZATION: Truncate all timeframes to max 500 rows
-                    # Generating 4h candles required 5000 rows of 1m data, but engines only need the recent candles
-                    for k in list(engine_tf_data.keys()):
-                        if len(engine_tf_data[k]) > 500:
-                            engine_tf_data[k] = engine_tf_data[k].iloc[-500:]
-                    
-                    # Store MTF data for all engines to use
+                    # Live GPU/external engines consume the exact same direct
+                    # native frames as Parts 1-12.  No resampling, truncation,
+                    # live-price injection, or forming-candle mutation occurs.
+                    if self.is_backtest_mode:
+                        engine_tf_data = {'1m': data}
+                    else:
+                        engine_tf_data = self._fetch_mtf_from_api(getattr(self, 'active_symbol', None))
+                        if set(engine_tf_data) != set(LIVE_TIMEFRAMES):
+                            logger.warning('[GPU] Direct native snapshot incomplete; external analysis blocked')
+                            engine_tf_data = {}
+                    if not engine_tf_data:
+                        return self._get_no_trade_signal('WAIT/NO-DATA: direct native frames unavailable')
                     self.market_context['mtf_datasets'] = engine_tf_data
-                    logger.info(f"📊 GPU Engines: {len(engine_tf_data)} timeframes ready: {list(engine_tf_data.keys())}")
+                    if not self.is_backtest_mode and self._active_candle_snapshot is not None:
+                        self.market_context['current_candles'] = self._active_candle_snapshot.current_candles
+                        self.market_context['current_candle_is_confirmed'] = False
+                    logger.info(f"📊 GPU Engines: direct native frames ready: {list(engine_tf_data.keys())}")
                     
                     # 1. Institutional Analysis (Native MTF)
                     inst_engine = self.engines.get('institutional')
@@ -5446,7 +5449,7 @@ class JarvisElite:
             
             # ============================================================
             # MULTI-TIMEFRAME ANALYSIS: All Parts on ALL Timeframes (1m-4h)
-            # FIX #16: Reuse engine_tf_data if already computed above (avoid duplicate resampling)
+            # Reuse the shared direct snapshot for Parts 1-12 and external engines.
             # ============================================================
             
             # Historical replay must rebuild every timeframe from the local
@@ -5474,57 +5477,17 @@ class JarvisElite:
                 self._api_mtf_cache = mtf_data
                 self.market_context['mtf_datasets'] = mtf_data
             else:
-                import time
-                current_time = time.time()
-            
-                # Fetch all TFs from API on first run OR every 5 minutes
-                if not hasattr(self, '_api_mtf_cache') or self._api_mtf_cache is None or not hasattr(self, '_last_mtf_fetch_time') or (current_time - self._last_mtf_fetch_time > 300):
-                    logger.info("[MTF-API] Fetching latest timeframes (1m-4h) from Delta API...")
-                    self._api_mtf_cache = self._fetch_mtf_from_api()
-                    self._last_mtf_fetch_time = current_time
-                
-                    # Fallback if API returns no data
-                    if not self._api_mtf_cache:
-                        logger.warning("[MTF-API] API unavailable — falling back to resampling.")
-                        if not isinstance(data.index, pd.DatetimeIndex):
-                            data = data.copy()
-                            data.index = pd.to_datetime(data.index)
-                    
-                        ohlcv_agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
-                        mtf_data_fb = {'1m': data}
-                        resample_map = {
-                            '3m': '3min', '5m': '5min', '15m': '15min', '30m': '30min',
-                            '1h': '1h', '2h': '2h', '4h': '4h'
-                        }
-                        for tf_name, tf_rule in resample_map.items():
-                            try:
-                                resampled = data.resample(tf_rule).agg(ohlcv_agg).dropna()
-                                if len(resampled) >= 20:
-                                    mtf_data_fb[tf_name] = resampled
-                            except Exception:
-                                pass
-                        self._api_mtf_cache = mtf_data_fb
-
-                # Always update 1m with latest data
-                if '1m' in self._api_mtf_cache:
-                    self._api_mtf_cache['1m'] = data  # Use live streaming 1m data
-                
-                # 🎓 TEACHER FIX #5: "Live Price Sync" (The Blindness Bug)
-                # Ensure the 4h, 1h, 15m charts aren't blind to live price movements between 5-min cache fetches
-                if not data.empty:
-                    live_close = float(data['close'].iloc[-1])
-                    live_high = float(data['high'].iloc[-1])
-                    live_low = float(data['low'].iloc[-1])
-                
-                    for tf_name, tf_df in self._api_mtf_cache.items():
-                        if tf_name != '1m' and not tf_df.empty:
-                            # Dynamically inject live price into the unfinished candle
-                            tf_df.iloc[-1, tf_df.columns.get_loc('close')] = live_close
-                            tf_df.iloc[-1, tf_df.columns.get_loc('high')] = max(float(tf_df['high'].iloc[-1]), live_high)
-                            tf_df.iloc[-1, tf_df.columns.get_loc('low')] = min(float(tf_df['low'].iloc[-1]), live_low)
-            
-                mtf_data = self._api_mtf_cache
+                # Live mode is strict: the shared snapshot is refreshed by the
+                # live loop and reused here.  A direct-fetch failure blocks the
+                # cycle; there is no synthetic/resampled fallback or BTC swap.
+                mtf_data = self._fetch_mtf_from_api(getattr(self, 'active_symbol', None))
+                if set(mtf_data) != set(LIVE_TIMEFRAMES):
+                    return self._get_no_trade_signal('WAIT/NO-DATA: incomplete native timeframe snapshot')
+                self._api_mtf_cache = mtf_data
                 self.market_context['mtf_datasets'] = mtf_data
+                if self._active_candle_snapshot is not None:
+                    self.market_context['current_candles'] = self._active_candle_snapshot.current_candles
+                    self.market_context['current_candle_is_confirmed'] = False
             
             logger.info(f"📊 MTF Analysis: {len(mtf_data)} timeframes active: {list(mtf_data.keys())}")
             
