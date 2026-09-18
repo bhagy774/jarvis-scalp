@@ -4,12 +4,14 @@ Binance Public Data Wrapper for Jarvis
 - No API Key required (public endpoints only)
 - Replaces Delta Exchange for price + candle data
 - Keeps Delta Exchange for options data + trade execution
+- Auto-fallback to Binance US / mirrors on HTTP 451 (geo-restriction)
 
 Endpoints used:
   GET /api/v3/ticker/price       -> Live real-time price
   GET /api/v3/klines             -> OHLCV candle data
 """
 
+import os
 import requests
 import logging
 import time
@@ -25,7 +27,25 @@ if sys.platform == "win32":
 
 logger = logging.getLogger(__name__)
 
-BINANCE_BASE_URL = "https://api.binance.com"
+# Primary + fallback base URLs (tried in order on geo-restriction / failure)
+# api.binance.us is the US-compliant endpoint; api1/api2/api3 are Binance CDN mirrors
+BINANCE_BASE_URLS = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api.binance.us",       # Binance US (geo-unrestricted for most regions)
+]
+BINANCE_FAPI_URLS = [
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+]
+BINANCE_BASE_URL = BINANCE_BASE_URLS[0]  # kept for backward compat
+
+# Optional: set BINANCE_PROXY env var to route via proxy
+# Example: BINANCE_PROXY=socks5://127.0.0.1:1080  or  http://user:pass@host:port
+_PROXY = os.environ.get("BINANCE_PROXY", "").strip()
 
 # Map Jarvis resolution names → Binance interval names
 RESOLUTION_MAP = {
@@ -51,11 +71,53 @@ class BinanceData:
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent": "JarvisTradingSystem/2.0"
+            "User-Agent": "Mozilla/5.0 (JarvisTradingSystem/2.0)"
         })
+        # Apply proxy if configured
+        if _PROXY:
+            self.session.proxies = {"http": _PROXY, "https": _PROXY}
+            logger.info(f"[BINANCE] Using proxy: {_PROXY}")
+
         self._last_price: float = 0.0
         self._last_price_ts: float = 0.0
         self._price_ttl: float = 3.0  # cache live price for 3 seconds max
+        self._active_base_url: str = BINANCE_BASE_URLS[0]   # tracks working URL
+        self._active_fapi_url: str = BINANCE_FAPI_URLS[0]
+
+    # ─────────────────────────────────────────────
+    # INTERNAL: geo-aware GET with auto-fallback
+    # ─────────────────────────────────────────────
+
+    def _get(self, path: str, params: dict = None, timeout: int = 5,
+             base_urls: List[str] = None) -> Optional[requests.Response]:
+        """
+        Try each base URL in order. On HTTP 451 (geo-restricted) or connection
+        error, automatically fall back to the next mirror.
+        Returns the first successful Response, or None.
+        """
+        if base_urls is None:
+            base_urls = BINANCE_BASE_URLS
+
+        for base_url in base_urls:
+            try:
+                url = f"{base_url}{path}"
+                resp = self.session.get(url, params=params, timeout=timeout)
+                if resp.status_code == 451:
+                    logger.warning(f"[BINANCE] HTTP 451 geo-block on {base_url} — trying next mirror...")
+                    continue
+                # Update active URL to the one that worked
+                if base_urls is BINANCE_BASE_URLS:
+                    self._active_base_url = base_url
+                elif base_urls is BINANCE_FAPI_URLS:
+                    self._active_fapi_url = base_url
+                return resp
+            except Exception as e:
+                logger.debug(f"[BINANCE] {base_url} failed: {e} — trying next...")
+                continue
+
+        logger.error("[BINANCE] All endpoints geo-blocked or unreachable. "
+                     "Set BINANCE_PROXY env var to route via proxy.")
+        return None
 
     # ─────────────────────────────────────────────
     # 1. LIVE PRICE
@@ -77,12 +139,8 @@ class BinanceData:
             return cached[0]  # return cached price for THIS symbol
 
         try:
-            resp = self.session.get(
-                f"{BINANCE_BASE_URL}/api/v3/ticker/price",
-                params={"symbol": sym},
-                timeout=5
-            )
-            if resp.status_code == 200:
+            resp = self._get("/api/v3/ticker/price", params={"symbol": sym}, timeout=5)
+            if resp is not None and resp.status_code == 200:
                 price = float(resp.json().get("price", 0))
                 if price > 0:
                     self._price_cache[sym] = (price, now)
@@ -90,7 +148,7 @@ class BinanceData:
                     self._last_price_ts = now
                     logger.debug(f"[BINANCE PRICE] {sym} = ${price:,.2f}")
                     return price
-            else:
+            elif resp is not None:
                 logger.warning(f"[BINANCE PRICE] HTTP {resp.status_code}: {resp.text[:80]}")
         except Exception as e:
             logger.warning(f"[BINANCE PRICE] Error: {e}")
@@ -118,12 +176,10 @@ class BinanceData:
         limit = min(limit, 1000)  # Binance max per request = 1000
 
         try:
-            resp = self.session.get(
-                f"{BINANCE_BASE_URL}/api/v3/klines",
-                params={"symbol": sym, "interval": interval, "limit": limit},
-                timeout=10
-            )
-            if resp.status_code == 200:
+            resp = self._get("/api/v3/klines",
+                             params={"symbol": sym, "interval": interval, "limit": limit},
+                             timeout=10)
+            if resp is not None and resp.status_code == 200:
                 raw = resp.json()
                 candles = []
                 for k in raw:
@@ -137,7 +193,7 @@ class BinanceData:
                     })
                 logger.info(f"[BINANCE] {sym} {interval}: {len(candles)} candles fetched")
                 return candles
-            else:
+            elif resp is not None:
                 logger.warning(f"[BINANCE CANDLES] HTTP {resp.status_code}: {resp.text[:100]}")
         except Exception as e:
             logger.warning(f"[BINANCE CANDLES] Error: {e}")
@@ -157,19 +213,15 @@ class BinanceData:
         """
         sym = symbol.upper().replace("USD", "USDT") if "USDT" not in symbol.upper() else symbol.upper()
         try:
-            resp = self.session.get(
-                f"{BINANCE_BASE_URL}/api/v3/bookTicker",
-                params={"symbol": sym},
-                timeout=5
-            )
-            if resp.status_code == 200:
+            resp = self._get("/api/v3/bookTicker", params={"symbol": sym}, timeout=5)
+            if resp is not None and resp.status_code == 200:
                 data = resp.json()
                 bid = float(data.get("bidPrice", 0))
                 ask = float(data.get("askPrice", 0))
                 spread = round(ask - bid, 2)
                 logger.debug(f"[BINANCE BID/ASK] Bid: ${bid:,.2f} | Ask: ${ask:,.2f} | Spread: ${spread}")
                 return {"bid": bid, "ask": ask, "spread": spread}
-            else:
+            elif resp is not None:
                 logger.warning(f"[BINANCE BID/ASK] HTTP {resp.status_code}")
         except Exception as e:
             logger.warning(f"[BINANCE BID/ASK] Error: {e}")
@@ -213,12 +265,9 @@ class BinanceData:
         """
         sym = symbol.upper().replace("USD", "USDT") if "USDT" not in symbol.upper() else symbol.upper()
         try:
-            resp = self.session.get(
-                "https://fapi.binance.com/fapi/v1/premiumIndex",
-                params={"symbol": sym},
-                timeout=5
-            )
-            if resp.status_code == 200:
+            resp = self._get("/fapi/v1/premiumIndex", params={"symbol": sym},
+                             timeout=5, base_urls=BINANCE_FAPI_URLS)
+            if resp is not None and resp.status_code == 200:
                 data = resp.json()
                 rate = float(data.get("lastFundingRate", 0.0))
                 next_time_ms = int(data.get("nextFundingTime", 0))
@@ -256,12 +305,9 @@ class BinanceData:
         """
         sym = symbol.upper().replace("USD", "USDT") if "USDT" not in symbol.upper() else symbol.upper()
         try:
-            resp = self.session.get(
-                "https://fapi.binance.com/fapi/v1/openInterest",
-                params={"symbol": sym},
-                timeout=5
-            )
-            if resp.status_code == 200:
+            resp = self._get("/fapi/v1/openInterest", params={"symbol": sym},
+                             timeout=5, base_urls=BINANCE_FAPI_URLS)
+            if resp is not None and resp.status_code == 200:
                 data = resp.json()
                 oi_contracts = float(data.get("openInterest", 0.0))
                 return {
@@ -280,12 +326,9 @@ class BinanceData:
         """
         sym = symbol.upper().replace("USD", "USDT") if "USDT" not in symbol.upper() else symbol.upper()
         try:
-            resp = self.session.get(
-                f"{BINANCE_BASE_URL}/api/v3/depth",
-                params={"symbol": sym, "limit": limit},
-                timeout=5
-            )
-            if resp.status_code == 200:
+            resp = self._get("/api/v3/depth",
+                             params={"symbol": sym, "limit": limit}, timeout=5)
+            if resp is not None and resp.status_code == 200:
                 data = resp.json()
                 bids = data.get("bids", [])
                 asks = data.get("asks", [])
@@ -331,12 +374,8 @@ class BinanceData:
         """
         sym = symbol.upper().replace("USD", "USDT") if "USDT" not in symbol.upper() else symbol.upper()
         try:
-            resp = self.session.get(
-                f"{BINANCE_BASE_URL}/api/v3/ticker/24hr",
-                params={"symbol": sym},
-                timeout=5
-            )
-            if resp.status_code == 200:
+            resp = self._get("/api/v3/ticker/24hr", params={"symbol": sym}, timeout=5)
+            if resp is not None and resp.status_code == 200:
                 data = resp.json()
                 return {
                     "price_change_pct": float(data.get("priceChangePercent", 0.0)),
