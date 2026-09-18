@@ -43,13 +43,29 @@ def build_snapshot(*, symbol: str, timestamp: Optional[str], current_price: Any,
                    position_state: Any = None, order_state: Any = None,
                    runtime: Any = None, safety_gates: Iterable[str] = ()) -> Dict[str, Any]:
     """Build one same-symbol snapshot; missing values are explicit markers."""
-    now = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    selected_symbol = str(symbol or "UNKNOWN").upper()
+    market_context = market_context or {}
+    reported_symbol = market_context.get("symbol") if isinstance(market_context, dict) else None
+    symbol_match = not reported_symbol or str(reported_symbol).upper() == selected_symbol
+    stale = False
+    freshness_limit = 300.0
+    try:
+        source_time = datetime.fromisoformat(str(timestamp or now).replace("Z", "+00:00"))
+        if source_time.tzinfo is None:
+            source_time = source_time.replace(tzinfo=timezone.utc)
+        stale = max(0.0, (now_dt - source_time.astimezone(timezone.utc)).total_seconds()) > freshness_limit
+    except (TypeError, ValueError, OverflowError):
+        stale = True
     snapshot = {
         "schema": "jarvis.ollama.snapshot.v1",
-        "symbol": str(symbol or "UNKNOWN").upper(),
+        "symbol": selected_symbol,
         "timestamp": timestamp or now,
         "snapshot_created_at": now,
-        "freshness": {"market_data": "provided" if market_context else "missing"},
+        "freshness": {"market_data": "provided" if market_context else "missing",
+                      "symbol_match": symbol_match, "stale": stale,
+                      "max_age_seconds": freshness_limit},
         "market": {"price": _clean(current_price), "context": _clean(market_context or {})},
         "parts_1_to_12": _parts(part_results),
         "fusion": _clean(fusion) if fusion is not None else {"missing": True},
@@ -63,6 +79,20 @@ def build_snapshot(*, symbol: str, timestamp: Optional[str], current_price: Any,
         "safety_gates": list(_clean(list(safety_gates)) or []),
     }
     return snapshot
+
+
+def snapshot_usable(snapshot: Dict[str, Any]) -> Tuple[bool, str]:
+    """Reject mixed-symbol or stale contexts before an AI-required decision."""
+    if not isinstance(snapshot, dict):
+        return False, "snapshot missing"
+    freshness = snapshot.get("freshness") or {}
+    if freshness.get("symbol_match") is False:
+        return False, "snapshot symbol mismatch"
+    if freshness.get("stale") is True:
+        return False, "snapshot stale"
+    if freshness.get("market_data") == "missing":
+        return False, "market data missing"
+    return True, "ok"
 
 
 def decision_prompt(snapshot: Dict[str, Any]) -> str:

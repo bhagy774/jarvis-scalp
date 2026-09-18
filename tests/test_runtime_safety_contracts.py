@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import jarvis_close_coordinator as close
 from jarvis_dashboard import render_dashboard
-from jarvis_ollama_context import build_snapshot, decision_prompt, validate_decision
+from jarvis_ollama_context import build_snapshot, decision_prompt, snapshot_usable, validate_decision
 from jarvis_runtime import detect_backend, safe_device
 
 
@@ -56,6 +56,14 @@ class RuntimeSafetyContracts(unittest.TestCase):
         self.assertNotIn("secret", text)
         self.assertLessEqual(len(snapshot["parts_1_to_12"]), 12)
         self.assertIn("ETHUSDT", decision_prompt(snapshot))
+        mismatch = build_snapshot(symbol="ETHUSDT", timestamp="2026-09-18T00:00:00Z",
+                                  current_price=100, market_context={"symbol": "BTCUSDT"},
+                                  part_results={})
+        self.assertFalse(snapshot_usable(mismatch)[0])
+        stale = build_snapshot(symbol="ETHUSDT", timestamp="2020-01-01T00:00:00Z",
+                               current_price=100, market_context={"symbol": "ETHUSDT"},
+                               part_results={})
+        self.assertFalse(snapshot_usable(stale)[0])
 
     def test_decision_validation(self):
         valid, err = validate_decision({"decision": "BUY", "confidence": 75,

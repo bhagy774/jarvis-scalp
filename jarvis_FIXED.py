@@ -22,7 +22,7 @@ from professional_display import ProfessionalSignalDisplay
 from jarvis_dashboard import UnifiedDashboard
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
 from jarvis_runtime import detect_backend, torch_device
-from jarvis_ollama_context import build_snapshot, decision_prompt, validate_decision
+from jarvis_ollama_context import build_snapshot, decision_prompt, snapshot_usable, validate_decision
 pro_display = ProfessionalSignalDisplay()
 import warnings
 from collections import deque, defaultdict
@@ -6288,6 +6288,11 @@ Follow the tag with a 1-sentence CEO executive directive.
         """Get AI validation for trade setup using local Supreme Commander AI (CEO) via Ollama"""
         try:
             prompt = self._generate_ollama_ceo_prompt(score, detailed_scores, telemetry, data=data)
+            usable, snapshot_reason = snapshot_usable(getattr(self, 'last_ollama_snapshot', None))
+            if not usable:
+                self.last_ollama_decision = {'decision': 'WAIT', 'confidence': 0,
+                                              'rationale': snapshot_reason}
+                return {'approved': False, 'reason': snapshot_reason, 'verdict': 'WAIT'}
             response, err = call_ollama(prompt, timeout=120)
             if response and not err:
                 raw_text = response.strip()
