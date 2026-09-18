@@ -6083,19 +6083,51 @@ class JarvisElite:
         thoughts = detailed_scores.get('thoughts', [])
         mtf_matrix = detailed_scores.get('mtf_matrix', {})
         walls = detailed_scores.get('options_walls', {})
-        
+
+        # ── Inject Market Oracle forecast into CEO context ──────────────────
+        oracle_summary = "Oracle: unavailable"
+        try:
+            oracle_data = None
+            if hasattr(self, 'jarvis') and hasattr(self.jarvis, 'market_oracle') and self.jarvis.market_oracle:
+                oracle_data = self.jarvis.market_oracle.get_latest_forecast()
+            elif MARKET_ORACLE_AVAILABLE and _get_market_oracle:
+                o = _get_market_oracle()
+                if o:
+                    oracle_data = o.get_latest_forecast()
+            if isinstance(oracle_data, dict) and oracle_data and oracle_data.get("model_used") != "startup_default":
+                sugg      = oracle_data.get("trade_suggestion", "WAIT")
+                conf      = oracle_data.get("confidence", 0)
+                d5m       = oracle_data.get("5min", {}).get("direction", "?")
+                d30m      = oracle_data.get("30min", {}).get("direction", "?")
+                hold      = oracle_data.get("hold_minutes", "?")
+                gem_sum   = oracle_data.get("gemini_summary", "")[:120]
+                oracle_summary = (
+                    f"Oracle→ Suggestion:{sugg} | Confidence:{conf}% | "
+                    f"5m:{d5m} / 30m:{d30m} | Hold:{hold}min | \"{gem_sum}\""
+                )
+        except Exception:
+            pass
+        # ────────────────────────────────────────────────────────────────────
+
         prompt = f"""You are the Supreme Commander AI (CEO) of an elite multi-agent quantitative trading system.
 
 Executive Voting Matrix & Telemetry:
 - Overall System Pulse Score: {score}/100
+- Market Oracle (30-sec cycle AI forecast): {oracle_summary}
 - Multi-Timeframe Matrix: {json.dumps(mtf_matrix, default=str)}
 - Sub-Agent Insights: {json.dumps(thoughts[:6], default=str)}
 - Options Walls (Smart Money): {json.dumps(walls, default=str)}
 
-Task: Review the sub-agent consensus. You hold supreme executive authority over trade execution.
-- If sub-agents are in high alignment and risk parameters are clean: issue [CEO_VERDICT: EXECUTE].
-- If sub-agents are conflicting or market risk is elevated: issue [CEO_VERDICT: STANDBY].
-- If sub-agents show severe divergence or trap signals: issue [CEO_VERDICT: ABORT].
+CRITICAL INSTRUCTION — Oracle Integration:
+- If Oracle Confidence >= 60% and Oracle Suggestion aligns with sub-agent majority: STRONGLY favor [CEO_VERDICT: EXECUTE].
+- If Oracle says WAIT or is unavailable: treat as neutral (do NOT auto-STANDBY for this reason alone).
+- If Oracle direction contradicts the sub-agent majority with >= 60% confidence: issue [CEO_VERDICT: STANDBY].
+- A conflicting Oracle + conflicting sub-agents = [CEO_VERDICT: ABORT].
+
+Task: Review the complete telemetry above. You hold supreme executive authority over trade execution.
+- If Oracle + sub-agents are in alignment and risk is clean: issue [CEO_VERDICT: EXECUTE].
+- If Oracle is WAIT or sub-agents are mildly conflicting: issue [CEO_VERDICT: STANDBY].
+- If Oracle + sub-agents show severe divergence or trap signals: issue [CEO_VERDICT: ABORT].
 
 Respond with EXACTLY ONE of the following tags at the beginning of your response:
 - [CEO_VERDICT: EXECUTE]
@@ -6105,6 +6137,7 @@ Respond with EXACTLY ONE of the following tags at the beginning of your response
 Follow the tag with a 1-sentence CEO executive directive.
 """
         return prompt
+
 
     def _get_deepseek_validation(self, data, score, detailed_scores, telemetry=None):
         """Get AI validation for trade setup using local Supreme Commander AI (CEO) via Ollama"""
