@@ -25,7 +25,10 @@ logger = logging.getLogger("JarvisWatchdog")
 
 STATE_FILE = os.environ.get("JARVIS_STATE_FILE", "jarvis_state.json")
 CHECK_INTERVAL_SECONDS = 60
-HEARTBEAT_STALE_SECONDS = 180  # heartbeats older than this are "stale"
+# How long before a heartbeat is considered stale.
+# Configurable via DOCTOR_STALE_THRESHOLD env var (default: 600s = 10 min).
+# Old default was 180s which caused false alerts when no trades were open.
+HEARTBEAT_STALE_SECONDS = int(os.environ.get("DOCTOR_STALE_THRESHOLD", "600"))
 
 _state_lock = threading.Lock()
 _heartbeats: Dict[str, float] = {}

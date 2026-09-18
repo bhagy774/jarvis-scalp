@@ -1446,6 +1446,14 @@ class LiveTradingEngine:
     
     def _check_paper_trades(self, current_price):
         """Check all open paper trades for TP/SL/Expiry"""
+        # Heartbeat FIRST — fires every cycle regardless of open trades
+        # Prevents false WATCHDOG STALE alerts when no positions are open
+        try:
+            from jarvis_watchdog import beat
+            beat("paper_trade_loop")
+        except Exception:
+            pass
+
         if not current_price or current_price < 100:
             return
         
@@ -1578,10 +1586,9 @@ class LiveTradingEngine:
         
         self.paper_open_trades = still_open
 
-        # Watchdog: heartbeat + persist state when trades closed (guarded)
+        # Watchdog: persist state when trades closed (beat already sent at top)
         try:
-            from jarvis_watchdog import beat, save_state
-            beat("paper_trade_loop")
+            from jarvis_watchdog import save_state
             if newly_closed:
                 save_state(self.paper_open_trades)
         except Exception:
