@@ -1,93 +1,58 @@
-# JARVIS audited safety correction report
+# JARVIS audited safety correction report (latest-main integration)
 
-## Source snapshot
+Repository: `bhagy774/jarvis-scalp`
+Base tested: `main` at `5cea878888bc2c26fe491843cca1e4ccc2adac25` (PR26 merged).
+This document describes clean integration PR #27; it is not a merge or deployment record.
 
-- Repository: `bhagy774/jarvis-scalp`
-- Base: current `main`
-- Verified fresh recursive Git tree: `fad84180b5ff22edb90ce7550e0581c9660eaff8` (not truncated; this is a tree SHA, not a commit SHA).
-- Branch/commit HEAD was not independently resolved because GitHub branch/commit listing access was not available.
-- No merge, push to `main`, bot launch, exchange/order/leverage call, or network/manual trading test was performed.
+## Integrated safety corrections
 
-## Corrective changes
-
-### Symbol and data integrity
-
-- Route selection remains locked before price/candle analysis; MTF, institutional, reversal, position-monitor, and legacy position-manager reads use the selected symbol.
-- Removed silent BTC selection from an empty scanner result; invalid/no candidate routes are `BLOCKED`.
-- Selected-asset options context is primary for execution. BTC options/oracle information is labeled macro-only and cannot silently serve as altcoin execution evidence. Live selected-asset options/institutional context is a required, non-bypassable gate; paper mode remains offline/advisory.
-- BTC-only Oracle paths are explicitly unavailable for non-BTC execution routes.
-- Binance mirrors retry geo/rate-limit/transient responses before changing venue; proxy logs redact credentials. Bybit fallback records `bybit_linear_perpetual` / `linear_perpetual` semantics. Delta's hybrid wrapper rejects non-spot fallback data unless `JARVIS_ALLOW_PERPETUAL_FALLBACK=1` is explicitly set.
-
-### Risk and execution safety
-
-- Live sizing resolves recognized Delta contract units/value and calculates quote notional, margin, leverage, and risk from actual contract metadata. Missing, ambiguous, or invalid metadata/balance blocks live execution; no one-USDT contract assumption remains in live paths.
-- Position records and dashboard/P&L use recorded contract value/notional.
-- Live execution remains independently gated by auto-trade, mainnet, live execution, and order-execution flags; paper mode does not submit venue orders or set venue leverage.
-- `DOCTOR_STALE_THRESHOLD` rejects malformed/non-positive values and falls back to 600 seconds. The live loop beats the watchdog before route/price/candle acquisition, including total data-outage cycles.
-
-### Canonical decision and output
-
-- Added `jarvis_decision.py` as the dependency-free confidence/decision contract. Confidence accepts numeric, `%`, fraction, and autonomy forms while preserving unavailable/rejected values as `N/A`.
-- One authoritative final snapshot carries symbol, price, canonical BUY/SELL/NO_TRADE direction, confidence, entry/TP/SL/expiry, reasons, options context, and execution status.
-- PreSim and scenario/entry gates now run before the snapshot is built; the paper ledger, auto-trader, and dashboard consume the same post-gate direction/confidence. Unresolved BUY/SELL opinion conflicts block rather than fabricate consensus.
-- Legacy recommendation-like terminal output was routed to structured logging or the unified dashboard; no second active terminal recommendation is intended.
-- Dashboard rendering avoids `N/A%` and consistently displays source/coin, plan, sizing, leverage, gates, and status.
+- Preserves PR26 direct native candle acquisition, closed/forming separation, close coordinator, runtime metadata, Ollama context, and Part7 fail-closed analyzer.
+- Locks the selected route symbol through MTF, institutional/options, reversal, and position paths; invalid empty-scanner routes block instead of silently selecting BTC.
+- Uses canonical confidence/decision normalization and one post-PreSim/scenario/gate snapshot for dashboard, paper ledger, and auto-trader. Opinion conflicts and selected-asset options/institutional gaps block live execution.
+- Resolves recognized Delta contract metadata into quote notional and sizes whole contracts against margin, stop-loss risk, policy/product leverage caps, and balance. Missing/ambiguous live metadata blocks rather than assuming one contract equals one USDT.
+- Keeps paper mode from submitting orders or setting venue leverage; close paths use `reduce_only` and stable `client_order_id`, with ownership and ambiguous-close reconciliation guards.
+- Redacts proxy credentials, retries transient Binance mirror responses, records Bybit linear-perpetual provenance, and blocks non-spot fallback unless explicitly opted in.
+- Validates watchdog thresholds and maintains live-loop heartbeat; dashboard formats unavailable confidence as `N/A`, not `N/A%`.
+- Keeps optional startup fail-safe: if optional wiring is incomplete, the heavy Part2 engine is not constructed and its deterministic range fallback remains available.
 
 ## Exact PR file set
 
-Expected source changes:
-
+- `CHANGE_REPORT.md`
 - `binance_data.py`
 - `delta_api_wrapper.py`
 - `jarvis_FIXED.py`
-- `jarvis_coin_scanner.py`
 - `jarvis_dashboard.py`
-- `jarvis_decision.py` (new)
+- `jarvis_decision.py`
 - `jarvis_live_trader.py`
-- `jarvis_market_oracle.py`
 - `jarvis_position_manager.py`
+- `jarvis_position_ownership.py`
 - `jarvis_risk.py`
 - `jarvis_sizer.py`
 - `jarvis_watchdog.py`
-- `oracle_trade_gate.py`
-- `tests/test_audit_regressions.py` (new)
-- `tests/test_auto_risk_dashboard.py` (metadata fixture update)
-- `CHANGE_REPORT.md` (this report)
+- `ollama_integration.py`
+- `part7_signal.py`
+- `tests/test_audit_regressions.py`
+- `tests/test_auto_risk_dashboard.py`
+- `tests/test_presim.py`
 
-The 15 legacy/manual scripts and `tests/test_runner_integration.py` were not deleted: safe unused-by-runtime/tests/config/docs verification was not established. Deletion is deferred.
+No `.orig`, cache, logs, credentials, or unverified legacy/manual files are included. The separately requested legacy cleanup remains deferred pending evidence that imported files are unused by runtime/tests/config/docs.
 
-## Verification
+## Offline verification
 
-Targeted compile passed:
+Credentials and execution variables were unset: `DELTA_API_KEY`, `DELTA_API_SECRET`, `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `DELTA_ORDER_EXECUTION_ENABLED`, and `DELTA_USE_MAINNET`. No exchange access, order, leverage mutation, credentialed startup, deployment, or live/manual test was performed.
 
-```text
-python -m py_compile delta_api_wrapper.py jarvis_decision.py jarvis_risk.py jarvis_sizer.py \
-  jarvis_dashboard.py jarvis_watchdog.py binance_data.py jarvis_live_trader.py \
-  jarvis_FIXED.py jarvis_position_manager.py tests_test_audit_regressions.py
-```
+- Changed runtime modules: `python -m py_compile` passed.
+- Audit/execution/auto-risk/Part7/backtest grouped safety tests: 43 passed.
+- PreSim module in isolation: 22 passed.
+- Additional offline modules: 30 passed (model/learning, backtest coverage, clean output, cross-source); 78 passed with one expected mocked-thread warning (data/feature/Ollama group); paper launch 1 passed; runner integration 5 passed; scenario simulator 9 passed.
+- Optional wiring: initialization group 5 passed; missing-module fail-safe parameters 8 passed, 5 deselected after bounded startup optimization.
+- Direct candle, runtime safety, routing, quote fallback, options context, and related safety tests passed in the grouped run; one combined-run PreSim fallback was an environment-isolation artifact and the isolated 22-test PreSim module was clean.
 
-Offline safety/regression suite passed:
+A repository-wide one-shot run was not used as evidence because the legacy module graph exhausted the sandbox during heavy collection. Hosted CI should run the final complete suite with an adequate timeout.
 
-```text
-python -m unittest tests_test_audit_regressions.py \
-  tests_test_execution_safety.py tests_test_auto_risk_dashboard.py \
-  tests_test_options_context.py -q
-```
+## Remaining review gates
 
-Result: **25 passed, 1 skipped**. The skip is selected-symbol MTF import coverage because optional `websockets` is unavailable. The local harness copies correspond to repository test paths listed above; no exchange/network calls were made.
-
-## Limitations and remaining review items
-
-- No dependency-complete full repository suite, lint/type check, frontend build, Windows run, or live startup was performed.
-- No authoritative Delta contract schema was available; unrecognized venue schemas intentionally remain blocked until metadata mapping is confirmed.
-- Bybit perpetual fallback is explicitly blocked by default for Delta's spot-compatible hybrid consumers; enabling it requires operator confirmation that downstream analysis accepts perpetual semantics.
-- The Oracle service is still initialized before route selection for historical compatibility, but its non-BTC influence is blocked/excluded. Route-aware initialization/removal remains a follow-up.
-- Remaining lifecycle/status prints (initialization, emergency stop, close reports) should be audited separately; recommendation-like active analysis output is logged/dashboard-owned.
-- `jarvis_position_manager.py` and `jarvis_live_trader.py` both contain lifecycle paths; offline tests covered safety but no live integration was run. Confirm deployment uses one authoritative position/close manager before enabling live execution.
-
-## Safe review/run instructions
-
-1. Review this PR and the exact changed-file list; verify the Delta product metadata keys against the venue's current schema.
-2. Run the targeted offline commands above with credentials unset and live execution flags disabled.
-3. Keep `JARVIS_ALLOW_PERPETUAL_FALLBACK` unset unless perpetual semantics are intentionally supported.
-4. Do not treat offline pass results as startup, exchange, or live-trading verification. Do not merge until reviewer checks contract metadata, lifecycle ownership, and remaining Oracle initialization behavior.
+1. Verify the current Delta product metadata schema before any live enablement; unknown keys intentionally remain blocked.
+2. Confirm deployment has one authoritative lifecycle/close manager; coordinator/ownership is process-local and ambiguous close remains `CLOSE_UNKNOWN` until reconciled.
+3. Oracle initialization remains historically early, although non-BTC data cannot satisfy a non-BTC execution gate; route-aware initialization is a follow-up.
+4. Hosted CI and human review are pending. Merge was not performed.
