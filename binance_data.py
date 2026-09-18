@@ -91,8 +91,14 @@ class BinanceData:
         self._last_price: float = 0.0
         self._last_price_ts: float = 0.0
         self._price_ttl: float = 3.0  # cache live price for 3 seconds max
-        self._active_base_url: str = BINANCE_BASE_URLS[0]   # tracks working URL
+        self._active_base_url: str = BINANCE_BASE_URLS[0]
         self._active_fapi_url: str = BINANCE_FAPI_URLS[0]
+
+        # Geo-block cache: if ALL Binance endpoints return 451, skip them for
+        # _GEO_BLOCK_TTL seconds and go straight to Bybit / Delta fallback.
+        self._binance_blocked: bool = False
+        self._binance_blocked_until: float = 0.0
+        self._GEO_BLOCK_TTL: float = 300.0   # re-check Binance every 5 minutes
 
     # ─────────────────────────────────────────────
     # INTERNAL: geo-aware GET with auto-fallback
@@ -103,18 +109,31 @@ class BinanceData:
         """
         Try each base URL in order. On HTTP 451 (geo-restricted) or connection
         error, automatically fall back to the next mirror.
+        If ALL mirrors are 451-blocked, caches the block state for 5 minutes
+        to avoid spamming logs and wasting network calls.
         Returns the first successful Response, or None.
         """
         if base_urls is None:
             base_urls = BINANCE_BASE_URLS
 
+        # Fast-path: if we already know Binance is geo-blocked, skip all mirrors
+        if base_urls is BINANCE_BASE_URLS and self._binance_blocked:
+            if time.time() < self._binance_blocked_until:
+                return None   # still blocked — caller will use Bybit/Delta
+            else:
+                # Block TTL expired — try Binance again
+                self._binance_blocked = False
+                logger.info("[BINANCE] Re-checking Binance endpoints after geo-block cooldown...")
+
+        all_451 = True
         for base_url in base_urls:
             try:
                 url = f"{base_url}{path}"
                 resp = self.session.get(url, params=params, timeout=timeout)
                 if resp.status_code == 451:
-                    logger.warning(f"[BINANCE] HTTP 451 geo-block on {base_url} — trying next mirror...")
+                    logger.debug(f"[BINANCE] HTTP 451 on {base_url} — trying next mirror...")
                     continue
+                all_451 = False
                 # Update active URL to the one that worked
                 if base_urls is BINANCE_BASE_URLS:
                     self._active_base_url = base_url
@@ -122,10 +141,18 @@ class BinanceData:
                     self._active_fapi_url = base_url
                 return resp
             except Exception as e:
+                all_451 = False
                 logger.debug(f"[BINANCE] {base_url} failed: {e} — trying next...")
                 continue
 
-        logger.warning("[BINANCE] All Binance endpoints geo-blocked — switching to Bybit fallback.")
+        if all_451 and base_urls is BINANCE_BASE_URLS:
+            if not self._binance_blocked:
+                logger.warning("[BINANCE] All endpoints geo-blocked (HTTP 451). "
+                               f"Switching to Bybit/Delta fallback for {int(self._GEO_BLOCK_TTL/60)} min.")
+            self._binance_blocked = True
+            self._binance_blocked_until = time.time() + self._GEO_BLOCK_TTL
+        elif not self._binance_blocked:
+            logger.warning("[BINANCE] All Binance endpoints geo-blocked — switching to Bybit fallback.")
         return None
 
     # ─────────────────────────────────────────────
