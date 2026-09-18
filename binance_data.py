@@ -4,11 +4,12 @@ Binance Public Data Wrapper for Jarvis
 - No API Key required (public endpoints only)
 - Replaces Delta Exchange for price + candle data
 - Keeps Delta Exchange for options data + trade execution
-- Auto-fallback to Binance US / mirrors on HTTP 451 (geo-restriction)
+- Auto-fallback to Binance mirrors on HTTP 451 (geo-restriction)
+- Ultimate fallback to Bybit public API when all Binance endpoints are blocked
 
 Endpoints used:
-  GET /api/v3/ticker/price       -> Live real-time price
-  GET /api/v3/klines             -> OHLCV candle data
+  Binance: GET /api/v3/ticker/price, /api/v3/klines
+  Bybit:   GET /v5/market/tickers, /v5/market/kline  (fallback, no auth needed)
 """
 
 import os
@@ -42,6 +43,15 @@ BINANCE_FAPI_URLS = [
     "https://fapi2.binance.com",
 ]
 BINANCE_BASE_URL = BINANCE_BASE_URLS[0]  # kept for backward compat
+
+# Bybit public API — used as ultimate fallback when Binance is geo-blocked
+BYBIT_BASE_URL = "https://api.bybit.com"
+
+# Bybit interval map (Binance format -> Bybit format)
+BYBIT_INTERVAL_MAP = {
+    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+    "1h": "60", "2h": "120", "4h": "240", "1d": "D",
+}
 
 # Optional: set BINANCE_PROXY env var to route via proxy
 # Example: BINANCE_PROXY=socks5://127.0.0.1:1080  or  http://user:pass@host:port
@@ -115,9 +125,65 @@ class BinanceData:
                 logger.debug(f"[BINANCE] {base_url} failed: {e} — trying next...")
                 continue
 
-        logger.error("[BINANCE] All endpoints geo-blocked or unreachable. "
-                     "Set BINANCE_PROXY env var to route via proxy.")
+        logger.warning("[BINANCE] All Binance endpoints geo-blocked — switching to Bybit fallback.")
         return None
+
+    # ─────────────────────────────────────────────
+    # INTERNAL: Bybit fallback helpers
+    # ─────────────────────────────────────────────
+
+    def _bybit_get_price(self, symbol: str) -> float:
+        """Fetch live price from Bybit (fallback when Binance is geo-blocked)."""
+        sym = symbol.upper().replace("USD", "USDT") if "USDT" not in symbol.upper() else symbol.upper()
+        try:
+            resp = self.session.get(
+                f"{BYBIT_BASE_URL}/v5/market/tickers",
+                params={"category": "linear", "symbol": sym},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("result", {}).get("list", [])
+                if items:
+                    price = float(items[0].get("lastPrice", 0))
+                    if price > 0:
+                        logger.info(f"[BYBIT FALLBACK] {sym} = ${price:,.2f}")
+                        return price
+        except Exception as e:
+            logger.warning(f"[BYBIT FALLBACK] Price error: {e}")
+        return 0.0
+
+    def _bybit_get_candles(self, symbol: str, resolution: str, limit: int) -> List[Dict]:
+        """Fetch OHLCV candles from Bybit (fallback when Binance is geo-blocked)."""
+        sym = symbol.upper().replace("USD", "USDT") if "USDT" not in symbol.upper() else symbol.upper()
+        interval = BYBIT_INTERVAL_MAP.get(resolution, "1")
+        try:
+            resp = self.session.get(
+                f"{BYBIT_BASE_URL}/v5/market/kline",
+                params={"category": "linear", "symbol": sym,
+                        "interval": interval, "limit": min(limit, 1000)},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                raw = data.get("result", {}).get("list", [])
+                # Bybit returns newest first — reverse to chronological order
+                candles = []
+                for k in reversed(raw):
+                    # k = [startTime, open, high, low, close, volume, turnover]
+                    candles.append({
+                        "time":   int(k[0]) // 1000,
+                        "open":   float(k[1]),
+                        "high":   float(k[2]),
+                        "low":    float(k[3]),
+                        "close":  float(k[4]),
+                        "volume": float(k[5]),
+                    })
+                logger.info(f"[BYBIT FALLBACK] {sym} {interval}: {len(candles)} candles fetched")
+                return candles
+        except Exception as e:
+            logger.warning(f"[BYBIT FALLBACK] Candles error: {e}")
+        return []
 
     # ─────────────────────────────────────────────
     # 1. LIVE PRICE
@@ -152,6 +218,14 @@ class BinanceData:
                 logger.warning(f"[BINANCE PRICE] HTTP {resp.status_code}: {resp.text[:80]}")
         except Exception as e:
             logger.warning(f"[BINANCE PRICE] Error: {e}")
+
+        # Binance fully blocked — try Bybit
+        bybit_price = self._bybit_get_price(sym)
+        if bybit_price > 0:
+            self._price_cache[sym] = (bybit_price, now)
+            self._last_price = bybit_price
+            self._last_price_ts = now
+            return bybit_price
 
         # Return last known price for THIS symbol only (not another symbol's price)
         return cached[0] if cached else 0.0
@@ -198,7 +272,8 @@ class BinanceData:
         except Exception as e:
             logger.warning(f"[BINANCE CANDLES] Error: {e}")
 
-        return []
+        # Binance fully blocked — try Bybit
+        return self._bybit_get_candles(symbol, resolution, limit)
 
     # ─────────────────────────────────────────────
     # 3. BID / ASK PRICE (for Part 12)
