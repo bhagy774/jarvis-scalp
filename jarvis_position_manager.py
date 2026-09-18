@@ -39,8 +39,9 @@ TRAIL_ACTIVATE   = float(os.environ.get("PM_TRAIL_ACTIVATE",  "0.003"))
 TRAIL_STEP       = float(os.environ.get("PM_TRAIL_STEP",      "0.001"))
 BREAK_EVEN_AT    = float(os.environ.get("PM_BREAKEVEN_AT",    "0.002"))
 MONITOR_INTERVAL = int(os.environ.get("PM_MONITOR_SEC",       "5"))
-from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
+from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP, contract_quote_value_usdt
 from jarvis_close_coordinator import claim_close, release_close, reconcile_close
+from jarvis_position_ownership import claim_position, position_owner
 LEVERAGE_CAP     = MAX_LEVERAGE_CAP  # policy cap only; leverage is derived per trade
 COMPOUND_ENABLED = os.environ.get("PM_COMPOUND", "true").lower() == "true"
 MIN_MARGIN       = float(os.environ.get("PM_MIN_MARGIN",      "0.05"))
@@ -52,11 +53,21 @@ class PositionRecord:
 
     def __init__(self, position_id: str, direction: str, entry_price: float,
                  contracts: int, confidence: int, coin: str = "BTC",
-                 trade_type: str = "SCALP"):
+                 trade_type: str = "SCALP", contract_value_usdt: float = 1.0,
+                 notional_usdt: Optional[float] = None):
         self.id            = position_id
         self.direction     = direction
         self.entry_price   = entry_price
         self.contracts     = contracts
+        try:
+            self.contract_value_usdt = float(contract_value_usdt)
+        except (TypeError, ValueError):
+            self.contract_value_usdt = 0.0
+        if self.contract_value_usdt <= 0:
+            raise ValueError("contract value must be positive")
+        self.notional_usdt = float(notional_usdt) if notional_usdt is not None else self.contracts * self.contract_value_usdt
+        if self.notional_usdt <= 0:
+            raise ValueError("notional must be positive")
         self.confidence    = confidence
         self.coin          = coin
         self.trade_type    = trade_type
@@ -88,7 +99,8 @@ class PositionRecord:
         return {
             "id": self.id, "coin": self.coin, "direction": self.direction,
             "entry": self.entry_price, "tp": self.tp_price, "sl": self.sl_price,
-            "contracts": self.contracts, "confidence": self.confidence,
+            "contracts": self.contracts, "contract_value_usdt": self.contract_value_usdt,
+            "notional_usdt": self.notional_usdt, "confidence": self.confidence,
             "status": self.status, "trailing": self.trailing_active,
             "open_time": self.open_time.isoformat(),
         }
@@ -109,6 +121,7 @@ class JarvisPositionManager:
         self._thread: Optional[threading.Thread] = None
         self.open_positions: List[PositionRecord] = []
         self.closed_today:   List[PositionRecord] = []
+        self._ownership_token = f"position_manager:{id(self)}"
         self.daily_pnl          = 0.0
         self.total_pnl          = 0.0
         self.compounded_balance = 0.0
@@ -145,7 +158,8 @@ class JarvisPositionManager:
     def register_position(self, position_id: str, direction: str,
                           entry_price: float, contracts: int,
                           confidence: int, coin: str = "BTC",
-                          trade_type: str = "SCALP") -> PositionRecord:
+                          trade_type: str = "SCALP", contract_value_usdt: Optional[float] = None,
+                          notional_usdt: Optional[float] = None) -> PositionRecord:
         if not isinstance(position_id, str) or not position_id:
             raise ValueError("position_id is required")
         if not isinstance(direction, str) or direction.upper() not in ("CALL", "PUT", "BUY", "SELL"):
@@ -160,10 +174,24 @@ class JarvisPositionManager:
             raise ValueError("invalid position fields")
         if not isinstance(coin, str) or not coin.strip():
             raise ValueError("invalid coin")
+        if contract_value_usdt is None:
+            if os.environ.get("DELTA_ORDER_EXECUTION_ENABLED", "false").lower() == "true":
+                get_metadata = getattr(self.delta, "get_product_metadata", None)
+                metadata = get_metadata(coin) if callable(get_metadata) else None
+                contract_value_usdt = contract_quote_value_usdt(metadata, entry_price) if metadata else None
+                if contract_value_usdt is None:
+                    raise ValueError("recognized contract metadata required for live position")
+            else:
+                contract_value_usdt = 1.0  # explicit paper-only compatibility
         pos = PositionRecord(
             position_id, direction.upper(), entry_price,
-            contracts, confidence, coin.strip(), trade_type
+            contracts, confidence, coin.strip(), trade_type,
+            contract_value_usdt, notional_usdt
         )
+        if not claim_position(position_id, self._ownership_token):
+            raise ValueError(
+                f"position {position_id} is already owned by {position_owner(position_id)}"
+            )
         with self._lock:
             self.open_positions.append(pos)
         logger.info("[PM] Registered #%s %s %s @ %s", position_id, direction, coin, entry_price)
@@ -174,9 +202,16 @@ class JarvisPositionManager:
     def get_sizing_for_coin(self, balance: float, confidence: int,
                             symbol: str = "BTCUSDT") -> Dict:
         """Use the same risk/margin-aware sizing policy as live and paper paths."""
+        # Entry price is not available in this legacy sizing API; do not guess
+        # base-denominated contract units.  Live callers must use the metadata-
+        # aware auto-trader path (or pass explicit units at registration).
+        contract_value = None
+        live_required = os.environ.get("DELTA_ORDER_EXECUTION_ENABLED", "false").lower() == "true"
         result = calculate_trade_size(
             balance, confidence, SL_PCT,
             compound_pool=self.compounded_balance if COMPOUND_ENABLED else 0.0,
+            contract_value_usdt=contract_value,
+            require_contract_value=live_required,
         )
         result.setdefault("symbol", symbol)
         return result
@@ -186,24 +221,21 @@ class JarvisPositionManager:
     def _monitor_loop(self):
         while self._running:
             try:
-                price = self._get_current_price()
-                if price and price > 0:
-                    with self._lock:
-                        positions = list(self.open_positions)
-                    for pos in positions:
+                with self._lock:
+                    positions = list(self.open_positions)
+                for pos in positions:
+                    price = self._get_current_price(pos.coin)
+                    if price and price > 0:
                         self._check_position(pos, price)
             except Exception as e:
                 logger.debug("[PM] Monitor tick error: %s", e)
             time.sleep(MONITOR_INTERVAL)
 
-    def _get_current_price(self) -> Optional[float]:
+    def _get_current_price(self, coin: str = "BTC") -> Optional[float]:
         try:
-            symbol = "BTCUSDT"
-            try:
-                from jarvis_coin_scanner import get_coin_scanner
-                symbol = get_coin_scanner().get_delta_symbol()
-            except Exception:
-                pass
+            symbol = str(coin or "BTC").upper().replace("-", "").replace("_", "")
+            if not symbol.endswith(("USDT", "USD")):
+                symbol += "USDT"
             p = self.delta.get_live_price(symbol)
             if p and float(p) > 0.01:
                 return float(p)
@@ -278,6 +310,11 @@ class JarvisPositionManager:
         """Close safely before accounting: one owner, reduce-only, no blind retry."""
         symbol = pos.coin + "USDT"
         close_side = "sell" if pos.is_call else "buy"
+        current_owner = position_owner(pos.id)
+        if current_owner and current_owner != self._ownership_token:
+            pos.status = "SUPERSEDED"
+            logger.warning("[PM] Position %s is owned by %s; close delegated", pos.id, current_owner)
+            return False
         if not claim_close(symbol, pos.id, owner="JarvisPositionManager"):
             pos.status = "CLOSE_UNKNOWN"
             logger.error("[PM] Close already claimed for %s; reconciliation required", pos.id)
@@ -364,6 +401,7 @@ _pm_instance: Optional[JarvisPositionManager] = None
 
 def get_position_manager(delta_client=None, bus=None,
                          signal_check_fn=None) -> Optional[JarvisPositionManager]:
+
     global _pm_instance
     if _pm_instance is None and delta_client is not None:
         _pm_instance = JarvisPositionManager(delta_client, bus, signal_check_fn)

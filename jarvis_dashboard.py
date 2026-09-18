@@ -41,11 +41,12 @@ def render_dashboard(snapshot: Dict[str, Any], stream=None, clear: bool = False)
     direction = _text(signal.get("direction"), "NO_TRADE")
     confidence = _text(signal.get("confidence"), "0")
     mode = _text(status.get("mode"), "PAPER")
+    confidence_suffix = "%" if confidence not in ("N/A", "—", "unknown") else ""
     out = [
         "=" * 96,
         f"JARVIS UNIFIED DASHBOARD  |  {ts}  |  {_text(s.get('symbol'), '—')}  |  {_text(s.get('price'), '—')}",
         "-" * 96,
-        _line("SIGNAL", f"{direction}  ({confidence}%)"),
+        _line("SIGNAL", f"{direction}  ({confidence}{confidence_suffix})"),
         _line("DECISION REASONS", "; ".join(_text(x) for x in reasons[:3]) if reasons else "Awaiting analysis"),
         _line("PLAN", f"Entry {_text(plan.get('entry'))} | TP1 {_text(plan.get('tp1'))} | SL {_text(plan.get('sl'))} | Expiry {_text(plan.get('expiry'))}"),
         _line("ACTION / GATES", f"{_text(plan.get('action'), 'WAIT')} | {_text(plan.get('gates'), 'not evaluated')}"),

@@ -92,7 +92,8 @@ def _validate_frame(data: Any, symbol: str, timeframe: str, context: Mapping[str
         return _blocked(symbol, timeframe, "invalid", f"Part7 data invalid: insufficient candles ({len(data)} < 30)", "invalid")
     try:
         numeric = data.loc[:, _REQUIRED_COLUMNS].apply(pd.to_numeric, errors="coerce")
-        if numeric.isna().any().any() or not numeric.map(math.isfinite).all().all():
+        finite = numeric.applymap(math.isfinite)
+        if numeric.isna().any().any() or not finite.all().all():
             return _blocked(symbol, timeframe, "invalid", "Part7 data invalid: non-finite OHLCV", "invalid")
         if (numeric[["open", "high", "low", "close"]] <= 0).any().any():
             return _blocked(symbol, timeframe, "invalid", "Part7 data invalid: non-positive price", "invalid")

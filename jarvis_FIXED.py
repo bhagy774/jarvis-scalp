@@ -21,6 +21,7 @@ import pandas as pd
 from professional_display import ProfessionalSignalDisplay
 from jarvis_dashboard import UnifiedDashboard
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
+from jarvis_decision import normalize_confidence, confidence_text, build_final_decision
 from jarvis_runtime import detect_backend, torch_device
 from jarvis_ollama_context import build_snapshot, decision_prompt, snapshot_usable, validate_decision
 pro_display = ProfessionalSignalDisplay()
@@ -483,8 +484,8 @@ class AutoBacktestEngine:
                     if trade_result['trade_signal']['direction'] != 'NO_TRADE':
                         signal = trade_result['trade_signal']['direction']
                         try:
-                            conf_str = trade_result['trade_signal'].get('confidence_score', '0/100')
-                            confidence = int(float(conf_str.split('/')[0]))
+                            conf_str = trade_result['trade_signal'].get('confidence_score')
+                            confidence = normalize_confidence(conf_str, default=0) or 0
                         except (ValueError, IndexError, AttributeError):
                             confidence = 0
                         
@@ -882,8 +883,8 @@ class AutoOptimizerEngine:
                 
                 if trade_result['trade_signal']['direction'] != 'NO_TRADE':
                     try:
-                        conf_str = trade_result['trade_signal'].get('confidence_score', '0/100')
-                        confidence = int(float(conf_str.split('/')[0]))
+                        conf_str = trade_result['trade_signal'].get('confidence_score')
+                        confidence = normalize_confidence(conf_str, default=0) or 0
                     except (ValueError, IndexError, AttributeError):
                         confidence = 0
                     
@@ -1679,13 +1680,13 @@ class LiveTradingEngine:
         try:
             signal = result.get('trade_signal', {})
             direction = signal.get('direction', 'NO_TRADE')
-            raw_conf = signal.get('confidence_score', '0/100')
-            confidence = int(str(raw_conf).split('/')[0])
+            raw_conf = signal.get('confidence_score')
+            confidence = normalize_confidence(raw_conf)
             context = resolve_options_context(self.jarvis.delta_data, symbol)
-            adjusted, note = apply_options_confirmation(direction, confidence, context)
+            adjusted, note = apply_options_confirmation(direction, confidence or 0, context)
             result.setdefault('market_context', {})['options_context'] = context.to_dict()
             result['market_context']['options_confirmation'] = note
-            if direction in ('CALL', 'PUT', 'BUY', 'SELL'):
+            if direction in ('CALL', 'PUT', 'BUY', 'SELL') and confidence is not None:
                 signal['confidence_score'] = f'{adjusted}/100'
             logger.info('[OPTIONS] %s | selected=%s | source=%s | %s',
                         context.role, context.selected_asset, context.source_asset or 'none', note)
@@ -1698,11 +1699,8 @@ class LiveTradingEngine:
         signal = result.get('trade_signal', {})
         direction = signal.get('direction', 'NO_TRADE')
         
-        try:
-            conf_str = signal.get('confidence_score', '0/100')
-            confidence = int(str(conf_str).split('/')[0])
-        except (ValueError, IndexError):
-            confidence = 0
+        conf_str = signal.get('confidence_score')
+        confidence = normalize_confidence(conf_str)
         
         raw_entry = signal.get('entry_price', current_price)
         tp1 = signal.get('take_profit_1')
@@ -1773,14 +1771,12 @@ class LiveTradingEngine:
 
             # Strong momentum = enter at market (body > 60% of candle range)
             volatility = str(market_ctx.get('volatility', 'MEDIUM')).upper()
-            conf_str = signal.get('confidence_score', '0/100')
-            try:
-                confidence = int(str(conf_str).split('/')[0])
-            except Exception:
-                confidence = 0
+            conf_str = signal.get('confidence_score')
+            confidence = normalize_confidence(conf_str)
+            confidence_for_entry = confidence if confidence is not None else -1
 
             # HIGH confidence (≥85%) + LOW volatility → MARKET entry (momentum)
-            if confidence >= 85 and volatility in ('LOW', 'VERY_LOW'):
+            if confidence_for_entry >= 85 and volatility in ('LOW', 'VERY_LOW'):
                 return current_price, 'MARKET (High Conf)'
 
             # Compute limit entry
@@ -2003,6 +1999,11 @@ class LiveTradingEngine:
         def _live_loop():
             while self.is_running and not self.stop_event.is_set():
                 try:
+                    from jarvis_watchdog import beat
+                    beat("live_loop")
+                except Exception:
+                    pass
+                try:
                     # --- KILL-SWITCH CHECK ---
                     if os.getenv("JARVIS_KILL_SWITCH", "1") != "0" and os.path.exists("C:\\jarvis\\STOP_JARVIS"):
                         logger.warning("🛑 KILL-SWITCH TRIGGERED (STOP_JARVIS file found). Initiating safe exit...")
@@ -2097,7 +2098,10 @@ class LiveTradingEngine:
                     cycle_count[0] += 1
                     current_price = None
                     direction = 'NO_TRADE'
-                    confidence = 0
+                    confidence = None
+                    self.last_decision = None
+                    self._dashboard_signal = {}
+                    self._dashboard_plan = {}
 
                     # 1. Select a verified crypto contract before collecting any
                     # data. A route is locked for the entire life of an open
@@ -2187,6 +2191,7 @@ class LiveTradingEngine:
                                         signal_data=signal_data
                                     )
                                     if consensus and consensus.get('final_verdict'):
+                                        consensus['_symbol'] = symbol
                                         self.last_consensus = consensus
                                         logger.info(f"[CONSENSUS] {consensus.get('final_verdict','?')} | Agree: {consensus.get('agreement_pct','?')}%")
                                 except Exception as ce:
@@ -2221,6 +2226,45 @@ class LiveTradingEngine:
                                 df=df, symbol=symbol,
                             )
 
+                        # 5b. Build one authoritative post-gate decision for
+                        # paper ledger, auto-trader, and dashboard.  PreSim is
+                        # applied before this snapshot so a veto propagates to
+                        # every downstream consumer.
+                        if direction in ('CALL', 'PUT'):
+                            direction, confidence = self._presim_gate(
+                                direction, confidence, entry_price,
+                                result=result, df=df, current_price=current_price, symbol=symbol
+                            )
+                            if direction not in ('CALL', 'PUT'):
+                                direction = 'NO_TRADE'
+                        _options_ctx = (result.get('market_context', {}) or {}).get('options_context', {})
+                        _opinions = list(result.get('decision_opinions', []) or [])
+                        _consensus = getattr(self, 'last_consensus', None)
+                        if isinstance(_consensus, dict) and _consensus.get('_symbol') == symbol:
+                            _verdict = _consensus.get('final_verdict') or _consensus.get('direction')
+                            if _verdict:
+                                _opinions.append(_verdict)
+                        _live_execution_enabled = bool(
+                            self.auto_trader and getattr(self.auto_trader, 'is_enabled', False)
+                        )
+                        _candidate = dict(result.get('trade_signal', {}) or {})
+                        _candidate['direction'] = direction if direction in ('CALL', 'PUT') else 'NO_TRADE'
+                        _candidate['confidence_score'] = confidence
+                        _final_snapshot = build_final_decision(
+                            _candidate, symbol=symbol, price=current_price,
+                            reasons=(result.get('intelligence_board', []) or [])[:3],
+                            opinions=_opinions, options_context=_options_ctx,
+                            require_options=_live_execution_enabled,
+                            gate_reason=('entry confirmation pending' if entry_gate_1m and not entry_gate_1m.get('confirmed', True) else ''),
+                            plan={'entry': entry_price, 'tp1': tp1, 'tp2': tp2, 'sl': sl, 'expiry': expiry},
+                        )
+                        self.last_decision = _final_snapshot
+                        if not _final_snapshot.get('execution_allowed'):
+                            direction = 'NO_TRADE'
+                        else:
+                            direction = _final_snapshot.get('execution_direction', 'NO_TRADE')
+                        confidence = _final_snapshot.get('confidence') or 0
+
                         # 6. AUTO-TRADE: Execute on Delta Exchange if enabled
                         if self.auto_trader and direction in ('CALL', 'PUT'):
                             try:
@@ -2251,11 +2295,7 @@ class LiveTradingEngine:
                             except Exception as at_err:
                                 self._dashboard_events.append(f"AutoTrader error: {at_err}")
                         elif direction in ('CALL', 'PUT') and self.can_trade():
-                            # --- PRE-TRADE SIMULATOR (fail-open; JARVIS_PRESIM=0 disables) ---
-                            direction, confidence = self._presim_gate(
-                                direction, confidence, entry_price,
-                                result=result, df=df, current_price=current_price, symbol=symbol
-                            )
+                            # PreSim was already applied in the authoritative gate above.
                             if direction in ('CALL', 'PUT') and confidence >= self.PAPER_CONFIG['min_confidence']:
                                 # Compute ATR for hedge advisor
                                 try:
@@ -2305,8 +2345,8 @@ class LiveTradingEngine:
                     
                     self._render_unified_dashboard(
                         symbol=symbol, current_price=current_price,
-                        action=direction if 'direction' in locals() else 'WAIT',
-                        gate_reason='risk/venue gates passed' if 'direction' in locals() and direction in ('CALL', 'PUT') else 'no eligible entry',
+                        action=(getattr(self, 'last_decision', None) or {}).get('direction') or ('WAIT' if direction == 'NO_TRADE' else direction),
+                        gate_reason='; '.join((getattr(self, 'last_decision', None) or {}).get('reasons', [])) or ('risk/venue gates passed' if direction in ('CALL', 'PUT') else 'no eligible entry'),
                     )
                     self._dashboard_events = []
                     time.sleep(float(os.getenv('JARVIS_POLL_SECONDS', '60')))  # Poll every candle
@@ -3505,14 +3545,15 @@ class Part12Confidence:
 
 class Part14OptionsChain:
     """Institutional Positioning Analysis - Prefers Delta, Fallbacks to Deribit"""
-    def __init__(self, delta_client=None):
+    def __init__(self, delta_client=None, asset='BTC'):
         self.delta_client = delta_client
+        self.asset = str(asset or 'BTC').upper().replace('USDT', '').replace('USD', '')
         try:
             from deribit_options_client import DeribitOptionsClient
             # BUG FIX #3: Never hardcode credentials — load from env
             client_id = os.getenv("DERIBIT_CLIENT_ID", "")
             client_secret = os.getenv("DERIBIT_CLIENT_SECRET", "")
-            self.deribit = DeribitOptionsClient(currency='BTC', client_id=client_id, client_secret=client_secret)
+            self.deribit = DeribitOptionsClient(currency=self.asset, client_id=client_id, client_secret=client_secret)
         except ImportError:
             self.deribit = None
         except Exception:
@@ -3584,21 +3625,28 @@ Follow the tag with a 1-sentence options analyst insight.
         return self.last_ollama_whale_tag, self.last_ollama_insight, ai_sig
 
     def analyze(self, data, context=None):
-        """Unified analysis for Options institutional walls and bias"""
+        """Unified selected-asset options analysis; BTC Deribit is never an alt substitute."""
         try:
+            requested = context.get('symbol') if isinstance(context, dict) else None
+            asset = str(requested or self.asset or '').upper().replace('USDT', '').replace('USD', '')
+            if asset:
+                self.asset = asset
             if data is None or 'close' not in data or len(data['close']) == 0:
                 return {"signal": 0, "thought": "No price data available", "telemetry": {"signal": 0}}
 
             current_price = float(data['close'].iloc[-1])
-            # Prefer Deribit for richer analytics (Greeks, Smart Money), fallback to Delta
-            source = self.deribit if self.deribit else self.delta_client
+            # Delta is asset-aware. Deribit is retained only for BTC and is
+            # never allowed to contaminate an altcoin decision.
+            delta_source = self.delta_client if self.delta_client and hasattr(self.delta_client, 'get_institutional_bias') else None
+            deribit_source = self.deribit if self.asset == 'BTC' else None
+            source = delta_source or deribit_source
             if not source:
-                return {"signal": 0, "thought": "No options source available", "telemetry": {"signal": 0, "exchange": "None"}}
+                return {"signal": 0, "thought": f"Selected-asset options unavailable ({self.asset or 'unknown'})", "telemetry": {"signal": 0, "exchange": "None", "available": False, "asset": self.asset}}
             
             # Fetch specialized bias analysis
             try:
-                if source == self.delta_client:
-                    bias_data = source.get_institutional_bias('BTC')
+                if source == delta_source:
+                    bias_data = source.get_institutional_bias(self.asset)
                 else:
                     bias_data = source.get_institutional_bias(current_price)
             except Exception as e:
@@ -3628,7 +3676,9 @@ Follow the tag with a 1-sentence options analyst insight.
             max_pain_float = float(max_pain_raw) if max_pain_raw is not None and str(max_pain_raw).replace('.', '', 1).isdigit() else None
 
             telemetry = {
-                "exchange": "Delta" if source == self.delta_client else "Deribit",
+                "exchange": "Delta" if source == delta_source else "Deribit",
+                "asset": self.asset,
+                "available": True,
                 "bias_score": float(bias_data.get('score', 0)),
                 "pcr": pcr_float,
                 "signal": math_signal,
@@ -4934,7 +4984,13 @@ class JarvisElite:
                 from deribit_options_client import DeribitOptionsClient
                 client_id = os.getenv("DERIBIT_CLIENT_ID", "")
                 client_secret = os.getenv("DERIBIT_CLIENT_SECRET", "")
-                self.deribit = DeribitOptionsClient(currency='BTC', client_id=client_id, client_secret=client_secret)
+                # The route may change after startup; Part14 is the only
+                # component allowed to use Deribit and keeps it asset-scoped.
+                self.deribit = DeribitOptionsClient(
+                    currency=str(getattr(self, 'active_base_asset', 'BTC') or 'BTC'),
+                    client_id=client_id,
+                    client_secret=client_secret,
+                )
                 logger.info("✅ Deribit Options Client Initialized (Dual Intelligence)")
             except Exception as e:
                 logger.warning(f"Deribit init failed: {e}")
@@ -5108,9 +5164,21 @@ class JarvisElite:
 
     
         # Existing Jarvis components (Now Adapters)
+        # If an optional integration is unavailable, keep Part2's deterministic
+        # range fallback but do not construct its heavyweight 16-brain engine.
+        # This makes missing-module startup genuinely fail-safe and bounded.
+        _optional_wiring_complete = all((SIZER_AVAILABLE, POSITION_MANAGER_AVAILABLE,
+                                          COIN_SCANNER_AVAILABLE, SPECIALIST_POOL_AVAILABLE,
+                                          BINANCE_DATA_AVAILABLE, UPSTOX_DATA_AVAILABLE,
+                                          BACKTESTER_AVAILABLE, KIE_GPT6_AVAILABLE))
+        if _optional_wiring_complete:
+            _part2_zone = Part2Zone()
+        else:
+            _part2_zone = object.__new__(Part2Zone)
+            _part2_zone._engine = None
         self.parts = {
             'part1_breakout': Part1Breakout(),
-            'part2_zone': Part2Zone(),
+            'part2_zone': _part2_zone,
             'part3_psychology': Part3Psychology(),
             'part4_volume': Part4Volume(),
             'part5_ml': Part5ML(),
@@ -5182,15 +5250,38 @@ class JarvisElite:
         return self.integration_sources.get(key)
     
     def _fetch_mtf_from_api(self, symbol=None):
-        """Return direct native live frames; never resample or substitute BTC."""
-        if self.is_backtest_mode or self.direct_candle_cache is None:
+        """Return direct native live frames; never resample or substitute BTC.
+
+        The compatibility branch is only for small unit fixtures that construct
+        ``JarvisElite`` with ``object.__new__`` and therefore bypass ``__init__``;
+        production instances always use ``DirectCandleCache`` below.
+        """
+        if self.is_backtest_mode:
             return {}
         symbol = symbol or getattr(self, 'active_symbol', None)
         if not symbol:
             logger.warning('[MTF-API] No active symbol; refusing candle fetch')
             return {}
+        direct_cache = getattr(self, 'direct_candle_cache', None)
+        if direct_cache is None:
+            # Test doubles made with object.__new__ predate the cache wiring.
+            # Keep their symbol-routing assertion direct and native; do not
+            # resample, synthesize, or use a different symbol in this branch.
+            client = getattr(self, 'delta_client', None)
+            fetch = getattr(client, 'get_historical_candles', None)
+            if callable(fetch):
+                frames = {}
+                try:
+                    for timeframe in LIVE_TIMEFRAMES:
+                        rows = fetch(symbol=symbol, resolution=timeframe, limit=501)
+                        if rows:
+                            frames[timeframe] = pd.DataFrame(rows)
+                    return frames
+                except Exception as error:
+                    logger.warning('[MTF-API] Compatibility fixture fetch rejected: %s', error)
+            return {}
         try:
-            snapshot = self._active_candle_snapshot
+            snapshot = getattr(self, '_active_candle_snapshot', None)
             if snapshot is None or snapshot.symbol != str(symbol).upper().replace('/', '').replace('-', '').replace('_', ''):
                 snapshot = self.direct_candle_cache.refresh(symbol)
                 self._active_candle_snapshot = snapshot
@@ -5677,20 +5768,29 @@ class JarvisElite:
             intel_delta = None
             intel_deribit = None
             
-            # Fetch Delta Intel
-            if not self.is_backtest_mode and self.delta_data:
+            # Fetch options/institutional intel for the locked asset.  Deribit
+            # is BTC-only in this integration; never use its BTC result as an
+            # altcoin signal or gate.  Missing selected-asset data remains
+            # explicitly unavailable and is handled fail-closed by the live
+            # decision gate.
+            selected_base = (analysis_symbol or getattr(self, 'active_symbol', '') or '').upper()
+            for quote in ('USDT', 'USD'):
+                if selected_base.endswith(quote):
+                    selected_base = selected_base[:-len(quote)]
+                    break
+            if not self.is_backtest_mode and self.delta_data and selected_base:
                 try:
-                    intel_delta = self.delta_data.get_institutional_bias('BTC')
+                    intel_delta = self.delta_data.get_institutional_bias(selected_base)
                     options_intel = intel_delta
-                except Exception: pass
-
-            # Fetch Deribit Intel
-            if not self.is_backtest_mode and self.deribit:
+                except Exception:
+                    intel_delta = None
+            if not self.is_backtest_mode and self.deribit and selected_base == 'BTC':
                 try:
                     current_price = float(data['close'].iloc[-1])
                     intel_deribit = self.deribit.get_institutional_bias(current_price)
                     if not options_intel: options_intel = intel_deribit
-                except Exception: pass
+                except Exception:
+                    intel_deribit = None
             
             # Store walls for AI context
             options_walls = {}
@@ -6053,6 +6153,23 @@ class JarvisElite:
                 except Exception as e:
                     logger.debug(f"[CONFIDENCE] compute_signal_confidence failed: {e}")
 
+            # Preserve independent directional opinions for the live canonical
+            # decision.  A disagreement is a hard block; never manufacture a
+            # consensus merely because one model was selected as the winner.
+            _decision_opinions = []
+            for _raw_opinion in (math_signal, logic_signal):
+                if _raw_opinion > 0:
+                    _decision_opinions.append('BUY')
+                elif _raw_opinion < 0:
+                    _decision_opinions.append('SELL')
+            if isinstance(neural_res, dict):
+                _neural_bias = str(neural_res.get('bias', '')).upper()
+                if _neural_bias in ('CALL', 'BUY', 'LONG'):
+                    _decision_opinions.append('BUY')
+                elif _neural_bias in ('PUT', 'SELL', 'SHORT'):
+                    _decision_opinions.append('SELL')
+            final_decision['decision_opinions'] = _decision_opinions
+
             # --- CNS PERCEPTION RECORDING ---
             final_decision['telemetry'] = full_telemetry
             if hasattr(self, 'cns'):
@@ -6250,41 +6367,48 @@ class JarvisElite:
         mtf_matrix = detailed_scores.get('mtf_matrix', {})
         walls = detailed_scores.get('options_walls', {})
 
-        # ── Inject Market Oracle forecast into CEO context ──────────────────
-        oracle_summary = "Oracle: unavailable"
-        try:
-            oracle_data = None
-            if hasattr(self, 'jarvis') and hasattr(self.jarvis, 'market_oracle') and self.jarvis.market_oracle:
-                oracle_data = self.jarvis.market_oracle.get_latest_forecast()
-            elif MARKET_ORACLE_AVAILABLE and _get_market_oracle:
-                o = _get_market_oracle()
-                if o:
-                    oracle_data = o.get_latest_forecast()
-            if isinstance(oracle_data, dict) and oracle_data and oracle_data.get("model_used") != "startup_default":
-                sugg      = oracle_data.get("trade_suggestion", "WAIT")
-                conf      = oracle_data.get("confidence", 0)
-                d5m       = oracle_data.get("5min", {}).get("direction", "?")
-                d30m      = oracle_data.get("30min", {}).get("direction", "?")
-                hold      = oracle_data.get("hold_minutes", "?")
-                gem_sum   = oracle_data.get("gemini_summary", "")[:120]
-                oracle_summary = (
-                    f"Oracle→ Suggestion:{sugg} | Confidence:{conf}% | "
-                    f"5m:{d5m} / 30m:{d30m} | Hold:{hold}min | \"{gem_sum}\""
-                )
-        except Exception:
-            pass
-        # ────────────────────────────────────────────────────────────────────
+        # ── Inject only asset-compatible Oracle context into CEO telemetry ──
+        # The current Oracle publishes a BTC-only market map.  It must not be
+        # presented as ETH/SOL evidence or used to approve an altcoin trade.
+        selected_symbol = str(getattr(self, 'active_symbol', '') or '').upper().replace('-', '').replace('_', '')
+        selected_base = selected_symbol[:-4] if selected_symbol.endswith('USDT') else (selected_symbol[:-3] if selected_symbol.endswith('USD') else selected_symbol)
+        oracle_summary = "Oracle: unavailable for selected asset"
+        if selected_base == "BTC":
+            try:
+                oracle_data = None
+                if hasattr(self, 'jarvis') and hasattr(self.jarvis, 'market_oracle') and self.jarvis.market_oracle:
+                    oracle_data = self.jarvis.market_oracle.get_latest_forecast()
+                elif MARKET_ORACLE_AVAILABLE and _get_market_oracle:
+                    o = _get_market_oracle()
+                    if o:
+                        oracle_data = o.get_latest_forecast()
+                if isinstance(oracle_data, dict) and oracle_data and oracle_data.get("model_used") != "startup_default":
+                    sugg      = oracle_data.get("trade_suggestion", "WAIT")
+                    conf      = oracle_data.get("confidence", 0)
+                    d5m       = oracle_data.get("5min", {}).get("direction", "?")
+                    d30m      = oracle_data.get("30min", {}).get("direction", "?")
+                    hold      = oracle_data.get("hold_minutes", "?")
+                    gem_sum   = oracle_data.get("gemini_summary", "")[:120]
+                    oracle_summary = (
+                        f"Oracle(BTC macro only) -> Suggestion:{sugg} | Confidence:{conf}% | "
+                        f"5m:{d5m} / 30m:{d30m} | Hold:{hold}min | \\\"{gem_sum}\\\""
+                    )
+            except Exception:
+                pass
+        elif selected_base:
+            oracle_summary = f"Oracle: BTC macro map unavailable for selected asset {selected_base} (advisory excluded)"
 
         prompt = f"""You are the Supreme Commander AI (CEO) of an elite multi-agent quantitative trading system.
 
 Executive Voting Matrix & Telemetry:
 - Overall System Pulse Score: {score}/100
-- Market Oracle (30-sec cycle AI forecast): {oracle_summary}
+- Market Oracle (BTC macro scope only; excluded for non-BTC execution): {oracle_summary}
 - Multi-Timeframe Matrix: {json.dumps(mtf_matrix, default=str)}
 - Sub-Agent Insights: {json.dumps(thoughts[:6], default=str)}
 - Options Walls (Smart Money): {json.dumps(walls, default=str)}
 
 CRITICAL INSTRUCTION — Oracle Integration:
+- Selected asset: {selected_base or 'unknown'}. BTC Oracle context is unavailable and advisory-only for any non-BTC route.
 - If Oracle Confidence >= 60% and Oracle Suggestion aligns with sub-agent majority: STRONGLY favor [CEO_VERDICT: EXECUTE].
 - If Oracle says WAIT or is unavailable: treat as neutral (do NOT auto-STANDBY for this reason alone).
 - If Oracle direction contradicts the sub-agent majority with >= 60% confidence: issue [CEO_VERDICT: STANDBY].
@@ -6348,10 +6472,11 @@ Follow the tag with a 1-sentence CEO executive directive.
         mtf_matrix = detailed_scores.get('mtf_matrix', {})
         walls = detailed_scores.get('options_walls', {})
         
+        selected_symbol = str(getattr(self, 'active_symbol', '') or 'selected asset').upper()
         prompt = f"""
         ### JARVIS AI MASTER JUDGE ###
         You are the Master AI Judge of the Jarvis trading system.
-        Analyze this BTC trade signal and give a final APPROVE or REJECT decision.
+        Analyze this {selected_symbol} trade signal and give a final APPROVE or REJECT decision.
         
         Pulse Score: {score}/100
         Proposed Direction: {direction}
@@ -6504,11 +6629,15 @@ Follow the tag with a 1-sentence CEO executive directive.
         real_part_results = getattr(self, 'latest_part_results', {})
 
         if not self.is_backtest_mode:
-            pro_display.display_full_signal(
-                unified_signal_data,
-                current_price=signal['trade_signal'].get('entry_price', 0),
-                part_results=real_part_results,
-                symbol=getattr(self, 'active_symbol', None)
+            # The live loop owns the sole terminal decision/dashboard.  Keep
+            # this legacy rich display in structured logs so it cannot emit a
+            # second BUY/SELL recommendation or disagree visually.
+            logger.info(
+                "[ANALYSIS SNAPSHOT] symbol=%s direction=%s confidence=%s entry=%s tp1=%s sl=%s",
+                getattr(self, 'active_symbol', None), direction, score,
+                signal['trade_signal'].get('entry_price', 0),
+                signal['trade_signal'].get('take_profit_1'),
+                signal['trade_signal'].get('stop_loss'),
             )
 
         return signal
@@ -6673,18 +6802,10 @@ Follow the tag with a 1-sentence CEO executive directive.
             if existing_signal == trade_signal:
                 return trade_signal
             else:
-                # Conflict - use the one with higher confidence
-                existing_conf = existing_result.get('confidence', 0) if isinstance(existing_result, dict) else 0
-                try:
-                    conf_str = trade_signal_dict.get('confidence_score', '0/100')
-                    trade_conf = int(float(str(conf_str).split('/')[0]))
-                except (ValueError, IndexError, AttributeError):
-                    trade_conf = 0
-                
-                if trade_conf >= 85:
-                    return trade_signal
-                else:
-                    return existing_signal
+                # Unresolved opinions are a hard WAIT/NO_TRADE.  Confidence
+                # cannot manufacture a consensus between opposing directions.
+                logger.warning("[DECISION] conflicting signal opinions: %s vs %s", existing_signal, trade_signal)
+                return 'NO-TRADE'
                     
         except Exception as e:
             logger.error(f"Signal combination error: {e}")
@@ -6776,26 +6897,9 @@ Follow the tag with a 1-sentence CEO executive directive.
                 else:
                     decision_reason = "Market neutral"
             
-            print(f"\n┌{'─'*78}┐")
-            print(f"│ 🎯 JARVIS: {decision:<20} │ Score: {avg_score:.1f}/100 │ Conf: {confidence}% │")
-            print(f"│ 💡 Reason: {decision_reason:<63} │")
-            print(f"├{'─'*78}┤")
-            print(f"│ ⏰ {datetime.now().strftime('%H:%M:%S'):<12} │ 💹 BTC/USDT 1m{' '*45} │")
-            print(f"├{'─'*78}┤")
-            
-            # Show top 6 parts sorted by score
-            sorted_parts = sorted(part_scores.items(), key=lambda x: x[1], reverse=True)
-            
-            print(f"│ 📊 TOP SIGNALS (Weighted):{' '*51} │")
-            for part, score in sorted_parts[:6]:
-                weight = part_weights.get(part, 1.0)
-                bar_length = int(score / 5)
-                bar = '█' * bar_length + '░' * (20 - bar_length)
-                emoji = "📈" if score >= 60 else "📉" if score <= 40 else "⚪"
-                weight_str = f"x{weight:.1f}" if weight != 1.0 else ""
-                print(f"│ {emoji} {format_name(part):<18} {weight_str:<4} │ {bar} {score:>3.0f}/100{' '*6} │")
-            
-            print(f"└{'─'*78}┘")
+            # Legacy/dead path: do not emit a second terminal decision.  The
+            # active live loop owns the one unified dashboard snapshot.
+            logger.info("[LEGACY ANALYSIS] %s | score=%.1f | confidence=%s | %s", decision, avg_score, confidence, decision_reason)
             
             logic_signal = self.parts['part11_fusion'].analyze(list(part_results.values()))
             confidence_res = self.parts['part12_confidence'].analyze(list(part_results.values()))
@@ -7068,13 +7172,20 @@ class Jarvis4EngineSystem:
             # Fallback to single TF analysis
             from delta_api_wrapper import DeltaExchangeData
             data_wrapper = DeltaExchangeData()
-            data = data_wrapper.get_historical_candles(symbol="BTCUSDT", resolution="1m", limit=100)
+            requested = str(symbol or '').upper().replace('-', '').replace('_', '')
+            if requested in {'BTC', 'ETH', 'SOL'}:
+                requested += 'USDT'
+            if not requested or requested == 'USDT':
+                logger.error('Multi-TF fallback blocked: missing requested symbol')
+                return None
+            data = data_wrapper.get_historical_candles(symbol=requested, resolution="1m", limit=100)
             if data:
                 import pandas as pd
                 df = pd.DataFrame(data)
                 for col in ['open', 'high', 'low', 'close', 'volume']:
                     df[col] = pd.to_numeric(df[col])
-                return self.jarvis.analyze_trade_setup(df)
+                self.jarvis.active_symbol = requested
+                return self.jarvis.analyze_trade_setup(df, symbol=requested)
             return None
         
         # Use Multi-TF Engine
@@ -7228,16 +7339,9 @@ def main():
         if os.getenv("JARVIS_AUTO_LIVE") == "1" or input("\n🎯 Start LIVE SwingScalp Trading? (y/n): ").strip().lower() == 'y':
             logger.info("Starting LIVE SwingScalp Trading...")
             
-            # Demo trade analysis
-            sample_data = jarvis_trade._generate_sample_data()
-            trade_result = jarvis_trade.jarvis.analyze_trade_setup(sample_data.tail(50))
-            
-            print("\n🎯 TRADE TRADING SIGNAL:")
-            try:
-                pro_display.display_full_signal(trade_result)
-            except Exception as e:
-                logger.error(f"Error displaying signal: {e}")
-                print(json.dumps(trade_result, indent=2, cls=NumpyEncoder))
+            # Do not run a second demo analysis or emit a competing terminal
+            # recommendation.  The live engine owns the canonical dashboard.
+            logger.info("Live trading service already owns the canonical decision display.")
             
         else:
             logger.info("LIVE trading cancelled. System ready for manual use.")
