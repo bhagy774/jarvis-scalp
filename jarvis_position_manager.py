@@ -40,6 +40,7 @@ TRAIL_STEP       = float(os.environ.get("PM_TRAIL_STEP",      "0.001"))
 BREAK_EVEN_AT    = float(os.environ.get("PM_BREAKEVEN_AT",    "0.002"))
 MONITOR_INTERVAL = int(os.environ.get("PM_MONITOR_SEC",       "5"))
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP, contract_quote_value_usdt
+from jarvis_position_ownership import claim_position, claim_close, position_owner
 LEVERAGE_CAP     = MAX_LEVERAGE_CAP  # policy cap only; leverage is derived per trade
 COMPOUND_ENABLED = os.environ.get("PM_COMPOUND", "true").lower() == "true"
 MIN_MARGIN       = float(os.environ.get("PM_MIN_MARGIN",      "0.05"))
@@ -119,6 +120,7 @@ class JarvisPositionManager:
         self._thread: Optional[threading.Thread] = None
         self.open_positions: List[PositionRecord] = []
         self.closed_today:   List[PositionRecord] = []
+        self._ownership_token = f"position_manager:{id(self)}"
         self.daily_pnl          = 0.0
         self.total_pnl          = 0.0
         self.compounded_balance = 0.0
@@ -185,6 +187,10 @@ class JarvisPositionManager:
             contracts, confidence, coin.strip(), trade_type,
             contract_value_usdt, notional_usdt
         )
+        if not claim_position(position_id, self._ownership_token):
+            raise ValueError(
+                f"position {position_id} is already owned by {position_owner(position_id)}"
+            )
         with self._lock:
             self.open_positions.append(pos)
         logger.info("[PM] Registered #%s %s %s @ %s", position_id, direction, coin, entry_price)
@@ -300,20 +306,38 @@ class JarvisPositionManager:
             self._close_position(pos, current_price, close_reason)
 
     def _close_position(self, pos: PositionRecord, exit_price: float, reason: str) -> bool:
-        """Close at the venue before changing local accounting state."""
+        """Close once, reduce-only, before changing local accounting state."""
         try:
+            allowed, current = claim_close(pos.id, self._ownership_token)
+            if not allowed:
+                pos.status = "SUPERSEDED" if current != self._ownership_token else "CLOSE_UNKNOWN"
+                logger.warning("[PM] Close skipped for %s; owner/claim is %s", pos.id, current)
+                return False
             close_side = "sell" if pos.is_call else "buy"
             close_symbol = str(pos.coin or "").upper().replace("-", "").replace("_", "")
             if not close_symbol.endswith(("USDT", "USD")):
                 close_symbol += "USDT"
-            venue_result = self.delta.place_order(close_symbol, close_side, pos.contracts, "market")
-            if not isinstance(venue_result, dict) or not venue_result.get("success"):
-                pos.status = "CLOSE_UNKNOWN"
-                logger.error("[PM] Exchange close unconfirmed for %s", pos.id)
-                return False
+            live_enabled = os.environ.get("DELTA_ORDER_EXECUTION_ENABLED", "false").lower() == "true"
+            paper_wrapper = getattr(self.delta.__class__, "__module__", "") == "delta_api_wrapper"
+            if live_enabled or not paper_wrapper:
+                # Test doubles and explicitly enabled execution use the same
+                # close contract.  The real wrapper itself rejects this call
+                # when execution is disabled, so paper mode never reaches an
+                # exchange request.
+                venue_result = self.delta.place_order(
+                    close_symbol, close_side, pos.contracts, "market",
+                    reduce_only=True, idempotency_key=f"jarvis-close-{pos.id}"
+                )
+                if not isinstance(venue_result, dict) or not venue_result.get("success"):
+                    pos.status = "CLOSE_UNKNOWN"
+                    logger.error("[PM] Exchange close unconfirmed for %s; reconciliation required", pos.id)
+                    return False
+            else:
+                # Paper/backtest has no venue state to mutate.
+                venue_result = {"success": True, "paper": True}
         except Exception as e:
             pos.status = "CLOSE_UNKNOWN"
-            logger.error("[PM] Exchange close failed: %s", type(e).__name__)
+            logger.error("[PM] Exchange close ambiguous for %s: %s", pos.id, type(e).__name__)
             return False
 
         pnl_pct = pos.current_pnl_pct(exit_price)
@@ -377,6 +401,7 @@ _pm_instance: Optional[JarvisPositionManager] = None
 
 def get_position_manager(delta_client=None, bus=None,
                          signal_check_fn=None) -> Optional[JarvisPositionManager]:
+
     global _pm_instance
     if _pm_instance is None and delta_client is not None:
         _pm_instance = JarvisPositionManager(delta_client, bus, signal_check_fn)

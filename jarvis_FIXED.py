@@ -1305,17 +1305,23 @@ class LiveTradingEngine:
     # ═══════════════════════════════════════════════════════════════
     
     def _presim_gate(self, direction, confidence, entry_price, result=None, df=None, current_price=None, symbol='BTCUSDT'):
-        """Pre-Trade Simulator gate (fail-open).
+        """Pre-Trade Simulator gate (fail-closed).
 
         Runs jarvis_presim on a candidate ENTER signal. Returns
         (direction, confidence): direction is set to None on veto (skip the
         entry), confidence is adjusted (clamped ±10) on 'adjust'.
-        Any exception → returns inputs unchanged ('pass').
+        Any wiring, simulator, or bookkeeping exception blocks the candidate;
+        a broken safety gate must never become an implicit pass.
         """
         try:
             if os.getenv('JARVIS_PRESIM', '1') == '0':
                 return direction, confidence
             from jarvis_presim import run_presim
+            # Partial test/recovery wiring may omit the optional event sink;
+            # initialize it locally so recording a veto cannot itself turn the
+            # gate into an implicit pass.
+            if not isinstance(getattr(self, '_dashboard_events', None), list):
+                self._dashboard_events = []
             market_ctx = (result or {}).get('market_context', {}) if isinstance(result, dict) else {}
             decision = run_presim(
                 signal={
@@ -1342,8 +1348,12 @@ class LiveTradingEngine:
                 logger.info(f"[PRESIM] ADJUST {delta:+d}: {decision.get('reason', '')}")
             return direction, confidence
         except Exception as e:
-            logger.debug(f"[PRESIM] gate error (fail-open → pass): {e}")
-            return direction, confidence
+            # A missing counter/event sink previously raised here and the
+            # broad handler returned the original signal, bypassing a veto.
+            # Preserve safety: no candidate may pass when PreSim cannot
+            # complete and record its decision.
+            logger.error(f"[PRESIM] gate error; blocking candidate: {e}")
+            return None, confidence
 
     def _scenario_gate(self, direction, entry_price=None, sl=None, tp=None, df=None, symbol='BTCUSDT'):
         """Pre-Trade Scenario Simulator gate (fail-open).
@@ -3556,7 +3566,7 @@ class Part14OptionsChain:
             # BUG FIX #3: Never hardcode credentials — load from env
             client_id = os.getenv("DERIBIT_CLIENT_ID", "")
             client_secret = os.getenv("DERIBIT_CLIENT_SECRET", "")
-            self.deribit = DeribitOptionsClient(currency='BTC', client_id=client_id, client_secret=client_secret)
+            self.deribit = DeribitOptionsClient(currency=self.asset, client_id=client_id, client_secret=client_secret)
         except ImportError:
             self.deribit = None
         except Exception:
@@ -4847,8 +4857,14 @@ class JarvisElite:
     """JARVIS TRADE ELITE v7.0 - Complete SwingScalp Trading System"""
     
     def __init__(self, backtest_mode=False):
-        """Backtests retain GPU analysis but block AI and live-data side effects."""
-        self.is_backtest_mode = bool(backtest_mode)
+        """Backtests retain GPU analysis but block AI and live-data side effects.
+
+        The environment safety switch is an additional floor: a caller cannot
+        accidentally construct a live-data brain while the process explicitly
+        declares backtest mode (for example, a test harness or paper worker).
+        """
+        env_backtest = str(os.environ.get("JARVIS_BACKTEST_MODE", "0")).lower() in {"1", "true", "yes", "on"}
+        self.is_backtest_mode = bool(backtest_mode or env_backtest)
         self.scoring_matrix = TradeScoringMatrix()
         self.trade_manager = TradeManager()
         self.expiry_optimizer = TradeOptimizer()
@@ -4966,7 +4982,13 @@ class JarvisElite:
                 from deribit_options_client import DeribitOptionsClient
                 client_id = os.getenv("DERIBIT_CLIENT_ID", "")
                 client_secret = os.getenv("DERIBIT_CLIENT_SECRET", "")
-                self.deribit = DeribitOptionsClient(currency='BTC', client_id=client_id, client_secret=client_secret)
+                # The route may change after startup; Part14 is the only
+                # component allowed to use Deribit and keeps it asset-scoped.
+                self.deribit = DeribitOptionsClient(
+                    currency=str(getattr(self, 'active_base_asset', 'BTC') or 'BTC'),
+                    client_id=client_id,
+                    client_secret=client_secret,
+                )
                 logger.info("✅ Deribit Options Client Initialized (Dual Intelligence)")
             except Exception as e:
                 logger.warning(f"Deribit init failed: {e}")
@@ -4996,9 +5018,12 @@ class JarvisElite:
             '15min': []
         }
 
-        # Initialize External GPU Engines
+        # Initialize External GPU Engines only when explicitly permitted.  The
+        # heavy CPU/GPU adapters are advisory and must not make safe startup or
+        # an offline wiring check wait on model/accelerator initialization.
         self.engines = {}
-        if EXTERNAL_ENGINES_AVAILABLE:
+        external_ai_disabled = str(os.environ.get("JARVIS_ENABLE_EXTERNAL_AI", "1")).lower() in {"0", "false", "no", "off"}
+        if EXTERNAL_ENGINES_AVAILABLE and not external_ai_disabled:
             try:
                 logger.info("🚀 Initializing External GPU Engines...")
                 self.engines['institutional'] = InstitutionalTradingEngineGPU(self)

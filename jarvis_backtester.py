@@ -20,8 +20,10 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-# Must be set before importing engine to ensure isolated replay mode.
-os.environ["JARVIS_BACKTEST_MODE"] = "1"
+# The replay safety mode is set immediately before importing the brain in
+# ``_init_jarvis``.  Do not mutate the process environment at module import:
+# importing this optional utility from the live brain must not silently turn the
+# live brain into a historical replay.
 
 if sys.platform == "win32":
     try:
@@ -300,6 +302,9 @@ class JarvisFullBacktester:
 
     def _init_jarvis(self):
         print("  Initializing JarvisElite central math/GPU decision path (isolated replay)...")
+        # Set the isolation floor before importing the engine.  This is scoped
+        # to an actual replay invocation rather than an optional-module import.
+        os.environ["JARVIS_BACKTEST_MODE"] = "1"
         from jarvis_FIXED import JarvisElite, pro_display
         # This must remain true: it preserves analysis engines while blocking live-only inputs.
         brain = JarvisElite(backtest_mode=True)

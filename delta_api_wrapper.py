@@ -763,7 +763,8 @@ class DeltaExchangeData:
             logger.error(f"[RISK] Failed to set leverage: {res.get('error')}")
             return False
 
-    def place_order(self, symbol: str, side: str, size: int, order_type: str = "market", limit_price: float = 0) -> Dict:
+    def place_order(self, symbol: str, side: str, size: int, order_type: str = "market", limit_price: float = 0,
+                    reduce_only: bool = False, idempotency_key: str = None) -> Dict:
         """
         Execute Trade (Live or Paper).
         side: "buy" or "sell"
@@ -813,6 +814,13 @@ class DeltaExchangeData:
 
         if ot == "limit" and limit_price > 0:
             payload["limit_price"] = str(limit_price)
+        if reduce_only:
+            payload["reduce_only"] = True
+        if idempotency_key:
+            # Delta deployments may ignore unknown client-order metadata, but
+            # retaining a stable key lets supported gateways deduplicate a
+            # retried request without changing ordinary order behavior.
+            payload["client_order_id"] = str(idempotency_key)
 
         logger.warning(f"[EXECUTION] Placing {side.upper()} {final_type} for {size} {symbol}...")
         res = self._request("POST", "/v2/orders", payload, authorized=True)

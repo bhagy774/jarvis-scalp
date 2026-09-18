@@ -95,6 +95,13 @@ def contract_quote_value_usdt(product: Dict[str, Any], price: float) -> Optional
     """
     if not isinstance(product, dict):
         return None
+    # Inverse/coin-margined contracts do not have a stable quote notional
+    # that this USDT risk model can safely represent.  Never reinterpret them
+    # as linear contracts merely because a contract_value field is present.
+    for key in ("contract_type", "notional_type", "margin_currency_type", "settlement_type"):
+        marker = str(product.get(key, "")).strip().lower().replace("-", "_")
+        if "inverse" in marker or "coin_margined" in marker or marker in {"coin", "base"}:
+            return None
     try:
         price = float(price)
     except (TypeError, ValueError):
@@ -113,9 +120,16 @@ def contract_quote_value_usdt(product: Dict[str, Any], price: float) -> Optional
         raw = unit_info.get("value", unit_info.get("size"))
         unit = unit_info.get("currency", unit_info.get("unit"))
     else:
+        # ``contract_unit_currency`` is the documented Delta field for base
+        # denominated contracts (for example BTCUSD contract_value=0.001,
+        # contract_unit_currency=BTC).  It must take precedence over a
+        # settlement asset: settlement currency alone does not identify the
+        # unit of contract_value.
         unit = product.get(
             "contract_value_currency",
-            product.get("quote_currency", product.get("settlement_asset", product.get("contract_unit"))),
+            product.get("contract_unit_currency", product.get(
+                "quote_currency", product.get("settlement_asset", product.get("contract_unit"))
+            )),
         )
     try:
         value = float(raw)
@@ -128,9 +142,32 @@ def contract_quote_value_usdt(product: Dict[str, Any], price: float) -> Optional
     unit_text = str(unit or "").upper().strip()
     if unit_text in {"USD", "USDT", "USDC", "QUOTE", "QUOTE_CURRENCY"}:
         return value
-    if unit_text in {"BASE", "ASSET", "COIN", "BTC", "ETH", "SOL"}:
+    if unit_text in {"BASE", "ASSET", "COIN"}:
+        # Generic labels are safe only when the product explicitly identifies
+        # itself as linear/base-unit; otherwise they are ambiguous.
+        base = str(product.get("base_asset", product.get("underlying_asset", ""))).upper().strip()
+        if not base:
+            symbol = str(product.get("symbol", "")).upper().replace("-", "").replace("_", "")
+            for quote in ("USDT", "USDC", "USD"):
+                if symbol.endswith(quote):
+                    base = symbol[:-len(quote)]
+                    break
+        if not base:
+            return None
         return value * price
-    # A bare value is ambiguous: fail closed instead of guessing its unit.
+    # For a documented base-unit currency, require that it matches the
+    # product's actual underlying asset.  This prevents a malformed fixture
+    # from converting an arbitrary unit at the selected price.
+    base = str(product.get("base_asset", product.get("underlying_asset", ""))).upper().strip()
+    if not base:
+        symbol = str(product.get("symbol", "")).upper().replace("-", "").replace("_", "")
+        for quote in ("USDT", "USDC", "USD"):
+            if symbol.endswith(quote):
+                base = symbol[:-len(quote)]
+                break
+    if base and unit_text == base:
+        return value * price
+    # A bare or unrelated unit is ambiguous: fail closed instead of guessing.
     return None
 
 

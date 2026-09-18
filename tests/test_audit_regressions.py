@@ -1,5 +1,6 @@
 import importlib
 import io
+import json
 import os
 import unittest
 from unittest.mock import patch
@@ -73,6 +74,16 @@ class AuditRegressionTests(unittest.TestCase):
         self.assertEqual(route.status, "BLOCKED")
         self.assertIn("invalid symbol", route.reason)
 
+    def test_documented_delta_base_contract_value_is_price_converted(self):
+        product = {
+            "id": 1, "symbol": "BTCUSD", "contract_value": "0.001",
+            "contract_unit_currency": "BTC", "contract_type": "perpetual_futures",
+            "default_leverage": 100, "max_leverage_notional": "1000000",
+        }
+        self.assertEqual(contract_quote_value_usdt(product, 65000), 65.0)
+        self.assertIsNone(contract_quote_value_usdt({**product, "contract_type": "inverse"}, 65000))
+        self.assertIsNone(contract_quote_value_usdt({"symbol": "BTCUSD", "contract_value": 0.001}, 65000))
+
     def test_non_one_contract_value_sizes_actual_notional(self):
         product = {"contract_value": 2, "contract_value_currency": "USDT"}
         self.assertEqual(contract_quote_value_usdt(product, 100), 2)
@@ -142,6 +153,83 @@ class AuditRegressionTests(unittest.TestCase):
             self.assertFalse(client._binance_spot_compatible())
         with patch.dict(os.environ, {"JARVIS_ALLOW_PERPETUAL_FALLBACK": "1"}):
             self.assertTrue(client._binance_spot_compatible())
+
+    def test_duplicate_manager_cannot_submit_second_close(self):
+        from jarvis_live_trader import JarvisAutoTrader
+        from jarvis_position_manager import JarvisPositionManager, PositionRecord
+        from jarvis_position_ownership import claim_position, clear_registry
+
+        class PaperVenue:
+            def __init__(self):
+                self.calls = []
+            def place_order(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return {"success": True}
+
+        clear_registry()
+        venue = PaperVenue()
+        auto = JarvisAutoTrader(venue)
+        manager = JarvisPositionManager(venue)
+        auto_pos = {
+            "id": "shared-1", "direction": "CALL", "symbol": "BTCUSDT",
+            "contracts": 2, "entry_price": 100.0,
+        }
+        self.assertTrue(claim_position("shared-1", auto._ownership_token))
+        pm_pos = PositionRecord("shared-1", "CALL", 100.0, 2, 90, "BTCUSDT")
+        manager.open_positions.append(pm_pos)  # simulate stale duplicate wiring
+        self.assertFalse(manager._close_position(pm_pos, 101.0, "TP HIT"))
+        self.assertEqual(venue.calls, [])
+        self.assertTrue(auto._close_position_market(auto_pos)["success"])
+        self.assertEqual(venue.calls, [])  # paper close never reaches venue
+        clear_registry()
+
+    def test_ollama_structured_output_is_schema_validated(self):
+        import ollama_integration as oi
+
+        class Response:
+            status_code = 200
+            def __init__(self, text):
+                self.text = text
+            def json(self):
+                return {"response": self.text}
+
+        schema = {
+            "type": "object", "required": ["direction"],
+            "properties": {"direction": {"type": "string", "enum": ["BUY", "SELL"]}},
+        }
+        with patch.object(oi, "OLLAMA_ENABLED", True), patch.object(oi, "_select_model", return_value="local-test"):
+            with patch.object(oi.requests, "post", return_value=Response('{"direction":"BUY"}')):
+                text, err = oi.call_gemini_structured("prompt", schema)
+                self.assertIsNone(err)
+                self.assertEqual(json.loads(text)["direction"], "BUY")
+            with patch.object(oi.requests, "post", return_value=Response('{"direction":"MAYBE"}')):
+                text, err = oi.call_gemini_structured("prompt", schema)
+                self.assertIsNone(text)
+                self.assertIn("invalid structured", err)
+
+    def test_ambiguous_close_is_not_retried_or_reversed(self):
+        from jarvis_live_trader import JarvisAutoTrader
+        from jarvis_position_ownership import clear_registry
+
+        class AmbiguousVenue:
+            def __init__(self):
+                self.calls = 0
+            def place_order(self, *args, **kwargs):
+                self.calls += 1
+                raise TimeoutError("response lost after submission")
+
+        clear_registry()
+        venue = AmbiguousVenue()
+        auto = JarvisAutoTrader(venue)
+        auto.is_enabled = True
+        pos = {"id": "ambiguous-1", "direction": "CALL", "symbol": "BTCUSDT", "contracts": 1}
+        first = auto._close_position_market(pos)
+        second = auto._close_position_market(pos)
+        self.assertFalse(first["success"])
+        self.assertTrue(first.get("ambiguous"))
+        self.assertFalse(second["success"])
+        self.assertEqual(venue.calls, 1)
+        clear_registry()
 
     def test_watchdog_bad_threshold_falls_back(self):
         import jarvis_watchdog

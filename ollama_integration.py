@@ -21,7 +21,9 @@ except ImportError:
     pass  # dotenv optional
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "deepseek-r1:14b")  # 24GB VRAM optimized
+# An unset model is intentionally auto-discovered.  Do not silently request a
+# model that is not installed merely because the host has an Ollama server.
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL")
 OLLAMA_ENABLED = False
 
 # ── Auto model resolution ────────────────────────────────────────────
@@ -93,6 +95,15 @@ def resolve_ollama_model(force_refresh: bool = False):
     return chosen
 
 
+def _select_model(explicit: Optional[str] = None) -> Optional[str]:
+    """Return an explicit or installed model; never invent a model name."""
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+    if OLLAMA_MODEL:
+        return OLLAMA_MODEL
+    return resolve_ollama_model()
+
+
 def preload_committee_models():
     """
     Optionally pre-load committee models into VRAM with bounded keep_alive.
@@ -150,8 +161,15 @@ def _init_ollama():
     try:
         resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
         if resp.status_code == 200:
+            # A reachable server without an installed/explicit model is not
+            # usable for advisory inference; remain disabled and fail safely.
+            selected_model = _select_model()
+            if not selected_model:
+                OLLAMA_ENABLED = False
+                logger.warning("Ollama server reachable but no model is installed")
+                return
             OLLAMA_ENABLED = True
-            logger.info(f"Ollama Local AI initialized ({OLLAMA_MODEL}) on {OLLAMA_BASE_URL}")
+            logger.info(f"Ollama Local AI initialized ({selected_model}) on {OLLAMA_BASE_URL}")
             # Start pre-loading in a background thread to prevent blocking main startup
             import threading
             threading.Thread(target=preload_committee_models, daemon=True).start()
@@ -181,11 +199,14 @@ def call_ollama(prompt: str, model: str = None, timeout: int = 120) -> Tuple[Opt
     """
     if not OLLAMA_ENABLED:
         return None, "Ollama AI not available"
-    
+    selected_model = _select_model(model)
+    if not selected_model:
+        return None, "No installed Ollama model available"
     try:
+        timeout = max(1, min(int(timeout), 120))
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/generate",
-            json={"model": model or OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            json={"model": selected_model, "prompt": prompt, "stream": False},
             timeout=timeout
         )
         if resp.status_code == 200:
@@ -204,10 +225,14 @@ def call_ollama_chat(messages: list, model: str = None, timeout: int = 60) -> Tu
     """
     if not OLLAMA_ENABLED:
         return None, "Ollama AI not available"
+    selected_model = _select_model(model)
+    if not selected_model:
+        return None, "No installed Ollama model available"
     try:
+        timeout = max(1, min(int(timeout), 120))
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/chat",
-            json={"model": model or OLLAMA_MODEL, "messages": messages, "stream": False},
+            json={"model": selected_model, "messages": messages, "stream": False},
             timeout=timeout
         )
         if resp.status_code == 200:
@@ -219,20 +244,63 @@ def call_ollama_chat(messages: list, model: str = None, timeout: int = 60) -> Tu
         return None, str(e)
 
 
+def _validate_structured_response(text: str, schema: dict) -> Optional[dict]:
+    """Validate the small JSON-schema subset used by advisory callers.
+
+    Structured model output is never passed through as trusted text.  Required
+    keys, object type, primitive types, and enum constraints are checked before
+    returning a normalized JSON object.
+    """
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or not isinstance(schema, dict):
+        return None
+    if schema.get("type") not in (None, "object"):
+        return None
+    required = schema.get("required", [])
+    if not isinstance(required, list) or any(key not in value for key in required):
+        return None
+    properties = schema.get("properties", {})
+    if not isinstance(properties, dict):
+        return None
+    for key, rule in properties.items():
+        if key not in value or not isinstance(rule, dict):
+            continue
+        item = value[key]
+        expected = rule.get("type")
+        valid_type = {
+            "string": isinstance(item, str),
+            "number": isinstance(item, (int, float)) and not isinstance(item, bool),
+            "integer": isinstance(item, int) and not isinstance(item, bool),
+            "boolean": isinstance(item, bool),
+            "object": isinstance(item, dict),
+            "array": isinstance(item, list),
+        }.get(expected, True)
+        if not valid_type or ("enum" in rule and item not in rule["enum"]):
+            return None
+    return value
+
+
 def call_gemini_structured(prompt: str, schema: dict, model: str = None) -> Tuple[Optional[str], Optional[str]]:
     """
-    Alias for compatibility, forces Ollama JSON format if possible.
+    Compatibility name for bounded Ollama JSON output.  Invalid or malformed
+    model responses fail closed instead of reaching trade-affecting callers.
     """
     if not OLLAMA_ENABLED:
         return None, "Ollama AI not available"
     
+    selected_model = _select_model(model)
+    if not selected_model:
+        return None, "No installed Ollama model available"
     try:
         # Prompt injection to force JSON adherence
         full_prompt = f"{prompt}\n\nPlease respond strictly in JSON matching this schema: {json.dumps(schema)}"
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/generate",
             json={
-                "model": model or OLLAMA_MODEL,
+                "model": selected_model,
                 "prompt": full_prompt,
                 "stream": False,
                 "format": "json"
@@ -240,7 +308,11 @@ def call_gemini_structured(prompt: str, schema: dict, model: str = None) -> Tupl
             timeout=60
         )
         if resp.status_code == 200:
-            return resp.json().get("response", ""), None
+            raw = resp.json().get("response", "")
+            parsed = _validate_structured_response(raw, schema)
+            if parsed is None:
+                return None, "Ollama returned invalid structured output"
+            return json.dumps(parsed, separators=(",", ":")), None
         return None, f"Ollama JSON output error {resp.status_code}"
     except Exception as e:
         logger.error(f"Ollama structured output error: {e}")

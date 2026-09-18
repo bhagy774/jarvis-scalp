@@ -67,7 +67,7 @@ def test_fetcher_fails_closed_when_client_is_unavailable():
 def test_brain_imports_cleanly_with_wired_modules_present(tmp_path):
     script = "import jarvis_FIXED as b; assert b.SIZER_AVAILABLE; assert b.POSITION_MANAGER_AVAILABLE"
     completed = subprocess.run([sys.executable, "-c", script], cwd=tmp_path,
-                               env={**os.environ, "PYTHONPATH": str(ROOT)}, text=True,
+                               env={**os.environ, "PYTHONPATH": str(ROOT), "JARVIS_ENABLE_EXTERNAL_AI": "0"}, text=True,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
     assert completed.returncode == 0, completed.stderr[-1000:]
 
@@ -92,7 +92,7 @@ if jarvis.bus:
     jarvis.bus.shutdown()
 '''
     completed = subprocess.run([sys.executable, "-c", script], cwd=tmp_path,
-                               env={**os.environ, "PYTHONPATH": str(ROOT)}, text=True,
+                               env={**os.environ, "PYTHONPATH": str(ROOT), "JARVIS_ENABLE_EXTERNAL_AI": "0"}, text=True,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
     assert completed.returncode == 0, completed.stderr[-1000:]
 
@@ -131,6 +131,6 @@ if jarvis.bus:
     jarvis.bus.shutdown()
 '''
     completed = subprocess.run([sys.executable, "-c", script], cwd=tmp_path,
-                               env={**os.environ, "PYTHONPATH": str(ROOT)}, text=True,
+                               env={**os.environ, "PYTHONPATH": str(ROOT), "JARVIS_ENABLE_EXTERNAL_AI": "0"}, text=True,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
     assert completed.returncode == 0, completed.stderr[-1000:]

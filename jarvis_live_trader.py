@@ -54,6 +54,7 @@ def _box(msg, col=C): print(f"{col}  ▶  {RST}{msg}")
 # ══════════════════════════════════════════════════════════════════
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP, contract_quote_value_usdt
 from jarvis_decision import normalize_confidence, build_final_decision
+from jarvis_position_ownership import claim_position, claim_close, position_owner
 LEVERAGE_CAP        = MAX_LEVERAGE_CAP  # policy cap; not a user-selected leverage
 MAX_RISK_USDT       = float(os.environ.get("JARVIS_MAX_RISK_USDT", "10"))
 MAX_DAILY_LOSS_USDT = float(os.environ.get("JARVIS_MAX_DAILY_LOSS","30"))
@@ -132,6 +133,9 @@ class JarvisAutoTrader:
         # ── State ────────────────────────────────────────────────
         self.open_positions: List[Dict] = []
         self.closed_today:   List[Dict] = []
+        # Process-local lifecycle owner token.  The active auto-trader is the
+        # sole component allowed to close its positions.
+        self._ownership_token = f"auto:{id(self)}"
         self.daily_pnl      = 0.0
         self.daily_trades   = 0
         self.consec_losses  = 0
@@ -564,6 +568,14 @@ class JarvisAutoTrader:
             "status":      "OPEN",
             "_last_reversal_check": datetime.now(),  # Track when we last re-evaluated
         }
+        position_id = pos["id"]
+        if not claim_position(position_id, self._ownership_token):
+            # The venue order succeeded but its identifier is already owned by
+            # another lifecycle manager.  Do not publish a second local
+            # position or allow two monitors to close it independently.
+            logger.error("[OWNERSHIP] Position %s already owned by %s; refusing duplicate registration", position_id, position_owner(position_id))
+            pos["status"] = "OWNERSHIP_UNKNOWN"
+            return {"success": False, "reason": "Position ownership conflict; reconciliation required", "position": pos}
         self.open_positions.append(pos)
         self.last_trade_time = datetime.now()
         self.daily_trades   += 1
@@ -925,24 +937,45 @@ class JarvisAutoTrader:
             return None
 
     def _close_position_market(self, pos: Dict) -> Dict:
-        """Close a position at market price."""
+        """Submit one reduce-only close; ambiguous results remain unresolved.
+
+        The ownership and close claims are process-local guards against two
+        monitors issuing duplicate closes.  The venue wrapper also receives an
+        idempotency key, while a transport failure is never treated as proof
+        that a close failed or succeeded.
+        """
         try:
             is_call    = pos["direction"] in ("CALL", "BUY")
             close_side = "sell" if is_call else "buy"
+            position_id = pos.get("id")
             if self.is_enabled:
                 symbol = pos.get("symbol")
                 if not isinstance(symbol, str) or not symbol:
                     return {"success": False, "error": "Position symbol is missing"}
-                return self.delta.place_order(
+                allowed, current = claim_close(position_id, self._ownership_token)
+                if not allowed:
+                    return {"success": False, "error": f"Close already claimed or owned by {current or 'another manager'}"}
+                result = self.delta.place_order(
                     symbol=symbol,
                     side=close_side,
                     size=pos["contracts"],
-                    order_type="market"
+                    order_type="market",
+                    reduce_only=True,
+                    idempotency_key=f"jarvis-close-{position_id}",
                 )
+                if not isinstance(result, dict) or not result.get("success"):
+                    return {"success": False, "ambiguous": True,
+                            "error": (result or {}).get("error", "Close not confirmed")}
+                return result
             else:
+                # Paper closes do not need a venue claim, but retain one local
+                # close transition so duplicate monitors cannot double-book.
+                allowed, current = claim_close(position_id, self._ownership_token)
+                if not allowed:
+                    return {"success": False, "error": f"Close already claimed or owned by {current or 'another manager'}"}
                 return {"success": True, "paper": True}
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            return {"success": False, "ambiguous": True, "error": str(e)}
 
     def _reset_daily(self):
         """Reset daily counters at midnight."""
