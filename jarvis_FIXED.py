@@ -149,6 +149,13 @@ except Exception:
     LIVE_TIMEFRAMES = ()
     DIRECT_CANDLE_CACHE_AVAILABLE = False
 try:
+    from part7_signal import analyze_timeframe as _analyze_part7_timeframe, aggregate_results as _aggregate_part7_results
+    PART7_SHARED_ANALYZER_AVAILABLE = True
+except Exception:
+    _analyze_part7_timeframe = None
+    _aggregate_part7_results = None
+    PART7_SHARED_ANALYZER_AVAILABLE = False
+try:
     from jarvis_backtester import JarvisFullBacktester as _JarvisFullBacktester
     BACKTESTER_AVAILABLE = True
 except Exception:
@@ -1276,6 +1283,7 @@ class LiveTradingEngine:
                 'max_leverage_cap': MAX_LEVERAGE_CAP,
                 'max_risk': float(os.getenv('JARVIS_MAX_RISK_USDT', '10')),
             })
+            part7 = result.get('part7_volatility') or getattr(self.jarvis, 'latest_part7', {}) or {}
             status = {
                 'mode': 'LIVE-EXECUTION' if getattr(self, 'auto_trader', None) and self.auto_trader.is_enabled else 'PAPER',
                 'open_trades': len(self.paper_open_trades),
@@ -1285,13 +1293,17 @@ class LiveTradingEngine:
                 'readiness': dict(getattr(self, 'readiness', {'status': 'UNKNOWN'})),
                 'native_engines': getattr(self.jarvis, 'native_engine_status', {}),
                 'ai_suggestion': getattr(self.jarvis, 'last_ollama_decision', {'decision': 'unavailable'}),
+                'part7': part7,
             }
+            reasons = (result.get('intelligence_board', []) or [])[:3]
+            if part7.get('entry_blocked'):
+                reasons = [part7.get('reason', 'Part7 entry gate blocked')] + reasons
             self.dashboard.update(
                 timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 symbol=symbol or self.active_symbol,
                 price=f"${float(current_price):,.2f}" if current_price else '—',
                 signal={'direction': signal.get('direction', 'NO_TRADE'), 'confidence': signal.get('confidence_score', signal.get('confidence', 0))},
-                reasons=(result.get('intelligence_board', []) or [])[:3] or [result.get('no_trade_reason', 'Awaiting analysis')],
+                reasons=reasons or [result.get('no_trade_reason', 'Awaiting analysis')],
                 plan=plan,
                 status=status,
                 account=account,
@@ -3021,71 +3033,33 @@ class Part6Trend:
 
 
 class Part7Volatility:
-    """Volatility/ATR Analysis — backed by VolatilityEngineGPU (Part7)"""
+    """Part 7 consumer for one selected-symbol native exchange timeframe.
+
+    This adapter intentionally does not instantiate the legacy standalone
+    trade-to-candle ``VolatilityEngineGPU``.  The canonical Jarvis path already
+    owns a shared native candle snapshot; this Part only analyzes the frame it
+    receives and reports the actual Pandas/CPU backend.
+    """
     def __init__(self):
-        try:
-            from part7_FIXED import VolatilityEngineGPU
-            self._engine = VolatilityEngineGPU()
-        except Exception:
-            self._engine = None
+        self.backend = "pandas_cpu"
 
     def analyze(self, data, context=None):
-        # ── 1. Try real Part 7 VolatilityEngineGPU ────────────────────────
-        if self._engine is not None:
-            try:
-                res = self._engine.analyze(data, context=context)
-                if isinstance(res, dict):
-                    return res
-            except Exception as e:
-                logger.debug(f"Part7 VolatilityEngine error: {e}")
-
-        # ── 2. Fallback: Quantitative Volatility & Regime Check ───────────
-        try:
-            if context:
-                regime = str(context.get('institutional_components', {}).get('regime', 'NEUTRAL')).upper()
-                if 'VOLATILE' in regime or 'PANIC' in regime:
-                    return {"signal": 0, "thought": f"High Volatility Regime ({regime}) — No trade (fallback)"}
-
-            if len(data) >= 30:
-                closes = data['close'].tail(50).astype(float)
-                highs  = data['high'].tail(50).astype(float)
-                lows   = data['low'].tail(50).astype(float)
-                current_close = float(closes.iloc[-1])
-
-                sma20 = float(closes.tail(20).mean())
-                std20 = float(closes.tail(20).std()) + 1e-8
-                upper_bb = sma20 + 2.0 * std20
-                lower_bb = sma20 - 2.0 * std20
-                pct_b = (current_close - lower_bb) / (upper_bb - lower_bb + 1e-8)
-
-                tr = pd.concat([
-                    highs - lows,
-                    (highs - closes.shift(1)).abs(),
-                    (lows - closes.shift(1)).abs()
-                ], axis=1).max(axis=1)
-                atr14 = float(tr.tail(14).mean())
-                atr50 = float(tr.tail(50).mean()) if len(tr) >= 50 else atr14
-                ema20 = float(closes.ewm(span=20).mean().iloc[-1])
-
-                upper_kc = ema20 + 1.5 * atr14
-                lower_kc = ema20 - 1.5 * atr14
-                is_squeeze = (upper_bb < upper_kc) and (lower_bb > lower_kc)
-                vol_ratio = atr14 / (atr50 + 1e-8)
-                norm_atr = atr14 / max(current_close, 1.0)
-
-                if vol_ratio > 2.8 or norm_atr > 0.015:
-                    return {"signal": 0, "thought": f"ATR Regime Extreme {norm_atr*100:.2f}% — no trade (fallback)"}
-
-                if is_squeeze:
-                    return {"signal": 0, "thought": "TTM Squeeze Coiling — Neutral (fallback)"}
-
-                if pct_b >= 0.85 and current_close > upper_bb and vol_ratio >= 1.0:
-                    return {"signal": 1, "thought": f"Bullish Volatility Expansion %B={pct_b:.2f} (fallback)"}
-                elif pct_b <= 0.15 and current_close < lower_bb and vol_ratio >= 1.0:
-                    return {"signal": -1, "thought": f"Bearish Volatility Breakdown %B={pct_b:.2f} (fallback)"}
-        except Exception:
-            pass
-        return {"signal": 0, "thought": "Stable Volatility (fallback)"}
+        context = dict(context or {})
+        symbol = context.get("selected_symbol") or context.get("symbol") or "UNKNOWN"
+        timeframe = context.get("timeframe") or "unknown"
+        if _analyze_part7_timeframe is None:
+            return {
+                "signal": 0, "signal_identity": f"part7:{symbol}:{timeframe}",
+                "symbol": str(symbol).upper(), "timeframe": str(timeframe),
+                "status": "error", "data_status": "error", "entry_blocked": True,
+                "risk_veto": False, "volatility_status": "unknown",
+                "reason": "Part7 shared analyzer unavailable",
+                "thought": "Part7 shared analyzer unavailable",
+                "computation_backend": self.backend,
+            }
+        return _analyze_part7_timeframe(
+            data, symbol=str(symbol), timeframe=str(timeframe), context=context
+        )
 
 
 class Part8Structure:
@@ -5181,6 +5155,12 @@ class JarvisElite:
         self.current_score = 0
         self.current_signals = {}
         self.market_context = {}
+        self.latest_part7 = {
+            'signal': 0, 'status': 'not_run', 'reason': 'Part7 has not run',
+            'entry_blocked': True, 'risk_veto': False, 'data_status': 'missing',
+            'volatility_status': 'unknown', 'computation_backend': 'pandas_cpu',
+            'timeframe_results': {},
+        }
 
     def get_optional_utility(self, name, **kwargs):
         """Return an explicitly requested optional analysis utility.
@@ -5466,8 +5446,10 @@ class JarvisElite:
                     '1h': '1h', '2h': '2h', '4h': '4h'
                 }.items():
                     resampled = data.resample(tf_rule).agg(ohlcv_agg).dropna()
-                    if len(resampled) >= 20:
-                        mtf_data[tf_name] = resampled
+                    # Keep every configured timeframe explicit.  A short replay
+                    # window must produce an invalid/missing Part 7 result and
+                    # block entries, rather than silently omitting that identity.
+                    mtf_data[tf_name] = resampled
                 
                 # OPTIMIZATION: Truncate to 500 rows to prevent massive slowdown in backtest
                 for k in list(mtf_data.keys()):
@@ -5522,8 +5504,24 @@ class JarvisElite:
                     
                     try:
                         # 🎓 TEACHER FIX #1: Data Pollution (Pass-by-reference mutation bug)
-                        # Ensure each part receives a pristine, independent copy of the dataframe
-                        res = part.analyze(tf_data.copy(), context=self.market_context)
+                        # Ensure each part receives a pristine, independent copy of the dataframe.
+                        # Part 7 also receives the selected symbol/timeframe identity so it
+                        # cannot silently analyze a BTC/default or mixed-symbol frame.
+                        part_context = self.market_context
+                        if name == 'part7_volatility':
+                            part_context = dict(self.market_context)
+                            part_context.update({
+                                'selected_symbol': getattr(self, 'active_symbol', None),
+                                'timeframe': tf_name,
+                                'is_backtest_mode': self.is_backtest_mode,
+                                'shared_candle_source': 'historical_replay' if self.is_backtest_mode else 'shared_exchange',
+                            })
+                            tf_data = tf_data.copy()
+                            tf_data.attrs = dict(getattr(tf_data, 'attrs', {}) or {})
+                            if getattr(self, 'active_symbol', None):
+                                tf_data.attrs['symbol'] = self.active_symbol
+                            tf_data.attrs['timeframe'] = tf_name
+                        res = part.analyze(tf_data, context=part_context)
                         if isinstance(res, dict):
                             tf_results[name] = res
                             raw_signal = res.get('signal', 0)
@@ -5561,6 +5559,26 @@ class JarvisElite:
                 
                 mtf_breakdown[tf_name] = tf_results
             
+            # Aggregate Part 7 explicitly by native timeframe.  A neutral frame
+            # remains neutral, while extreme volatility, missing/stale/wrong-
+            # symbol data, or an analyzer exception commits a new-entry block.
+            part7_by_timeframe = {
+                tf: mtf_breakdown.get(tf, {}).get('part7_volatility', {})
+                for tf in mtf_data
+            }
+            if _aggregate_part7_results is not None:
+                self.latest_part7 = _aggregate_part7_results(
+                    part7_by_timeframe,
+                    symbol=getattr(self, 'active_symbol', None) or 'UNKNOWN',
+                    required_timeframes=tuple(mtf_data.keys()),
+                )
+            else:
+                self.latest_part7 = {
+                    'signal': 0, 'status': 'error', 'reason': 'Part7 aggregator unavailable',
+                    'entry_blocked': True, 'risk_veto': False, 'data_status': 'error',
+                    'computation_backend': 'pandas_cpu', 'timeframe_results': part7_by_timeframe,
+                }
+
             # Build final part_results with MTF confirmation & veto protection
             for name, part in self.parts.items():
                 if name in ['part11_fusion', 'part12_confidence']:
@@ -5635,6 +5653,15 @@ class JarvisElite:
                 
                 if final_signal != 0:
                     logger.debug(f"🔍 MTF TRACER: {name} signal={final_signal} base={base_sig} HTF={htf_avg:.3f}")
+
+            # Keep the canonical part result explicit and dashboard-ready.  The
+            # gate is not represented only as a neutral signal: downstream entry
+            # logic reads entry_blocked/risk_veto and commits the veto.
+            if isinstance(self.latest_part7, dict):
+                part_results['part7_volatility'] = {
+                    **part_results.get('part7_volatility', {}),
+                    **self.latest_part7,
+                }
             
             # Log MTF summary
             buy_parts = sum(1 for r in part_results.values() if r.get('signal', 0) > 0)
@@ -5914,6 +5941,26 @@ class JarvisElite:
             
             # Generate final signal
             final_decision = self._generate_trade_signal(data, score, detailed_scores, options_intel, logic_signal)
+
+            # Canonical Part 7 new-entry gate.  Protective-exit ownership lives
+            # outside this analysis result and is intentionally not altered.
+            # A veto/data failure must remain a veto even when every other part
+            # is bullish; do not reduce it to a neutral reason string.
+            part7_gate = getattr(self, 'latest_part7', {}) or {}
+            if part7_gate.get('entry_blocked'):
+                p7_reason = part7_gate.get('reason', 'Part7 entry gate blocked')
+                final_decision['trade_signal'].update({
+                    'direction': 'NO_TRADE',
+                    'confidence_score': '0/100',
+                    'part7_entry_blocked': True,
+                })
+                final_decision['no_trade_reason'] = p7_reason
+                final_decision['part7_volatility'] = part7_gate
+                detailed_scores['part7_entry_blocked'] = True
+                detailed_scores['part7_gate_reason'] = p7_reason
+                logger.warning('[PART7] New-entry gate blocked: %s', p7_reason)
+            else:
+                final_decision['part7_volatility'] = part7_gate
             
             # --- BIG PLAYER FILTER (STRICT DUAL CONFLUENCE) ---
             if TRADE_CONFIG.get('use_big_player_filter', True):
@@ -6011,6 +6058,19 @@ class JarvisElite:
             if hasattr(self, 'cns'):
                 self.cns.record_perception(final_decision)
                 
+            # Re-assert the canonical Part 7 gate after advisory confidence and
+            # big-player layers.  Those layers may enrich a result, but may not
+            # turn a blocked new entry back into CALL/PUT or restore confidence.
+            if part7_gate.get('entry_blocked'):
+                final_decision['trade_signal'].update({
+                    'direction': 'NO_TRADE',
+                    'confidence_score': '0/100',
+                    'part7_entry_blocked': True,
+                })
+                final_decision['no_trade_reason'] = part7_gate.get(
+                    'reason', 'Part7 entry gate blocked')
+                final_decision['part7_volatility'] = part7_gate
+
             # Return valid signal (passed or filtered)
             # --- AI AUTONOMY (JARVIS UNLEASHED) ---
             # User Request: Trust AI logic over hard thresholds
@@ -6034,6 +6094,8 @@ class JarvisElite:
                 return final_decision
                 
             else:
+                if part7_gate.get('entry_blocked'):
+                    return final_decision
                 return self._get_no_trade_signal(f"Score too low: {score}/100")
                 
         except Exception as e:
