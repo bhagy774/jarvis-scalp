@@ -163,6 +163,32 @@ def _init_ollama():
         OLLAMA_ENABLED = False
 
 
+def runtime_metadata() -> dict:
+    """Return bounded remote Ollama residency metadata when the server supports /api/ps.
+
+    Local PyTorch detection cannot establish what a remote Ollama host uses; this
+    endpoint is therefore reported separately and unavailable is explicit.
+    """
+    base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+    try:
+        resp = requests.get(f"{base}/api/ps", timeout=5)
+        if resp.status_code != 200:
+            return {"available": False, "reason": f"HTTP {resp.status_code}"}
+        models = []
+        for item in (resp.json().get("models", []) or [])[:16]:
+            if not isinstance(item, dict):
+                continue
+            models.append({
+                "name": str(item.get("name", ""))[:120],
+                "size_vram": item.get("size_vram"),
+                "size": item.get("size"),
+                "processor": str(item.get("processor", ""))[:80] or "unknown",
+            })
+        return {"available": True, "models": models}
+    except Exception as exc:
+        return {"available": False, "reason": type(exc).__name__}
+
+
 def test_ollama_connection() -> bool:
     """Test if Ollama API is accessible"""
     if not OLLAMA_ENABLED:

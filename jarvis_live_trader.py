@@ -53,6 +53,7 @@ def _box(msg, col=C): print(f"{col}  ▶  {RST}{msg}")
 #  RISK CONFIGURATION  (override via .env)
 # ══════════════════════════════════════════════════════════════════
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
+from jarvis_close_coordinator import claim_close, release_close, reconcile_close
 LEVERAGE_CAP        = MAX_LEVERAGE_CAP  # policy cap; not a user-selected leverage
 MAX_RISK_USDT       = float(os.environ.get("JARVIS_MAX_RISK_USDT", "10"))
 MAX_DAILY_LOSS_USDT = float(os.environ.get("JARVIS_MAX_DAILY_LOSS","30"))
@@ -884,24 +885,38 @@ class JarvisAutoTrader:
             return None
 
     def _close_position_market(self, pos: Dict) -> Dict:
-        """Close a position at market price."""
+        """Close at market, reduce-only, with one owner and no blind retry."""
         try:
-            is_call    = pos["direction"] in ("CALL", "BUY")
+            is_call = pos["direction"] in ("CALL", "BUY")
             close_side = "sell" if is_call else "buy"
-            if self.is_enabled:
-                symbol = pos.get("symbol")
-                if not isinstance(symbol, str) or not symbol:
-                    return {"success": False, "error": "Position symbol is missing"}
-                return self.delta.place_order(
-                    symbol=symbol,
-                    side=close_side,
-                    size=pos["contracts"],
-                    order_type="market"
-                )
-            else:
+            if not self.is_enabled:
                 return {"success": True, "paper": True}
+            symbol = pos.get("symbol")
+            if not isinstance(symbol, str) or not symbol:
+                return {"success": False, "error": "Position symbol is missing"}
+            size = int(pos.get("contracts", 0))
+            if size <= 0:
+                return {"success": False, "error": "Position size is invalid"}
+            position_id = pos.get("id")
+            if not claim_close(symbol, position_id, owner="JarvisAutoTrader"):
+                return {"success": False, "error": "Close already claimed; reconcile before retry"}
+            client_order_id = f"jarvis-close-{symbol}-{position_id or 'position'}"[:64]
+            result = self.delta.place_order(
+                symbol=symbol, side=close_side, size=size, order_type="market",
+                reduce_only=True, client_order_id=client_order_id,
+            )
+            if isinstance(result, dict) and result.get("success"):
+                release_close(symbol, position_id)
+                return result
+            # A timeout/API error does not justify another order. Read position
+            # state once; keep the claim when still ambiguous for operator action.
+            recon = reconcile_close(self.delta, symbol, close_side, size)
+            if recon.get("confirmed"):
+                release_close(symbol, position_id)
+                return {"success": True, "reconciled": True, "details": recon}
+            return {"success": False, "error": "Close unconfirmed; operator reconciliation required", "reconciliation": recon}
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            return {"success": False, "error": type(e).__name__ + ": close unconfirmed"}
 
     def _reset_daily(self):
         """Reset daily counters at midnight."""

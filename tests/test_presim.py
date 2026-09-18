@@ -265,11 +265,12 @@ class PreSimWiringTests(unittest.TestCase):
         self.assertEqual(eng.presim_stats["adjustments"], 0)
         self.assertEqual(eng.presim_stats["vetoes"], 0)
 
-    def test_exception_fails_open(self):
+    def test_exception_fails_closed(self):
         eng = self._engine()
         with patch("jarvis_presim.run_presim", side_effect=RuntimeError("boom")):
             direction, conf = eng._presim_gate("CALL", 75, 100.0, result={}, df=None, current_price=100.0)
-        self.assertEqual((direction, conf), ("CALL", 75))
+        self.assertEqual((direction, conf), (None, 75))
+        self.assertEqual(eng.presim_stats["errors"], 1)
 
     def test_env_zero_disables(self):
         os.environ["JARVIS_PRESIM"] = "0"

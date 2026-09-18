@@ -21,6 +21,8 @@ import pandas as pd
 from professional_display import ProfessionalSignalDisplay
 from jarvis_dashboard import UnifiedDashboard
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
+from jarvis_runtime import detect_backend, torch_device
+from jarvis_ollama_context import build_snapshot, decision_prompt, validate_decision
 pro_display = ProfessionalSignalDisplay()
 import warnings
 from collections import deque, defaultdict
@@ -164,10 +166,11 @@ except ImportError as _de:
 
 # Import Ollama Local AI Integration
 try:
-    from ollama_integration import call_ollama
+    from ollama_integration import call_ollama, runtime_metadata
     OLLAMA_INTEGRATION_AVAILABLE = True
 except ImportError:
     OLLAMA_INTEGRATION_AVAILABLE = False
+    runtime_metadata = lambda: {"available": False, "reason": "integration unavailable"}
     def call_ollama(prompt, model=None, timeout=120):
         return None, "ollama_integration module not found"
 
@@ -1055,6 +1058,9 @@ class LiveTradingEngine:
         self.jarvis = jarvis_system
         self.optimized_params = optimized_params or {}
         self.is_running = False
+        self.stop_event = threading.Event()
+        self.readiness = {"status": "STOPPED", "reason": "not started", "updated_at": datetime.now().isoformat()}
+        self._live_future = None
         self.trade_queue = Queue()
         # BUG FIX #5: These attributes used in can_trade() / record_trade() but were never initialized
         self.daily_trades = 0
@@ -1267,6 +1273,10 @@ class LiveTradingEngine:
                 'open_trades': len(self.paper_open_trades),
                 'pending': sum(1 for t in self.paper_open_trades if t.get('status') == 'PENDING_LIMIT'),
                 'uptime': uptime,
+                'gpu': getattr(self.jarvis, 'gpu_status', {'backend': 'unknown'}),
+                'readiness': dict(getattr(self, 'readiness', {'status': 'UNKNOWN'})),
+                'native_engines': getattr(self.jarvis, 'native_engine_status', {}),
+                'ai_suggestion': getattr(self.jarvis, 'last_ollama_decision', {'decision': 'unavailable'}),
             }
             self.dashboard.update(
                 timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -1302,12 +1312,12 @@ class LiveTradingEngine:
     # ═══════════════════════════════════════════════════════════════
     
     def _presim_gate(self, direction, confidence, entry_price, result=None, df=None, current_price=None, symbol='BTCUSDT'):
-        """Pre-Trade Simulator gate (fail-open).
+        """Run the pre-trade simulator and fail closed on safety uncertainty.
 
-        Runs jarvis_presim on a candidate ENTER signal. Returns
-        (direction, confidence): direction is set to None on veto (skip the
-        entry), confidence is adjusted (clamped ±10) on 'adjust'.
-        Any exception → returns inputs unchanged ('pass').
+        Returns ``(None, confidence)`` for a veto or simulator error. A
+        dashboard/bookkeeping failure is deliberately non-fatal and cannot
+        turn a committed veto into an allowed entry. Disable explicitly with
+        ``JARVIS_PRESIM=0`` when the operator accepts bypassing this gate.
         """
         try:
             if os.getenv('JARVIS_PRESIM', '1') == '0':
@@ -1324,23 +1334,42 @@ class LiveTradingEngine:
                 candles=df,
                 snapshot=market_ctx,
             )
-            self.presim_stats['checks'] += 1
+            self.presim_stats = getattr(self, 'presim_stats', {}) or {}
+            self.presim_stats['checks'] = self.presim_stats.get('checks', 0) + 1
             action = decision.get('action', 'pass')
             if action == 'veto':
-                self.presim_stats['vetoes'] += 1
-                self._dashboard_events.append(f"PreSim veto: {decision.get('reason', '')}")
+                # The safety decision is committed before optional dashboard
+                # bookkeeping. A missing/broken display must never turn veto
+                # into an allowed entry.
+                self.presim_stats['vetoes'] = self.presim_stats.get('vetoes', 0) + 1
+                event = f"PreSim veto: {decision.get('reason', '')}"
+                try:
+                    self._dashboard_events.append(event)
+                except Exception:
+                    logger.debug("[PRESIM] veto dashboard event unavailable")
                 logger.info(f"[PRESIM] VETO {direction}: {decision.get('reason', '')}")
                 return None, confidence
             if action == 'adjust':
-                self.presim_stats['adjustments'] += 1
+                self.presim_stats['adjustments'] = self.presim_stats.get('adjustments', 0) + 1
                 delta = max(-10, min(10, int(decision.get('confidence_delta', 0))))
                 confidence = max(0, min(100, confidence + delta))
-                self._dashboard_events.append(f"PreSim adjust {delta:+d}: {decision.get('reason', '')}")
+                try:
+                    self._dashboard_events.append(f"PreSim adjust {delta:+d}: {decision.get('reason', '')}")
+                except Exception:
+                    logger.debug("[PRESIM] adjust dashboard event unavailable")
                 logger.info(f"[PRESIM] ADJUST {delta:+d}: {decision.get('reason', '')}")
             return direction, confidence
         except Exception as e:
-            logger.debug(f"[PRESIM] gate error (fail-open → pass): {e}")
-            return direction, confidence
+            # The simulator is a safety gate. An unavailable/corrupt simulator
+            # must never silently authorize a candidate entry.
+            self.presim_stats = getattr(self, 'presim_stats', {}) or {}
+            self.presim_stats['errors'] = self.presim_stats.get('errors', 0) + 1
+            try:
+                self._dashboard_events.append(f"PreSim error: {type(e).__name__}; entry vetoed")
+            except Exception:
+                pass
+            logger.warning("[PRESIM] gate error; entry vetoed: %s", type(e).__name__)
+            return None, confidence
 
     def _scenario_gate(self, direction, entry_price=None, sl=None, tp=None, df=None, symbol='BTCUSDT'):
         """Pre-Trade Scenario Simulator gate (fail-open).
@@ -1881,12 +1910,50 @@ class LiveTradingEngine:
         except Exception:
             pass
 
+    def _set_readiness(self, status, reason=''):
+        self.readiness = {
+            'status': str(status).upper(),
+            'reason': str(reason)[:240],
+            'updated_at': datetime.now().isoformat(),
+        }
+
+    def stop_live_trading(self, timeout=None):
+        """Request a bounded, orderly stop without touching open positions."""
+        self.is_running = False
+        self.stop_event.set()
+        self._set_readiness('STOPPING', 'stop requested')
+        future = getattr(self, '_live_future', None)
+        if future is not None:
+            try:
+                future.result(timeout=float(timeout if timeout is not None else os.getenv('JARVIS_SHUTDOWN_TIMEOUT', '10')))
+            except Exception:
+                logger.warning('[LIVE] loop did not stop within bounded timeout')
+        try:
+            if getattr(self, 'executor', None):
+                self.executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        self._set_readiness('STOPPED', 'stopped; positions require independent reconciliation')
+        return dict(self.readiness)
+
     def start_live_trading(self):
-        """Start the live trading loop with Paper Trading + Live Signals"""
+        """Start live/paper analysis asynchronously with explicit readiness state."""
         import pandas as pd
         import time
-        
+
+        if self.is_running and self._live_future is not None and not self._live_future.done():
+            return {'status': 'running', 'mode': 'paper_trading_live', 'readiness': dict(self.readiness)}
+        self.stop_event.clear()
+        self._set_readiness('STARTING', 'awaiting a verified venue route and candle data')
         self.is_running = True
+        # Evaluate the kill-switch before spawning any worker. This makes the
+        # safety boundary deterministic and avoids a startup race with daemon
+        # services or an unavailable venue.
+        if os.getenv('JARVIS_KILL_SWITCH', '1') != '0' and os.path.exists('C:\\jarvis\\STOP_JARVIS'):
+            self.is_running = False
+            self._set_readiness('STOPPED', 'kill-switch file present')
+            logger.warning('[LIVE] startup blocked by kill-switch')
+            return {'status': 'stopped', 'mode': 'paper_trading_live', 'readiness': dict(self.readiness)}
         
         print(f"\n{'═' * 60}")
         print(f"  🚀 JARVIS LIVE ENGINE + PAPER TRADING")
@@ -1914,7 +1981,7 @@ class LiveTradingEngine:
         last_report_date = [datetime.now().date() - timedelta(days=1)] # Force report if time matches on startup
         
         def _live_loop():
-            while self.is_running:
+            while self.is_running and not self.stop_event.is_set():
                 try:
                     # --- KILL-SWITCH CHECK ---
                     if os.getenv("JARVIS_KILL_SWITCH", "1") != "0" and os.path.exists("C:\\jarvis\\STOP_JARVIS"):
@@ -2023,8 +2090,9 @@ class LiveTradingEngine:
                         )
                         route = self.market_router.select_crypto(has_open_position=has_position)
                         if route.status != 'READY':
+                            self._set_readiness('NOT_READY', f'venue route unavailable: {route.reason}')
                             logger.warning('[MARKET-ROUTER] Cycle blocked: %s', route.reason)
-                            time.sleep(5)
+                            time.sleep(float(os.getenv('JARVIS_ROUTE_RETRY_SECONDS', '5')))
                             continue
                     symbol = route.symbol if route else os.getenv('JARVIS_DEFAULT_SYMBOL', 'BTCUSDT')
                     base_asset = route.base_asset if route else 'BTC'
@@ -2055,6 +2123,7 @@ class LiveTradingEngine:
                             symbol=symbol, resolution="1m", limit=500
                         )
                         if candles:
+                            self._set_readiness('READY', f'verified route {symbol}; market data available')
                             df = pd.DataFrame(candles)
                             for col in ['open', 'high', 'low', 'close', 'volume']:
                                 if col in df.columns:
@@ -2216,7 +2285,7 @@ class LiveTradingEngine:
                         gate_reason='risk/venue gates passed' if 'direction' in locals() and direction in ('CALL', 'PUT') else 'no eligible entry',
                     )
                     self._dashboard_events = []
-                    time.sleep(60)  # Poll every 60 seconds (1 candle)
+                    time.sleep(float(os.getenv('JARVIS_POLL_SECONDS', '60')))  # Poll every candle
                     
                 except Exception as e:
                     logger.error(f"[LIVE] Trading loop error: {e}")
@@ -2226,9 +2295,12 @@ class LiveTradingEngine:
                     if hasattr(self.jarvis, 'bus') and self.jarvis.bus:
                         self.jarvis.bus.report_error('JarvisElite_LiveLoop', e, context='main _live_loop cycle', try_ollama=True)
                     time.sleep(30)
-        
-        self.executor.submit(_live_loop)
-        return {"status": "running", "mode": "paper_trading_live"}
+            self.is_running = False
+            if self.readiness.get('status') not in {'STOPPING', 'STOPPED'}:
+                self._set_readiness('STOPPED', 'loop exited')
+
+        self._live_future = self.executor.submit(_live_loop)
+        return {"status": "running", "mode": "paper_trading_live", "readiness": dict(self.readiness)}
 
     def can_trade(self):
         """Check if trading is allowed"""
@@ -4738,6 +4810,13 @@ class JarvisElite:
     def __init__(self, backtest_mode=False):
         """Backtests retain GPU analysis but block AI and live-data side effects."""
         self.is_backtest_mode = bool(backtest_mode)
+        # All native modules see one normalized device contract.  Telemetry
+        # records detection/fallback separately; no GPU availability is faked.
+        self.runtime = detect_backend()
+        self.device = torch_device(self.runtime)
+        self.gpu_status = self.runtime.to_dict()
+        self.last_ollama_decision = {"decision": "WAIT", "confidence": 0, "rationale": "not queried"}
+        self.last_ollama_snapshot = None
         self.scoring_matrix = TradeScoringMatrix()
         self.trade_manager = TradeManager()
         self.expiry_optimizer = TradeOptimizer()
@@ -4887,14 +4966,40 @@ class JarvisElite:
 
         # Initialize External GPU Engines
         self.engines = {}
-        if EXTERNAL_ENGINES_AVAILABLE:
+        self.native_engine_status = {}
+        if EXTERNAL_ENGINES_AVAILABLE and self.runtime.torch_available:
             try:
                 logger.info("🚀 Initializing External GPU Engines...")
-                self.engines['institutional'] = InstitutionalTradingEngineGPU(self)
-                self.engines['neural'] = NeuralNetworkManager(self)
-                self.engines['fusion'] = GPUEnhancedFusionEngine(self.parts)
-                self.engines['confidence'] = GPUUnifiedConfidenceEngine()
-                self.engines['pattern'] = EnhancedGPUPatternRecognitionEngine()
+                self.native_engine_status = {}
+                def _native(name, factory):
+                    try:
+                        engine = factory()
+                        # Normalize post-construction contracts where engines
+                        # expose a device field; never overwrite a valid custom
+                        # backend with a string.
+                        try:
+                            if hasattr(engine, 'device'):
+                                engine.device = self.device
+                        except Exception:
+                            pass
+                        self.native_engine_status[name] = {"status": "ready", "backend": self.runtime.backend}
+                        return engine
+                    except Exception as exc:
+                        # Isolate one incompatible native constructor instead of
+                        # hiding the cause behind a batch failure (e.g. string
+                        # device values used where torch.device was required).
+                        self.native_engine_status[name] = {
+                            "status": "fallback", "backend": "cpu",
+                            "error": f"{type(exc).__name__}: {str(exc)[:160]}"
+                        }
+                        logger.warning("[GPU] %s unavailable; CPU/fallback path: %s", name, self.native_engine_status[name]['error'])
+                        return None
+                self.engines['institutional'] = _native('institutional', lambda: InstitutionalTradingEngineGPU(self))
+                self.engines['neural'] = _native('neural', lambda: NeuralNetworkManager(self))
+                self.engines['fusion'] = _native('fusion', lambda: GPUEnhancedFusionEngine(self.parts))
+                self.engines['confidence'] = _native('confidence', lambda: GPUUnifiedConfidenceEngine())
+                self.engines['pattern'] = _native('pattern', lambda: EnhancedGPUPatternRecognitionEngine())
+                self.engines = {name: engine for name, engine in self.engines.items() if engine is not None}
                 if not self.is_backtest_mode:
                     try:
                         from part7_FIXED import EnhancedGPULiveDataEngine
@@ -4987,7 +5092,18 @@ class JarvisElite:
                 # ----------------------------------------
                 
             except Exception as e:
-                logger.error(f"❌ Failed to initialize external engines: {e}") 
+                logger.error(f"❌ Failed to initialize external engines: {e}")
+        elif EXTERNAL_ENGINES_AVAILABLE:
+            # Optional modules may import a lightweight torch shim when
+            # PyTorch is absent. Do not construct those modules: their
+            # ``device`` values can be strings while native code expects
+            # ``torch.device.type``. Record an explicit CPU fallback instead
+            # of emitting an opaque startup exception.
+            for _name in ('institutional', 'neural', 'fusion', 'confidence', 'pattern'):
+                self.native_engine_status[_name] = {
+                    'status': 'fallback', 'backend': 'cpu',
+                    'error': 'PyTorch unavailable; native engine not constructed',
+                }
 
 
     
@@ -5725,7 +5841,8 @@ class JarvisElite:
                     # Never let the advisory perspective break the decision flow
                     logger.debug(f"🌐 CROSS-EXCHANGE skipped (error): {xe}")
 
-            # 3D. Pattern Recognition confluence (was computed but never read)            pattern_mtf = self.market_context.get('pattern_mtf', {})
+            # 3D. Pattern Recognition confluence (computed above; always define the branch value)
+            pattern_mtf = self.market_context.get('pattern_mtf', {}) or {}
             if pattern_mtf and isinstance(pattern_mtf, dict):
                 pattern_tf_count = len(pattern_mtf)
                 if pattern_tf_count >= 3:
@@ -6078,9 +6195,33 @@ class JarvisElite:
                 return session
         return 'OVERNIGHT'
         
-    def _generate_ollama_ceo_prompt(self, score: float, detailed_scores: Dict, telemetry: Dict = None) -> str:
-        """Generate Ollama prompt for Supreme Commander AI (CEO) Master Verdict"""
+    def _generate_ollama_ceo_prompt(self, score: float, detailed_scores: Dict, telemetry: Dict = None, data=None) -> str:
+        """Generate a bounded Ollama prompt from one same-symbol system snapshot."""
         thoughts = detailed_scores.get('thoughts', [])
+        try:
+            current_price = float(data['close'].iloc[-1]) if data is not None and len(data) else None
+        except Exception:
+            current_price = None
+        self.last_ollama_snapshot = build_snapshot(
+            symbol=getattr(self, 'active_symbol', os.getenv('JARVIS_DEFAULT_SYMBOL', 'UNKNOWN')),
+            timestamp=(self.market_context or {}).get('timestamp'),
+            current_price=current_price,
+            market_context=getattr(self, 'market_context', {}),
+            part_results=getattr(self, 'latest_part_results', {}),
+            fusion=detailed_scores.get('fusion_mtf'),
+            confidence=score,
+            mtf=detailed_scores.get('mtf_matrix'),
+            options=detailed_scores.get('options_walls'),
+            risk=getattr(self, 'gpu_status', {}),
+            position_state=getattr(self, 'position_manager', None).__dict__ if getattr(self, 'position_manager', None) else None,
+            order_state={'live_execution_enabled': os.getenv('DELTA_ORDER_EXECUTION_ENABLED', 'false').lower() == 'true'},
+            runtime={'local': getattr(self, 'gpu_status', {}), 'ollama_remote': runtime_metadata()},
+            safety_gates=detailed_scores.get('safety_gates', []),
+        )
+        # The bounded schema is the canonical prompt. Do not append legacy
+        # free-form telemetry or hidden instructions that could reintroduce
+        # mixed symbols, secrets, or uncontrolled context volume.
+        return decision_prompt(self.last_ollama_snapshot)
         mtf_matrix = detailed_scores.get('mtf_matrix', {})
         walls = detailed_scores.get('options_walls', {})
 
@@ -6136,35 +6277,38 @@ Respond with EXACTLY ONE of the following tags at the beginning of your response
 
 Follow the tag with a 1-sentence CEO executive directive.
 """
+        # Keep the legacy executive framing for compatibility, but append the
+        # bounded schema as the sole source of detailed context.
+        prompt += "\n\nBOUNDED SYSTEM SNAPSHOT (no secrets; safety rules remain authoritative):\n"
+        prompt += json.dumps(self.last_ollama_snapshot, separators=(',', ':'), default=str)
         return prompt
 
 
     def _get_deepseek_validation(self, data, score, detailed_scores, telemetry=None):
         """Get AI validation for trade setup using local Supreme Commander AI (CEO) via Ollama"""
         try:
-            prompt = self._generate_ollama_ceo_prompt(score, detailed_scores, telemetry)
+            prompt = self._generate_ollama_ceo_prompt(score, detailed_scores, telemetry, data=data)
             response, err = call_ollama(prompt, timeout=120)
-            
             if response and not err:
                 raw_text = response.strip()
-                if "[CEO_VERDICT: EXECUTE]" in raw_text.upper() or "EXECUTE" in raw_text.upper():
-                    verdict = "EXECUTE"
-                    approved = True
-                elif "[CEO_VERDICT: ABORT]" in raw_text.upper() or "ABORT" in raw_text.upper():
-                    verdict = "ABORT"
-                    approved = False
-                else:
-                    verdict = "STANDBY"
-                    approved = False
-
-                print(f"[JARVIS SUPREME COMMANDER] Verdict: [{verdict}] | {raw_text}")
-                return {'approved': approved, 'reason': raw_text, 'verdict': verdict}
-            else:
-                print(f"[JARVIS SUPREME COMMANDER] Ollama CEO skipped or unavailable: {err}")
-                return {'approved': True, 'reason': 'Supreme Commander AI offline, proceeding with local logic', 'verdict': 'BYPASS'}
+                parsed, parse_err = validate_decision(raw_text)
+                if parsed is not None:
+                    self.last_ollama_decision = parsed
+                    approved = parsed['decision'] in {'BUY', 'SELL'} and parsed['confidence'] >= 50
+                    return {'approved': approved, 'reason': parsed['rationale'],
+                            'verdict': parsed['decision'], 'suggestion': parsed}
+                # Legacy tag output remains advisory but cannot bypass validation.
+                upper = raw_text.upper()
+                verdict = 'EXECUTE' if '[CEO_VERDICT: EXECUTE]' in upper else ('ABORT' if '[CEO_VERDICT: ABORT]' in upper else 'STANDBY')
+                self.last_ollama_decision = {'decision': 'WAIT', 'confidence': 0, 'rationale': parse_err or 'invalid Ollama response'}
+                return {'approved': False, 'reason': 'Invalid Ollama response; fail closed', 'verdict': verdict}
+            self.last_ollama_decision = {'decision': 'WAIT', 'confidence': 0, 'rationale': err or 'Ollama unavailable'}
+            logger.warning("[OLLAMA] AI-required validation unavailable; entry vetoed: %s", err)
+            return {'approved': False, 'reason': 'Ollama unavailable; AI-required workflow fails closed', 'verdict': 'WAIT'}
         except Exception as e:
-            logger.error(f"Supreme Commander AI validation error: {e}")
-            return {'approved': True, 'reason': f"Validation error: {e}", 'verdict': 'ERROR'}
+            logger.error(f"Supreme Commander AI validation error: {type(e).__name__}")
+            self.last_ollama_decision = {'decision': 'WAIT', 'confidence': 0, 'rationale': 'validation error'}
+            return {'approved': False, 'reason': 'AI validation error; fail closed', 'verdict': 'WAIT'}
             
     def _create_deepseek_prompt(self, data, score, detailed_scores, telemetry=None):
         """Create prompt for DeepSeek ASI synthesis with Universal MTF and Sensory Telemetry"""
@@ -6790,8 +6934,13 @@ Follow the tag with a 1-sentence CEO executive directive.
 class Jarvis4EngineSystem:
     """MASTER CONTROLLER - All 4 engines with trade integration"""
     
-    def __init__(self):
-        self.jarvis = JarvisElite()  # Use trade-enhanced Jarvis
+    def __init__(self, backtest_mode=None):
+        # One authoritative mode reaches the active coordinator.  An explicit
+        # argument wins; otherwise JARVIS_BACKTEST_MODE is respected.
+        if backtest_mode is None:
+            backtest_mode = os.environ.get('JARVIS_BACKTEST_MODE', '0') == '1'
+        self.backtest_mode = bool(backtest_mode)
+        self.jarvis = JarvisElite(backtest_mode=self.backtest_mode)
         self.backtest_engine = AutoBacktestEngine(self.jarvis)
         self.training_engine = AutoTrainingEngine(self.jarvis)
         self.optimizer_engine = AutoOptimizerEngine(self.jarvis)
@@ -6853,10 +7002,14 @@ class Jarvis4EngineSystem:
             logger.info("⚡ BACKTEST & TRAINING: SKIPPED (Direct Live Mode)")
             logger.info("   (To run backtest, set env var: JARVIS_RUN_BACKTEST=1)")
         
-        # Step 4️⃣: LIVE TRADING ENGINE - Always runs
-        logger.info("🔹 LIVE TRADING ENGINE: STARTING NOW 🚀")
-        self.live_engine = LiveTradingEngine(self.jarvis, self.optimized_params)
-        live_status = self.live_engine.start_live_trading()
+        # Step 4️⃣: Live engine is never started by a historical replay.
+        if self.backtest_mode:
+            logger.info("🔹 LIVE TRADING ENGINE: SKIPPED (backtest mode)")
+            live_status = {"status": "skipped", "mode": "backtest"}
+        else:
+            logger.info("🔹 LIVE TRADING ENGINE: STARTING NOW 🚀")
+            self.live_engine = LiveTradingEngine(self.jarvis, self.optimized_params)
+            live_status = self.live_engine.start_live_trading()
         
         # Final summary
         self._print_final_summary()

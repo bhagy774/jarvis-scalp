@@ -635,9 +635,31 @@ class DeltaExchangeData:
                 continue
             # If long (size > 0) → sell to close. If short → buy to close.
             close_side = "sell" if raw_size > 0 else "buy"
-            res = self.place_order(symbol, close_side, size, order_type="market")
-            results.append(res)
-            logger.warning(f"[EMERGENCY] Closed {size}x {symbol}: {res}")
+            # Emergency close shares the same process-local ownership guard as
+            # normal monitors. A timeout remains claimed until an operator or
+            # reconciliation confirms that the venue position is flat.
+            try:
+                from jarvis_close_coordinator import claim_close, release_close, reconcile_close
+                position_id = pos.get("id") or pos.get("position_id") or "position"
+                if not claim_close(symbol, position_id, owner="DeltaEmergencyClose"):
+                    results.append({"success": False, "error": "close already claimed"})
+                    continue
+                client_id = f"jarvis-emergency-close-{symbol}-{position_id}"[:64]
+                res = self.place_order(symbol, close_side, size, order_type="market",
+                                       reduce_only=True, client_order_id=client_id)
+                if isinstance(res, dict) and res.get("success"):
+                    release_close(symbol, position_id)
+                else:
+                    recon = reconcile_close(self, symbol, close_side, size)
+                    if recon.get("confirmed"):
+                        release_close(symbol, position_id)
+                    elif isinstance(res, dict):
+                        res = dict(res, error="close unconfirmed; operator reconciliation required",
+                                   reconciliation=recon)
+                results.append(res)
+                logger.warning(f"[EMERGENCY] Closed {size}x {symbol}: {res}")
+            except Exception as exc:
+                results.append({"success": False, "error": f"close unconfirmed: {type(exc).__name__}"})
         return results
 
     def _resolve_product(self, symbol: str) -> Optional[Dict]:
@@ -734,12 +756,14 @@ class DeltaExchangeData:
             logger.error(f"[RISK] Failed to set leverage: {res.get('error')}")
             return False
 
-    def place_order(self, symbol: str, side: str, size: int, order_type: str = "market", limit_price: float = 0) -> Dict:
+    def place_order(self, symbol: str, side: str, size: int, order_type: str = "market", limit_price: float = 0,
+                    reduce_only: bool = False, client_order_id: str = None) -> Dict:
         """
         Execute Trade (Live or Paper).
-        side: "buy" or "sell"
-        size: number of contracts
-        order_type: "market", "limit", "market_order", or "limit_order" — all handled
+
+        Delta supports ``reduce_only`` and ``client_order_id`` on order payloads.
+        Close paths must set both so a retry cannot intentionally reverse a
+        position and the venue can deduplicate a stable close identity.
         """
         # An explicit process-level opt-in is required even on testnet.  This
         # prevents a caller or configuration mistake from turning analysis into
@@ -784,8 +808,14 @@ class DeltaExchangeData:
 
         if ot == "limit" and limit_price > 0:
             payload["limit_price"] = str(limit_price)
+        if reduce_only:
+            payload["reduce_only"] = True
+        if client_order_id:
+            client_order_id = str(client_order_id).strip()[:64]
+            if client_order_id:
+                payload["client_order_id"] = client_order_id
 
-        logger.warning(f"[EXECUTION] Placing {side.upper()} {final_type} for {size} {symbol}...")
+        logger.warning(f"[EXECUTION] Placing {side.upper()} {final_type} for {size} {symbol} (reduce_only={bool(reduce_only)})...")
         res = self._request("POST", "/v2/orders", payload, authorized=True)
 
         if res["success"]:
@@ -823,6 +853,12 @@ class DeltaExchangeData:
         """Place a limit order (wrapper for place_order)"""
         return self.place_order(symbol, side, quantity, order_type="limit_order", limit_price=price)
     
+    def get_order(self, order_id: str) -> Dict:
+        """Read one order for operator reconciliation; never retries or mutates."""
+        if not order_id:
+            return {"success": False, "error": "Invalid order id"}
+        return self._request("GET", f"/v2/orders/{str(order_id)}", authorized=True)
+
     def cancel_order(self, order_id: str) -> Dict:
         """Cancel an open order"""
         payload = {"id": order_id}
