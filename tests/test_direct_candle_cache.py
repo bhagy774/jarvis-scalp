@@ -124,6 +124,19 @@ def test_instrument_mismatch_fails_closed():
         DirectCandleCache(Mismatched(clock), clock=clock).refresh("ETHUSDT")
 
 
+def test_unsupported_and_stale_data_fail_closed():
+    clock = FakeClock(1_700_000_000)
+    cache = DirectCandleCache(FakeClient(clock), clock=clock)
+    with pytest.raises(CandleDataError):
+        cache._normalize("ETHUSDT", "7m", [], "binance", "ETHUSDT", clock.value)
+
+    def stale(rows, tf):
+        seconds = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400}[tf]
+        return [dict(row, time=row["time"] - 2 * seconds) for row in rows]
+    with pytest.raises(CandleDataError):
+        DirectCandleCache(FakeClient(clock, stale), clock=clock).refresh("ETHUSDT")
+
+
 def test_no_resampling_is_used():
     clock = FakeClock(1_700_000_000)
     client = FakeClient(clock)
