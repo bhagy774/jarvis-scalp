@@ -640,6 +640,7 @@ class DeltaExchangeData:
             if product_id is None:
                 logger.error("[DELTA API] Product ID not found for requested positions")
                 return []
+            resolved_symbol = product.get("symbol", symbol)
             try:
                 pid = int(product_id)
             except (TypeError, ValueError):
