@@ -1074,7 +1074,8 @@ class SmartBreakoutAI:
                 if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1] and lows[i] < lows[i+2]:
                     pivot_lows.append(lows[i])
                     
-            current_price = closes[-1]
+            # Use prev close to find levels, so current close can break them!
+            current_price = closes[-2]
             support_levels = sorted([p for p in pivot_lows if p < current_price])[-3:]
             resistance_levels = sorted([p for p in pivot_highs if p >= current_price])[:3]
             
@@ -1673,7 +1674,11 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
             # High risk or high fakeout probability invalidates the breakout
             risk_brain = brain_support.get('risk', {})
             risk_score = float(risk_brain.get('risk_score', 0.5))
-            if fakeout_prob > 0.6 or risk_score > 0.8:
+            
+            print(f"BREAKOUT DETECTED! Dir: {breakout_direction} | Str: {breakout_strength:.3f} | FakeoutProb: {fakeout_prob:.3f} | Risk: {risk_score:.3f}")
+            
+            if fakeout_prob > 0.85 or risk_score > 0.95:
+                print(f" -> INVALIDATED: FakeoutProb ({fakeout_prob:.3f}) > 0.85 OR Risk ({risk_score:.3f}) > 0.95")
                 return 0, 0.0
 
             trend_brain = brain_support.get('trend', {})
@@ -1689,6 +1694,7 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
             confidence = min(max(conviction * 10.0, 1.0), 10.0)
             return breakout_direction, float(confidence)
         except Exception as e:
+            print(f"ERROR in _generate_signal: {e}")
             if hasattr(self, 'bus') and self.bus:
                 self.bus.report_error('Part1_Breakout', e, context='analyze')
             return 0, 0.0

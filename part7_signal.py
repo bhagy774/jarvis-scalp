@@ -82,7 +82,7 @@ def _validate_frame(data: Any, symbol: str, timeframe: str, context: Mapping[str
     frame_symbol = _symbol(data.attrs.get("symbol"))
     if not context.get("is_backtest_mode", False) and not expected_symbol:
         return _blocked(symbol, timeframe, "invalid", "Part7 selected symbol missing", "invalid")
-    if expected_symbol and not frame_symbol and not context.get("is_backtest_mode", False):
+    if expected_symbol and not frame_symbol and not context.get("is_backtest_mode", False) and not context.get("allow_missing_frame_symbol", False):
         return _blocked(symbol, timeframe, "symbol_mismatch", "Part7 data symbol identity missing", "invalid")
     if expected_symbol and frame_symbol and expected_symbol != frame_symbol:
         return _blocked(symbol, timeframe, "symbol_mismatch", f"Part7 data symbol mismatch: {frame_symbol} != {expected_symbol}", "invalid")
@@ -92,7 +92,9 @@ def _validate_frame(data: Any, symbol: str, timeframe: str, context: Mapping[str
         return _blocked(symbol, timeframe, "invalid", f"Part7 data invalid: insufficient candles ({len(data)} < 30)", "invalid")
     try:
         numeric = data.loc[:, _REQUIRED_COLUMNS].apply(pd.to_numeric, errors="coerce")
-        finite = numeric.applymap(math.isfinite)
+        # pandas >= 2.1 deprecated applymap in favour of map
+        _applymap = getattr(numeric, "map", None) or getattr(numeric, "applymap", None)
+        finite = _applymap(math.isfinite)
         if numeric.isna().any().any() or not finite.all().all():
             return _blocked(symbol, timeframe, "invalid", "Part7 data invalid: non-finite OHLCV", "invalid")
         if (numeric[["open", "high", "low", "close"]] <= 0).any().any():

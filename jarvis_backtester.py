@@ -207,8 +207,7 @@ class BacktestPosition:
             return "SL HIT", self.sl_price
         if tp_hit:
             return "TP HIT", self.tp_price
-        if dt >= self.expiry_time:
-            return "EXPIRY", close
+        # Time expiry removed per user request: only close on SL/TP
         return None
 
     def close(self, raw_exit_price: float, exit_time: datetime, reason: str) -> float:
@@ -428,7 +427,8 @@ class JarvisFullBacktester:
             self.equity_curve.append({"time": dt.isoformat(), "balance": self.balance,
                                       "price": float(candle["close"]), "open": len(self.gate.open_positions),
                                       "trades": len(self.all_trades)})
-            ws = max(0, i - 500)
+            # Provide 5000 candles to allow 1h and 4h MTF generation (needs >20 candles)
+            ws = max(0, i - 5000)
             df_win = df.iloc[ws:i].copy()  # excludes candle i: no signal lookahead
             try:
                 result = brain.analyze_trade_setup(df_win)

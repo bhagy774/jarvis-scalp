@@ -1518,22 +1518,38 @@ class ConfidenceEngineGPU:
         else:
             return {"confidence": 10, "thought": "Invalid input to ConfidenceEngine"}
 
-        w_buy, w_sell = 0.0, 0.0
-        buy_engines, sell_engines = [], []
+        w_buy, w_sell, w_neutral = 0.0, 0.0, 0.0
+        total_weight_den = 0.0
+        buy_engines, sell_engines, neutral_engines = [], [], []
         p2_thought = ""
 
         for name, r in items:
             if not isinstance(r, dict):
                 continue
             sig = r.get('signal', 0)
+            thought = str(r.get('thought', '')).lower()
             try:
                 sig = float(sig)
             except (ValueError, TypeError):
                 continue
+                
+            # Skip offline or errored engines
+            if any(k in thought for k in ["error", "offline", "fallback", "missing"]):
+                continue
+
+            # MTF Penalty: If signal is 1m noise (MTF: 1/4), treat it as Neutral (chop)
+            import re
+            mtf_match = re.search(r'mtf: (\d)/4', thought)
+            if mtf_match and sig != 0:
+                mtf_agree = int(mtf_match.group(1))
+                if mtf_agree < 2:
+                    sig = 0  # Force to Neutral because higher timeframes don't support it
 
             w = self.weights.get(name, 1.0)
-            if 'zone' in name or 'support' in str(r.get('thought', '')).lower() or 'resistance' in str(r.get('thought', '')).lower():
-                p2_thought = str(r.get('thought', '')).lower()
+            total_weight_den += w  # FULL weight goes to denominator regardless of signal strength
+            
+            if 'zone' in name or 'support' in thought or 'resistance' in thought:
+                p2_thought = thought
 
             if sig > 0:
                 w_buy += w * sig
@@ -1541,6 +1557,9 @@ class ConfidenceEngineGPU:
             elif sig < 0:
                 w_sell += w * abs(sig)
                 sell_engines.append(name)
+            else:
+                w_neutral += w
+                neutral_engines.append(name)
 
         if len(buy_engines) == 0 and len(sell_engines) == 0:
             return {
@@ -1561,7 +1580,7 @@ class ConfidenceEngineGPU:
             agree_engines, dissent_engines = sell_engines, buy_engines
 
         agree_count = len(agree_engines)
-        w_active = w_agree + w_dissent
+        w_active = total_weight_den
 
         # 1. Quorum check: If fewer than 3 engines or low weight, cap confidence low
         if agree_count < 3 or w_active < 3.5:

@@ -1076,28 +1076,49 @@ class SignalFusionEngineGPU:
 
         weighted_buy = 0.0
         weighted_sell = 0.0
+        weighted_neutral = 0.0
+        total_weight_den = 0.0
         active_buy_engines = []
         active_sell_engines = []
+        active_neutral_engines = []
 
         for name, r in results_dict.items():
             if not isinstance(r, dict):
                 continue
             sig = r.get('signal', 0)
+            thought = str(r.get('thought', '')).lower()
             try:
                 sig = float(sig)
             except (ValueError, TypeError):
                 continue
+                
+            # Skip offline or errored engines so they don't dilute confidence
+            if any(k in thought for k in ["error", "offline", "fallback", "missing"]):
+                continue
+
+            # MTF Penalty: If signal is 1m noise (MTF: 1/4), treat it as Neutral (chop)
+            import re
+            mtf_match = re.search(r'mtf: (\d)/4', thought)
+            if mtf_match and sig != 0:
+                mtf_agree = int(mtf_match.group(1))
+                if mtf_agree < 2:
+                    sig = 0  # Force to Neutral because higher timeframes don't support it
 
             w = self.weights.get(name, 1.0)
+            total_weight_den += w  # FULL weight goes to denominator regardless of signal strength
+            
             if sig > 0:
                 weighted_buy += w * sig
                 active_buy_engines.append(name)
             elif sig < 0:
                 weighted_sell += w * abs(sig)
                 active_sell_engines.append(name)
+            else:
+                weighted_neutral += w
+                active_neutral_engines.append(name)
 
-        total_weight = weighted_buy + weighted_sell
-        total_active_engines = len(active_buy_engines) + len(active_sell_engines)
+        total_weight = total_weight_den
+        total_active_engines = len(active_buy_engines) + len(active_sell_engines) + len(active_neutral_engines)
 
         # 1. Quorum & Confluence Threshold: Require at least 3 active engines & 3.5 total weight
         if total_active_engines < self.min_active_engines or total_weight < self.min_weighted_score:

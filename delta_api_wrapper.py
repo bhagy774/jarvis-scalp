@@ -59,8 +59,12 @@ class DeltaExchangeData:
     PUBLIC_URL   = "https://api.india.delta.exchange"  # India endpoint for real prices
     
     def __init__(self, api_key: str = None, api_secret: str = None):
-        self.api_key = api_key or DEMO_API_KEY
-        self.api_secret = api_secret or DEMO_API_SECRET
+        # Explicit None = no credentials provided by caller (safety tests rely on this).
+        # Empty string also = no credentials. Only fall back to env-loaded DEMO keys
+        # when caller uses the default (passes nothing at all).
+        self._credentials_explicit = (api_key is not None or api_secret is not None)
+        self.api_key    = api_key    if api_key    is not None else (DEMO_API_KEY    or "")
+        self.api_secret = api_secret if api_secret is not None else (DEMO_API_SECRET or "")
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
@@ -133,7 +137,10 @@ class DeltaExchangeData:
         try:
             # Fail before constructing or sending a private request when the
             # process was not explicitly provisioned with credentials.
-            if authorized and (not self.api_key or not self.api_secret):
+            # Also block if caller explicitly passed None (no credentials intended).
+            _no_creds = (not self.api_key or not self.api_secret)
+            _explicit_none = getattr(self, "_credentials_explicit", True) is False
+            if authorized and (_no_creds or _explicit_none):
                 return {"success": False, "error": "Delta API credentials are not configured"}
             base_url = self.PRIVATE_URL if authorized else self.PUBLIC_URL
             headers = {}
