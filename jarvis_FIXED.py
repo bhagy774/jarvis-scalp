@@ -1422,6 +1422,36 @@ class LiveTradingEngine:
             logger.debug(f"[SCENARIO] gate error (fail-open → pass): {e}")
             return direction
 
+    def _scenario_gate(self, direction, entry_price=None, sl=None, tp=None, df=None, symbol='BTCUSDT'):
+        """Pre-Trade Scenario Simulator gate (fail-open).
+
+        Runs jarvis_scenario_simulator on a candidate ENTER signal. Returns
+        direction — set to 'NO_TRADE' on veto (too many stress scenarios
+        fail). Any exception or disabled env → returns direction unchanged.
+        """
+        try:
+            if os.getenv('JARVIS_SCEN_SIM', '1') == '0':
+                return direction
+            from jarvis_scenario_simulator import run_scenarios
+            verdict = run_scenarios(
+                direction=direction,
+                entry_price=entry_price,
+                sl=sl, tp=tp,
+                df=df,
+                fee_bps=float(os.getenv('JARVIS_SCEN_FEE_BPS', '10')),
+                slippage_bps=float(os.getenv('JARVIS_SCEN_SLIPPAGE_BPS', '5')),
+            )
+            if verdict.get('action') == 'veto':
+                print(f"  🛡️ SCENARIO VETO: {verdict.get('passed')}/{verdict.get('total')} pass — {verdict.get('reason')}")
+                logger.info(f"[SCENARIO] VETO {direction} {symbol}: {verdict.get('reason')}")
+                return 'NO_TRADE'
+            if verdict.get('total'):
+                logger.info(f"[SCENARIO] PASS {verdict.get('passed')}/{verdict.get('total')} {direction} {symbol}")
+            return direction
+        except Exception as e:
+            logger.debug(f"[SCENARIO] gate error (fail-open → pass): {e}")
+            return direction
+
     def _open_paper_trade(self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl, current_price=None, symbol='BTCUSDT'):
         """Open a new paper trade"""
         if len(self.paper_open_trades) >= self.PAPER_CONFIG['max_open_trades']:
