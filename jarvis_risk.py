@@ -86,6 +86,91 @@ def derive_auto_leverage(
     }
 
 
+def contract_quote_value_usdt(product: Dict[str, Any], price: float) -> Optional[float]:
+    """Resolve one venue contract to quote-currency notional.
+
+    Delta product schemas have used several names over time.  We accept only
+    explicit, recognized quote/asset-unit metadata and return None otherwise;
+    live sizing must never assume one contract equals one USDT.
+    """
+    if not isinstance(product, dict):
+        return None
+    # Inverse/coin-margined contracts do not have a stable quote notional
+    # that this USDT risk model can safely represent.  Never reinterpret them
+    # as linear contracts merely because a contract_value field is present.
+    for key in ("contract_type", "notional_type", "margin_currency_type", "settlement_type"):
+        marker = str(product.get(key, "")).strip().lower().replace("-", "_")
+        if "inverse" in marker or "coin_margined" in marker or marker in {"coin", "base"}:
+            return None
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0:
+        return None
+    raw = None
+    value_key = None
+    for key in ("contract_value_usdt", "contract_value_quote", "contract_value", "contract_size", "notional_per_contract", "multiplier"):
+        if product.get(key) is not None:
+            raw = product.get(key)
+            value_key = key
+            break
+    if raw is None and isinstance(product.get("contract_unit"), dict):
+        unit_info = product["contract_unit"]
+        raw = unit_info.get("value", unit_info.get("size"))
+        unit = unit_info.get("currency", unit_info.get("unit"))
+    else:
+        # ``contract_unit_currency`` is the documented Delta field for base
+        # denominated contracts (for example BTCUSD contract_value=0.001,
+        # contract_unit_currency=BTC).  It must take precedence over a
+        # settlement asset: settlement currency alone does not identify the
+        # unit of contract_value.
+        unit = product.get(
+            "contract_value_currency",
+            product.get("contract_unit_currency", product.get(
+                "quote_currency", product.get("settlement_asset", product.get("contract_unit"))
+            )),
+        )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    if not unit and value_key in {"contract_value_usdt", "contract_value_quote"}:
+        unit = "USDT"
+    unit_text = str(unit or "").upper().strip()
+    if unit_text in {"USD", "USDT", "USDC", "QUOTE", "QUOTE_CURRENCY"}:
+        return value
+    if unit_text in {"BASE", "ASSET", "COIN"}:
+        # Generic labels are safe only when the product explicitly identifies
+        # itself as linear/base-unit; otherwise they are ambiguous.
+        base = str(product.get("base_asset", product.get("underlying_asset", ""))).upper().strip()
+        if not base:
+            symbol = str(product.get("symbol", "")).upper().replace("-", "").replace("_", "")
+            for quote in ("USDT", "USDC", "USD"):
+                if symbol.endswith(quote):
+                    base = symbol[:-len(quote)]
+                    break
+        if not base:
+            return None
+        return value * price
+    # For a documented base-unit currency, require that it matches the
+    # product's actual underlying asset.  This prevents a malformed fixture
+    # from converting an arbitrary unit at the selected price.
+    base = str(product.get("base_asset", product.get("underlying_asset", ""))).upper().strip()
+    if not base:
+        symbol = str(product.get("symbol", "")).upper().replace("-", "").replace("_", "")
+        for quote in ("USDT", "USDC", "USD"):
+            if symbol.endswith(quote):
+                base = symbol[:-len(quote)]
+                break
+    if base and unit_text == base:
+        return value * price
+    # A bare or unrelated unit is ambiguous: fail closed instead of guessing.
+    return None
+
+
 def calculate_trade_size(
     available_balance: float,
     confidence: int,
@@ -96,6 +181,8 @@ def calculate_trade_size(
     base_risk_pct: float = BASE_RISK_PCT,
     max_margin_pct: float = MAX_RISK_PCT,
     min_margin_usdt: float = MIN_MARGIN_USDT,
+    contract_value_usdt: Optional[float] = None,
+    require_contract_value: bool = False,
 ) -> Dict[str, Any]:
     """Return one consistent size/leverage decision for paper and live paths."""
     try:
@@ -116,23 +203,34 @@ def calculate_trade_size(
     risk_budget = min(balance * max(0.0, float(MAX_RISK_PCT)) * mult, max_trade_risk_usdt if max_trade_risk_usdt is not None else float("inf"))
     if risk_budget <= 0:
         return {"ok": False, "reason": "trade risk budget is zero", "contracts": 0, "leverage": 0}
+    try:
+        contract_value = float(contract_value_usdt) if contract_value_usdt is not None else 0.0
+    except (TypeError, ValueError):
+        contract_value = 0.0
+    if require_contract_value and contract_value <= 0:
+        return {"ok": False, "reason": "recognized contract value metadata is required", "contracts": 0, "leverage": 0}
+    if contract_value <= 0:
+        # Paper/backtest callers may explicitly use the historical one-unit
+        # convention, but live callers must set require_contract_value=True.
+        contract_value = 1.0
     lev = derive_auto_leverage(balance, margin, risk_budget, stop, product_max_leverage)
     if not lev.get("ok"):
         return {**lev, "contracts": 0, "margin_usdt": round(margin, 8), "confidence": conf, "multiplier": mult}
-    contracts = int(math.floor(lev["max_notional_usdt"]))
+    contracts = int(math.floor(lev["max_notional_usdt"] / contract_value))
     if contracts <= 0:
-        return {**lev, "ok": False, "reason": "risk budget cannot fund one whole contract", "contracts": 0, "confidence": conf, "multiplier": mult}
-    actual_notional = float(contracts)
+        return {**lev, "ok": False, "reason": "risk budget cannot fund one whole contract", "contracts": 0, "confidence": conf, "multiplier": mult, "contract_value_usdt": contract_value}
+    actual_notional = float(contracts) * contract_value
     actual_margin = min(margin, actual_notional / lev["leverage"])
     return {
         **lev,
         "ok": True,
         "contracts": contracts,
+        "contract_value_usdt": round(contract_value, 8),
         "notional_usdt": round(actual_notional, 8),
         "margin_usdt": round(actual_margin, 8),
         "balance": round(balance, 8),
         "confidence": conf,
         "multiplier": mult,
         "compound_used": round(compound, 8),
-        "sizing_note": f"balance=${balance:.4f}, margin=${actual_margin:.4f}, risk=${risk_budget:.4f}, leverage={lev['leverage']}x",
+        "sizing_note": f"balance=${balance:.4f}, margin=${actual_margin:.4f}, risk=${risk_budget:.4f}, exposure=${actual_notional:.4f}, contracts={contracts}, leverage={lev['leverage']}x",
     }

@@ -28,7 +28,12 @@ CHECK_INTERVAL_SECONDS = 60
 # How long before a heartbeat is considered stale.
 # Configurable via DOCTOR_STALE_THRESHOLD env var (default: 600s = 10 min).
 # Old default was 180s which caused false alerts when no trades were open.
-HEARTBEAT_STALE_SECONDS = int(os.environ.get("DOCTOR_STALE_THRESHOLD", "600"))
+try:
+    HEARTBEAT_STALE_SECONDS = int(os.environ.get("DOCTOR_STALE_THRESHOLD", "600"))
+    if HEARTBEAT_STALE_SECONDS <= 0:
+        raise ValueError("threshold must be positive")
+except (TypeError, ValueError):
+    HEARTBEAT_STALE_SECONDS = 600
 
 _state_lock = threading.Lock()
 _heartbeats: Dict[str, float] = {}

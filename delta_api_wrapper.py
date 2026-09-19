@@ -77,6 +77,21 @@ class DeltaExchangeData:
             self._binance = None
             logger.warning("[HYBRID] ⚠️  binance_data.py not found, using Delta for everything")
 
+    @staticmethod
+    def _perpetual_fallback_allowed() -> bool:
+        """Require an explicit opt-in before treating Bybit perps as spot data."""
+        return os.environ.get("JARVIS_ALLOW_PERPETUAL_FALLBACK", "0").lower() in {"1", "true", "yes"}
+
+    def _binance_spot_compatible(self) -> bool:
+        if not self._binance:
+            return False
+        try:
+            source = self._binance.get_last_source()
+            semantics = str(source.get("market_semantics", "")).lower()
+            return semantics == "spot" or self._perpetual_fallback_allowed()
+        except Exception:
+            return False
+
     def _generate_signature(self, method: str, path: str, payload: str = "") -> Dict[str, str]:
         """Generate HMAC SHA256 Signature for authenticated endpoints."""
         if not self.api_key or not self.api_secret:
@@ -190,8 +205,10 @@ class DeltaExchangeData:
         if self._binance:
             try:
                 price = self._binance.get_live_price(symbol)
-                if price > 100:
+                if price > 0 and self._binance_spot_compatible():
                     return price
+                if price > 0:
+                    logger.warning("[HYBRID] Rejecting non-spot fallback price for %s; set JARVIS_ALLOW_PERPETUAL_FALLBACK=1 only when explicitly compatible", symbol)
             except Exception as e:
                 logger.warning(f"[BINANCE PRICE] Failed: {e}")
 
@@ -218,7 +235,10 @@ class DeltaExchangeData:
         if self._binance:
             try:
                 ba = self._binance.get_bid_ask(symbol)
-                if ba["bid"] > 0:
+                if ba["bid"] > 0 and (
+                    str(ba.get("market_semantics", "spot")).lower() == "spot"
+                    or self._perpetual_fallback_allowed()
+                ):
                     return {
                         "buy": [{"price": str(ba["bid"]), "size": "1"}],
                         "sell": [{"price": str(ba["ask"]), "size": "1"}],
@@ -238,8 +258,14 @@ class DeltaExchangeData:
     def get_bid_ask(self, symbol: str = "BTCUSDT") -> Dict:
         """Convenience: Returns {bid, ask, spread} from Binance bookTicker."""
         if self._binance:
-            return self._binance.get_bid_ask(symbol)
-        return {"bid": self.get_live_price(symbol), "ask": self.get_live_price(symbol), "spread": 0.0}
+            result = self._binance.get_bid_ask(symbol)
+            if result.get("bid", 0) > 0 and (
+                str(result.get("market_semantics", "spot")).lower() == "spot"
+                or self._perpetual_fallback_allowed()
+            ):
+                return result
+        price = self.get_live_price(symbol)
+        return {"bid": price, "ask": price, "spread": 0.0, "source": "delta_or_unavailable", "market_semantics": "unknown"}
 
     # ==========================================
     # 2. HISTORICAL DATA (Replaces Binance)

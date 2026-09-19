@@ -58,7 +58,7 @@ class AutoRiskDashboardTests(unittest.TestCase):
 
     def test_leverage_rejection_blocks_order(self):
         import jarvis_live_trader
-        venue = VenueStub(metadata={"id": 1, "symbol": "BTCUSD"}, leverage_ok=False)
+        venue = VenueStub(metadata={"id": 1, "symbol": "BTCUSD", "contract_value": 1, "contract_value_currency": "USDT"}, leverage_ok=False)
         trader = jarvis_live_trader.JarvisAutoTrader(venue)
         trader.is_enabled = True
         result = trader._place_trade("CALL", 90, 100.0, "SCALP", {"do_hedge": False}, "BTCUSDT")

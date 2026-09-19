@@ -272,6 +272,13 @@ class PreSimWiringTests(unittest.TestCase):
         self.assertEqual((direction, conf), (None, 75))
         self.assertEqual(eng.presim_stats["errors"], 1)
 
+    def test_partial_wiring_cannot_bypass_veto(self):
+        eng = self._engine()
+        with patch("jarvis_presim.run_presim", return_value={"action": "veto", "confidence_delta": 0, "reason": "blocked"}):
+            direction, conf = eng._presim_gate("CALL", 80, 100.0, result={}, df=None, current_price=100.0)
+        self.assertIsNone(direction)
+        self.assertEqual(conf, 80)
+
     def test_env_zero_disables(self):
         os.environ["JARVIS_PRESIM"] = "0"
         eng = self._engine()

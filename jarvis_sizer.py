@@ -37,13 +37,17 @@ class JarvisSizer:
     def calculate_size(self, confidence: int, symbol: str = "BTCUSDT",
                        force_balance: float = None, stop_distance_pct: float = 0.002,
                        max_trade_risk_usdt: float = None,
-                       product_max_leverage: float = None) -> Dict:
+                       product_max_leverage: float = None,
+                       contract_value_usdt: float = None,
+                       require_contract_value: bool = False) -> Dict:
         balance = force_balance if force_balance is not None else self.get_live_balance()
         result = calculate_trade_size(
             balance, confidence, stop_distance_pct,
             max_trade_risk_usdt=max_trade_risk_usdt,
             compound_pool=self._compound_pool,
             product_max_leverage=product_max_leverage,
+            contract_value_usdt=contract_value_usdt,
+            require_contract_value=require_contract_value,
         )
         result.setdefault("balance", float(balance or 0))
         result.setdefault("symbol", symbol)
