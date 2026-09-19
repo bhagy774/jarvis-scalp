@@ -54,13 +54,19 @@ class OracleTradeGate:
     #  GATE CHECK: DIRECTION ALIGNMENT
     # ──────────────────────────────────────────────────────────
 
-    def is_trade_aligned(self, direction: str) -> Tuple[bool, str]:
+    def is_trade_aligned(self, direction: str, symbol: str = "BTCUSDT") -> Tuple[bool, str]:
         """
         Check if signal direction aligns with Oracle multi-timeframe forecast.
         Returns: (allowed: bool, reason: str)
         """
         if not self.enabled:
             return True, "Oracle gate disabled (bypassed)"
+        requested = str(symbol or "").upper().replace("-", "").replace("_", "")
+        requested_base = requested[:-4] if requested.endswith("USDT") else (requested[:-3] if requested.endswith("USD") else requested)
+        # Current oracle payload is explicitly BTC-only.  Never apply that
+        # forecast as an altcoin execution gate.
+        if requested_base and requested_base != "BTC":
+            return False, f"Oracle BTC macro forecast unavailable for selected asset {requested_base}"
 
         forecast = self.get_forecast()
         if not isinstance(direction, str) or direction.upper() not in ("CALL", "BUY", "LONG", "PUT", "SELL", "SHORT"):
@@ -103,13 +109,17 @@ class OracleTradeGate:
     #  GATE CHECK: ENTRY ZONE VERIFICATION
     # ──────────────────────────────────────────────────────────
 
-    def is_price_in_entry_zone(self, current_price: float) -> Tuple[bool, str]:
+    def is_price_in_entry_zone(self, current_price: float, symbol: str = "BTCUSDT") -> Tuple[bool, str]:
         """
         Verifies if current spot price is within Oracle's recommended entry zone.
         Returns: (in_zone: bool, reason: str)
         """
         if not self.enabled:
             return True, "Oracle gate disabled"
+        requested = str(symbol or "").upper().replace("-", "").replace("_", "")
+        requested_base = requested[:-4] if requested.endswith("USDT") else (requested[:-3] if requested.endswith("USD") else requested)
+        if requested_base and requested_base != "BTC":
+            return False, f"Oracle BTC entry zone unavailable for selected asset {requested_base}"
 
         try:
             current_price = float(current_price)

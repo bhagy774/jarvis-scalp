@@ -341,9 +341,9 @@ class JarvisPositionManager:
             return False
 
         pnl_pct = pos.current_pnl_pct(exit_price)
-        # Contracts represent notional under this repository's Delta convention;
-        # multiplying by leverage again double-counts exposure.
-        pnl_usdt = pnl_pct * pos.contracts
+        # P&L uses the recorded quote notional; one-contract == one-USDT is
+        # only the explicit paper compatibility default.
+        pnl_usdt = pnl_pct * pos.notional_usdt
         is_win = pnl_pct > 0
 
         pos.status = "CLOSED"

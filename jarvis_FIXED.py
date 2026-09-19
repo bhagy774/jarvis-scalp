@@ -1301,7 +1301,7 @@ class LiveTradingEngine:
                 reasons = [part7.get('reason', 'Part7 entry gate blocked')] + reasons
             self.dashboard.update(
                 timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                symbol=symbol or self.active_symbol,
+                symbol=(_decision.get('symbol') if _decision else None) or symbol or self.active_symbol,
                 price=f"${float(current_price):,.2f}" if current_price else '—',
                 signal={'direction': signal.get('direction', 'NO_TRADE'), 'confidence': signal.get('confidence_score', signal.get('confidence', 0))},
                 reasons=reasons or [result.get('no_trade_reason', 'Awaiting analysis')],
@@ -1344,6 +1344,11 @@ class LiveTradingEngine:
             if os.getenv('JARVIS_PRESIM', '1') == '0':
                 return direction, confidence
             from jarvis_presim import run_presim
+            # Partial test/recovery wiring may omit the optional event sink;
+            # initialize it locally so recording a veto cannot itself turn the
+            # gate into an implicit pass.
+            if not isinstance(getattr(self, '_dashboard_events', None), list):
+                self._dashboard_events = []
             market_ctx = (result or {}).get('market_context', {}) if isinstance(result, dict) else {}
             decision = run_presim(
                 signal={
@@ -5050,7 +5055,9 @@ class JarvisElite:
             '15min': []
         }
 
-        # Initialize External GPU Engines
+        # Initialize External GPU Engines only when explicitly permitted.  The
+        # heavy CPU/GPU adapters are advisory and must not make safe startup or
+        # an offline wiring check wait on model/accelerator initialization.
         self.engines = {}
         self.native_engine_status = {}
         if EXTERNAL_ENGINES_AVAILABLE and self.runtime.torch_available:

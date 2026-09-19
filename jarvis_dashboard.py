@@ -39,7 +39,8 @@ def render_dashboard(snapshot: Dict[str, Any], stream=None, clear: bool = False)
     events = list(s.get("events", []) or [])
     ts = _text(s.get("timestamp"), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     direction = _text(signal.get("direction"), "NO_TRADE")
-    confidence = _text(signal.get("confidence"), "0")
+    confidence = _text(signal.get("confidence"), "N/A")
+    confidence_label = confidence if str(confidence).upper() == "N/A" else f"{confidence}%"
     mode = _text(status.get("mode"), "PAPER")
     confidence_suffix = "%" if confidence not in ("N/A", "—", "unknown") else ""
     out = [
@@ -62,7 +63,7 @@ def render_dashboard(snapshot: Dict[str, Any], stream=None, clear: bool = False)
         _line("DELTA AVAILABLE", f"{_money(account.get('delta_available'))} ({_text(account.get('delta_status'), 'unavailable')})"),
         _line("PAPER BALANCE", _money(account.get("paper_balance"))),
         _line("RISK / MARGIN", f"risk {_money(account.get('trade_risk'))} | margin {_money(account.get('margin'))}"),
-        _line("EXPOSURE", f"{_text(account.get('contracts'), '0')} contracts | notional {_money(account.get('notional'))} | leverage {_text(account.get('leverage'), 'AUTO')}x"),
+        _line("EXPOSURE", f"{_text(account.get('contracts'), '0')} contracts @ {_money(account.get('contract_value_usdt'))} | notional {_money(account.get('notional'))} | leverage {_text(account.get('leverage'), 'AUTO')}x"),
         _line("CAPS", f"max leverage {_text(account.get('max_leverage_cap'))}x | max risk {_money(account.get('max_risk'))}"),
     ]
     if events:

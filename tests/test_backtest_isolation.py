@@ -47,14 +47,16 @@ def test_backtester_has_no_execution_client_or_order_submission_path():
 
 
 def test_brain_backtest_mode_keeps_core_engines_but_does_not_construct_live_sources():
-    assert "self.is_backtest_mode = bool(backtest_mode)" in BRAIN
+    assert "self.is_backtest_mode = bool(backtest_mode or env_backtest)" in BRAIN
     assert "self.deepseek_enabled = not self.is_backtest_mode" in BRAIN
     assert "# Initialize External GPU Engines" in BRAIN
     assert "if not self.is_backtest_mode:\n                    try:\n                        from part7_FIXED" in BRAIN
     assert "# Historical replay must not even construct a live data client." in BRAIN
     assert "# Historical replay has no asynchronous/live event bus." in BRAIN
     assert "if not self.is_backtest_mode and self.delta_data" in BRAIN
-    assert "if not self.is_backtest_mode and self.deribit" in BRAIN
+    # Deribit is allowed only for the selected BTC asset, never as an altcoin
+    # substitute during replay or execution.
+    assert "if selected_base == 'BTC' and not self.is_backtest_mode and self.deribit" in BRAIN
 
 
 def test_signal_window_excludes_entry_bar_and_entry_uses_next_open():
