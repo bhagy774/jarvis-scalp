@@ -1,0 +1,47 @@
+[package]
+name = "jarvis_rust"
+version = "0.1.0"
+edition = "2021"
+description = "JARVIS HFT Rust Speed Layer — Math Engine, Cache, WebSocket, Order Executor"
+authors = ["JARVIS Dev"]
+
+# Build as a Python extension module (cdylib)
+[lib]
+name = "jarvis_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+# PyO3: Python ↔ Rust bridge
+pyo3 = { version = "0.22", features = ["extension-module"] }
+
+# --- Module 2: Cache ---
+dashmap = "6"
+
+# --- Module 3: WebSocket ---
+tokio        = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# --- Module 4: Order Executor ---
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+hmac    = "0.12"
+sha2    = "0.10"
+hex     = "0.4"
+
+# Shared utils
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+once_cell   = "1"
+log         = "0.4"
+
+[profile.release]
+# Maximum performance for trading
+opt-level     = 3
+lto           = true        # Link-time optimization
+codegen-units = 1           # Single codegen unit for best inlining
+panic         = "abort"     # No unwind overhead
+strip         = true        # Strip debug symbols
+
+[features]
+default = []
+simd = []  # Enable for SIMD math (requires nightly or specific target)

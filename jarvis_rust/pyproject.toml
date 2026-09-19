@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "jarvis-rust"
+version = "0.1.0"
+description = "JARVIS HFT Rust Speed Layer"
+requires-python = ">=3.10"
+
+[tool.maturin]
+# The Python module name that will be importable
+module-name = "jarvis_rust"
+features = ["pyo3/extension-module"]
+# Build in release mode by default for production performance
+profile = "release"
