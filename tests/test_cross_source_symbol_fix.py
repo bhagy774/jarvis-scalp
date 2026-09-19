@@ -11,7 +11,7 @@ def test_cross_source_uses_active_base_asset():
     """Brain must request Binance price for the selected coin (e.g. SOLUSDT),
     not the hardcoded BTCUSDT default."""
     src = open(os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), 'jarvis_FIXED.py')).read()
+        os.path.abspath(__file__))), 'jarvis_FIXED.py'), encoding='utf-8').read()
     assert 'active_base_asset' in src, "brain must track active_base_asset"
     assert 'get_live_price(symbol=f"{_xs_base}USDT")' in src, (
         "cross-source check must fetch the selected coin's Binance price")
@@ -22,7 +22,7 @@ def test_cross_source_uses_active_base_asset():
 
 def test_loop_sets_active_symbol_on_brain():
     src = open(os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), 'jarvis_FIXED.py')).read()
+        os.path.abspath(__file__))), 'jarvis_FIXED.py'), encoding='utf-8').read()
     assert 'self.jarvis.active_symbol = symbol' in src
     assert 'self.jarvis.active_base_asset = base_asset' in src
 

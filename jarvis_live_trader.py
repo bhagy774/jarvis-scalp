@@ -52,13 +52,15 @@ def _box(msg, col=C): print(f"{col}  ▶  {RST}{msg}")
 # ══════════════════════════════════════════════════════════════════
 #  RISK CONFIGURATION  (override via .env)
 # ══════════════════════════════════════════════════════════════════
-from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
+from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP, contract_quote_value_usdt
 from jarvis_lot_limits import enforce_entry_lots
 try:
-    from jarvis_position_ownership import claim_position
+    from jarvis_position_ownership import claim_position, claim_close
 except ImportError:
     def claim_position(position_id, owner):
         return True  # fail-open fallback if module missing
+    def claim_close(position_id, owner):
+        return True, None  # fail-open fallback
 LEVERAGE_CAP        = MAX_LEVERAGE_CAP  # policy cap; not a user-selected leverage
 MAX_RISK_USDT       = float(os.environ.get("JARVIS_MAX_RISK_USDT", "10"))
 MAX_DAILY_LOSS_USDT = float(os.environ.get("JARVIS_MAX_DAILY_LOSS","30"))

@@ -169,6 +169,7 @@ class AuditRegressionTests(unittest.TestCase):
         clear_registry()
         venue = PaperVenue()
         auto = JarvisAutoTrader(venue)
+        auto.is_enabled = False  # paper mode: close must not reach venue
         manager = JarvisPositionManager(venue)
         auto_pos = {
             "id": "shared-1", "direction": "CALL", "symbol": "BTCUSDT",

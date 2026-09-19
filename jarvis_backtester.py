@@ -62,9 +62,6 @@ HISTORICAL_DATA_NOT_IN_OHLCV = (
     'order-book/tick trades', 'liquidations', 'dated cross-exchange snapshots',
 )
 
-    def __init__(self, source: Path):
-        self.source = source
-
 class HistoricalCandleLoader:
     """Read a local, immutable historical OHLCV export; never fetches a feed."""
 

@@ -4880,7 +4880,8 @@ class JarvisElite:
     
     def __init__(self, backtest_mode=False):
         """Backtests retain GPU analysis but block AI and live-data side effects."""
-        self.is_backtest_mode = bool(backtest_mode)
+        env_backtest = os.environ.get("JARVIS_BACKTEST_MODE", "").lower() in ("1", "true", "yes")
+        self.is_backtest_mode = bool(backtest_mode or env_backtest)
         # All native modules see one normalized device contract.  Telemetry
         # records detection/fallback separately; no GPU availability is faked.
         self.runtime = detect_backend()
@@ -5821,7 +5822,7 @@ class JarvisElite:
                     options_intel = intel_delta
                 except Exception:
                     intel_delta = None
-            if not self.is_backtest_mode and self.deribit and selected_base == 'BTC':
+            if selected_base == 'BTC' and not self.is_backtest_mode and self.deribit:
                 try:
                     current_price = float(data['close'].iloc[-1])
                     intel_deribit = self.deribit.get_institutional_bias(current_price)
