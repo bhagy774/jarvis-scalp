@@ -632,21 +632,22 @@ class DeltaExchangeData:
         than sending an unsupported ``symbol`` query parameter or making a
         broad positions request.
         """
-        params = None
         resolved_symbol = symbol
-        if symbol:
-            product = self._resolve_product(symbol)
-            if product is None:
+        if not symbol:
+            res = self._request("GET", "/v2/positions", None, authorized=True)
+        else:
+            product_id = self.get_product_id(symbol)
+            if product_id is None:
                 logger.error("[DELTA API] Product ID not found for requested positions")
                 return []
-            resolved_symbol = product.get("symbol", symbol)
             try:
-                params = {"product_id": int(product["id"])}
-            except (KeyError, TypeError, ValueError):
+                pid = int(product_id)
+            except (TypeError, ValueError):
                 logger.error("[DELTA API] Invalid product ID for requested positions")
                 return []
-
-        res = self._request("GET", "/v2/positions", params, authorized=True)
+            # Build signed URL with product_id as query param (Delta requirement)
+            endpoint_with_param = f"/v2/positions?product_id={pid}"
+            res = self._request("GET", endpoint_with_param, None, authorized=True)
         if res["success"]:
             try:
                 positions = res["data"].get("result", [])
