@@ -3,7 +3,6 @@
 ///
 /// All functions are callable from Python:
 ///   from jarvis_rust import calculate_rsi, calculate_ema, calculate_vwap, calculate_bollinger
-
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -34,6 +33,12 @@ fn validate_input(prices: &[f64], period: usize, fn_name: &str) -> PyResult<()> 
             prices.len()
         )));
     }
+    if prices.iter().any(|value| !value.is_finite()) {
+        return Err(PyValueError::new_err(format!(
+            "{}: prices must contain only finite values",
+            fn_name
+        )));
+    }
     Ok(())
 }
 
@@ -60,12 +65,18 @@ pub fn calculate_ema(prices: Vec<f64>, period: usize) -> PyResult<f64> {
 
     // Seed EMA with simple average of first `period` prices
     let seed: f64 = prices[..period].iter().sum::<f64>() / period as f64;
+    if !seed.is_finite() {
+        return Err(PyValueError::new_err("calculate_ema: result is not finite"));
+    }
 
     // Apply EMA formula over remaining prices
-    let ema = prices[period..].iter().fold(seed, |prev_ema, &price| {
-        price * k + prev_ema * (1.0 - k)
-    });
+    let ema = prices[period..]
+        .iter()
+        .fold(seed, |prev_ema, &price| price * k + prev_ema * (1.0 - k));
 
+    if !ema.is_finite() {
+        return Err(PyValueError::new_err("calculate_ema: result is not finite"));
+    }
     Ok(ema)
 }
 
@@ -84,7 +95,13 @@ pub fn calculate_ema(prices: Vec<f64>, period: usize) -> PyResult<f64> {
 /// Uses Wilder's smoothing (not simple EMA) — matches TradingView exactly.
 #[pyfunction]
 pub fn calculate_rsi(prices: Vec<f64>, period: usize) -> PyResult<f64> {
-    validate_input(&prices, period + 1, "calculate_rsi")?;
+    if period == 0 {
+        return Err(PyValueError::new_err("calculate_rsi: period must be > 0"));
+    }
+    let required_prices = period
+        .checked_add(1)
+        .ok_or_else(|| PyValueError::new_err("calculate_rsi: period is too large"))?;
+    validate_input(&prices, required_prices, "calculate_rsi")?;
 
     // Compute price changes
     let changes: Vec<f64> = prices.windows(2).map(|w| w[1] - w[0]).collect();
@@ -163,6 +180,22 @@ pub fn calculate_vwap(
             "calculate_vwap: high, low, close, volume must all have the same length",
         ));
     }
+    if high
+        .iter()
+        .chain(low.iter())
+        .chain(close.iter())
+        .chain(volume.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(PyValueError::new_err(
+            "calculate_vwap: all values must be finite",
+        ));
+    }
+    if volume.iter().any(|value| *value < 0.0) {
+        return Err(PyValueError::new_err(
+            "calculate_vwap: volume cannot be negative",
+        ));
+    }
 
     let mut cumulative_tpv = 0.0_f64; // Σ(typical_price × volume)
     let mut cumulative_vol = 0.0_f64; // Σ(volume)
@@ -179,7 +212,13 @@ pub fn calculate_vwap(
         ));
     }
 
-    Ok(cumulative_tpv / cumulative_vol)
+    let vwap = cumulative_tpv / cumulative_vol;
+    if !vwap.is_finite() {
+        return Err(PyValueError::new_err(
+            "calculate_vwap: result is not finite",
+        ));
+    }
+    Ok(vwap)
 }
 
 // ─────────────────────────────────────────────────────────
@@ -208,7 +247,7 @@ pub fn calculate_bollinger(
 ) -> PyResult<(f64, f64, f64)> {
     validate_input(&prices, period, "calculate_bollinger")?;
 
-    if num_std <= 0.0 {
+    if !num_std.is_finite() || num_std <= 0.0 {
         return Err(PyValueError::new_err(
             "calculate_bollinger: num_std must be > 0.0 (typically 2.0)",
         ));
@@ -226,6 +265,11 @@ pub fn calculate_bollinger(
 
     let upper = middle + num_std * std_dev;
     let lower = middle - num_std * std_dev;
+    if !upper.is_finite() || !middle.is_finite() || !lower.is_finite() {
+        return Err(PyValueError::new_err(
+            "calculate_bollinger: result is not finite",
+        ));
+    }
 
     Ok((upper, middle, lower))
 }
@@ -245,7 +289,11 @@ pub fn calculate_bollinger(
 pub fn calculate_sma(prices: Vec<f64>, period: usize) -> PyResult<f64> {
     validate_input(&prices, period, "calculate_sma")?;
     let window = &prices[prices.len() - period..];
-    Ok(window.iter().sum::<f64>() / period as f64)
+    let sma = window.iter().sum::<f64>() / period as f64;
+    if !sma.is_finite() {
+        return Err(PyValueError::new_err("calculate_sma: result is not finite"));
+    }
+    Ok(sma)
 }
 
 // ─────────────────────────────────────────────────────────
@@ -268,7 +316,18 @@ pub fn calculate_macd(
     slow_period: usize,
     signal_period: usize,
 ) -> PyResult<(f64, f64, f64)> {
-    validate_input(&prices, slow_period + signal_period, "calculate_macd")?;
+    if fast_period == 0 || slow_period == 0 || signal_period == 0 {
+        return Err(PyValueError::new_err("calculate_macd: periods must be > 0"));
+    }
+    if fast_period > slow_period {
+        return Err(PyValueError::new_err(
+            "calculate_macd: fast_period must be <= slow_period",
+        ));
+    }
+    let required_prices = slow_period
+        .checked_add(signal_period)
+        .ok_or_else(|| PyValueError::new_err("calculate_macd: periods are too large"))?;
+    validate_input(&prices, required_prices, "calculate_macd")?;
 
     // We need to compute MACD line for enough bars to get a signal line
     // Calculate EMA arrays for MACD line history
@@ -283,8 +342,8 @@ pub fn calculate_macd(
     // Build MACD line values from slow_period onwards
     let mut macd_values: Vec<f64> = Vec::with_capacity(prices.len() - slow_period);
 
-    for i in fast_period..slow_period {
-        fast_ema = prices[i] * fast_k + fast_ema * (1.0 - fast_k);
+    for &price in &prices[fast_period..slow_period] {
+        fast_ema = price * fast_k + fast_ema * (1.0 - fast_k);
     }
 
     for &price in &prices[slow_period..] {
@@ -332,13 +391,36 @@ pub fn calculate_atr(
     close: Vec<f64>,
     period: usize,
 ) -> PyResult<f64> {
+    if period == 0 {
+        return Err(PyValueError::new_err("calculate_atr: period must be > 0"));
+    }
+    let required_bars = period
+        .checked_add(1)
+        .ok_or_else(|| PyValueError::new_err("calculate_atr: period is too large"))?;
     let len = high.len();
-    if len < period + 1 || low.len() < period + 1 || close.len() < period + 1 {
+    if low.len() != len || close.len() != len {
+        return Err(PyValueError::new_err(
+            "calculate_atr: high, low, close must all have the same length",
+        ));
+    }
+    if len < required_bars {
         return Err(PyValueError::new_err(format!(
             "calculate_atr: need at least {} bars, got {}",
-            period + 1,
-            len
+            required_bars, len
         )));
+    }
+    if high
+        .iter()
+        .chain(low.iter())
+        .chain(close.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(PyValueError::new_err(
+            "calculate_atr: all values must be finite",
+        ));
+    }
+    if high.iter().zip(low.iter()).any(|(high, low)| high < low) {
+        return Err(PyValueError::new_err("calculate_atr: high must be >= low"));
     }
 
     // True Range = max(high-low, |high-prev_close|, |low-prev_close|)
@@ -365,5 +447,77 @@ pub fn calculate_atr(
         atr = (atr * (period as f64 - 1.0) + tr) / period as f64;
     }
 
+    if !atr.is_finite() {
+        return Err(PyValueError::new_err("calculate_atr: result is not finite"));
+    }
     Ok(atr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx(actual: f64, expected: f64) {
+        let tolerance = 1e-10_f64.max(expected.abs() * 1e-10);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{actual} != {expected}"
+        );
+    }
+
+    #[test]
+    fn sma_ema_and_bollinger_match_reference() {
+        let prices = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        approx(calculate_sma(prices.clone(), 3).unwrap(), 4.0);
+        approx(calculate_ema(prices.clone(), 3).unwrap(), 4.0);
+        let (upper, middle, lower) = calculate_bollinger(prices, 3, 2.0).unwrap();
+        approx(middle, 4.0);
+        approx(upper, 4.0 + 2.0 * (2.0_f64 / 3.0).sqrt());
+        approx(lower, 4.0 - 2.0 * (2.0_f64 / 3.0).sqrt());
+    }
+
+    #[test]
+    fn rsi_vwap_and_atr_match_independent_fixtures() {
+        let rsi = calculate_rsi(vec![1.0, 2.0, 3.0, 2.0, 2.0], 2).unwrap();
+        approx(rsi, 50.0);
+        let vwap = calculate_vwap(
+            vec![11.0, 12.0],
+            vec![9.0, 10.0],
+            vec![10.0, 11.0],
+            vec![2.0, 1.0],
+        )
+        .unwrap();
+        approx(vwap, ((10.0 * 2.0) + (11.0 * 1.0)) / 3.0);
+        let atr = calculate_atr(
+            vec![11.0, 13.0, 14.0],
+            vec![9.0, 10.0, 12.0],
+            vec![10.0, 12.0, 13.0],
+            2,
+        )
+        .unwrap();
+        approx(atr, (3.0 + 2.0) / 2.0);
+    }
+
+    #[test]
+    fn macd_fixture_and_constant_prices_are_stable() {
+        let prices: Vec<f64> = (1..=40).map(|value| value as f64).collect();
+        let (line, signal, histogram) = calculate_macd(prices, 3, 5, 2).unwrap();
+        approx(histogram, line - signal);
+        assert_eq!(calculate_rsi(vec![5.0; 15], 14).unwrap(), 100.0);
+        assert_eq!(calculate_sma(vec![5.0; 3], 3).unwrap(), 5.0);
+    }
+
+    #[test]
+    fn invalid_and_non_finite_inputs_are_controlled_errors() {
+        assert!(calculate_sma(vec![], 1).is_err());
+        assert!(calculate_sma(vec![1.0], 0).is_err());
+        assert!(calculate_rsi(vec![1.0, 2.0], 0).is_err());
+        assert!(calculate_sma(vec![1.0, f64::NAN], 2).is_err());
+        assert!(calculate_ema(vec![1.0, f64::INFINITY], 2).is_err());
+        assert!(calculate_bollinger(vec![1.0, 2.0], 2, f64::NAN).is_err());
+        assert!(calculate_vwap(vec![1.0], vec![1.0], vec![1.0], vec![-1.0]).is_err());
+        assert!(calculate_atr(vec![1.0], vec![0.0], vec![0.5], 0).is_err());
+        assert!(calculate_macd(vec![1.0; 10], 0, 2, 2).is_err());
+        assert!(calculate_macd(vec![1.0; 10], 3, 2, 2).is_err());
+    }
 }

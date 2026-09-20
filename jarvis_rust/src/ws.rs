@@ -1,3 +1,4 @@
+use futures_util::{SinkExt, StreamExt};
 /// JARVIS Module 3 — High-Performance WebSocket Feed
 ///
 /// Replaces Python websockets library with async Rust (tokio + tungstenite).
@@ -10,9 +11,8 @@
 ///   feed = WebSocketFeed()
 ///   feed.connect_delta("BTCUSDT", on_tick)  # non-blocking
 ///   feed.stop()
-
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use serde_json::Value;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -20,23 +20,21 @@ use std::sync::{
 use std::thread;
 use tokio::runtime::Runtime;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use futures_util::StreamExt;
-use serde_json::Value;
 
 // ─────────────────────────────────────────────────────────
 // Known WebSocket endpoints
 // ─────────────────────────────────────────────────────────
-const DELTA_WS_URL:   &str = "wss://socket.delta.exchange";
+const DELTA_WS_URL: &str = "wss://socket.delta.exchange";
 const BINANCE_WS_BASE: &str = "wss://stream.binance.com:9443/ws";
 
 /// Message parsed from exchange WebSocket
 #[derive(Debug, Clone)]
 struct Tick {
     pub symbol: String,
-    pub price:  f64,
+    pub price: f64,
     pub volume: f64,
-    pub ts_ms:  u64,
-    pub side:   String, // "buy" / "sell" / "unknown"
+    pub ts_ms: u64,
+    pub side: String, // "buy" / "sell" / "unknown"
 }
 
 /// Parse Delta Exchange trade feed message
@@ -46,18 +44,30 @@ fn parse_delta_tick(text: &str) -> Option<Tick> {
     if v["type"].as_str()? != "all_trades" {
         return None;
     }
+    let symbol = v["symbol"].as_str()?.trim();
+    let price = v["price"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| v["price"].as_f64())?;
+    let volume = v["size"].as_f64()?;
+    if symbol.is_empty()
+        || !price.is_finite()
+        || price <= 0.0
+        || !volume.is_finite()
+        || volume < 0.0
+    {
+        return None;
+    }
     Some(Tick {
-        symbol: v["symbol"].as_str().unwrap_or("UNKNOWN").to_string(),
-        price:  v["price"].as_str()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .or_else(|| v["price"].as_f64())
-                    .unwrap_or(0.0),
-        volume: v["size"].as_f64().unwrap_or(0.0),
-        ts_ms:  v["timestamp"].as_u64().unwrap_or(0),
-        side:   v["buyer_role"].as_str()
-                    .map(|r| if r == "taker" { "buy" } else { "sell" })
-                    .unwrap_or("unknown")
-                    .to_string(),
+        symbol: symbol.to_string(),
+        price,
+        volume,
+        ts_ms: v["timestamp"].as_u64().unwrap_or(0),
+        side: v["buyer_role"]
+            .as_str()
+            .map(|r| if r == "taker" { "buy" } else { "sell" })
+            .unwrap_or("unknown")
+            .to_string(),
     })
 }
 
@@ -68,16 +78,28 @@ fn parse_binance_tick(text: &str) -> Option<Tick> {
     if v["e"].as_str()? != "trade" {
         return None;
     }
+    let symbol = v["s"].as_str()?.trim();
+    let price = v["p"].as_str()?.parse::<f64>().ok()?;
+    let volume = v["q"].as_str()?.parse::<f64>().ok()?;
+    if symbol.is_empty()
+        || !price.is_finite()
+        || price <= 0.0
+        || !volume.is_finite()
+        || volume < 0.0
+    {
+        return None;
+    }
     Some(Tick {
-        symbol: v["s"].as_str().unwrap_or("UNKNOWN").to_string(),
-        price:  v["p"].as_str()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0),
-        volume: v["q"].as_str()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0),
-        ts_ms:  v["T"].as_u64().unwrap_or(0),
-        side:   if v["m"].as_bool().unwrap_or(false) { "sell" } else { "buy" }.to_string(),
+        symbol: symbol.to_string(),
+        price,
+        volume,
+        ts_ms: v["T"].as_u64().unwrap_or(0),
+        side: if v["m"].as_bool().unwrap_or(false) {
+            "sell"
+        } else {
+            "buy"
+        }
+        .to_string(),
     })
 }
 
@@ -87,7 +109,13 @@ fn parse_binance_tick(text: &str) -> Option<Tick> {
 #[pyclass]
 pub struct WebSocketFeed {
     running: Arc<AtomicBool>,
-    handle:  Option<thread::JoinHandle<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Default for WebSocketFeed {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[pymethods]
@@ -96,7 +124,7 @@ impl WebSocketFeed {
     pub fn new() -> Self {
         WebSocketFeed {
             running: Arc::new(AtomicBool::new(false)),
-            handle:  None,
+            handle: None,
         }
     }
 
@@ -109,7 +137,7 @@ impl WebSocketFeed {
     #[pyo3(signature = (symbol, callback, reconnect=true))]
     pub fn connect_delta(
         &mut self,
-        py: Python<'_>,
+        _py: Python<'_>,
         symbol: String,
         callback: PyObject,
         reconnect: bool,
@@ -134,7 +162,8 @@ impl WebSocketFeed {
                     }
                 ]
             }
-        }).to_string();
+        })
+        .to_string();
 
         let url = DELTA_WS_URL.to_string();
 
@@ -151,13 +180,15 @@ impl WebSocketFeed {
                     match conn {
                         Err(e) => {
                             eprintln!("[JARVIS WS] Delta connection error: {e}");
-                            if !reconnect { break; }
+                            if !reconnect {
+                                break;
+                            }
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                             continue;
                         }
                         Ok((mut ws_stream, _)) => {
                             // Send subscribe message
-                            let _ = ws_stream.send(Message::Text(subscribe_msg.clone().into())).await;
+                            let _ = ws_stream.send(Message::Text(subscribe_msg.clone())).await;
 
                             // Process incoming messages
                             while let Some(msg) = ws_stream.next().await {
@@ -169,13 +200,16 @@ impl WebSocketFeed {
                                         if let Some(tick) = parse_delta_tick(&text) {
                                             // Call Python callback
                                             Python::with_gil(|py| {
-                                                let _ = callback.call1(py, (
-                                                    tick.symbol,
-                                                    tick.price,
-                                                    tick.volume,
-                                                    tick.ts_ms,
-                                                    tick.side,
-                                                ));
+                                                let _ = callback.call1(
+                                                    py,
+                                                    (
+                                                        tick.symbol,
+                                                        tick.price,
+                                                        tick.volume,
+                                                        tick.ts_ms,
+                                                        tick.side,
+                                                    ),
+                                                );
                                             });
                                         }
                                     }
@@ -237,30 +271,39 @@ impl WebSocketFeed {
             let rt = Runtime::new().expect("tokio runtime");
             rt.block_on(async move {
                 loop {
-                    if !running.load(Ordering::SeqCst) { break; }
+                    if !running.load(Ordering::SeqCst) {
+                        break;
+                    }
 
                     let conn = connect_async(&url).await;
                     match conn {
                         Err(e) => {
                             eprintln!("[JARVIS WS] Binance connection error: {e}");
-                            if !reconnect { break; }
+                            if !reconnect {
+                                break;
+                            }
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                             continue;
                         }
                         Ok((mut ws_stream, _)) => {
                             while let Some(msg) = ws_stream.next().await {
-                                if !running.load(Ordering::SeqCst) { break; }
+                                if !running.load(Ordering::SeqCst) {
+                                    break;
+                                }
                                 match msg {
                                     Ok(Message::Text(text)) => {
                                         if let Some(tick) = parse_binance_tick(&text) {
                                             Python::with_gil(|py| {
-                                                let _ = callback.call1(py, (
-                                                    tick.symbol,
-                                                    tick.price,
-                                                    tick.volume,
-                                                    tick.ts_ms,
-                                                    tick.side,
-                                                ));
+                                                let _ = callback.call1(
+                                                    py,
+                                                    (
+                                                        tick.symbol,
+                                                        tick.price,
+                                                        tick.volume,
+                                                        tick.ts_ms,
+                                                        tick.side,
+                                                    ),
+                                                );
                                             });
                                         }
                                     }
@@ -274,7 +317,9 @@ impl WebSocketFeed {
                         }
                     }
 
-                    if !reconnect || !running.load(Ordering::SeqCst) { break; }
+                    if !reconnect || !running.load(Ordering::SeqCst) {
+                        break;
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                 }
             });
@@ -305,5 +350,40 @@ impl WebSocketFeed {
 impl Drop for WebSocketFeed {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parsers_accept_valid_frames_and_reject_malformed_or_other_events() {
+        let delta = parse_delta_tick(r#"{"type":"all_trades","symbol":"BTCUSDT","price":"100.5","size":2.0,"timestamp":42,"buyer_role":"taker"}"#).unwrap();
+        assert_eq!(delta.symbol, "BTCUSDT");
+        assert_eq!(delta.price, 100.5);
+        assert_eq!(delta.side, "buy");
+        assert!(parse_delta_tick("not-json").is_none());
+        assert!(parse_delta_tick(r#"{"type":"subscriptions"}"#).is_none());
+
+        let binance = parse_binance_tick(
+            r#"{"e":"trade","s":"BTCUSDT","p":"100.5","q":"2.0","T":42,"m":true}"#,
+        )
+        .unwrap();
+        assert_eq!(binance.side, "sell");
+        assert_eq!(binance.ts_ms, 42);
+        assert!(parse_binance_tick(r#"{"e":"kline"}"#).is_none());
+        assert!(parse_binance_tick(
+            r#"{"e":"trade","s":"BTCUSDT","p":"bad","q":"2","T":42,"m":false}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn feed_starts_stopped_and_stop_is_idempotent() {
+        let mut feed = WebSocketFeed::new();
+        assert!(!feed.is_running());
+        feed.stop();
+        assert!(!feed.is_running());
     }
 }
