@@ -139,7 +139,7 @@ class Audit:
                 self.add("import-wiring", "FAIL", "high",
                          f"Local module {name!r} is not present", f"import {name}", rel, line)
         elif unclassified:
-            evidence = "\\n".join(f"{rel}:{line}: import {name}" for rel, line, name in unclassified[:20])
+            evidence = "\n".join(f"{rel}:{line}: import {name}" for rel, line, name in unclassified[:20])
             self.add("import-wiring", "UNVERIFIED", "medium",
                      "No known missing local imports found; unresolved names need classification before local completeness can be claimed",
                      evidence, category="coverage")
@@ -154,10 +154,10 @@ class Audit:
                      ", ".join(names), category="environment")
         if unclassified:
             names = sorted({n for _, _, n in unclassified})
-            evidence = "\\n".join(f"{rel}:{line}: import {name}" for rel, line, name in unclassified[:20])
+            evidence = "\n".join(f"{rel}:{line}: import {name}" for rel, line, name in unclassified[:20])
             self.add("dependency-classification", "UNVERIFIED", "medium",
                      "Missing imports could not be classified as local or optional external; review required",
-                     f"names: {', '.join(names)}\\n{evidence}", category="coverage")
+                     f"names: {', '.join(names)}\n{evidence}", category="coverage")
         elif not names:
             self.add("dependency-availability", "PASS", "info",
                      "All statically referenced external imports are available")
