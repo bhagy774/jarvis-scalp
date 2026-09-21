@@ -90,6 +90,16 @@ class Audit:
         local = self.local_modules()
         unresolved: list[tuple[str, int, str]] = []
         unavailable: list[tuple[str, int, str]] = []
+        unclassified: list[tuple[str, int, str]] = []
+        # These top-level names are package/module names, not distribution
+        # names.  They are intentionally explicit so an absent package is not
+        # mistaken for a missing repository-local module.
+        known_external = {
+            "aiohttp", "cupy", "dotenv", "fastapi", "google", "numpy",
+            "pandas", "psutil", "pytest", "requests", "sklearn", "torch",
+            "uvicorn", "uvloop", "websocket", "websockets", "gpu_rl_learner",
+        }
+        optional_adapter = {"jarvis_rust", "part1_main", "part2_zones", "part_ai"}
         for rel, tree in self.trees.items():
             for node in ast.walk(tree):
                 names: list[str] = []
@@ -101,10 +111,10 @@ class Audit:
                     if name in local:
                         continue
                     # Repository naming is intentionally conservative: modules
-                    # in the jarvis_/part* namespace are expected to be local;
-                    # other names are third-party and may be absent here.
-                    optional_adapter = name in {"jarvis_rust", "part1_main", "part2_zones", "part_ai"}
-                    expected_local = (name.startswith("jarvis_") or name.endswith("_FIXED") or name in {"trading_config", "run_all_parts"}) and not optional_adapter
+                    # in the jarvis_/part* namespace are expected to be local.
+                    expected_local = (name.startswith("jarvis_") or
+                                      name.endswith("_FIXED") or
+                                      name in {"trading_config", "run_all_parts"}) and name not in optional_adapter
                     if expected_local:
                         unresolved.append((rel, node.lineno, name))
                         continue
@@ -112,14 +122,27 @@ class Audit:
                         present = importlib.util.find_spec(name) is not None
                     except (ImportError, ModuleNotFoundError, ValueError):
                         present = False
-                    if not present and name not in sys.builtin_module_names:
+                    if present or name in sys.builtin_module_names:
+                        continue
+                    # The legacy/external runner has its own optional module
+                    # graph.  Treat its unresolved imports as external, while
+                    # requiring an explicit classification for everything else.
+                    if name in known_external or rel == "run_all_parts.py" or name in optional_adapter:
                         unavailable.append((rel, node.lineno, name))
-        # Local imports are checked as a graph: missing local module is a real
-        # wiring error; third-party availability varies by audit environment.
+                    else:
+                        unclassified.append((rel, node.lineno, name))
+        # Local imports are checked as a graph: a known missing local module is
+        # a real wiring error.  Unknown missing names prevent a PASS because a
+        # static audit cannot prove that they are not local modules.
         if unresolved:
             for rel, line, name in unresolved:
                 self.add("import-wiring", "FAIL", "high",
                          f"Local module {name!r} is not present", f"import {name}", rel, line)
+        elif unclassified:
+            evidence = "\\n".join(f"{rel}:{line}: import {name}" for rel, line, name in unclassified[:20])
+            self.add("import-wiring", "UNVERIFIED", "medium",
+                     "No known missing local imports found; unresolved names need classification before local completeness can be claimed",
+                     evidence, category="coverage")
         else:
             self.add("import-wiring", "PASS", "info",
                      "No missing repository-local imports found")
@@ -129,7 +152,13 @@ class Audit:
             self.add("dependency-availability", "SKIPPED", "medium",
                      "Optional/external imports unavailable in this audit environment",
                      ", ".join(names), category="environment")
-        else:
+        if unclassified:
+            names = sorted({n for _, _, n in unclassified})
+            evidence = "\\n".join(f"{rel}:{line}: import {name}" for rel, line, name in unclassified[:20])
+            self.add("dependency-classification", "UNVERIFIED", "medium",
+                     "Missing imports could not be classified as local or optional external; review required",
+                     f"names: {', '.join(names)}\\n{evidence}", category="coverage")
+        elif not names:
             self.add("dependency-availability", "PASS", "info",
                      "All statically referenced external imports are available")
 
@@ -178,7 +207,14 @@ class Audit:
                      "It is not used as the audit entrypoint", "run_all_parts.py")
 
     def evidence(self, label: str, patterns: Iterable[str], files: Iterable[str] | None = None,
-                 status: str = "PASS", severity: str = "info") -> None:
+                 status: str = "UNVERIFIED", severity: str = "medium") -> None:
+        """Report bounded source evidence without presenting it as a safety pass.
+
+        Regex matches are useful pointers for review, but they do not establish
+        producer/transformer/consumer wiring or runtime safety.  Keep the
+        defensive status coercion so a future broad evidence call cannot
+        accidentally reintroduce a PASS finding.
+        """
         selected = files or self.sources.keys()
         hits: list[tuple[str, int, str]] = []
         for rel in selected:
@@ -186,11 +222,16 @@ class Audit:
             for i, line in enumerate(text.splitlines(), 1):
                 if any(re.search(p, line, re.I) for p in patterns):
                     hits.append((rel, i, line.strip()[:240]))
+        evidence = "\n".join(f"{f}:{n}: {line}" for f, n, line in hits[:12])
+        if status == "PASS":
+            status = "UNVERIFIED"
         if hits:
-            evidence = "\n".join(f"{f}:{n}: {line}" for f, n, line in hits[:12])
-            self.add(label, status, severity, f"Found {len(hits)} code-referenced evidence line(s)", evidence, category="coverage" if status != "PASS" else "bug")
+            self.add(label, status, severity,
+                     f"Static evidence only: found {len(hits)} code-referenced line(s); runtime wiring and safety remain unverified",
+                     evidence, category="coverage")
         else:
-            self.add(label, "UNVERIFIED", "medium", "No code evidence matched; runtime wiring remains unverified", category="coverage")
+            self.add(label, "UNVERIFIED", "medium",
+                     "No code evidence matched; runtime wiring remains unverified", category="coverage")
 
     def static_safety(self) -> None:
         main = self.sources.get("jarvis_FIXED.py", "")
@@ -223,7 +264,9 @@ class Audit:
                             r"\1\2[REDACTED]\2", line.strip())
                         hits.append(f"{rel}:{i}: {safe[:240]}")
             if hits:
-                self.add(name, "SKIPPED", "medium", "Potential secret-like assignments found; values redacted and not validated", "\n".join(hits[:20]), category="coverage")
+                self.add(name, "UNVERIFIED", "medium",
+                         "Potential secret-like assignments found; values redacted; review required (scan is not validation)",
+                         "\n".join(hits[:20]), category="coverage")
             else:
                 self.add(name, "PASS", "info", "No non-empty secret-like assignment found in scanned source")
 
