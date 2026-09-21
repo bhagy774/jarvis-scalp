@@ -177,7 +177,8 @@ class Audit:
                      "run_all_parts.py is treated as a separate legacy/external runner",
                      "It is not used as the audit entrypoint", "run_all_parts.py")
 
-    def evidence(self, label: str, patterns: Iterable[str], files: Iterable[str] | None = None) -> None:
+    def evidence(self, label: str, patterns: Iterable[str], files: Iterable[str] | None = None,
+                 status: str = "PASS", severity: str = "info") -> None:
         selected = files or self.sources.keys()
         hits: list[tuple[str, int, str]] = []
         for rel in selected:
@@ -187,7 +188,7 @@ class Audit:
                     hits.append((rel, i, line.strip()[:240]))
         if hits:
             evidence = "\n".join(f"{f}:{n}: {line}" for f, n, line in hits[:12])
-            self.add(label, "PASS", "info", f"Found {len(hits)} code-referenced evidence line(s)", evidence)
+            self.add(label, status, severity, f"Found {len(hits)} code-referenced evidence line(s)", evidence, category="coverage" if status != "PASS" else "bug")
         else:
             self.add(label, "UNVERIFIED", "medium", "No code evidence matched; runtime wiring remains unverified", category="coverage")
 
@@ -286,7 +287,7 @@ assert q == 10 and q % 5 == 0
         if "jarvis_position_ownership.py" in self.sources and "jarvis_close_coordinator.py" in self.sources:
             self.probe("close-idempotency-ownership", """
 from jarvis_position_ownership import clear_registry, claim_position, claim_close
-from jarvis_close_coordinator import claim_close as cclaim, release_close
+from jarvis_close_coordinator import claim_close as cclaim, release_close, reconcile_close
 clear_registry()
 assert claim_position('p','owner-a') is True
 assert claim_position('p','owner-b') is False
@@ -294,6 +295,14 @@ assert claim_close('p', owner='owner-a')[0] is True
 assert claim_close('p', owner='owner-b')[0] is False
 assert cclaim('BTCUSDT','p','owner-a') is True
 assert cclaim('BTCUSDT','p','owner-b') is False
+class MismatchExchange:
+    def get_open_positions(self, symbol):
+        return [{'symbol':'ETHUSDT', 'size':0}]
+assert reconcile_close(MismatchExchange(), 'BTCUSDT', 'SELL', 1)['ambiguous'] is True
+class PartialExchange:
+    def get_open_positions(self, symbol):
+        return [{'symbol':'BTCUSDT', 'size':1}]
+assert reconcile_close(PartialExchange(), 'BTCUSDT', 'SELL', 1)['ambiguous'] is True
 release_close('BTCUSDT','p', force=True)
 """)
         else:
@@ -307,6 +316,10 @@ valid, err = validate_decision({'decision':'WAIT', 'confidence':0, 'rationale':'
 assert valid and err is None
 s = build_snapshot(symbol='BTCUSDT', timestamp=None, current_price=100, market_context={'symbol':'BTCUSDT'}, part_results={})
 assert snapshot_usable(s)[0] is True
+stale = build_snapshot(symbol='BTCUSDT', timestamp='2000-01-01T00:00:00+00:00', current_price=float('nan'), market_context={'symbol':'BTCUSDT'}, part_results={})
+assert snapshot_usable(stale)[0] is False and stale['market']['price'] is None
+mismatch = build_snapshot(symbol='BTCUSDT', timestamp=None, current_price=100, market_context={'symbol':'ETHUSDT'}, part_results={})
+assert snapshot_usable(mismatch)[0] is False
 """, severity="medium")
         else:
             self.add("ollama-error-boundary", "SKIPPED", "medium", "Ollama context helper absent", category="environment")
@@ -324,7 +337,7 @@ assert snapshot_usable(s)[0] is True
             ("paper-isolation", ["jarvis_FIXED.py", "jarvis_live_trader.py"], [r"PAPER_CONFIG", r"paper", r"reduce_only"]),
             ("restart-reconciliation", ["jarvis_FIXED.py", "jarvis_live_trader.py", "jarvis_position_manager.py"], [r"load.*trade|read.*json|reconcile|restart|persist"]),
         ]:
-            self.evidence(check, pats, files)
+            self.evidence(check, pats, files, status="UNVERIFIED", severity="medium")
 
     def report(self) -> dict[str, Any]:
         counts = {s: sum(1 for f in self.findings if f.status == s)
