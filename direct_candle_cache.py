@@ -41,6 +41,17 @@ class CandleFrame:
     def current_is_confirmed(self) -> bool:
         return False
 
+    def sma(self, period: int) -> float:
+        """Calculate a latest-window SMA from completed candles only.
+
+        ``JARVIS_RUST_MATH=1`` opts this pure calculation into the Rust
+        extension; the adapter provides an explicit equivalent Python fallback.
+        The forming candle is intentionally never included.
+        """
+        from jarvis_rust_integration import calculate_sma
+
+        return calculate_sma(self.closed["close"].tolist(), period)
+
 
 @dataclass(frozen=True)
 class CandleSnapshot:

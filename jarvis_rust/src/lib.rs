@@ -1,3 +1,5 @@
+#![allow(clippy::useless_conversion)]
+
 /// JARVIS Rust — Main Library Entry Point
 ///
 /// Registers all 4 modules as Python-importable:
@@ -13,7 +15,6 @@
 ///       # Module 4: Order Executor
 ///       OrderExecutor,
 ///   )
-
 use pyo3::prelude::*;
 
 pub mod cache;
@@ -44,7 +45,10 @@ fn jarvis_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Version metadata
     m.add("__version__", "0.2.0")?;
-    m.add("__description__", "JARVIS HFT Rust Speed Layer — math + cache + websocket + executor")?;
+    m.add(
+        "__description__",
+        "JARVIS HFT Rust Speed Layer — math + cache + websocket + executor",
+    )?;
 
     Ok(())
 }
