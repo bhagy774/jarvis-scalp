@@ -190,9 +190,9 @@ except Exception as e:
 # ══ 7. AUTO TRADER ════════════════════════════════════════════
 hdr("7 / 8  │  JARVIS AUTO TRADER")
 try:
-    from jarvis_live_trader import JarvisAutoTrader, AUTO_TRADE_ENABLED, LEVERAGE, MAX_RISK_USDT
+    from jarvis_live_trader import JarvisAutoTrader, AUTO_TRADE_ENABLED, LEVERAGE_CAP, MAX_RISK_USDT
     ok(f"JarvisAutoTrader imported ✅")
-    ok(f"Leverage: {LEVERAGE}x  │  Risk/trade: ${MAX_RISK_USDT}  │  Auto: {'ON' if AUTO_TRADE_ENABLED else 'OFF (set JARVIS_AUTO_TRADE=true)'}")
+    ok(f"Leverage: {LEVERAGE_CAP}x  │  Risk/trade: ${MAX_RISK_USDT}  │  Auto: {'ON' if AUTO_TRADE_ENABLED else 'OFF (set JARVIS_AUTO_TRADE=true)'}")
     results['trader'] = 'OK'
 except Exception as e:
     fail(f"AutoTrader error: {e}")
