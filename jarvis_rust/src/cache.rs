@@ -8,8 +8,8 @@
 ///   cache = CandleCache()
 ///   cache.set("BTCUSDT", "1m", candles_list)
 ///   candles = cache.get("BTCUSDT", "1m")
-
 use dashmap::DashMap;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use std::sync::Arc;
@@ -18,12 +18,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// One OHLCV candle stored internally
 #[derive(Clone, Debug)]
 struct Candle {
-    pub open:   f64,
-    pub high:   f64,
-    pub low:    f64,
-    pub close:  f64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
     pub volume: f64,
-    pub ts:     u64, // Unix timestamp ms
+    pub ts: u64, // Unix timestamp ms
 }
 
 /// Cache key: "BTCUSDT:1m"
@@ -45,11 +45,11 @@ fn now_ms() -> u64 {
 #[pyclass]
 pub struct CandleCache {
     /// symbol:timeframe → Vec<Candle>
-    store:        Arc<DashMap<String, Vec<Candle>>>,
+    store: Arc<DashMap<String, Vec<Candle>>>,
     /// symbol:timeframe → last_updated_ms
     last_updated: Arc<DashMap<String, u64>>,
     /// Maximum candles to keep per key (rolling window)
-    max_candles:  usize,
+    max_candles: usize,
 }
 
 #[pymethods]
@@ -60,12 +60,15 @@ impl CandleCache {
     ///   max_candles: max candles to keep per symbol/timeframe (default 500)
     #[new]
     #[pyo3(signature = (max_candles = 500))]
-    pub fn new(max_candles: usize) -> Self {
-        CandleCache {
-            store:        Arc::new(DashMap::new()),
+    pub fn new(max_candles: usize) -> PyResult<Self> {
+        if max_candles == 0 {
+            return Err(PyValueError::new_err("max_candles must be > 0"));
+        }
+        Ok(CandleCache {
+            store: Arc::new(DashMap::new()),
             last_updated: Arc::new(DashMap::new()),
             max_candles,
-        }
+        })
     }
 
     /// Store candles for a symbol/timeframe.
@@ -81,6 +84,11 @@ impl CandleCache {
         timeframe: &str,
         candles: &Bound<'_, PyList>,
     ) -> PyResult<usize> {
+        if symbol.trim().is_empty() || timeframe.trim().is_empty() {
+            return Err(PyValueError::new_err(
+                "symbol and timeframe must be non-empty",
+            ));
+        }
         let key = make_key(symbol, timeframe);
         let mut parsed: Vec<Candle> = Vec::with_capacity(candles.len());
 
@@ -88,36 +96,66 @@ impl CandleCache {
             // Try dict format first: {open, high, low, close, volume, ts}
             let candle = if let Ok(dict) = item.downcast::<pyo3::types::PyDict>() {
                 let get_f64 = |k: &str| -> PyResult<f64> {
-                    dict.get_item(k)?
-                        .map(|v| v.extract::<f64>())
-                        .unwrap_or(Ok(0.0))
+                    let value = dict
+                        .get_item(k)?
+                        .ok_or_else(|| PyValueError::new_err(format!("missing candle field: {k}")))?
+                        .extract::<f64>()?;
+                    if !value.is_finite() {
+                        return Err(PyValueError::new_err(format!(
+                            "candle field {k} must be finite"
+                        )));
+                    }
+                    Ok(value)
                 };
                 Candle {
-                    open:   get_f64("open")?,
-                    high:   get_f64("high")?,
-                    low:    get_f64("low")?,
-                    close:  get_f64("close")?,
+                    open: get_f64("open")?,
+                    high: get_f64("high")?,
+                    low: get_f64("low")?,
+                    close: get_f64("close")?,
                     volume: get_f64("volume")?,
-                    ts:     dict.get_item("ts")?
-                                .and_then(|v| v.extract::<u64>().ok())
-                                .unwrap_or(now_ms()),
+                    ts: dict
+                        .get_item("ts")?
+                        .map(|value| value.extract::<u64>())
+                        .transpose()?
+                        .unwrap_or_else(now_ms),
                 }
             } else if let Ok(lst) = item.downcast::<PyList>() {
                 // List format: [ts, open, high, low, close, volume]
                 if lst.len() < 6 {
-                    continue;
+                    return Err(PyValueError::new_err(
+                        "candle list must contain [ts, open, high, low, close, volume]",
+                    ));
                 }
                 Candle {
-                    ts:     lst.get_item(0)?.extract::<u64>().unwrap_or(0),
-                    open:   lst.get_item(1)?.extract::<f64>().unwrap_or(0.0),
-                    high:   lst.get_item(2)?.extract::<f64>().unwrap_or(0.0),
-                    low:    lst.get_item(3)?.extract::<f64>().unwrap_or(0.0),
-                    close:  lst.get_item(4)?.extract::<f64>().unwrap_or(0.0),
-                    volume: lst.get_item(5)?.extract::<f64>().unwrap_or(0.0),
+                    ts: lst.get_item(0)?.extract::<u64>()?,
+                    open: lst.get_item(1)?.extract::<f64>()?,
+                    high: lst.get_item(2)?.extract::<f64>()?,
+                    low: lst.get_item(3)?.extract::<f64>()?,
+                    close: lst.get_item(4)?.extract::<f64>()?,
+                    volume: lst.get_item(5)?.extract::<f64>()?,
                 }
             } else {
-                continue; // Skip unrecognised format
+                return Err(PyValueError::new_err(
+                    "each candle must be a mapping or six-item list",
+                ));
             };
+            if !candle.open.is_finite()
+                || !candle.high.is_finite()
+                || !candle.low.is_finite()
+                || !candle.close.is_finite()
+                || !candle.volume.is_finite()
+            {
+                return Err(PyValueError::new_err("candle values must be finite"));
+            }
+            if candle.high < candle.low
+                || candle.high < candle.open.max(candle.close)
+                || candle.low > candle.open.min(candle.close)
+            {
+                return Err(PyValueError::new_err("candle OHLC bounds are invalid"));
+            }
+            if candle.volume < 0.0 {
+                return Err(PyValueError::new_err("candle volume cannot be negative"));
+            }
             parsed.push(candle);
         }
 
@@ -142,16 +180,16 @@ impl CandleCache {
     ///          or empty list if not found.
     pub fn get(&self, py: Python<'_>, symbol: &str, timeframe: &str) -> PyResult<PyObject> {
         let key = make_key(symbol, timeframe);
-        let result = PyList::empty(py);
+        let result = PyList::empty_bound(py);
 
         if let Some(candles) = self.store.get(&key) {
             for c in candles.iter() {
-                let dict = pyo3::types::PyDict::new(py);
-                dict.set_item("ts",     c.ts)?;
-                dict.set_item("open",   c.open)?;
-                dict.set_item("high",   c.high)?;
-                dict.set_item("low",    c.low)?;
-                dict.set_item("close",  c.close)?;
+                let dict = pyo3::types::PyDict::new_bound(py);
+                dict.set_item("ts", c.ts)?;
+                dict.set_item("open", c.open)?;
+                dict.set_item("high", c.high)?;
+                dict.set_item("low", c.low)?;
+                dict.set_item("close", c.close)?;
                 dict.set_item("volume", c.volume)?;
                 result.append(dict)?;
             }
@@ -165,7 +203,7 @@ impl CandleCache {
     /// Returns: list of floats (close prices, oldest first)
     pub fn get_closes(&self, py: Python<'_>, symbol: &str, timeframe: &str) -> PyResult<PyObject> {
         let key = make_key(symbol, timeframe);
-        let result = PyList::empty(py);
+        let result = PyList::empty_bound(py);
         if let Some(candles) = self.store.get(&key) {
             for c in candles.iter() {
                 result.append(c.close)?;
@@ -181,7 +219,7 @@ impl CandleCache {
         let key = make_key(symbol, timeframe);
         if let Some(candles) = self.store.get(&key) {
             if let Some(last) = candles.last() {
-                return last.close.into_pyobject(py).unwrap().into_any().unbind();
+                return last.close.into_py(py);
             }
         }
         py.None()
@@ -223,7 +261,7 @@ impl CandleCache {
 
     /// List all cached symbol:timeframe keys.
     pub fn keys(&self, py: Python<'_>) -> PyObject {
-        let result = PyList::empty(py);
+        let result = PyList::empty_bound(py);
         for entry in self.store.iter() {
             result.append(entry.key().clone()).ok();
         }
@@ -232,9 +270,9 @@ impl CandleCache {
 
     /// Stats summary for monitoring.
     pub fn stats(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("total_keys",    self.store.len())?;
-        dict.set_item("max_candles",   self.max_candles)?;
+        let dict = pyo3::types::PyDict::new_bound(py);
+        dict.set_item("total_keys", self.store.len())?;
+        dict.set_item("max_candles", self.max_candles)?;
         let total: usize = self.store.iter().map(|e| e.value().len()).sum();
         dict.set_item("total_candles", total)?;
         Ok(dict.into())
@@ -246,5 +284,63 @@ impl CandleCache {
             self.store.len(),
             self.max_candles
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::PyList;
+
+    fn candle(ts: u64, close: f64) -> (u64, f64, f64, f64, f64, f64) {
+        (ts, close - 1.0, close + 1.0, close - 1.0, close, 10.0)
+    }
+
+    #[test]
+    fn cache_isolates_keys_and_evicts_oldest() {
+        Python::with_gil(|py| {
+            let cache = CandleCache::new(2).unwrap();
+            let list = PyList::empty_bound(py);
+            for (ts, open, high, low, close, volume) in
+                [candle(1, 10.0), candle(2, 11.0), candle(3, 12.0)]
+            {
+                let row = PyList::empty_bound(py);
+                row.append(ts).unwrap();
+                row.append(open).unwrap();
+                row.append(high).unwrap();
+                row.append(low).unwrap();
+                row.append(close).unwrap();
+                row.append(volume).unwrap();
+                list.append(row).unwrap();
+            }
+            assert_eq!(cache.set("btcusdt", "1m", &list).unwrap(), 3);
+            assert_eq!(cache.len("BTCUSDT", "1m"), 2);
+            let closes = cache.get_closes(py, "BTCUSDT", "1m").unwrap();
+            assert_eq!(closes.extract::<Vec<f64>>(py).unwrap(), vec![11.0, 12.0]);
+            assert_eq!(cache.len("BTCUSDT", "5m"), 0);
+            assert!(cache.contains("BTCUSDT", "1m"));
+            assert!(cache.invalidate("BTCUSDT", "1m"));
+            assert!(!cache.contains("BTCUSDT", "1m"));
+        });
+    }
+
+    #[test]
+    fn cache_rejects_bad_candles_and_zero_capacity() {
+        Python::with_gil(|py| {
+            assert!(CandleCache::new(0).is_err());
+            let cache = CandleCache::new(2).unwrap();
+            let bad = PyList::empty_bound(py);
+            let bad_row = PyList::empty_bound(py);
+            bad_row.append(1_u64).unwrap();
+            bad_row.append(2.0).unwrap();
+            bad_row.append(1.0).unwrap();
+            bad_row.append(1.5).unwrap();
+            bad_row.append(1.2).unwrap();
+            bad_row.append(1.0).unwrap();
+            bad.append(bad_row).unwrap();
+            assert!(cache.set("BTCUSDT", "1m", &bad).is_err());
+            let nan = PyList::new_bound(py, vec![candle(1, f64::NAN)]);
+            assert!(cache.set("BTCUSDT", "1m", &nan).is_err());
+        });
     }
 }
