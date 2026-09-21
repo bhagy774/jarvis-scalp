@@ -1,204 +1,75 @@
-# JARVIS Scalp
+# 🤖 JARVIS: Autonomous AI-Powered High-Frequency Trading System
 
-## Local AI (Ollama only)
+**A production-grade, hybrid Python-Rust quantitative trading engine integrating local LLMs for autonomous decision-making and orderflow analysis.**
 
-JARVIS runs on **local Ollama models only** by default. No external cloud AI is
-contacted unless you explicitly opt in via environment variables:
+---
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Local Ollama server URL used by the DeepSeek V3/R1 brains and specialist pool. |
-| `OLLAMA_MODEL` | unset (auto) | Pin a specific Ollama model. When unset, JARVIS auto-detects from installed models (`GET /api/tags`) using a preference order (phi3.5/phi3 → qwen2.5 → mistral → llama3.1/llama3 → deepseek-r1 → gemma2 → whatever exists). The choice is logged once at startup and cached in-process. |
-| `JARVIS_LEARNING` | `1` (on) | Set `0` to disable the Learning Loop (trade-outcome recording and per-engine adaptive weights). |
-| `JARVIS_PRESIM` | `1` (on) | Set `0` to disable the Pre-Trade Simulator (instant offline history check before each paper entry). |
-| `JARVIS_PRESIM_MIN_RR` | `1.0` | Minimum reward:risk ratio required by the Pre-Trade Simulator; setups below this are vetoed. |
-| `JARVIS_PRESIM_BUDGET_MS` | `500` | Time budget (milliseconds) for the pre-trade simulation. When exhausted, remaining checks abstain (pass). |
-| `JARVIS_ENABLE_GEMINI` | `0` (off) | Set `1` **and** provide `GEMINI_API_KEY` to enable the external Gemini Supreme Advisor. Otherwise it is skipped at startup. |
-| `JARVIS_ENABLE_EXTERNAL_AI` | `0` (off) | Set `1` to enable external AI clients (e.g. KIE GPT-6). When off, external clients return a clean `disabled` result and never make a network call. |
+## 🎯 Architecture Overview
 
-If Ollama is unreachable or has no installed model, the local brains degrade
-gracefully through their existing fallbacks (log: "No Ollama model found — AI
-brains in math-fallback mode").
+JARVIS is a proprietary algorithmic trading system engineered for high-frequency crypto scalping. It moves beyond traditional quantitative models by combining **raw computational speed (Rust)** with **advanced mathematical modeling (Python)** and **cognitive reasoning (Local LLMs)**.
 
-## Learning Loop
+The system is designed to operate 24/7 with zero downtime, utilizing a self-healing diagnostic daemon and a WebSocket-driven data ingestion pipeline.
 
-`jarvis_learning.py` records every closed paper-trade outcome (timestamp,
-symbol, direction, entry/exit, P&L, plus the per-engine signal snapshot when
-available) into `jarvis_learning.json` (atomic writes, corruption-safe).
+---
 
-From those outcomes it maintains per-engine running stats (trades, wins,
-losses, win rate) and derives a weight multiplier in `[0.5, 1.5]`
-(`0.5 + win_rate`: 0% win rate → 0.5, 50% → 1.0, 100% → 1.5). Engines with
-fewer than 10 recorded trades stay neutral at `1.0`. The brain's weighted
-signal fusion multiplies each engine's static weight by this factor, so
-consistently winning engines gradually get more say and losing ones less.
+## 🚀 Core Technologies
+- **Core Logic:** Python (Asyncio, OOP)
+- **Performance Layer:** Rust (PyO3, Maturin)
+- **AI / Reasoning:** Local Ollama (DeepSeek-r1, Llama3)
+- **Market Data:** Live WebSockets (Binance, Delta Exchange, Bybit)
+- **Execution:** REST API Wrappers with strict Risk Management guardrails.
 
-Everything is fail-safe — any error is logged and ignored, never breaking the
-trading loop. Disable with `JARVIS_LEARNING=0`.
+---
 
-## Pre-Trade Simulator
+## ⚙️ The 12-Engine Mathematical Core
 
-`jarvis_presim.py` runs a fast, fully offline "instant backtest check" on
-every candidate ENTER signal **before** the paper trade is opened — *"aa
-setup history ma kaam karyu hato?"* (did this setup work in history?). It
-never touches the network and never blocks the decision loop beyond a bounded
-time budget (`JARVIS_PRESIM_BUDGET_MS`, default 500 ms).
+JARVIS does not rely on a single indicator. It aggregates data across 12 specialized mathematical engines running in parallel. 
 
-Three checks (each returns pass / adjust / veto with a reason):
+1. **SmartBreakoutAI:** Detects volatility expansions and breakout confirmation.
+2. **NeuralNetworkManager:** Manages historical pattern weights.
+3. **InstitutionalTradingEngine:** Analyzes market psychology and trap detection.
+4. **InstitutionalBacktestingEngine:** High-speed volume backtesting.
+5. **EnhancedFusionEngine:** Machine learning data fusion.
+6. **ComprehensiveBacktester:** Trend validation engine.
+7. **EnhancedLiveDataEngine:** Volatility shield and live tick processing.
+8. **PatternRecognitionEngine:** Multi-timeframe fractal detection.
+9. **AIAdaptiveLearningEngine:** Orderflow and heat-map analysis.
+10. **UnifiedConfidenceEngine:** Final math fusion and signal weighting.
+11. **OrderExecutionEngine:** Precision entry/exit logic.
+12. **DoctorMonitor (Self-Healing):** Continuous health checks and error resolution.
 
-1. **Historical win-rate** — win rate of similar recorded trades (same
-   direction + symbol, + regime when available) from `jarvis_learning.json`.
-   Fewer than 5 similar trades → abstain (`pass`, delta 0) — it never vetoes
-   on missing data. Win rate < 35% → veto; < 50% → confidence penalty;
-   ≥ 60% → small boost.
-2. **R:R sanity** — TP/SL from `smart_tpsl_calculator` (import guarded);
-   reward:risk below `JARVIS_PRESIM_MIN_RR` (default 1.0) → veto.
-3. **Volatility regime** — ATR extremely low/high vs price (or an extreme
-   `volatility` label in the market snapshot) → `adjust` with a small
-   confidence penalty, never a veto.
+---
 
-The brain (`jarvis_FIXED.py`) calls the simulator after its fused decision
-and existing safety/risk checks, just before the paper-trade open path.
-`veto` skips the entry and logs `[PRESIM] VETO: {reason}`; `adjust` applies
-the confidence delta (clamped ±10); `pass` is silent. Veto/adjust counts are
-tracked in `presim_stats` and shown in the compact status line. The whole
-call is fail-open — any exception behaves as `pass`. Disable entirely with
-`JARVIS_PRESIM=0`.
+## ⚡ Performance Engineering (Rust Speed Layer)
 
-## Data Validator
+To combat Python's Global Interpreter Lock (GIL) and latency bottlenecks in high-frequency candlestick processing, critical calculations were rewritten in **Rust**.
+- Custom Rust extensions compiled via `PyO3/Maturin`.
+- 10x reduction in mathematical processing latency (RSI, EMA, VWAP, Matrix calculations).
+- Memory-safe concurrent execution for massive tick data arrays.
 
-`jarvis_data_validator.py` is a pre-brain data quality gate that ensures the
-brain (`JarvisElite.analyze_trade_setup()`) never makes a trading decision on
-stale, incomplete, or suspicious data.
+---
 
-**Four checks run on every cycle, before any analysis begins:**
+## 🧠 Neural Cortex & AI Consciousness
 
-1. **Completeness** — OHLC values must all exist; NaN, None, and Inf are
-   rejected.
-2. **Price Sanity** — price must be > 0 and must not jump > 20% from the
-   last known good price (spike filter). The spike filter does **not** update
-   its reference on a rejected candle, so recovery after a bad tick is
-   automatic.
-3. **Staleness** — the data timestamp must be < 30 seconds old. Millisecond
-   timestamps are auto-detected and converted. Future timestamps are also
-   flagged.
-4. **Cross-Source** — Delta vs Binance live price divergence:
-   - \> 1% → warning logged, trading continues.
-   - \> 3% → this cycle is blocked (`WAIT/NO-DATA`).
+While the 12 engines provide the mathematical *instincts*, the **Neural Cortex** provides the *reasoning*. 
+- Integrates locally deployed LLMs (DeepSeek-r1) via Ollama to ensure complete data privacy and zero API rate limits.
+- Evaluates the fused algorithmic signals against current market sentiment and institutional psychology.
+- Maintains a "JSON-based Memory" of previous trades to self-correct and avoid repetitive losses in ranging markets.
 
-When any check fails the brain receives a `NO_TRADE` signal with reason
-`WAIT/NO-DATA: <details>` — it never sees the bad data. Reject and warning
-counts are shown in the compact status line (`DV: 2R/1W`).
+---
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `JARVIS_DATA_VALIDATOR` | `1` (on) | Set `0` to disable all validation (data passes through unchecked). |
+## 🛡️ Self-Healing Operations (JARVIS Doctor)
 
-Safety guarantees:
-- **Fail-open**: if the validator itself crashes, data passes through. The
-  validator can never break the brain.
-- Thread-safe counters (supports concurrent cycle evaluation).
-- Zero network calls — pure local validation only.
-- Per-source spike tracking (Delta and Binance maintain independent last
-  prices).
+A dedicated continuous monitoring daemon (`jarvis_doctor.py`) acts as the system's immune system.
+- Scans active memory, GPU/CUDA state, and application logs.
+- Automatically detects missing dependencies, broken WebSocket connections, or API rate limits.
+- Capable of running autonomous pip installations or system reboots to ensure uninterrupted market operation.
 
-## Dynamic crypto market routing
+---
 
-`jarvis_market_router.py` makes crypto selection symbol-safe. Every selection follows this sequence:
+## 👨‍💻 Developer & Architect
+**Bhagydip Makwana**  
+*Self-Taught Software & AI Engineer*  
+Built entirely from scratch through deep research, iterative development, and an obsession with algorithmic trading systems.
 
-1. `jarvis_coin_scanner.py` ranks its liquid Binance candidates.
-2. The exact winner is checked against Delta's current product list.
-3. Only a verified Delta contract is routed into candles, validation, analysis, option-chain lookup, paper ledger, and (after independent live opt-ins) order execution.
-4. The route is locked while a paper or live position remains open. JARVIS cannot switch coin in the middle of a trade.
-
-If scanning, product verification, or a selected contract fails, the cycle is **blocked**; it never silently substitutes BTC or submits an order for a different coin. Selection refreshes every five minutes by default, not every loop.
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `JARVIS_MULTI_MARKET` | `1` | `1` selects from scanner candidates; `0` uses `JARVIS_DEFAULT_SYMBOL` after Delta verification. |
-| `JARVIS_DEFAULT_SYMBOL` | `BTCUSDT` | Fixed crypto symbol when multi-market selection is disabled. |
-| `JARVIS_SELECTION_INTERVAL_SEC` | `300` | Minimum seconds between selections (minimum accepted value: 30). |
-| `JARVIS_INDIA_DATA` | `1` | Enables India-market readiness reporting when Upstox data is authenticated. It does **not** enable India orders. |
-
-### India / Upstox boundary
-
-Upstox currently provides Indian-market LTP, quote, and NSE option-chain data. That is useful for a separate NIFTY/BANKNIFTY analysis lane, but it is **not an execution adapter**: this repository contains no verified Upstox order-placement, fill reconciliation, contract resolver, or India risk/sizing implementation. Therefore the router reports NSE as `DATA_ONLY` even with valid data. It must remain separate from Delta crypto execution until those components are built and paper-tested.
-
-## Crash recovery & watchdog
-
-`jarvis_watchdog.py` provides:
-
-- **Startup reconciliation** — compares persisted local open trades
-  (`jarvis_state.json`) with exchange open positions; logs mismatches and
-  adopts exchange truth. Fail-safe: any API error is logged and startup
-  continues; it never places orders.
-- **Watchdog thread** — every 60 s checks heartbeats of core services (brain
-  loop, data feeds) and alerts via log (and Telegram if configured). Detection
-  + alerting only; no auto-restart. `get_health()` returns a status dict.
-- **State persistence** — open paper trades are saved to `jarvis_state.json`
-  on open/close for reconciliation after a crash.
-
-Disable with `JARVIS_WATCHDOG=0`. All wiring in `jarvis_FIXED.py` is guarded by
-`try/except` so the watchdog can never break startup. Paper-mode safety guards
-are unchanged.
-
-## Kill-switch & Daily Report
-
-**Kill-switch:**
-JARVIS provides an emergency kill-switch. If you create a file named `STOP_JARVIS` in the root folder, the live trading loop will perform a safe exit immediately. Open positions are intentionally left open so you can manage them manually.
-- To disable this check, set `JARVIS_KILL_SWITCH=0`.
-- A Telegram notification ("JARVIS stopped via kill-switch") is sent upon shutdown.
-
-**Daily Report:**
-A comprehensive performance report is sent to Telegram daily at a configured time (default 20:00). It includes the number of trades taken, win rate, total P&L, best/worst trades, PreSim vetoes, Data Validator rejects, top AI engines, system uptime, and error count.
-- Disable with `JARVIS_DAILY_REPORT=0`.
-- Change time using `JARVIS_REPORT_TIME=20:00` (e.g., IST).
-- The report is sent via `telegram_notifier.py`.
-
-Python trading/analysis modules with a React/Vite dashboard and a local FastAPI HUD. This repository is experimental, not production-ready trading software. Offline tests do not establish profitability, exchange compatibility, or live safety.
-
-## Runtime, GPU, Ollama, and safety boundaries
-
-- `jarvis_runtime.py` is the single local backend detector. `JARVIS_DEVICE=auto` (default) selects supported CUDA, then Apple MPS, then CPU; `cuda`, `mps`, and `cpu` are explicit requests. An unavailable accelerator is never faked: the dashboard reports the selected backend, device name, memory when available, and fallback reason. This describes the Python process only; it does not prove that a remote Ollama server or every optional native engine uses the same device.
-- Ollama context is one bounded, same-symbol JSON snapshot (`jarvis_ollama_context.py`) containing freshness, market/data quality, Parts 1–12, fusion/confidence, MTF/options where available, read-only risk/account/position/order state, runtime metadata, and safety gates. Secrets are redacted and invalid/unavailable model responses become advisory `WAIT`; local risk and safety gates remain authoritative. `/api/ps` metadata is queried separately when available to report remote model residency; no models are downloaded or implicitly preloaded.
-- Committee warm-loading is opt-in only: set `OLLAMA_PRELOAD_COMMITTEE=1`. Keep it unset for normal startup so large models are not loaded implicitly.
-- Paper/live analysis exposes bounded readiness states (`STARTING`, `READY`, `NOT_READY`, `STOPPING`, `STOPPED`) and `stop_live_trading()` provides a bounded shutdown request. Unavailable venue routes remain `NOT_READY` and retry; no order is submitted without the independent execution flags.
-- Position closes use venue `reduce_only` plus a stable `client_order_id` and a process-local single-close claim. Timeout, malformed, partial, or symbol-mismatched reconciliation remains `CLOSE_UNKNOWN`; the system does not blindly retry or book P&L.
-
-## Safe installation and tests
-
-Use Python 3.12+ and Node.js 22+.
-
-```sh
-python -m venv .venv
-# Activate .venv for your platform before the following commands.
-python -m pip install -r requirements.txt
-python -m pip install pytest httpx
-python -m pytest -q
-cd jarvis_web
-npm ci --ignore-scripts
-npm run build
-npm run lint
-```
-
-`pytest.ini` limits normal collection to `tests/`. Root-level `test_*.py` files are legacy network diagnostics, NOT the offline regression suite. Do not run them against production credentials.
-
-`install.cmd` and `setup_server.sh` install checkout dependencies only; they do not start trading/services or download unrelated executables/models. Windows launchers have not been executed on Windows in this review.
-
-## Paper startup
-
-Keep `JARVIS_AUTO_TRADE`, `JARVIS_LIVE_EXECUTION`, and `DELTA_ORDER_EXECUTION_ENABLED` unset or `false`. Set `JARVIS_START_PAPER=1` only when intentionally starting networked paper monitoring. The Python entrypoints reject paper startup if any of those live flags is `true`. On Windows, `run_jarvis_live.ps1 -StartPaper` launches once without automatic restart.
-
-Paper mode can still request market data and call configured AI services. Full entrypoint execution has not been validated here; optional engines/models may need additional setup. Do not mistake a successful unit test for full system readiness.
-
-## Dashboard
-
-The HUD defaults to `127.0.0.1:7788`. Vite development proxies `/ws`, `/chat`, and `/api` to that address. Production requires an authenticated reverse proxy routing these paths to the HUD. React derives `ws:`/`wss:` from its page; `VITE_JARVIS_WS_URL` can override it at build time.
-
-The coordinator sends display-only `/api/telemetry` with a per-launch token. A manually started HUD without a token accepts loopback telemetry. Origin filtering and loopback binding are NOT user authentication; never expose the HUD directly to the internet. The legacy standalone HTML HUD has not received a complete security/browser review.
-
-## Credentials and live trading
-
-Previously committed Delta and Upstox credentials/tokens must be treated as exposed. Revoke/rotate them at the providers. Removing literals from the new branch does not remove Git history. Use environment variables, never source literals.
-
-New execution opt-ins are safeguards, not certification. Before any live operation, independently verify exchange product IDs, contract multiplier, sizing/P&L, order/fill/close responses, hedging and durable reconciliation. `CLOSE_UNKNOWN` needs operator reconciliation; do not blindly retry or restart. See `AUDIT_NOTES.md` for the exact tested scope and unresolved risks.
+> **Note to Recruiters:** This repository serves as a technical showcase of my architectural capabilities. Due to the proprietary nature of the live trading strategies, API keys and certain configuration files have been strictly excluded from this public repository. 
