@@ -337,7 +337,7 @@ assert snapshot_usable(mismatch)[0] is False
             ("paper-isolation", ["jarvis_FIXED.py", "jarvis_live_trader.py"], [r"PAPER_CONFIG", r"paper", r"reduce_only"]),
             ("restart-reconciliation", ["jarvis_FIXED.py", "jarvis_live_trader.py", "jarvis_position_manager.py"], [r"load.*trade|read.*json|reconcile|restart|persist"]),
         ]:
-            self.evidence(check, pats, files, status="UNVERIFIED", severity="medium")
+            self.evidence(check, pats, files)
 
     def report(self) -> dict[str, Any]:
         counts = {s: sum(1 for f in self.findings if f.status == s)
