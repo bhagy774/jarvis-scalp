@@ -497,6 +497,10 @@ class DeepSeekValidator:
         
     async def validate_signal(self, signal_data: Dict) -> Dict[str, Any]:
         """Comprehensive signal validation with AI reasoning"""
+        import os
+        if os.environ.get("JARVIS_PURE_ALGO", "True") == "True":
+            return {"status": "VALID", "reason": "Pure Algo Mode Bypassed DeepSeek", "verdict": "EXECUTE"}
+            
         if not self.enabled:
             return {"status": "disabled", "reason": "DeepSeek validation disabled"}
             
@@ -643,6 +647,10 @@ Follow the tag with a 1-sentence institutional risk justification.
 
     async def validate_signal(self, signal_data: Dict) -> Dict[str, Any]:
         """Validate signal locally using Ollama Local AI"""
+        import os
+        if os.environ.get("JARVIS_PURE_ALGO", "True") == "True":
+            return {"status": "VALID", "reasoning": "Pure Algo Mode Bypassed Ollama", "verdict": "EXECUTE"}
+
         if not OLLAMA_INTEGRATION_AVAILABLE:
             return {"status": "DISABLED", "reasoning": "Ollama integration not available", "verdict": "EXECUTE"}
 

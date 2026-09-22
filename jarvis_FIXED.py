@@ -16,6 +16,11 @@ import re
 import gc
 import requests
 import subprocess
+
+# --- ZERO LAG PURE ALGO MODE ---
+# Set to "True" to completely bypass all LLM/Ollama network calls during live trading
+os.environ["JARVIS_PURE_ALGO"] = "True"
+# -------------------------------
 import numpy as np
 import pandas as pd
 from professional_display import ProfessionalSignalDisplay
@@ -5811,7 +5816,7 @@ class JarvisElite:
             # altcoin signal or gate.  Missing selected-asset data remains
             # explicitly unavailable and is handled fail-closed by the live
             # decision gate.
-            selected_base = (analysis_symbol or getattr(self, 'active_symbol', '') or '').upper()
+            selected_base = (getattr(self, 'active_symbol', '') or '').upper()
             for quote in ('USDT', 'USD'):
                 if selected_base.endswith(quote):
                     selected_base = selected_base[:-len(quote)]
