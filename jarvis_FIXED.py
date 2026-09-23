@@ -34,7 +34,18 @@ import warnings
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
 from queue import Queue
-from typing import Dict, List, Tuple, Optional, Union
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Union, Any
+
+@dataclass
+class PresimParams:
+    direction: str
+    confidence: int
+    entry_price: float
+    result: Optional[Dict[str, Any]] = None
+    df: Optional[Any] = None
+    current_price: Optional[float] = None
+    symbol: str = 'BTCUSDT'
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
@@ -1337,7 +1348,7 @@ class LiveTradingEngine:
     #  PAPER TRADE MANAGEMENT
     # ═══════════════════════════════════════════════════════════════
     
-    def _presim_gate(self, direction, confidence, entry_price, result=None, df=None, current_price=None, symbol='BTCUSDT'):
+    def _presim_gate(self, params: PresimParams):
         """Run the pre-trade simulator and fail closed on safety uncertainty.
 
         Returns ``(None, confidence)`` for a veto or simulator error. A
@@ -1347,22 +1358,22 @@ class LiveTradingEngine:
         """
         try:
             if os.getenv('JARVIS_PRESIM', '1') == '0':
-                return direction, confidence
+                return params.direction, params.confidence
             from jarvis_presim import run_presim
             # Partial test/recovery wiring may omit the optional event sink;
             # initialize it locally so recording a veto cannot itself turn the
             # gate into an implicit pass.
             if not isinstance(getattr(self, '_dashboard_events', None), list):
                 self._dashboard_events = []
-            market_ctx = (result or {}).get('market_context', {}) if isinstance(result, dict) else {}
+            market_ctx = (params.result or {}).get('market_context', {}) if isinstance(params.result, dict) else {}
             decision = run_presim(
                 signal={
-                    'symbol': symbol,
-                    'direction': direction,
-                    'entry_price': entry_price or current_price,
+                    'symbol': params.symbol,
+                    'direction': params.direction,
+                    'entry_price': params.entry_price or params.current_price,
                     'regime': market_ctx.get('trend'),
                 },
-                candles=df,
+                candles=params.df,
                 snapshot=market_ctx,
             )
             self.presim_stats = getattr(self, 'presim_stats', {}) or {}
@@ -1378,18 +1389,19 @@ class LiveTradingEngine:
                     self._dashboard_events.append(event)
                 except Exception:
                     logger.debug("[PRESIM] veto dashboard event unavailable")
-                logger.info(f"[PRESIM] VETO {direction}: {decision.get('reason', '')}")
-                return None, confidence
+                logger.info(f"[PRESIM] VETO {params.direction}: {decision.get('reason', '')}")
+                return None, params.confidence
             if action == 'adjust':
                 self.presim_stats['adjustments'] = self.presim_stats.get('adjustments', 0) + 1
                 delta = max(-10, min(10, int(decision.get('confidence_delta', 0))))
-                confidence = max(0, min(100, confidence + delta))
+                confidence = max(0, min(100, params.confidence + delta))
                 try:
                     self._dashboard_events.append(f"PreSim adjust {delta:+d}: {decision.get('reason', '')}")
                 except Exception:
                     logger.debug("[PRESIM] adjust dashboard event unavailable")
                 logger.info(f"[PRESIM] ADJUST {delta:+d}: {decision.get('reason', '')}")
-            return direction, confidence
+                return params.direction, confidence
+            return params.direction, params.confidence
         except Exception as e:
             # The simulator is a safety gate. An unavailable/corrupt simulator
             # must never silently authorize a candidate entry.
@@ -1400,7 +1412,7 @@ class LiveTradingEngine:
             except Exception:
                 pass
             logger.warning("[PRESIM] gate error; entry vetoed: %s", type(e).__name__)
-            return None, confidence
+            return None, params.confidence
 
     def _scenario_gate(self, direction, entry_price=None, sl=None, tp=None, df=None, symbol='BTCUSDT'):
         """Pre-Trade Scenario Simulator gate (fail-open).
@@ -2271,10 +2283,16 @@ class LiveTradingEngine:
                         # applied before this snapshot so a veto propagates to
                         # every downstream consumer.
                         if direction in ('CALL', 'PUT'):
-                            direction, confidence = self._presim_gate(
-                                direction, confidence, entry_price,
-                                result=result, df=df, current_price=current_price, symbol=symbol
+                            params = PresimParams(
+                                direction=direction,
+                                confidence=confidence,
+                                entry_price=entry_price,
+                                result=result,
+                                df=df,
+                                current_price=current_price,
+                                symbol=symbol
                             )
+                            direction, confidence = self._presim_gate(params)
                             if direction not in ('CALL', 'PUT'):
                                 direction = 'NO_TRADE'
                         _options_ctx = (result.get('market_context', {}) or {}).get('options_context', {})
