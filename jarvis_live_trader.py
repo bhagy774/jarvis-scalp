@@ -26,6 +26,16 @@ import logging
 import threading
 from datetime import datetime, timedelta, date
 from typing import Dict, Optional, List
+from dataclasses import dataclass
+
+@dataclass
+class TradeRequest:
+    direction: str
+    confidence: int
+    current_price: float
+    part_results: Dict = None
+    trade_type: str = "SCALP"
+    symbol: str = "BTCUSDT"
 
 try:
     from dotenv import load_dotenv
@@ -169,14 +179,19 @@ class JarvisAutoTrader:
     #  PUBLIC API
     # ──────────────────────────────────────────────────────────────
 
-    def execute(self, direction: str, confidence: int,
-                current_price: float, part_results: Dict = None,
-                trade_type: str = "SCALP", symbol: str = "BTCUSDT") -> Dict:
+    def execute(self, request: TradeRequest) -> Dict:
         """
         Main entry: receive signal → run all gates → place order.
-        direction  : 'CALL' or 'PUT'
-        trade_type : 'SCALP' or 'SWING'
+        request.direction  : 'CALL' or 'PUT'
+        request.trade_type : 'SCALP' or 'SWING'
         """
+        direction = request.direction
+        confidence = request.confidence
+        current_price = request.current_price
+        part_results = request.part_results
+        trade_type = request.trade_type
+        symbol = request.symbol
+
         if self.emergency_stop:
             return self._skip("🛑 EMERGENCY STOP ACTIVE")
         if not isinstance(direction, str) or direction.upper() not in ("CALL", "PUT", "BUY", "SELL"):
