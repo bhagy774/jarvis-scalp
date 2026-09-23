@@ -59,7 +59,7 @@ except ImportError:
     _init_gemini_advisor = None
     GEMINI_ADVISOR_AVAILABLE = False
 try:
-    from jarvis_live_trader import JarvisAutoTrader
+    from jarvis_live_trader import JarvisAutoTrader, TradeRequest
     LIVE_TRADER_AVAILABLE = True
 except ImportError as _e:
     JarvisAutoTrader = None
@@ -2313,12 +2313,14 @@ class LiveTradingEngine:
                                 if expiry and str(expiry).upper() in ('DAY_TRADE', 'SWING', '15M', '30M'):
                                     trade_type = 'SWING'
                                 at_result = self.auto_trader.execute(
-                                    direction=direction,
-                                    confidence=confidence,
-                                    current_price=current_price or 0,
-                                    symbol=symbol,
-                                    part_results=getattr(self.jarvis, 'latest_part_results', {}),
-                                    trade_type=trade_type,
+                                    TradeRequest(
+                                        direction=direction,
+                                        confidence=confidence,
+                                        current_price=current_price or 0,
+                                        symbol=symbol,
+                                        part_results=getattr(self.jarvis, 'latest_part_results', {}),
+                                        trade_type=trade_type,
+                                    )
                                 )
                                 if at_result.get('success'):
                                     pos = at_result.get('position', {})
