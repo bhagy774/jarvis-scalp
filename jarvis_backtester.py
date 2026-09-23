@@ -14,6 +14,7 @@ import math
 import os
 import sys
 from datetime import datetime, timedelta
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -271,24 +272,36 @@ class BacktestRiskGate:
         return math.floor(max(0.0, quantity) * 100_000_000) / 100_000_000
 
 
+@dataclass
+class BacktestConfig:
+    symbol: str = "BTCUSDT"
+    timeframe: str = "5m"
+    years: int = 3
+    starting_capital: float = 1000.0
+    warmup: int = 100
+    slippage_bps: float = 5.0
+    fee_bps: float = 10.0
+    scalp_tp: float = SCALP_TP_PCT
+    scalp_sl: float = SCALP_SL_PCT
+    swing_tp: float = SWING_TP_PCT
+    swing_sl: float = SWING_SL_PCT
+    live_audit: bool = True
+
+
 class JarvisFullBacktester:
     """Historical-only replay with central math/GPU decision analysis in isolation mode."""
 
-    def __init__(self, symbol: str = "BTCUSDT", timeframe: str = "5m", years: int = 3,
-                 starting_capital: float = 1000.0, warmup: int = 100,
-                 slippage_bps: float = 5.0, fee_bps: float = 10.0,
-                 scalp_tp: float = SCALP_TP_PCT, scalp_sl: float = SCALP_SL_PCT,
-                 swing_tp: float = SWING_TP_PCT, swing_sl: float = SWING_SL_PCT,
-                 live_audit: bool = True):
-        self.symbol, self.timeframe, self.years = symbol.upper(), timeframe, years
-        self.starting_capital, self.warmup = starting_capital, warmup
-        self.slippage_bps, self.fee_bps = slippage_bps, fee_bps
-        self.scalp_tp, self.scalp_sl = scalp_tp, scalp_sl
-        self.swing_tp, self.swing_sl = swing_tp, swing_sl
-        self.live_audit = live_audit
+    def __init__(self, config: Optional[BacktestConfig] = None):
+        config = config or BacktestConfig()
+        self.symbol, self.timeframe, self.years = config.symbol.upper(), config.timeframe, config.years
+        self.starting_capital, self.warmup = config.starting_capital, config.warmup
+        self.slippage_bps, self.fee_bps = config.slippage_bps, config.fee_bps
+        self.scalp_tp, self.scalp_sl = config.scalp_tp, config.scalp_sl
+        self.swing_tp, self.swing_sl = config.swing_tp, config.swing_sl
+        self.live_audit = config.live_audit
         self.gate = BacktestRiskGate()
         self.all_trades: List[BacktestPosition] = []
-        self.balance = self.peak = starting_capital
+        self.balance = self.peak = config.starting_capital
         self.equity_curve: List[Dict[str, object]] = []
         self.n_no_signal = self.n_skip_gate = self.n_unaffordable = 0
         self.part_activity = {name: {'decisions_seen': 0, 'non_neutral': 0, 'offline': 0}
@@ -635,11 +648,22 @@ def main() -> None:
     args = parser.parse_args()
     if args.capital <= 0 or args.warmup < 20 or args.slippage_bps < 0 or args.fee_bps < 0:
         parser.error("capital must be positive; warmup >=20; costs must be non-negative")
-    runner = JarvisFullBacktester(args.symbol, args.tf, args.years, args.capital, args.warmup,
-                                  args.slippage_bps, args.fee_bps,
-                                  scalp_tp=args.scalp_tp, scalp_sl=args.scalp_sl,
-                                  swing_tp=args.swing_tp, swing_sl=args.swing_sl,
-                                  live_audit=not args.no_audit)
+
+    config = BacktestConfig(
+        symbol=args.symbol,
+        timeframe=args.tf,
+        years=args.years,
+        starting_capital=args.capital,
+        warmup=args.warmup,
+        slippage_bps=args.slippage_bps,
+        fee_bps=args.fee_bps,
+        scalp_tp=args.scalp_tp,
+        scalp_sl=args.scalp_sl,
+        swing_tp=args.swing_tp,
+        swing_sl=args.swing_sl,
+        live_audit=not args.no_audit
+    )
+    runner = JarvisFullBacktester(config)
     runner.run(args.data_file)
 
 
