@@ -54,6 +54,7 @@ def _box(msg, col=C): print(f"{col}  ▶  {RST}{msg}")
 # ══════════════════════════════════════════════════════════════════
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP, contract_quote_value_usdt
 from jarvis_lot_limits import enforce_entry_lots
+from jarvis_decision import build_final_decision, DecisionContext
 try:
     from jarvis_position_ownership import claim_position, claim_close
 except ImportError:
@@ -793,11 +794,13 @@ class JarvisAutoTrader:
                 selected_ctx = (result.get("market_context", {}) or {}).get("options_context", {})
                 reversal_decision = build_final_decision(
                     sig,
-                    symbol=selected_symbol,
-                    price=position_price,
-                    opinions=result.get("decision_opinions", []) or [],
-                    options_context=selected_ctx,
-                    require_options=bool(self.is_enabled),
+                    DecisionContext(
+                        symbol=selected_symbol,
+                        price=position_price,
+                        opinions=result.get("decision_opinions", []) or [],
+                        options_context=selected_ctx,
+                        require_options=bool(self.is_enabled),
+                    )
                 )
                 if not reversal_decision.get("execution_allowed"):
                     logger.info("[REVERSAL] blocked by canonical decision: %s", reversal_decision.get("reasons"))
