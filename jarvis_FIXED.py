@@ -28,6 +28,7 @@ from jarvis_dashboard import UnifiedDashboard
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
 from jarvis_decision import normalize_confidence, confidence_text, build_final_decision
 from jarvis_runtime import detect_backend, torch_device
+from dataclasses import dataclass
 from jarvis_ollama_context import build_snapshot, decision_prompt, snapshot_usable, validate_decision
 pro_display = ProfessionalSignalDisplay()
 import warnings
@@ -39,6 +40,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 try:
+
     from dotenv import load_dotenv
     # Load .env file
     load_dotenv()
@@ -1060,6 +1062,16 @@ class DeltaWebSocketClient:
                 logger.error(f"⚠️ WebSocket Connection Connection Lost ({e}). Reconnecting in 5s...")
                 await asyncio.sleep(5)
 
+
+@dataclass
+class ScenarioConfig:
+    direction: str
+    entry_price: float = None
+    sl: float = None
+    tp: float = None
+    df: pd.DataFrame = None
+    symbol: str = 'BTCUSDT'
+
 class LiveTradingEngine:
     """Live Trading Engine with Paper Trading + Live Signals"""
     
@@ -1402,7 +1414,7 @@ class LiveTradingEngine:
             logger.warning("[PRESIM] gate error; entry vetoed: %s", type(e).__name__)
             return None, confidence
 
-    def _scenario_gate(self, direction, entry_price=None, sl=None, tp=None, df=None, symbol='BTCUSDT'):
+    def _scenario_gate(self, config: ScenarioConfig):
         """Pre-Trade Scenario Simulator gate (fail-open).
 
         Runs jarvis_scenario_simulator on a candidate ENTER signal. Returns
@@ -1411,56 +1423,28 @@ class LiveTradingEngine:
         """
         try:
             if os.getenv('JARVIS_SCEN_SIM', '1') == '0':
-                return direction
+                return config.direction
             from jarvis_scenario_simulator import run_scenarios
             verdict = run_scenarios(
-                direction=direction,
-                entry_price=entry_price,
-                sl=sl, tp=tp,
-                df=df,
-                fee_bps=float(os.getenv('JARVIS_SCEN_FEE_BPS', '10')),
-                slippage_bps=float(os.getenv('JARVIS_SCEN_SLIPPAGE_BPS', '5')),
-            )
-            if verdict.get('action') == 'veto':
-                self._dashboard_events.append(f"Scenario veto: {verdict.get('reason', 'stress gate')}")
-                logger.info(f"[SCENARIO] VETO {direction} {symbol}: {verdict.get('reason')}")
-                return 'NO_TRADE'
-            if verdict.get('total'):
-                logger.info(f"[SCENARIO] PASS {verdict.get('passed')}/{verdict.get('total')} {direction} {symbol}")
-            return direction
-        except Exception as e:
-            logger.debug(f"[SCENARIO] gate error (fail-open → pass): {e}")
-            return direction
-
-    def _scenario_gate(self, direction, entry_price=None, sl=None, tp=None, df=None, symbol='BTCUSDT'):
-        """Pre-Trade Scenario Simulator gate (fail-open).
-
-        Runs jarvis_scenario_simulator on a candidate ENTER signal. Returns
-        direction — set to 'NO_TRADE' on veto (too many stress scenarios
-        fail). Any exception or disabled env → returns direction unchanged.
-        """
-        try:
-            if os.getenv('JARVIS_SCEN_SIM', '1') == '0':
-                return direction
-            from jarvis_scenario_simulator import run_scenarios
-            verdict = run_scenarios(
-                direction=direction,
-                entry_price=entry_price,
-                sl=sl, tp=tp,
-                df=df,
+                direction=config.direction,
+                entry_price=config.entry_price,
+                sl=config.sl, tp=config.tp,
+                df=config.df,
                 fee_bps=float(os.getenv('JARVIS_SCEN_FEE_BPS', '10')),
                 slippage_bps=float(os.getenv('JARVIS_SCEN_SLIPPAGE_BPS', '5')),
             )
             if verdict.get('action') == 'veto':
                 print(f"  🛡️ SCENARIO VETO: {verdict.get('passed')}/{verdict.get('total')} pass — {verdict.get('reason')}")
-                logger.info(f"[SCENARIO] VETO {direction} {symbol}: {verdict.get('reason')}")
+                if hasattr(self, '_dashboard_events'):
+                    self._dashboard_events.append(f"Scenario veto: {verdict.get('reason', 'stress gate')}")
+                logger.info(f"[SCENARIO] VETO {config.direction} {config.symbol}: {verdict.get('reason')}")
                 return 'NO_TRADE'
             if verdict.get('total'):
-                logger.info(f"[SCENARIO] PASS {verdict.get('passed')}/{verdict.get('total')} {direction} {symbol}")
-            return direction
+                logger.info(f"[SCENARIO] PASS {verdict.get('passed')}/{verdict.get('total')} {config.direction} {config.symbol}")
+            return config.direction
         except Exception as e:
             logger.debug(f"[SCENARIO] gate error (fail-open → pass): {e}")
-            return direction
+            return config.direction
 
     def _open_paper_trade(self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl, current_price=None, symbol='BTCUSDT'):
         """Open a new paper trade"""
@@ -2260,10 +2244,12 @@ class LiveTradingEngine:
                         # Fail-open; JARVIS_SCEN_SIM=0 thi off.
                         if direction in ('CALL', 'PUT'):
                             direction = self._scenario_gate(
-                                direction,
-                                entry_price=entry_price or current_price,
-                                sl=sl, tp=tp2 or tp1,
-                                df=df, symbol=symbol,
+                                ScenarioConfig(
+                                    direction=direction,
+                                    entry_price=entry_price or current_price,
+                                    sl=sl, tp=tp2 or tp1,
+                                    df=df, symbol=symbol
+                                )
                             )
 
                         # 5b. Build one authoritative post-gate decision for
