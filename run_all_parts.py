@@ -874,7 +874,7 @@ def run_all_parts(ai_brain=None, predictor=None):
                             "pcr": chain_raw.get("total_oi", 0) and (bias_data.get("raw_data", {}).get("expiries", {}).get("total", {}).get("puts", 0) / max(1, chain_raw.get("total_oi", 1))), # Approx or use computed
                             "bias_score": bias_data.get("score", 0),
                             "smart_money": bias_data.get("reasons", ["Neutral"])[0] if bias_data.get("reasons") else "Neutral",
-                            "max_pain": 0, # Todo: calc in wrapper
+                            "max_pain": chain_raw.get("max_pain", 0),
                             "comment": bias_data.get("bias", "NEUTRAL")
                         }
                         

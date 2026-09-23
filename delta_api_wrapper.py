@@ -450,6 +450,7 @@ class DeltaExchangeData:
         # Note: Full Max Pain requires iterating all strikes. 
         # For efficiency, we just store the raw lists.
         # Smart Backtester/Live Analyst can calculate specifics.
+        chain_data["max_pain"] = self._calculate_max_pain(chain_data)
             
         return chain_data
 
@@ -524,6 +525,7 @@ class DeltaExchangeData:
                 "expiries": expiries,
                 "total_oi": chain["total_oi"],
                 "pcr": round(chain.get("pcr", 0), 3),  # FIX: also in raw_data for compatibility
+                "max_pain": chain.get("max_pain", 0),
             }
         }
 
