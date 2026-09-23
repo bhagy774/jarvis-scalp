@@ -24,6 +24,7 @@ import time
 import json
 import logging
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Dict, Optional, List
 
@@ -48,6 +49,15 @@ BD = '\033[1m';  RST= '\033[0m'
 
 def _p(text, *col):  return ''.join(col) + str(text) + RST
 def _box(msg, col=C): print(f"{col}  ▶  {RST}{msg}")
+
+@dataclass
+class TradeRequest:
+    direction: str
+    confidence: float
+    price: float
+    trade_type: str
+    hedge_plan: Dict
+    symbol: str = "BTCUSDT"
 
 # ══════════════════════════════════════════════════════════════════
 #  RISK CONFIGURATION  (override via .env)
@@ -229,8 +239,15 @@ class JarvisAutoTrader:
                 direction, confidence, current_price, part_results, symbol)
 
         # ─ Gate 3: Execute ───────────────────────────────────────
-        return self._place_trade(
-            direction, confidence, current_price, trade_type, hedge_plan, symbol)
+        req = TradeRequest(
+            direction=direction,
+            confidence=confidence,
+            price=current_price,
+            trade_type=trade_type,
+            hedge_plan=hedge_plan,
+            symbol=symbol
+        )
+        return self._place_trade(req)
 
     def trigger_emergency_stop(self):
         """Close ALL positions immediately."""
@@ -380,9 +397,15 @@ class JarvisAutoTrader:
     #  GATE 3: TRADE EXECUTION
     # ──────────────────────────────────────────────────────────────
 
-    def _place_trade(self, direction, confidence, price,
-                     trade_type, hedge_plan, symbol: str = "BTCUSDT") -> Dict:
+    def _place_trade(self, request: TradeRequest) -> Dict:
         """Execute both legs (futures + optional hedge)."""
+        direction = request.direction
+        confidence = request.confidence
+        price = request.price
+        trade_type = request.trade_type
+        hedge_plan = request.hedge_plan
+        symbol = request.symbol
+
         symbol = str(symbol or "").upper().replace("-", "").replace("_", "").strip()
         if not symbol:
             return {"success": False, "reason": "Execution symbol is missing"}
@@ -904,10 +927,15 @@ class JarvisAutoTrader:
 
         hedge_plan = {"do_hedge": False, "reason": "Reversal trade — no hedge"}
         trade_type = pos.get("trade_type", "SCALP")
-        result = self._place_trade(
-            new_dir, confidence, price, trade_type, hedge_plan,
+        req = TradeRequest(
+            direction=new_dir,
+            confidence=confidence,
+            price=price,
+            trade_type=trade_type,
+            hedge_plan=hedge_plan,
             symbol=pos.get("symbol", "")
         )
+        result = self._place_trade(req)
 
         if result.get("success"):
             logger.info("[REVERSAL] reverse trade opened id=%s", (result.get('position') or {}).get('id'))
