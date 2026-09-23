@@ -156,7 +156,7 @@ class AuditRegressionTests(unittest.TestCase):
 
     def test_duplicate_manager_cannot_submit_second_close(self):
         from jarvis_live_trader import JarvisAutoTrader
-        from jarvis_position_manager import JarvisPositionManager, PositionRecord
+        from jarvis_position_manager import PositionConfig, JarvisPositionManager, PositionRecord
         from jarvis_position_ownership import claim_position, clear_registry
 
         class PaperVenue:
@@ -176,7 +176,7 @@ class AuditRegressionTests(unittest.TestCase):
             "contracts": 2, "entry_price": 100.0,
         }
         self.assertTrue(claim_position("shared-1", auto._ownership_token))
-        pm_pos = PositionRecord("shared-1", "CALL", 100.0, 2, 90, "BTCUSDT")
+        pm_pos = PositionRecord(PositionConfig("shared-1", "CALL", 100.0, 2, 90, "BTCUSDT"))
         manager.open_positions.append(pm_pos)  # simulate stale duplicate wiring
         self.assertFalse(manager._close_position(pm_pos, 101.0, "TP HIT"))
         self.assertEqual(venue.calls, [])

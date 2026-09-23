@@ -80,12 +80,12 @@ class ExecutionSafetyTests(unittest.TestCase):
         self.assertEqual(small["contracts"], 0)
 
     def test_position_manager_does_not_book_failed_close(self):
-        from jarvis_position_manager import JarvisPositionManager
+        from jarvis_position_manager import PositionConfig, JarvisPositionManager
         delta = DeltaStub(order_result={"success": False, "error": "rejected"})
         # Run in paper mode so register_position doesn't require live contract metadata
         with patch.dict(os.environ, {"DELTA_ORDER_EXECUTION_ENABLED": "false"}):
             manager = JarvisPositionManager(delta)
-            pos = manager.register_position("p1", "CALL", 100, 10, 80)
+            pos = manager.register_position(PositionConfig("p1", "CALL", 100, 10, 80))
             self.assertFalse(manager._close_position(pos, 101, "test"))
             self.assertEqual(pos.status, "CLOSE_UNKNOWN")
             self.assertEqual(manager.daily_pnl, 0.0)

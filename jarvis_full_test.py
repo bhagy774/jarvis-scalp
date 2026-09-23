@@ -146,14 +146,14 @@ def test_sizer():
             f"conf72={sz2['multiplier']}x | conf65={sz3['multiplier']}x")
 
 def test_position_manager():
-    from jarvis_position_manager import JarvisPositionManager, PositionRecord
+    from jarvis_position_manager import PositionConfig, JarvisPositionManager, PositionRecord
     class MockDelta:
         def get_wallet_balance(self): return 6.0
         def get_live_price(self, s): return 95000.0
         def place_order(self, *a, **kw): return {"success": True}
     pm = JarvisPositionManager(MockDelta())
     assert not pm.has_open_position()
-    pos = pm.register_position("T001", "CALL", 95000.0, 10, 85, "BTC", "SCALP")
+    pos = pm.register_position(PositionConfig("T001", "CALL", 95000.0, 10, 85, "BTC", "SCALP"))
     assert pm.has_open_position()
     assert pos.tp_price > 95000.0
     assert pos.sl_price < 95000.0
@@ -455,8 +455,8 @@ def test_e2e_simulation():
     size_inf = sizer.calculate_size(confidence, coin + "USDT")
 
     # 5. Position Manager creates record
-    from jarvis_position_manager import PositionRecord
-    pos = PositionRecord("E2E_TEST_001", "CALL", price, size_inf["contracts"], confidence, coin)
+    from jarvis_position_manager import PositionConfig, PositionRecord
+    pos = PositionRecord(PositionConfig("E2E_TEST_001", "CALL", price, size_inf["contracts"], confidence, coin))
 
     # 6. Verify
     assert pos.tp_price > price
