@@ -1550,6 +1550,9 @@ class LiveTradingEngine:
         still_open = []
         newly_closed = []
         
+        now = datetime.now()
+        now_iso = now.isoformat()
+
         for trade in self.paper_open_trades:
             closed = False
             
@@ -1557,15 +1560,15 @@ class LiveTradingEngine:
             if trade.get('status') == 'PENDING_LIMIT':
                 if trade['direction'] == 'CALL' and current_price <= trade['entry_price']:
                     trade['status'] = 'OPEN'
-                    trade['entry_time'] = datetime.now().isoformat()
+                    trade['entry_time'] = now_iso
                     expiry_min = self.PAPER_CONFIG['expiry_map'].get(trade['expiry_name'], 3)
-                    trade['expiry_time'] = (datetime.now() + timedelta(minutes=expiry_min)).isoformat()
+                    trade['expiry_time'] = (now + timedelta(minutes=expiry_min)).isoformat()
                     self._dashboard_events.append(f"Limit filled: {trade['direction']} @ {trade['entry_price']}")
                 elif trade['direction'] == 'PUT' and current_price >= trade['entry_price']:
                     trade['status'] = 'OPEN'
-                    trade['entry_time'] = datetime.now().isoformat()
+                    trade['entry_time'] = now_iso
                     expiry_min = self.PAPER_CONFIG['expiry_map'].get(trade['expiry_name'], 3)
-                    trade['expiry_time'] = (datetime.now() + timedelta(minutes=expiry_min)).isoformat()
+                    trade['expiry_time'] = (now + timedelta(minutes=expiry_min)).isoformat()
                     self._dashboard_events.append(f"Limit filled: {trade['direction']} @ {trade['entry_price']}")
                 else:
                     still_open.append(trade)
@@ -1594,7 +1597,7 @@ class LiveTradingEngine:
                     closed = True
             
             # Check Time Expiry
-            if not closed and datetime.now() >= expiry_dt:
+            if not closed and now >= expiry_dt:
                 if direction == 'CALL':
                     if current_price > entry:
                         trade['result'] = 'WIN'
