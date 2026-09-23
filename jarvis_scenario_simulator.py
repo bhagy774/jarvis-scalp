@@ -56,7 +56,7 @@ def _scenario_normal_move(direction, entry, sl, tp, atr):
     return True, "TP within reachable range"
 
 
-def _scenario_slippage_spike(direction, entry, sl, tp, fee_bps, slippage_bps):
+def _scenario_slippage_spike(entry, sl, tp, fee_bps, slippage_bps):
     """Slippage 3x thay to pan net R:R positive rahe?"""
     cost = entry * (fee_bps + 3.0 * slippage_bps) / 10000.0
     reward = abs(tp - entry) - cost
@@ -136,7 +136,7 @@ def run_scenarios(direction, entry_price, sl, tp, df,
     atr = _atr(df)
     scenarios = [
         ("normal_move", *_scenario_normal_move(direction, entry, sl, tp, atr)),
-        ("slippage_spike", *_scenario_slippage_spike(direction, entry, sl, tp, fee_bps, slippage_bps)),
+        ("slippage_spike", *_scenario_slippage_spike(entry, sl, tp, fee_bps, slippage_bps)),
         ("wick_hunt", *_scenario_wick_hunt(direction, entry, sl, df, atr)),
         ("volatility_collapse", *_scenario_volatility_collapse(df, atr)),
         ("volume_drop", *_scenario_volume_drop(df)),
