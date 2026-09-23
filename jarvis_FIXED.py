@@ -1412,15 +1412,15 @@ class LiveTradingEngine:
         try:
             if os.getenv('JARVIS_SCEN_SIM', '1') == '0':
                 return direction
-            from jarvis_scenario_simulator import run_scenarios
-            verdict = run_scenarios(
+            from jarvis_scenario_simulator import run_scenarios, ScenarioConfig
+            verdict = run_scenarios(ScenarioConfig(
                 direction=direction,
                 entry_price=entry_price,
                 sl=sl, tp=tp,
                 df=df,
                 fee_bps=float(os.getenv('JARVIS_SCEN_FEE_BPS', '10')),
                 slippage_bps=float(os.getenv('JARVIS_SCEN_SLIPPAGE_BPS', '5')),
-            )
+            ))
             if verdict.get('action') == 'veto':
                 self._dashboard_events.append(f"Scenario veto: {verdict.get('reason', 'stress gate')}")
                 logger.info(f"[SCENARIO] VETO {direction} {symbol}: {verdict.get('reason')}")
@@ -1442,15 +1442,15 @@ class LiveTradingEngine:
         try:
             if os.getenv('JARVIS_SCEN_SIM', '1') == '0':
                 return direction
-            from jarvis_scenario_simulator import run_scenarios
-            verdict = run_scenarios(
+            from jarvis_scenario_simulator import run_scenarios, ScenarioConfig
+            verdict = run_scenarios(ScenarioConfig(
                 direction=direction,
                 entry_price=entry_price,
                 sl=sl, tp=tp,
                 df=df,
                 fee_bps=float(os.getenv('JARVIS_SCEN_FEE_BPS', '10')),
                 slippage_bps=float(os.getenv('JARVIS_SCEN_SLIPPAGE_BPS', '5')),
-            )
+            ))
             if verdict.get('action') == 'veto':
                 print(f"  🛡️ SCENARIO VETO: {verdict.get('passed')}/{verdict.get('total')} pass — {verdict.get('reason')}")
                 logger.info(f"[SCENARIO] VETO {direction} {symbol}: {verdict.get('reason')}")
