@@ -254,19 +254,18 @@ class BacktestRiskGate:
         self.daily_pnl += position.pnl_usdt
         self.consec_losses = 0 if position.result == "WIN" else self.consec_losses + 1
 
-    def calc_contracts(self, entry_price: float, stop_trigger: float, direction: str,
-                       cash_balance: float, fee_bps: float, slippage_bps: float) -> float:
+    def calc_contracts(self, position: BacktestPosition, cash_balance: float) -> float:
         """Size base-asset quantity by worst stop loss, then cap gross exposure."""
-        if entry_price <= 0 or cash_balance <= 0:
+        if position.entry_price <= 0 or cash_balance <= 0:
             return 0.0
-        is_call = direction in ("CALL", "BUY")
-        adverse_stop = stop_trigger * (1 - slippage_bps / 10_000 if is_call else 1 + slippage_bps / 10_000)
-        loss_per_unit = abs(entry_price - adverse_stop) + (entry_price + adverse_stop) * fee_bps / 20_000
+        is_call = position.direction in ("CALL", "BUY")
+        adverse_stop = position.sl_price * (1 - position.slippage_bps / 10_000 if is_call else 1 + position.slippage_bps / 10_000)
+        loss_per_unit = abs(position.entry_price - adverse_stop) + (position.entry_price + adverse_stop) * position.fee_bps / 20_000
         if loss_per_unit <= 0:
             return 0.0
         used_notional = sum(p.entry_price * p.contracts for p in self.open_positions)
         exposure_room = max(0.0, cash_balance * LEVERAGE - used_notional)
-        quantity = min(MAX_RISK_USDT / loss_per_unit, exposure_room / entry_price)
+        quantity = min(MAX_RISK_USDT / loss_per_unit, exposure_room / position.entry_price)
         # Deterministic quantity precision without forcing an unaffordable one-unit trade.
         return math.floor(max(0.0, quantity) * 100_000_000) / 100_000_000
 
@@ -452,8 +451,7 @@ class JarvisFullBacktester:
                                             self.slippage_bps, self.fee_bps,
                                             scalp_tp=self.scalp_tp, scalp_sl=self.scalp_sl,
                                             swing_tp=self.swing_tp, swing_sl=self.swing_sl)
-            quantity = self.gate.calc_contracts(entry_price, provisional.sl_price, direction,
-                                                self.balance, self.fee_bps, self.slippage_bps)
+            quantity = self.gate.calc_contracts(provisional, self.balance)
             if quantity <= 0:
                 self.n_unaffordable += 1
                 continue
