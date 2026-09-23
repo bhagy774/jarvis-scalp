@@ -13,6 +13,8 @@ import os
 import time
 import logging
 import threading
+import asyncio
+import aiohttp
 import requests
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -143,11 +145,18 @@ class JarvisCoinScanner:
         scores = {}
         stats_map = self._fetch_binance_stats_bulk()
 
+        symbols_to_fetch = [BINANCE_SYMBOL_MAP.get(c, "") for c in SCAN_COINS if c in BINANCE_SYMBOL_MAP]
+        candles_map, funding_map = asyncio.run(self._fetch_all_async_data(symbols_to_fetch))
+
         for coin in SCAN_COINS:
             try:
-                symbol = BINANCE_SYMBOL_MAP[coin]
+                symbol = BINANCE_SYMBOL_MAP.get(coin, "")
+                if not symbol:
+                    continue
                 stats  = stats_map.get(symbol, {})
-                scores[coin] = self._score_coin(coin, symbol, stats)
+                closes = candles_map.get(symbol, [])
+                funding = funding_map.get(symbol, 0.0)
+                scores[coin] = self._score_coin(coin, symbol, stats, closes, funding)
             except Exception as e:
                 logger.debug("[CoinScanner] Scoring %s failed: %s", coin, e)
                 scores[coin] = {"total": 0, "error": str(e)}
@@ -227,6 +236,45 @@ class JarvisCoinScanner:
             logger.warning("[CoinScanner] Binance bulk stats failed: %s", e)
         return {}
 
+    async def _fetch_binance_candles_async(self, session: aiohttp.ClientSession, symbol: str, interval: str = "5m", limit: int = 20):
+        try:
+            async with session.get(
+                f"{BINANCE_BASE}/api/v3/klines",
+                params={"symbol": symbol, "interval": interval, "limit": limit},
+                timeout=8,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return symbol, [float(c[4]) for c in data]
+        except Exception as e:
+            logger.debug("[CoinScanner] Fetching async candles for %s failed: %s", symbol, e)
+        return symbol, []
+
+    async def _fetch_funding_rate_async(self, session: aiohttp.ClientSession, symbol: str):
+        try:
+            async with session.get(
+                "https://fapi.binance.com/fapi/v1/premiumIndex",
+                params={"symbol": symbol},
+                timeout=5,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return symbol, float(data.get("lastFundingRate", 0))
+        except Exception as e:
+            logger.debug("[CoinScanner] Fetching async funding rate for %s failed: %s", symbol, e)
+        return symbol, 0.0
+
+    async def _fetch_all_async_data(self, symbols: List[str]):
+        async with aiohttp.ClientSession() as session:
+            candle_tasks = [self._fetch_binance_candles_async(session, sym, "5m", 15) for sym in symbols]
+            funding_tasks = [self._fetch_funding_rate_async(session, sym) for sym in symbols]
+            results = await asyncio.gather(*candle_tasks, *funding_tasks)
+
+            n_symbols = len(symbols)
+            candles_map = {sym: data for sym, data in results[:n_symbols]}
+            funding_map = {sym: data for sym, data in results[n_symbols:]}
+            return candles_map, funding_map
+
     def _fetch_binance_candles(self, symbol: str, interval: str = "5m",
                                 limit: int = 20) -> List[float]:
         try:
@@ -258,7 +306,7 @@ class JarvisCoinScanner:
     # SCORING ENGINE
     # ----------------------------------------------------------
 
-    def _score_coin(self, coin: str, symbol: str, stats: Dict) -> Dict:
+    def _score_coin(self, coin: str, symbol: str, stats: Dict, closes: List[float] = None, funding: float = None) -> Dict:
         score = {
             "coin": coin, "symbol": symbol,
             "volume_score": 0, "momentum_score": 0, "rsi_score": 0,
@@ -302,7 +350,8 @@ class JarvisCoinScanner:
         score["momentum_score"] = ms
 
         # 3. RSI Score (0-20)
-        closes = self._fetch_binance_candles(symbol, "5m", 15)
+        if closes is None:
+            closes = self._fetch_binance_candles(symbol, "5m", 15)
         rsi = self._calc_rsi(closes)
         score["rsi"] = rsi
         if 40 <= rsi <= 60:    rs = 20
@@ -322,7 +371,8 @@ class JarvisCoinScanner:
         score["volatility_score"] = vs2
 
         # 5. Funding Score (0-10)
-        funding = self._fetch_funding_rate(symbol)
+        if funding is None:
+            funding = self._fetch_funding_rate(symbol)
         score["funding_rate"] = funding
         af = abs(funding) * 100
         if af < 0.02:    fs = 10
