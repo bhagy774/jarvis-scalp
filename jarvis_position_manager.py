@@ -15,6 +15,7 @@ import logging
 import threading
 from typing import Dict, List, Optional, Callable
 from datetime import datetime
+from dataclasses import dataclass
 
 try:
     from dotenv import load_dotenv
@@ -46,6 +47,19 @@ LEVERAGE_CAP     = MAX_LEVERAGE_CAP  # policy cap only; leverage is derived per 
 COMPOUND_ENABLED = os.environ.get("PM_COMPOUND", "true").lower() == "true"
 MIN_MARGIN       = float(os.environ.get("PM_MIN_MARGIN",      "0.05"))
 MAX_MARGIN_PCT   = float(os.environ.get("PM_MAX_MARGIN_PCT",  "0.05"))
+
+
+@dataclass
+class PositionRequest:
+    position_id: str
+    direction: str
+    entry_price: float
+    contracts: int
+    confidence: int
+    coin: str = "BTC"
+    trade_type: str = "SCALP"
+    contract_value_usdt: Optional[float] = None
+    notional_usdt: Optional[float] = None
 
 
 class PositionRecord:
@@ -155,47 +169,46 @@ class JarvisPositionManager:
         with self._lock:
             return len(self.open_positions)
 
-    def register_position(self, position_id: str, direction: str,
-                          entry_price: float, contracts: int,
-                          confidence: int, coin: str = "BTC",
-                          trade_type: str = "SCALP", contract_value_usdt: Optional[float] = None,
-                          notional_usdt: Optional[float] = None) -> PositionRecord:
-        if not isinstance(position_id, str) or not position_id:
+    def register_position(self, req: PositionRequest) -> PositionRecord:
+        if not isinstance(req.position_id, str) or not req.position_id:
             raise ValueError("position_id is required")
-        if not isinstance(direction, str) or direction.upper() not in ("CALL", "PUT", "BUY", "SELL"):
+        if not isinstance(req.direction, str) or req.direction.upper() not in ("CALL", "PUT", "BUY", "SELL"):
             raise ValueError("invalid position direction")
         try:
-            entry_price = float(entry_price)
-            contracts = int(contracts)
-            confidence = int(confidence)
+            entry_price = float(req.entry_price)
+            contracts = int(req.contracts)
+            confidence = int(req.confidence)
         except (TypeError, ValueError):
             raise ValueError("invalid position fields")
         if entry_price <= 0 or contracts <= 0 or not 0 <= confidence <= 100:
             raise ValueError("invalid position fields")
-        if not isinstance(coin, str) or not coin.strip():
+        if not isinstance(req.coin, str) or not req.coin.strip():
             raise ValueError("invalid coin")
+
+        contract_value_usdt = req.contract_value_usdt
         if contract_value_usdt is None:
             if os.environ.get("DELTA_ORDER_EXECUTION_ENABLED", "false").lower() == "true":
                 get_metadata = getattr(self.delta, "get_product_metadata", None)
-                metadata = get_metadata(coin) if callable(get_metadata) else None
+                metadata = get_metadata(req.coin) if callable(get_metadata) else None
                 contract_value_usdt = contract_quote_value_usdt(metadata, entry_price) if metadata else None
                 if contract_value_usdt is None:
                     raise ValueError("recognized contract metadata required for live position")
             else:
                 contract_value_usdt = 1.0  # explicit paper-only compatibility
+
         pos = PositionRecord(
-            position_id, direction.upper(), entry_price,
-            contracts, confidence, coin.strip(), trade_type,
-            contract_value_usdt, notional_usdt
+            req.position_id, req.direction.upper(), entry_price,
+            contracts, confidence, req.coin.strip(), req.trade_type,
+            contract_value_usdt, req.notional_usdt
         )
-        if not claim_position(position_id, self._ownership_token):
+        if not claim_position(req.position_id, self._ownership_token):
             raise ValueError(
-                f"position {position_id} is already owned by {position_owner(position_id)}"
+                f"position {req.position_id} is already owned by {position_owner(req.position_id)}"
             )
         with self._lock:
             self.open_positions.append(pos)
-        logger.info("[PM] Registered #%s %s %s @ %s", position_id, direction, coin, entry_price)
-        print(f"  {G}[PM] Position #{position_id} registered: {direction} {coin} @ ${entry_price:,.4f}{RST}")
+        logger.info("[PM] Registered #%s %s %s @ %s", req.position_id, req.direction, req.coin, entry_price)
+        print(f"  {G}[PM] Position #{req.position_id} registered: {req.direction} {req.coin} @ ${entry_price:,.4f}{RST}")
         print(f"  {DG}  TP: ${pos.tp_price:,.4f} | SL: ${pos.sl_price:,.4f}{RST}")
         return pos
 
