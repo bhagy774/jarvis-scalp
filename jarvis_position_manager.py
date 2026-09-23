@@ -13,6 +13,7 @@ import os
 import time
 import logging
 import threading
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Callable
 from datetime import datetime
 
@@ -48,36 +49,46 @@ MIN_MARGIN       = float(os.environ.get("PM_MIN_MARGIN",      "0.05"))
 MAX_MARGIN_PCT   = float(os.environ.get("PM_MAX_MARGIN_PCT",  "0.05"))
 
 
+@dataclass
+class PositionConfig:
+    position_id: str
+    direction: str
+    entry_price: float
+    contracts: int
+    confidence: int
+    coin: str = "BTC"
+    trade_type: str = "SCALP"
+    contract_value_usdt: Optional[float] = None
+    notional_usdt: Optional[float] = None
+
 class PositionRecord:
     """Single open position tracking object."""
 
-    def __init__(self, position_id: str, direction: str, entry_price: float,
-                 contracts: int, confidence: int, coin: str = "BTC",
-                 trade_type: str = "SCALP", contract_value_usdt: float = 1.0,
-                 notional_usdt: Optional[float] = None):
-        self.id            = position_id
-        self.direction     = direction
-        self.entry_price   = entry_price
-        self.contracts     = contracts
+    def __init__(self, config: "PositionConfig"):
+        self.id            = config.position_id
+        self.direction     = config.direction
+        self.entry_price   = config.entry_price
+        self.contracts     = config.contracts
+        cv = 1.0 if config.contract_value_usdt is None else config.contract_value_usdt
         try:
-            self.contract_value_usdt = float(contract_value_usdt)
+            self.contract_value_usdt = float(cv)
         except (TypeError, ValueError):
             self.contract_value_usdt = 0.0
         if self.contract_value_usdt <= 0:
             raise ValueError("contract value must be positive")
-        self.notional_usdt = float(notional_usdt) if notional_usdt is not None else self.contracts * self.contract_value_usdt
+        self.notional_usdt = float(config.notional_usdt) if config.notional_usdt is not None else self.contracts * self.contract_value_usdt
         if self.notional_usdt <= 0:
             raise ValueError("notional must be positive")
-        self.confidence    = confidence
-        self.coin          = coin
-        self.trade_type    = trade_type
+        self.confidence    = config.confidence
+        self.coin          = config.coin
+        self.trade_type    = config.trade_type
         self.open_time     = datetime.now()
         self.status        = "OPEN"
-        is_call            = direction in ("CALL", "BUY")
-        self.tp_price      = round(entry_price * (1 + TP_PCT) if is_call else entry_price * (1 - TP_PCT), 4)
-        self.sl_price      = round(entry_price * (1 - SL_PCT) if is_call else entry_price * (1 + SL_PCT), 4)
+        is_call            = config.direction in ("CALL", "BUY")
+        self.tp_price      = round(config.entry_price * (1 + TP_PCT) if is_call else config.entry_price * (1 - TP_PCT), 4)
+        self.sl_price      = round(config.entry_price * (1 - SL_PCT) if is_call else config.entry_price * (1 + SL_PCT), 4)
         self.orig_sl       = self.sl_price
-        self.peak_price    = entry_price
+        self.peak_price    = config.entry_price
         self.breakeven_moved  = False
         self.trailing_active  = False
         self.exit_price    = None
@@ -155,47 +166,41 @@ class JarvisPositionManager:
         with self._lock:
             return len(self.open_positions)
 
-    def register_position(self, position_id: str, direction: str,
-                          entry_price: float, contracts: int,
-                          confidence: int, coin: str = "BTC",
-                          trade_type: str = "SCALP", contract_value_usdt: Optional[float] = None,
-                          notional_usdt: Optional[float] = None) -> PositionRecord:
-        if not isinstance(position_id, str) or not position_id:
+    def register_position(self, config: "PositionConfig") -> PositionRecord:
+        if not isinstance(config.position_id, str) or not config.position_id:
             raise ValueError("position_id is required")
-        if not isinstance(direction, str) or direction.upper() not in ("CALL", "PUT", "BUY", "SELL"):
+        if not isinstance(config.direction, str) or config.direction.upper() not in ("CALL", "PUT", "BUY", "SELL"):
             raise ValueError("invalid position direction")
         try:
-            entry_price = float(entry_price)
-            contracts = int(contracts)
-            confidence = int(confidence)
+            config.entry_price = float(config.entry_price)
+            config.contracts = int(config.contracts)
+            config.confidence = int(config.confidence)
         except (TypeError, ValueError):
             raise ValueError("invalid position fields")
-        if entry_price <= 0 or contracts <= 0 or not 0 <= confidence <= 100:
+        if config.entry_price <= 0 or config.contracts <= 0 or not 0 <= config.confidence <= 100:
             raise ValueError("invalid position fields")
-        if not isinstance(coin, str) or not coin.strip():
+        if not isinstance(config.coin, str) or not config.coin.strip():
             raise ValueError("invalid coin")
-        if contract_value_usdt is None:
+        if config.contract_value_usdt is None:
             if os.environ.get("DELTA_ORDER_EXECUTION_ENABLED", "false").lower() == "true":
                 get_metadata = getattr(self.delta, "get_product_metadata", None)
-                metadata = get_metadata(coin) if callable(get_metadata) else None
-                contract_value_usdt = contract_quote_value_usdt(metadata, entry_price) if metadata else None
-                if contract_value_usdt is None:
+                metadata = get_metadata(config.coin) if callable(get_metadata) else None
+                config.contract_value_usdt = contract_quote_value_usdt(metadata, config.entry_price) if metadata else None
+                if config.contract_value_usdt is None:
                     raise ValueError("recognized contract metadata required for live position")
             else:
-                contract_value_usdt = 1.0  # explicit paper-only compatibility
-        pos = PositionRecord(
-            position_id, direction.upper(), entry_price,
-            contracts, confidence, coin.strip(), trade_type,
-            contract_value_usdt, notional_usdt
-        )
-        if not claim_position(position_id, self._ownership_token):
+                config.contract_value_usdt = 1.0  # explicit paper-only compatibility
+        config.direction = config.direction.upper()
+        config.coin = config.coin.strip()
+        pos = PositionRecord(config)
+        if not claim_position(config.position_id, self._ownership_token):
             raise ValueError(
-                f"position {position_id} is already owned by {position_owner(position_id)}"
+                f"position {config.position_id} is already owned by {position_owner(config.position_id)}"
             )
         with self._lock:
             self.open_positions.append(pos)
-        logger.info("[PM] Registered #%s %s %s @ %s", position_id, direction, coin, entry_price)
-        print(f"  {G}[PM] Position #{position_id} registered: {direction} {coin} @ ${entry_price:,.4f}{RST}")
+        logger.info("[PM] Registered #%s %s %s @ %s", config.position_id, config.direction, config.coin, config.entry_price)
+        print(f"  {G}[PM] Position #{config.position_id} registered: {config.direction} {config.coin} @ ${config.entry_price:,.4f}{RST}")
         print(f"  {DG}  TP: ${pos.tp_price:,.4f} | SL: ${pos.sl_price:,.4f}{RST}")
         return pos
 
