@@ -1462,8 +1462,18 @@ class LiveTradingEngine:
             logger.debug(f"[SCENARIO] gate error (fail-open → pass): {e}")
             return direction
 
-    def _open_paper_trade(self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl, current_price=None, symbol='BTCUSDT'):
+    def _open_paper_trade(self, trade_spec: dict):
         """Open a new paper trade"""
+        direction = trade_spec['direction']
+        entry_price = trade_spec['entry_price']
+        confidence = trade_spec['confidence']
+        expiry_name = trade_spec['expiry_name']
+        tp1 = trade_spec['tp1']
+        tp2 = trade_spec['tp2']
+        sl = trade_spec['sl']
+        current_price = trade_spec.get('current_price')
+        symbol = trade_spec.get('symbol', 'BTCUSDT')
+
         if len(self.paper_open_trades) >= self.PAPER_CONFIG['max_open_trades']:
             return None
             
@@ -2361,11 +2371,17 @@ class LiveTradingEngine:
                                     self._dashboard_events.append(f"Hedge: {hedged_result.get('status')} / applied={hedged_result.get('hedge_applied')}")
                                 
                                 # Always open paper trade to track P&L
-                                trade = self._open_paper_trade(
-                                    direction, entry_price or current_price,
-                                    confidence, expiry, tp1, tp2, sl, current_price=current_price,
-                                    symbol=symbol
-                                )
+                                trade = self._open_paper_trade({
+                                    'direction': direction,
+                                    'entry_price': entry_price or current_price,
+                                    'confidence': confidence,
+                                    'expiry_name': expiry,
+                                    'tp1': tp1,
+                                    'tp2': tp2,
+                                    'sl': sl,
+                                    'current_price': current_price,
+                                    'symbol': symbol
+                                })
                                 if trade:
                                     self._dashboard_events.append(
                                         f"Paper trade #{trade['id']} {trade['status']} | "
