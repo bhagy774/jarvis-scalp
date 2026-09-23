@@ -226,7 +226,7 @@ class JarvisAutoTrader:
         hedge_plan = {"do_hedge": False, "reason": "Hedge disabled"}
         if HEDGE_ENABLED and self.hedge_advisor:
             hedge_plan = self._get_hedge_plan(
-                direction, confidence, current_price, part_results, symbol)
+                direction, confidence, current_price, symbol)
 
         # ─ Gate 3: Execute ───────────────────────────────────────
         return self._place_trade(
@@ -340,7 +340,7 @@ class JarvisAutoTrader:
     #  GATE 2: HEDGE DECISION
     # ──────────────────────────────────────────────────────────────
 
-    def _get_hedge_plan(self, direction, confidence, price, part_results, symbol: str) -> Dict:
+    def _get_hedge_plan(self, direction, confidence, price, symbol: str) -> Dict:
         try:
             options_chain = {}
             try:
