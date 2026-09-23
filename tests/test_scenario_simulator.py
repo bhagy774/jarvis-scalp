@@ -85,10 +85,10 @@ def test_env_disable():
 
 def test_gate_integration_on_engine():
     """_scenario_gate exists on LiveTradingEngine and vetoes bad setups."""
-    import jarvis_FIXED
-    eng = jarvis_FIXED.LiveTradingEngine.__new__(jarvis_FIXED.LiveTradingEngine)
+    from jarvis_FIXED import LiveTradingEngine, ScenarioConfig
+    eng = LiveTradingEngine.__new__(LiveTradingEngine)
     df = _df(rng=400.0)
     df.loc[df.index[-1], "volume"] = 10.0
     # tight SL + volume drop + tiny range... force multiple fails
-    out = eng._scenario_gate("CALL", entry_price=100000, sl=99950, tp=100020, df=df)
+    out = eng._scenario_gate(ScenarioConfig(direction="CALL", entry_price=100000, sl=99950, tp=100020, df=df))
     assert out in ("CALL", "NO_TRADE")  # gate never crashes; returns valid direction
