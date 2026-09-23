@@ -489,10 +489,9 @@ class GPUComprehensiveBacktester:
                 highs = batch_tensor[:, 1]
                 lows = batch_tensor[:, 2]
                 closes = batch_tensor[:, 3]
-                volumes = batch_tensor[:, 4] if batch_tensor.shape[1] > 4 else torch.ones_like(closes)
                 
                 volatilities = await self._calculate_volatility_gpu(highs, lows, closes)
-                patterns = await self._detect_patterns_batch_gpu(opens, highs, lows, closes, volumes)
+                patterns = await self._detect_patterns_batch_gpu(opens, highs, lows, closes)
                 
                 # FIX: Safe CUDA tensor to NumPy conversion using _to_numpy helper
                 patterns_cpu = _to_numpy(patterns)
@@ -537,7 +536,7 @@ class GPUComprehensiveBacktester:
         except Exception:
             return torch.zeros_like(highs)
 
-    async def _detect_patterns_batch_gpu(self, opens, highs, lows, closes, volumes):
+    async def _detect_patterns_batch_gpu(self, opens, highs, lows, closes):
         try:
             _ctx = torch.cuda.device(self.device) if (hasattr(self.device, 'type') and self.device.type == 'cuda') else nullcontext()
             with _ctx:
