@@ -162,10 +162,11 @@ except Exception:
     _aggregate_part7_results = None
     PART7_SHARED_ANALYZER_AVAILABLE = False
 try:
-    from jarvis_backtester import JarvisFullBacktester as _JarvisFullBacktester
+    from jarvis_backtester import JarvisFullBacktester as _JarvisFullBacktester, BacktestConfig as _BacktestConfig
     BACKTESTER_AVAILABLE = True
 except Exception:
     _JarvisFullBacktester = None
+    _BacktestConfig = None
     BACKTESTER_AVAILABLE = False
 try:
     from kie_gpt6_client import KieGPT6Client as _KieGPT6Client
@@ -4971,6 +4972,7 @@ class JarvisElite:
         self.specialist_pool = None
         self.specialist_pool_class = _SpecialistPool
         self.backtester_class = _JarvisFullBacktester
+        self.backtester_config_class = _BacktestConfig
         self.kie_gpt6_client_class = _KieGPT6Client
         self.integration_sources = {}
         if self.delta_data is not None:
@@ -5286,8 +5288,9 @@ class JarvisElite:
             if self.specialist_pool is None:
                 self.specialist_pool = self.specialist_pool_class(**kwargs)
             return self.specialist_pool
-        if key == "backtester" and self.backtester_class:
-            return self.backtester_class(**kwargs)
+        if key == "backtester" and self.backtester_class and self.backtester_config_class:
+            config = self.backtester_config_class(**kwargs)
+            return self.backtester_class(config=config)
         if key in {"kie_gpt6", "kie"} and self.kie_gpt6_client_class:
             return self.kie_gpt6_client_class(**kwargs)
         return self.integration_sources.get(key)
