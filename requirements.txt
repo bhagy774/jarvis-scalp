@@ -11,3 +11,5 @@ python-dotenv
 psutil
 fastapi
 uvicorn
+
+aiofiles==23.2.1
