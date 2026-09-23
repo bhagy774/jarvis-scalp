@@ -242,7 +242,8 @@ class PreSimWiringTests(unittest.TestCase):
         eng = self._engine()
         with patch("jarvis_presim.run_presim",
                    return_value={"action": "veto", "confidence_delta": 0, "reason": "bad setup"}):
-            direction, conf = eng._presim_gate("CALL", 80, 100.0, result={}, df=None, current_price=100.0)
+            params = self.brain.PresimParams(direction="CALL", confidence=80, entry_price=100.0, result={}, df=None, current_price=100.0)
+            direction, conf = eng._presim_gate(params)
         self.assertIsNone(direction)
         self.assertEqual(eng.presim_stats["vetoes"], 1)
         self.assertEqual(eng.presim_stats["checks"], 1)
@@ -251,7 +252,8 @@ class PreSimWiringTests(unittest.TestCase):
         eng = self._engine()
         with patch("jarvis_presim.run_presim",
                    return_value={"action": "adjust", "confidence_delta": -50, "reason": "weak"}):
-            direction, conf = eng._presim_gate("PUT", 80, 100.0, result={}, df=None, current_price=100.0)
+            params = self.brain.PresimParams(direction="PUT", confidence=80, entry_price=100.0, result={}, df=None, current_price=100.0)
+            direction, conf = eng._presim_gate(params)
         self.assertEqual(direction, "PUT")
         self.assertEqual(conf, 70)  # clamped to -10
         self.assertEqual(eng.presim_stats["adjustments"], 1)
@@ -260,7 +262,8 @@ class PreSimWiringTests(unittest.TestCase):
         eng = self._engine()
         with patch("jarvis_presim.run_presim",
                    return_value={"action": "pass", "confidence_delta": 0, "reason": ""}):
-            direction, conf = eng._presim_gate("CALL", 75, 100.0, result={}, df=None, current_price=100.0)
+            params = self.brain.PresimParams(direction="CALL", confidence=75, entry_price=100.0, result={}, df=None, current_price=100.0)
+            direction, conf = eng._presim_gate(params)
         self.assertEqual((direction, conf), ("CALL", 75))
         self.assertEqual(eng.presim_stats["adjustments"], 0)
         self.assertEqual(eng.presim_stats["vetoes"], 0)
@@ -268,14 +271,16 @@ class PreSimWiringTests(unittest.TestCase):
     def test_exception_fails_closed(self):
         eng = self._engine()
         with patch("jarvis_presim.run_presim", side_effect=RuntimeError("boom")):
-            direction, conf = eng._presim_gate("CALL", 75, 100.0, result={}, df=None, current_price=100.0)
+            params = self.brain.PresimParams(direction="CALL", confidence=75, entry_price=100.0, result={}, df=None, current_price=100.0)
+            direction, conf = eng._presim_gate(params)
         self.assertEqual((direction, conf), (None, 75))
         self.assertEqual(eng.presim_stats["errors"], 1)
 
     def test_partial_wiring_cannot_bypass_veto(self):
         eng = self._engine()
         with patch("jarvis_presim.run_presim", return_value={"action": "veto", "confidence_delta": 0, "reason": "blocked"}):
-            direction, conf = eng._presim_gate("CALL", 80, 100.0, result={}, df=None, current_price=100.0)
+            params = self.brain.PresimParams(direction="CALL", confidence=80, entry_price=100.0, result={}, df=None, current_price=100.0)
+            direction, conf = eng._presim_gate(params)
         self.assertIsNone(direction)
         self.assertEqual(conf, 80)
 
@@ -283,7 +288,8 @@ class PreSimWiringTests(unittest.TestCase):
         os.environ["JARVIS_PRESIM"] = "0"
         eng = self._engine()
         with patch("jarvis_presim.run_presim", side_effect=AssertionError("must not run")):
-            direction, conf = eng._presim_gate("CALL", 75, 100.0, result={}, df=None, current_price=100.0)
+            params = self.brain.PresimParams(direction="CALL", confidence=75, entry_price=100.0, result={}, df=None, current_price=100.0)
+            direction, conf = eng._presim_gate(params)
         self.assertEqual((direction, conf), ("CALL", 75))
         self.assertEqual(eng.presim_stats["checks"], 0)
 
