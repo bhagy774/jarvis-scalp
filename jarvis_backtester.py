@@ -13,12 +13,23 @@ import logging
 import math
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+
+@dataclass
+class BacktestMetrics:
+    net: float
+    gross: float
+    fees: float
+    wr: float
+    dd: float
+    sharpe: float
 
 # The replay safety mode is set immediately before importing the brain in
 # ``_init_jarvis``.  Do not mutate the process environment at module import:
@@ -558,7 +569,8 @@ class JarvisFullBacktester:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         prefix = RESULT_DIR / f"backtest_{self.symbol}_{self.timeframe}_{stamp}"
         self._csv(closed, prefix)
-        self._html(prefix, closed, net, gross, fees, wr, dd, sharpe, stamp, fault_summary)
+        metrics = BacktestMetrics(net=net, gross=gross, fees=fees, wr=wr, dd=dd, sharpe=sharpe)
+        self._html(prefix, closed, metrics, stamp, fault_summary)
         coverage = self._part_coverage()
         coverage_path = prefix.with_name(prefix.name + '_part_coverage.json')
         coverage_path.write_text(json.dumps({
@@ -584,8 +596,7 @@ class JarvisFullBacktester:
                 } for t in closed]
         pd.DataFrame(rows).to_csv(f"{prefix}.csv", index=False)
 
-    def _html(self, prefix: Path, closed: List[BacktestPosition], net: float, gross: float,
-              fees: float, wr: float, dd: float, sharpe: float, stamp: str,
+    def _html(self, prefix: Path, closed: List[BacktestPosition], metrics: BacktestMetrics, stamp: str,
               fault_summary: Optional[dict] = None) -> None:
         rows = "".join(
             f"<tr><td>{t.id}</td><td>{t.direction}</td><td>{t.confidence}%</td><td>{t.entry_price:.2f}</td><td>{t.exit_price:.2f}</td><td>{t.close_reason}</td><td>{t.pnl_usdt:.4f}</td></tr>"
@@ -599,7 +610,7 @@ class JarvisFullBacktester:
         html = f"""<!doctype html><html><head><meta charset='utf-8'><title>JARVIS historical replay</title>
 <style>body{{font-family:system-ui;background:#10151c;color:#e8edf2;margin:2rem}}section,table{{background:#19212b;padding:1rem;margin:1rem 0;border-radius:8px}}table{{border-collapse:collapse;width:100%}}td,th{{padding:.5rem;text-align:left;border-bottom:1px solid #334}}</style></head><body>
 <h1>JARVIS Historical Replay</h1><p>{stamp} · {self.symbol} · {self.timeframe}</p>
-<section><h2>Results</h2><p>Net PnL: ${net:.2f}; gross PnL: ${gross:.2f}; modeled fees: ${fees:.2f}; net win rate: {wr:.1f}%; max drawdown: {dd:.2f}%; Sharpe: {sharpe:.2f}</p></section>
+<section><h2>Results</h2><p>Net PnL: ${metrics.net:.2f}; gross PnL: ${metrics.gross:.2f}; modeled fees: ${metrics.fees:.2f}; net win rate: {metrics.wr:.1f}%; max drawdown: {metrics.dd:.2f}%; Sharpe: {metrics.sharpe:.2f}</p></section>
 <section><h2>Execution assumptions (Option B)</h2><p>Conservative, user-configurable assumptions: adverse entry/exit slippage {self.slippage_bps:.2f} bps each side; round-trip trading fee {self.fee_bps:.2f} bps. Scalp TP: {self.scalp_tp*100:.2f}%, SL: {self.scalp_sl*100:.2f}%. Swing TP: {self.swing_tp*100:.2f}%, SL: {self.swing_sl*100:.2f}%. Entries fill at next candle open; TP/SL use high/low; same-candle dual touch resolves to SL first.</p></section>
 <section><h2>Core Part Accuracy & Fault Breakdown (Kaya Part no Vak Hato)</h2>
 <table><thead><tr><th>Part Name</th><th>Total Votes</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Fault Share</th><th>Assessment</th></tr></thead><tbody>{fault_rows}</tbody></table>
