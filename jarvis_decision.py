@@ -51,7 +51,7 @@ def normalize_confidence(raw: Any, default: Optional[int] = None) -> Optional[in
             value = numerator / denominator * 100
         else:
             percent = re.search(r"([-+]?\d+(?:\.\d+)?)\s*%", text)
-            number = percent or re.search(r"[-+]?\d+(?:\.\d+)?", text)
+            number = percent or re.search(r"([-+]?\d+(?:\.\d+)?)", text)
             if not number:
                 return default
             value = float(number.group(1))
