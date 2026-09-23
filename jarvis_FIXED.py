@@ -35,6 +35,7 @@ from collections import deque, defaultdict
 from datetime import datetime, timedelta
 from queue import Queue
 from typing import Dict, List, Tuple, Optional, Union
+from dataclasses import dataclass
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
@@ -316,6 +317,14 @@ import os
 from pathlib import Path
 
 # --- NEW: Terminal Logger for HUD ---
+@dataclass
+class EntryRefinementContext:
+    direction: str
+    entry_price: float
+    sl: Optional[float]
+    df: Optional[pd.DataFrame]
+    current_price: float
+
 class TerminalLogger(object):
     def __init__(self, stream, log_file):
         self.stream = stream
@@ -1756,9 +1765,14 @@ class LiveTradingEngine:
         # ── 1M ENTRY REFINEMENT: HTF decision stays; 1m swing SL + confirmation ──
         self.last_1m_entry = None
         if direction in ('CALL', 'PUT'):
-            entry_price, sl, confirmed_1m, note_1m = self._refine_entry_with_1m(
-                direction, entry_price, sl, df, current_price
+            ctx = EntryRefinementContext(
+                direction=direction,
+                entry_price=entry_price,
+                sl=sl,
+                df=df,
+                current_price=current_price
             )
+            entry_price, sl, confirmed_1m, note_1m = self._refine_entry_with_1m(ctx)
             if note_1m not in ('1M-OFF', 'N/A', '1M-FALLBACK'):
                 entry_type = f'{entry_type} | 1m: {note_1m}'
 
@@ -1835,7 +1849,7 @@ class LiveTradingEngine:
             logger.debug(f"[SMART ENTRY] Fallback to market: {e}")
             return current_price, 'MARKET'
 
-    def _refine_entry_with_1m(self, direction, entry_price, sl, df, current_price):
+    def _refine_entry_with_1m(self, ctx: EntryRefinementContext):
         """
         1-MINUTE ENTRY REFINEMENT (HTF decision + LTF execution).
 
@@ -1864,37 +1878,37 @@ class LiveTradingEngine:
         self.last_1m_entry = None
         try:
             if os.getenv('JARVIS_ENTRY_1M', '1').lower() in ('0', 'false', 'off'):
-                return entry_price, sl, True, '1M-OFF'
-            if direction not in ('CALL', 'PUT') or not entry_price or not current_price:
-                return entry_price, sl, True, 'N/A'
-            if df is None or len(df) < 15:
-                return entry_price, sl, True, 'NO-1M-DATA'
+                return ctx.entry_price, ctx.sl, True, '1M-OFF'
+            if ctx.direction not in ('CALL', 'PUT') or not ctx.entry_price or not ctx.current_price:
+                return ctx.entry_price, ctx.sl, True, 'N/A'
+            if ctx.df is None or len(ctx.df) < 15:
+                return ctx.entry_price, ctx.sl, True, 'NO-1M-DATA'
 
             lookback = int(os.getenv('JARVIS_ENTRY_1M_LOOKBACK', '12'))
             # Last candle haji close na thayeli hoy sake — swing mate exclude kariye
-            win = df.iloc[-(lookback + 1):-1]
+            win = ctx.df.iloc[-(lookback + 1):-1]
             if len(win) < 5:
-                return entry_price, sl, True, 'NO-1M-DATA'
+                return ctx.entry_price, ctx.sl, True, 'NO-1M-DATA'
 
             buffer_pct = 0.0003   # 0.03% swing buffer
             min_dist   = 0.0010   # SL entry thi ochho ma ochho 0.10% dur
             max_dist   = 0.0120   # SL entry thi vadhu ma vadhu 1.20% dur
 
             note_parts = []
-            refined_sl = sl
-            if direction == 'CALL':
+            refined_sl = ctx.sl
+            if ctx.direction == 'CALL':
                 swing = float(win['low'].min()) * (1.0 - buffer_pct)
                 # Tighten only: 1m swing SL original SL karta UP j hoy to j use
-                if swing < entry_price and (sl is None or swing > sl):
-                    dist = (entry_price - swing) / entry_price
+                if swing < ctx.entry_price and (ctx.sl is None or swing > ctx.sl):
+                    dist = (ctx.entry_price - swing) / ctx.entry_price
                     if min_dist <= dist <= max_dist:
                         refined_sl = round(swing, 2)
                         note_parts.append(f'SL 1m-swing ${refined_sl:,.2f} ({dist*100:.2f}%)')
             else:  # PUT
                 swing = float(win['high'].max()) * (1.0 + buffer_pct)
                 # Tighten only: 1m swing SL original SL karta NICHE j hoy to j use
-                if swing > entry_price and (sl is None or swing < sl):
-                    dist = (swing - entry_price) / entry_price
+                if swing > ctx.entry_price and (ctx.sl is None or swing < ctx.sl):
+                    dist = (swing - ctx.entry_price) / ctx.entry_price
                     if min_dist <= dist <= max_dist:
                         refined_sl = round(swing, 2)
                         note_parts.append(f'SL 1m-swing ${refined_sl:,.2f} ({dist*100:.2f}%)')
@@ -1902,12 +1916,12 @@ class LiveTradingEngine:
             # 1m direction confirmation (last CLOSED candle)
             confirmed = True
             if os.getenv('JARVIS_ENTRY_1M_CONFIRM', '1').lower() not in ('0', 'false', 'off'):
-                last = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+                last = ctx.df.iloc[-2] if len(ctx.df) >= 2 else ctx.df.iloc[-1]
                 candle_bull = float(last['close']) > float(last['open'])
-                if direction == 'CALL' and not candle_bull:
+                if ctx.direction == 'CALL' and not candle_bull:
                     confirmed = False
                     note_parts.append('1m confirm wait (bearish candle)')
-                elif direction == 'PUT' and candle_bull:
+                elif ctx.direction == 'PUT' and candle_bull:
                     confirmed = False
                     note_parts.append('1m confirm wait (bullish candle)')
 
@@ -1915,15 +1929,15 @@ class LiveTradingEngine:
             self.last_1m_entry = {
                 'confirmed': confirmed,
                 'refined_sl': refined_sl,
-                'original_sl': sl,
+                'original_sl': ctx.sl,
                 'note': note,
             }
-            logger.info('[1M-ENTRY] %s | confirmed=%s | %s', direction, confirmed, note)
-            return entry_price, refined_sl, confirmed, note
+            logger.info('[1M-ENTRY] %s | confirmed=%s | %s', ctx.direction, confirmed, note)
+            return ctx.entry_price, refined_sl, confirmed, note
 
         except Exception as e:
             logger.debug(f"[1M-ENTRY] fail-open fallback: {e}")
-            return entry_price, sl, True, '1M-FALLBACK'
+            return ctx.entry_price, ctx.sl, True, '1M-FALLBACK'
 
     def _print_compact_status(self, current_price=None):
         self._render_unified_dashboard(current_price=current_price)
