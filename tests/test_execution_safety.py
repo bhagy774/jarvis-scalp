@@ -93,9 +93,17 @@ class ExecutionSafetyTests(unittest.TestCase):
 
     def test_live_paper_mode_never_sets_leverage_or_submits_order(self):
         import jarvis_live_trader
+        from jarvis_live_trader import TradeRequest
         trader = jarvis_live_trader.JarvisAutoTrader(DeltaStub(100))
         trader.is_enabled = False
-        response = trader._place_trade("CALL", 90, 100.0, "SCALP", {"do_hedge": False})
+        req = TradeRequest(
+            direction="CALL",
+            confidence=90,
+            price=100.0,
+            trade_type="SCALP",
+            hedge_plan={"do_hedge": False}
+        )
+        response = trader._place_trade(req)
         self.assertTrue(response["success"])
         self.assertEqual(trader.delta.leverage_calls, [])
         self.assertEqual(trader.delta.order_calls, [])
