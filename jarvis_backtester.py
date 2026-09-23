@@ -15,6 +15,7 @@ import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -123,6 +124,17 @@ def extract_signal(result: dict) -> Tuple[str, int]:
     return {"BUY": "CALL", "SELL": "PUT"}.get(direction, direction), confidence
 
 
+@dataclass
+class BacktestConfig:
+    """Execution assumptions and targets for a backtest."""
+    slippage_bps: float = 5.0
+    fee_bps: float = 10.0
+    scalp_tp: Optional[float] = None
+    scalp_sl: Optional[float] = None
+    swing_tp: Optional[float] = None
+    swing_sl: Optional[float] = None
+
+
 class BacktestPosition:
     """A filled futures position using deterministic OHLC execution assumptions."""
 
@@ -130,20 +142,19 @@ class BacktestPosition:
 
     def __init__(self, direction: str, entry_price: float, entry_time: datetime,
                  contracts: float, trade_type: str = "SCALP", confidence: int = 0,
-                 slippage_bps: float = 5.0, fee_bps: float = 10.0,
-                 part_snapshot: Optional[Dict[str, dict]] = None,
-                 scalp_tp: Optional[float] = None, scalp_sl: Optional[float] = None,
-                 swing_tp: Optional[float] = None, swing_sl: Optional[float] = None):
+                 config: Optional[BacktestConfig] = None,
+                 part_snapshot: Optional[Dict[str, dict]] = None):
         BacktestPosition._ctr += 1
         self.id = BacktestPosition._ctr
         self.direction, self.entry_price, self.entry_time = direction, entry_price, entry_time
         self.contracts, self.trade_type, self.confidence = contracts, trade_type, confidence
-        self.slippage_bps, self.fee_bps = slippage_bps, fee_bps
+        config = config or BacktestConfig()
+        self.slippage_bps, self.fee_bps = config.slippage_bps, config.fee_bps
         self.part_snapshot = part_snapshot or {}
-        tp_ref = swing_tp if swing_tp is not None else SWING_TP_PCT
-        sl_ref = swing_sl if swing_sl is not None else SWING_SL_PCT
-        s_tp_ref = scalp_tp if scalp_tp is not None else SCALP_TP_PCT
-        s_sl_ref = scalp_sl if scalp_sl is not None else SCALP_SL_PCT
+        tp_ref = config.swing_tp if config.swing_tp is not None else SWING_TP_PCT
+        sl_ref = config.swing_sl if config.swing_sl is not None else SWING_SL_PCT
+        s_tp_ref = config.scalp_tp if config.scalp_tp is not None else SCALP_TP_PCT
+        s_sl_ref = config.scalp_sl if config.scalp_sl is not None else SCALP_SL_PCT
         tp_pct = tp_ref if trade_type == "SWING" else s_tp_ref
         sl_pct = sl_ref if trade_type == "SWING" else s_sl_ref
         self.is_call = direction in ("CALL", "BUY")
@@ -285,6 +296,11 @@ class JarvisFullBacktester:
         self.slippage_bps, self.fee_bps = slippage_bps, fee_bps
         self.scalp_tp, self.scalp_sl = scalp_tp, scalp_sl
         self.swing_tp, self.swing_sl = swing_tp, swing_sl
+        self.config = BacktestConfig(
+            slippage_bps=slippage_bps, fee_bps=fee_bps,
+            scalp_tp=scalp_tp, scalp_sl=scalp_sl,
+            swing_tp=swing_tp, swing_sl=swing_sl
+        )
         self.live_audit = live_audit
         self.gate = BacktestRiskGate()
         self.all_trades: List[BacktestPosition] = []
@@ -449,9 +465,7 @@ class JarvisFullBacktester:
             else:
                 trade_type = "SWING" if trade_type in ("SWING", "DAY_TRADE") else "SCALP"
             provisional = BacktestPosition(direction, entry_price, dt, 0.0, trade_type, confidence,
-                                            self.slippage_bps, self.fee_bps,
-                                            scalp_tp=self.scalp_tp, scalp_sl=self.scalp_sl,
-                                            swing_tp=self.swing_tp, swing_sl=self.swing_sl)
+                                            config=self.config)
             quantity = self.gate.calc_contracts(entry_price, provisional.sl_price, direction,
                                                 self.balance, self.fee_bps, self.slippage_bps)
             if quantity <= 0:
@@ -459,10 +473,7 @@ class JarvisFullBacktester:
                 continue
             part_snapshot = dict(getattr(brain, 'latest_part_results', {}) or {})
             position = BacktestPosition(direction, entry_price, dt, quantity, trade_type, confidence,
-                                        self.slippage_bps, self.fee_bps,
-                                        part_snapshot=part_snapshot,
-                                        scalp_tp=self.scalp_tp, scalp_sl=self.scalp_sl,
-                                        swing_tp=self.swing_tp, swing_sl=self.swing_sl)
+                                        config=self.config, part_snapshot=part_snapshot)
             self.gate.record_open(position, dt)
             self.all_trades.append(position)
             if self.live_audit:
