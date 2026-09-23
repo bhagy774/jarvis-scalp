@@ -26,7 +26,7 @@ import pandas as pd
 from professional_display import ProfessionalSignalDisplay
 from jarvis_dashboard import UnifiedDashboard
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
-from jarvis_decision import normalize_confidence, confidence_text, build_final_decision
+from jarvis_decision import normalize_confidence, confidence_text, build_final_decision, DecisionContext
 from jarvis_runtime import detect_backend, torch_device
 from jarvis_ollama_context import build_snapshot, decision_prompt, snapshot_usable, validate_decision
 pro_display = ProfessionalSignalDisplay()
@@ -2291,12 +2291,17 @@ class LiveTradingEngine:
                         _candidate['direction'] = direction if direction in ('CALL', 'PUT') else 'NO_TRADE'
                         _candidate['confidence_score'] = confidence
                         _final_snapshot = build_final_decision(
-                            _candidate, symbol=symbol, price=current_price,
-                            reasons=(result.get('intelligence_board', []) or [])[:3],
-                            opinions=_opinions, options_context=_options_ctx,
-                            require_options=_live_execution_enabled,
-                            gate_reason=('entry confirmation pending' if entry_gate_1m and not entry_gate_1m.get('confirmed', True) else ''),
-                            plan={'entry': entry_price, 'tp1': tp1, 'tp2': tp2, 'sl': sl, 'expiry': expiry},
+                            _candidate,
+                            DecisionContext(
+                                symbol=symbol,
+                                price=current_price,
+                                reasons=(result.get('intelligence_board', []) or [])[:3],
+                                opinions=_opinions,
+                                options_context=_options_ctx,
+                                require_options=_live_execution_enabled,
+                                gate_reason=('entry confirmation pending' if entry_gate_1m and not entry_gate_1m.get('confirmed', True) else ''),
+                                plan={'entry': entry_price, 'tp1': tp1, 'tp2': tp2, 'sl': sl, 'expiry': expiry},
+                            )
                         )
                         self.last_decision = _final_snapshot
                         if not _final_snapshot.get('execution_allowed'):
