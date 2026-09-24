@@ -1,0 +1,12 @@
+{
+  "raw_rows": 372335,
+  "parsed_rows": 372275,
+  "invalid_rows": 0,
+  "duplicate_timestamps": 60,
+  "zero_volume_rows": 372275,
+  "gap_count": 1083,
+  "gap_minutes_total": 153324.0,
+  "largest_gap_minutes": 3727.0,
+  "timezone": "unknown; used as supplied",
+  "price_side": "unknown"
+}
