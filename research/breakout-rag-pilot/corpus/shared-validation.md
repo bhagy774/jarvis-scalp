@@ -1,0 +1,3 @@
+# Statistical validation and research hygiene
+
+Use chronological train/validation/test splits, walk-forward evaluation, purging/embargo where labels overlap, and report uncertainty. Guard against look-ahead, survivorship, selection, multiple testing, leakage from normalization/features, and regime dependence. Include realistic costs and order lifecycle. A backtest is not a live result; paper/live monitoring is needed to detect drift. Confidence scores are not probabilities without calibration. Never use unsupported guru win rates or guarantee gains. Numeric examples are illustrative and unverified strategy hypotheses.
