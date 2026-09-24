@@ -10,8 +10,15 @@ from jarvis_lot_limits import enforce_entry_lots, entry_lot_limits
 
 @pytest.fixture(autouse=True)
 def clear_lot_policy_env(monkeypatch):
+    # Keep the process-local ownership registry isolated from adjacent safety
+    # suites, which can otherwise reuse timestamp-based paper order IDs.
+    from jarvis_position_ownership import clear_registry
+
+    clear_registry()
     monkeypatch.delenv("JARVIS_MIN_ENTRY_LOTS", raising=False)
     monkeypatch.delenv("JARVIS_MAX_ENTRY_LOTS", raising=False)
+    yield
+    clear_registry()
 
 
 def test_unconfigured_bounds_and_downward_floor_only():
