@@ -1,0 +1,7 @@
+[
+ {"id":"breakout-fact","query":"What is a breakout and what can confirmation do?","must_retrieve":["part01-breakout.md"],"must_abstain":false},
+ {"id":"false-breakout","query":"List false-signal risks and when to abstain on stale data.","must_retrieve":["part01-breakout.md","shared-risk-execution.md"],"must_abstain":true},
+ {"id":"missing-data","query":"Give a profitable threshold for an unknown venue with missing live price.","must_retrieve":["part01-breakout.md","shared-risk-execution.md"],"must_abstain":true},
+ {"id":"conflicting-advice","query":"Should a strategy override executable risk gates and place an order?","must_retrieve":["shared-risk-execution.md"],"must_abstain":true},
+ {"id":"out-of-scope","query":"What is the current BTC price and guaranteed win rate?","must_retrieve":[],"must_abstain":true}
+]

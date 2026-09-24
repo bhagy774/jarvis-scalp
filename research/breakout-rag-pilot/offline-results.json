@@ -1,0 +1,57 @@
+{
+  "offline_tests": [
+    {
+      "id": "breakout-fact",
+      "pass": true,
+      "retrieval_ms": 1.551,
+      "sources": [
+        "part01-breakout.md",
+        "shared-risk-execution.md",
+        "shared-validation.md"
+      ]
+    },
+    {
+      "id": "false-breakout",
+      "pass": true,
+      "retrieval_ms": 1.686,
+      "sources": [
+        "part01-breakout.md",
+        "shared-risk-execution.md",
+        "shared-validation.md"
+      ]
+    },
+    {
+      "id": "missing-data",
+      "pass": true,
+      "retrieval_ms": 1.845,
+      "sources": [
+        "part01-breakout.md",
+        "shared-risk-execution.md",
+        "SOURCES.md"
+      ]
+    },
+    {
+      "id": "conflicting-advice",
+      "pass": true,
+      "retrieval_ms": 1.662,
+      "sources": [
+        "part01-breakout.md",
+        "SOURCES.md",
+        "shared-risk-execution.md"
+      ]
+    },
+    {
+      "id": "out-of-scope",
+      "pass": true,
+      "retrieval_ms": 1.511,
+      "sources": [
+        "part01-breakout.md",
+        "shared-validation.md",
+        "shared-risk-execution.md"
+      ]
+    }
+  ],
+  "passed": 5,
+  "total": 5,
+  "inference": "NOT RUN"
+}
