@@ -22,6 +22,7 @@ class OptionsContext:
     strength: int = 0
     pcr: float = 0.0
     reason: str = ""
+    expiry_coverage: Dict[str, Any] | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -49,8 +50,9 @@ def _valid_bias(raw: Any, asset: str) -> OptionsContext | None:
     # A neutral / zero score is valid intelligence but contributes no direction.
     if not raw.get("reasons") and not raw.get("raw_data"):
         return None
+    coverage = raw.get("raw_data", {}).get("expiry_coverage") if isinstance(raw.get("raw_data"), dict) else None
     return OptionsContext(asset, asset, "asset_primary", True, bias, strength, pcr,
-                          "; ".join(str(x) for x in raw.get("reasons", [])[:2]))
+                          "; ".join(str(x) for x in raw.get("reasons", [])[:2]), coverage)
 
 
 def resolve_options_context(delta_client: Any, selected_symbol: str) -> OptionsContext:
