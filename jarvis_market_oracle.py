@@ -623,7 +623,11 @@ In 1 concise sentence, issue your final verdict: CONSENSUS_EXECUTE (CALL or PUT,
                     err_str = str(e)
                     logger.warning(f"[Oracle] Call error on {model}: {err_str[:120]}")
                     if "503" in err_str or "UNAVAILABLE" in err_str:
-                        time.sleep(5)
+                        wait_time = 2 ** retry  # Exponential backoff (1s, 2s)
+                        for _ in range(int(wait_time * 10)):
+                            if not self._running:
+                                break
+                            time.sleep(0.1)
                         continue
                     elif "429" in err_str:
                         break  # try next model
