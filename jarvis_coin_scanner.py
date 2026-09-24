@@ -168,7 +168,9 @@ class JarvisCoinScanner:
             try:
                 can_switch = not self._position_check_fn()
             except Exception:
-                can_switch = True
+                # Unknown position state must fail closed: never switch symbols
+                # while an open position may exist.
+                can_switch = False
 
         with self._lock:
             self._all_scores  = scores
