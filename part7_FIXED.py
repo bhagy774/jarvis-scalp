@@ -1,6 +1,7 @@
 # ---- Helpers inserted for Part-7 Fix ----
 from collections import deque
 from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
@@ -504,6 +505,14 @@ class VolatilityEngineGPU:
                 "telemetry": {}
             }
 
+@dataclass
+class OHLCVData:
+    opens: torch.Tensor
+    highs: torch.Tensor
+    lows: torch.Tensor
+    closes: torch.Tensor
+    volumes: torch.Tensor
+
 
 class EnhancedGPULiveDataEngine:
     """
@@ -876,9 +885,14 @@ class EnhancedGPULiveDataEngine:
                 features['bollinger_bands'] = self._calculate_bollinger_bands_gpu(recent_closes)
                 
                 # Market microstructure
-                features['microstructure'] = self._calculate_enhanced_microstructure_gpu(
-                    recent_opens, recent_highs, recent_lows, recent_closes, recent_volumes
+                ohlcv = OHLCVData(
+                    opens=recent_opens,
+                    highs=recent_highs,
+                    lows=recent_lows,
+                    closes=recent_closes,
+                    volumes=recent_volumes
                 )
+                features['microstructure'] = self._calculate_enhanced_microstructure_gpu(ohlcv)
                 
                 # Price patterns
                 features['price_patterns'] = self._detect_price_patterns_gpu(
@@ -1018,10 +1032,14 @@ class EnhancedGPULiveDataEngine:
             distance = (closes[-1] - sma) / (std + 1e-8)
             return torch.tanh(distance / 2.0)  # Normalize
     
-    def _calculate_enhanced_microstructure_gpu(self, opens: torch.Tensor, highs: torch.Tensor, 
-                                             lows: torch.Tensor, closes: torch.Tensor, 
-                                             volumes: torch.Tensor) -> torch.Tensor:
+    def _calculate_enhanced_microstructure_gpu(self, data: OHLCVData) -> torch.Tensor:
         """Enhanced market microstructure features"""
+        opens = data.opens
+        highs = data.highs
+        lows = data.lows
+        closes = data.closes
+        volumes = data.volumes
+
         with _cuda_guard(self.device):  # BUG FIX: CPU-safe cuda guard
             if len(closes) < 10:
                 return torch.zeros(5, device=self.device)
