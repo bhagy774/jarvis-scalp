@@ -2,7 +2,6 @@
 # JARVIS PART 5 - INSTITUTIONAL GPU FUSION ENGINE (GTX 1650 & CPU OPTIMIZED)
 # Fully hardened against hidden bugs, missing CUDA helpers, syntax flaws,
 # missing method signatures, parameter mismatches, and PyTorch fallback errors.
-# Includes Ollama Local AI Integration for Institutional Fusion Validation.
 # ==============================================================================
 
 import sys
@@ -24,15 +23,6 @@ if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     except Exception:
         pass
-
-# Import Ollama Local AI Integration
-try:
-    from ollama_integration import call_ollama
-    OLLAMA_INTEGRATION_AVAILABLE = True
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
-        return None, "ollama_integration module not found"
 
 # ---- PyTorch with complete NumPy Fallback for Windows/WSL compatibility ----
 try:
@@ -446,13 +436,7 @@ class GPUEnhancedFusionEngine:
                 fused_signal = self._fuse_signals_gpu(module_results)
                 final_confidence = self._aggregate_confidence_gpu(module_results)
                 
-                # Perform Ollama AI Sanity Check if available
-                ollama_thought, ollama_sig = self._call_ollama_fusion_sanity_check(module_results, fused_signal, final_confidence)
-                
                 res = self._create_gpu_signal(fused_signal, final_confidence, "GPU Results Fusion")
-                if ollama_thought:
-                    res['ollama_thought'] = ollama_thought
-                    res['ollama_signal'] = ollama_sig
                 return res
 
             df_1min = df_1min_or_results
@@ -468,56 +452,12 @@ class GPUEnhancedFusionEngine:
             fused_signal = self._fuse_signals_gpu(module_results)
             final_confidence = self._aggregate_confidence_gpu(module_results)
             
-            # Ollama AI Sanity Check
-            ollama_thought, ollama_sig = self._call_ollama_fusion_sanity_check(module_results, fused_signal, final_confidence)
-            
             res = self._create_gpu_signal(fused_signal, final_confidence, "GPU Data Fusion")
-            if ollama_thought:
-                res['ollama_thought'] = ollama_thought
-                res['ollama_signal'] = ollama_sig
             return res
             
         except Exception as e:
             error_msg = f"Fusion error: {str(e)}"
             return self._create_gpu_signal("NO TRADE", 0, error_msg)
-
-    def _call_ollama_fusion_sanity_check(self, module_results, fused_signal, confidence):
-        """Call Ollama Local AI (phi3.5:3.8b) for Fusion Sanity Check"""
-        import os
-        if os.environ.get("JARVIS_PURE_ALGO", "True") == "True":
-            return "APPROVED_BY_PURE_ALGO", 9.9
-            
-        if not OLLAMA_INTEGRATION_AVAILABLE:
-            return None, None
-            
-        try:
-            summary = []
-            for k, v in module_results.items():
-                if isinstance(v, dict):
-                    summary.append(f"{k}: signal={v.get('signal', v.get('direction', 'HOLD'))}, conf={v.get('confidence', 5.0)}")
-            
-            prompt = f"""You are the Chief AI Risk Officer analyzing a trading signal fusion package.
-Input Module Signals:
-{chr(10).join(summary) if summary else 'No individual module signals available'}
-
-Current Fused Signal: {fused_signal} (Confidence: {confidence:.2f})
-
-Respond in 1 short sentence validating or questioning this fused signal. State [BUY], [SELL], or [NO-TRADE] at the beginning."""
-            
-            resp, err = call_ollama(prompt, model=__import__('os').environ.get('OLLAMA_MODEL', 'deepseek-r1:14b'), timeout=10)
-            if resp:
-                clean_resp = resp.strip()
-                print(f"\n[PART 5 OLLAMA FUSION THOUGHTS] 🧠\n{clean_resp}\n")
-                
-                sig = "NO TRADE"
-                if "[BUY]" in clean_resp.upper() or "BUY" in clean_resp.upper():
-                    sig = "CALL"
-                elif "[SELL]" in clean_resp.upper() or "SELL" in clean_resp.upper():
-                    sig = "PUT"
-                return clean_resp, sig
-            return None, None
-        except Exception:
-            return None, None
 
     def fuse_modules_mtf(self, mtf_data):
         """Multi-Timeframe GPU Fusion"""
