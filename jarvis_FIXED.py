@@ -2149,17 +2149,30 @@ class LiveTradingEngine:
                     # accidentally use different symbols.
                     route = None
                     if self.market_router:
+                        position_manager = getattr(self.jarvis, 'position_manager', None)
+                        manager_has_position = bool(
+                            position_manager and position_manager.has_open_position()
+                        )
                         has_position = bool(self.paper_open_trades) or bool(
                             self.auto_trader and getattr(self.auto_trader, 'open_positions', [])
-                        )
+                        ) or manager_has_position
                         route = self.market_router.select_crypto(has_open_position=has_position)
                         if route.status != 'READY':
                             self._set_readiness('NOT_READY', f'venue route unavailable: {route.reason}')
                             logger.warning('[MARKET-ROUTER] Cycle blocked: %s', route.reason)
                             time.sleep(float(os.getenv('JARVIS_ROUTE_RETRY_SECONDS', '5')))
                             continue
-                    symbol = route.symbol if route else os.getenv('JARVIS_DEFAULT_SYMBOL', 'BTCUSDT')
-                    base_asset = route.base_asset if route else 'BTC'
+                    else:
+                        # A missing router is not permission to silently route
+                        # to BTC (especially when multi-market selection is on).
+                        route = None
+                        reason = 'market router unavailable; symbol selection cannot be verified'
+                        self._set_readiness('NOT_READY', reason)
+                        logger.error('[MARKET-ROUTER] Cycle blocked: %s', reason)
+                        time.sleep(float(os.getenv('JARVIS_ROUTE_RETRY_SECONDS', '5')))
+                        continue
+                    symbol = route.symbol
+                    base_asset = route.base_asset
                     # Let the brain know which symbol is being analysed so that
                     # cross-source checks compare the SAME asset (not BTC).
                     try:
