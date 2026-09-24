@@ -1,0 +1,3 @@
+# Corrected EURUSD backtest
+
+Fixed 5m/1h breakout proxy, using only complete contiguous OHLC bars and prior closed bars. Raw open entry reference; raw ATR stop/2R target. Gross raw price difference; exact one-time exit cost qty*(spread+2×slippage). MTM reserves that total cost once while open. Risk 0.5% includes stop plus unit roundtrip cost, 30x cap, integer FX units; zero skipped. Existing gap stop, then open time expiry, then intraminute stop/target (stop wins ties). Entry minute is processed for stop/target. No re-entry on exit minute. Timeout is wall-clock (60/2880 minutes). Zero swap assumed. Indicators reset across missing bars. EOD closes once and updates DD.
