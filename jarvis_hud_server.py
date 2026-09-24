@@ -306,21 +306,29 @@ def start_terminal_tailer() -> None:
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "jarvis_terminal.log")
     state["terminal_logs"] = []
 
-    def tail() -> None:
+    async def tail() -> None:
         try:
+            import aiofiles
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "a+", encoding="utf-8") as file:
-                file.seek(0, 2)
+            # aiofiles doesn't strictly have a+, but a+b is supported, or we can just touch the file and use r
+            # Let's ensure the file exists first:
+            with open(path, "a+", encoding="utf-8"):
+                pass
+
+            async with aiofiles.open(path, mode="r", encoding="utf-8") as file:
+                await file.seek(0, 2)
                 while True:
-                    line = file.readline()
+                    line = await file.readline()
                     if line:
                         state["terminal_logs"] = (state["terminal_logs"] + [_bounded_text(line, 500)])[-200:]
                     else:
-                        time.sleep(0.1)
+                        await asyncio.sleep(0.1)
         except Exception as exc:
             logger.debug("terminal tailer stopped: %s", exc)
 
-    threading.Thread(target=tail, daemon=True).start()
+    task = asyncio.create_task(tail())
+    # Keep a strong reference to the task so it doesn't get garbage collected
+    state["_tail_task"] = task
 
 
 @app.on_event("startup")
