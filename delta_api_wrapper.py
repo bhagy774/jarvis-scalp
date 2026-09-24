@@ -632,41 +632,41 @@ class DeltaExchangeData:
         return 0.0
 
     def get_open_positions(self, symbol: str = "BTCUSDT") -> List[Dict]:
-        """Get open positions, scoping the private request to one product.
+        """Return positions, raising when venue state cannot be verified.
 
-        Delta's positions endpoint uses ``product_id`` for this filter. Resolve
-        the caller-facing symbol through the existing product lookup rather
-        than sending an unsupported ``symbol`` query parameter or making a
-        broad positions request.
+        A successful empty list means the account is flat. Product lookup,
+        request, or response failures must not be collapsed to an empty list:
+        callers use this method for fail-closed order and close reconciliation.
+        An empty symbol intentionally requests the account-wide position list.
         """
-        resolved_symbol = symbol
-        if not symbol:
-            res = self._request("GET", "/v2/positions", None, authorized=True)
+        resolved_symbol = ""
+        if symbol:
+            product = self._resolve_product(symbol)
+            if not isinstance(product, dict):
+                raise RuntimeError("Product lookup failed for positions")
+            resolved_symbol = str(product.get("symbol") or symbol)
+            try:
+                product_id = int(product["id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("Invalid product ID for positions") from exc
+            endpoint = f"/v2/positions?product_id={product_id}"
         else:
-            product_id = self.get_product_id(symbol)
-            if product_id is None:
-                logger.error("[DELTA API] Product ID not found for requested positions")
-                return []
-            resolved_symbol = product.get("symbol", symbol)
-            try:
-                pid = int(product_id)
-            except (TypeError, ValueError):
-                logger.error("[DELTA API] Invalid product ID for requested positions")
-                return []
-            # Build signed URL with product_id as query param (Delta requirement)
-            endpoint_with_param = f"/v2/positions?product_id={pid}"
-            res = self._request("GET", endpoint_with_param, None, authorized=True)
-        if res["success"]:
-            try:
-                positions = res["data"].get("result", [])
-                if resolved_symbol:
-                    positions = [p for p in positions
-                                 if p.get("product", {}).get("symbol") == resolved_symbol
-                                 or p.get("symbol") == resolved_symbol]
-                return positions
-            except Exception:
-                return []
-        return []
+            endpoint = "/v2/positions"
+
+        res = self._request("GET", endpoint, None, authorized=True)
+        if not isinstance(res, dict) or not res.get("success"):
+            raise RuntimeError("Position request failed")
+        data = res.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("result"), list):
+            raise RuntimeError("Malformed positions response")
+        positions = data["result"]
+        if any(not isinstance(position, dict) for position in positions):
+            raise RuntimeError("Malformed position record")
+        if resolved_symbol:
+            positions = [position for position in positions
+                          if (position.get("product") or {}).get("symbol") == resolved_symbol
+                          or position.get("symbol") == resolved_symbol]
+        return positions
 
     def close_all_positions(self, symbol: str = "BTCUSDT") -> List[Dict]:
         """

@@ -22,6 +22,7 @@ import os
 import sys
 import time
 import json
+import math
 import logging
 import threading
 from datetime import datetime, timedelta, date
@@ -54,6 +55,8 @@ def _box(msg, col=C): print(f"{col}  ▶  {RST}{msg}")
 # ══════════════════════════════════════════════════════════════════
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP, contract_quote_value_usdt
 from jarvis_lot_limits import enforce_entry_lots
+from jarvis_close_coordinator import reconcile_close
+from jarvis_decision import normalize_confidence
 try:
     from jarvis_position_ownership import claim_position, claim_close
 except ImportError:
@@ -142,6 +145,9 @@ class JarvisAutoTrader:
         # Process-local lifecycle owner token.  The active auto-trader is the
         # sole component allowed to close its positions.
         self._ownership_token = f"auto:{id(self)}"
+        # Serialize the final live preflight + order path. Two concurrent
+        # decisions must not both observe a flat venue and submit entries.
+        self._entry_lock = threading.Lock()
         self.daily_pnl      = 0.0
         self.daily_trades   = 0
         self.consec_losses  = 0
@@ -229,8 +235,38 @@ class JarvisAutoTrader:
                 direction, confidence, current_price, part_results, symbol)
 
         # ─ Gate 3: Execute ───────────────────────────────────────
-        return self._place_trade(
-            direction, confidence, current_price, trade_type, hedge_plan, symbol)
+        # A live execution is strictly one-position-at-a-time. Local state
+        # alone is insufficient after a process restart, so reconcile the
+        # account-wide venue position list immediately before entry. The lock
+        # spans this preflight and order submission to prevent concurrent
+        # callers from both observing a flat account.
+        with self._entry_lock:
+            if self.is_enabled:
+                if self.open_positions:
+                    return self._skip("One-position policy: a local position is still open or unresolved")
+                get_positions = getattr(self.delta, "get_open_positions", None)
+                if not callable(get_positions):
+                    return self._skip("Exchange position state unavailable; entry blocked")
+                try:
+                    venue_positions = get_positions("")
+                except Exception as exc:
+                    return self._skip(f"Exchange position state unavailable; entry blocked ({type(exc).__name__})")
+                if not isinstance(venue_positions, list):
+                    return self._skip("Exchange position state malformed; entry blocked")
+                for position in venue_positions:
+                    if not isinstance(position, dict):
+                        return self._skip("Exchange position record malformed; entry blocked")
+                    raw_size = position.get("size", position.get("position_size"))
+                    try:
+                        position_size = float(raw_size)
+                    except (TypeError, ValueError):
+                        return self._skip("Exchange position size unavailable; entry blocked")
+                    if not math.isfinite(position_size):
+                        return self._skip("Exchange position size invalid; entry blocked")
+                    if position_size != 0:
+                        return self._skip("One-position policy: exchange already has an open position")
+            return self._place_trade(
+                direction, confidence, current_price, trade_type, hedge_plan, symbol)
 
     def trigger_emergency_stop(self):
         """Close ALL positions immediately."""
@@ -853,7 +889,11 @@ class JarvisAutoTrader:
         # Step 1: Close current position
         close_result = self._close_position_market(pos)
         if not close_result.get("success"):
-            logger.error("[REVERSAL] failed: could not close current position %s", pos.get('id'))
+            # Keep the old position locked when venue flatness cannot be
+            # established. A reverse entry must never follow an ACK alone.
+            pos["status"] = "CLOSE_UNKNOWN"
+            pos["close_error"] = close_result.get("error", "Close not confirmed flat")
+            logger.error("[REVERSAL] blocked: current position %s is not verified flat", pos.get('id'))
             return
 
         # Calculate P&L of closed position
@@ -951,43 +991,58 @@ class JarvisAutoTrader:
             return None
 
     def _close_position_market(self, pos: Dict) -> Dict:
-        """Submit one reduce-only close; ambiguous results remain unresolved.
+        """Submit one reduce-only close and verify the venue is flat.
 
-        The ownership and close claims are process-local guards against two
-        monitors issuing duplicate closes.  The venue wrapper also receives an
-        idempotency key, while a transport failure is never treated as proof
-        that a close failed or succeeded.
+        Claims are one-shot: after any order response, including a timeout, the
+        venue is queried and the order is never retried blindly. A venue ACK is
+        not treated as a fill, and unresolved exposure stays ambiguous.
         """
         try:
-            is_call    = pos["direction"] in ("CALL", "BUY")
-            close_side = "sell" if is_call else "buy"
             position_id = pos.get("id")
+            try:
+                raw_size = float(pos.get("contracts"))
+            except (TypeError, ValueError):
+                return {"success": False, "error": "Position close quantity is invalid"}
+            if not math.isfinite(raw_size) or raw_size <= 0 or not raw_size.is_integer():
+                return {"success": False, "error": "Position close quantity must be a positive integer"}
+            size = int(raw_size)
+            is_call = pos.get("direction") in ("CALL", "BUY")
+            close_side = "sell" if is_call else "buy"
             if self.is_enabled:
                 symbol = pos.get("symbol")
-                if not isinstance(symbol, str) or not symbol:
+                if not isinstance(symbol, str) or not symbol.strip():
                     return {"success": False, "error": "Position symbol is missing"}
                 allowed, current = claim_close(position_id, self._ownership_token)
                 if not allowed:
                     return {"success": False, "error": f"Close already claimed or owned by {current or 'another manager'}"}
-                result = self.delta.place_order(
-                    symbol=symbol,
-                    side=close_side,
-                    size=pos["contracts"],
-                    order_type="market",
-                    reduce_only=True,
-                    idempotency_key=f"jarvis-close-{position_id}",
-                )
-                if not isinstance(result, dict) or not result.get("success"):
-                    return {"success": False, "ambiguous": True,
-                            "error": (result or {}).get("error", "Close not confirmed")}
-                return result
-            else:
-                # Paper closes do not need a venue claim, but retain one local
-                # close transition so duplicate monitors cannot double-book.
-                allowed, current = claim_close(position_id, self._ownership_token)
-                if not allowed:
-                    return {"success": False, "error": f"Close already claimed or owned by {current or 'another manager'}"}
-                return {"success": True, "paper": True}
+                try:
+                    order_result = self.delta.place_order(
+                        symbol=symbol,
+                        side=close_side,
+                        size=size,
+                        order_type="market",
+                        reduce_only=True,
+                        client_order_id=f"jarvis-close-{position_id}"[:64],
+                    )
+                except Exception as exc:
+                    order_result = {"success": False, "error": str(exc)}
+                reconciliation = reconcile_close(self.delta, symbol, close_side, size)
+                if reconciliation.get("confirmed"):
+                    if isinstance(order_result, dict) and order_result.get("success"):
+                        return {**order_result, "reconciliation": reconciliation}
+                    return {"success": True, "reconciled": True,
+                            "order_error": (order_result or {}).get("error", "Order response unavailable"),
+                            "reconciliation": reconciliation}
+                return {"success": False, "ambiguous": True,
+                        "error": (order_result or {}).get("error", "Close not confirmed"),
+                        "reconciliation": reconciliation}
+
+            # Paper closes do not touch the venue, but retain a one-shot local
+            # transition so duplicate monitors cannot double-book.
+            allowed, current = claim_close(position_id, self._ownership_token)
+            if not allowed:
+                return {"success": False, "error": f"Close already claimed or owned by {current or 'another manager'}"}
+            return {"success": True, "paper": True}
         except Exception as e:
             return {"success": False, "ambiguous": True, "error": str(e)}
 
