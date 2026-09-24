@@ -16,6 +16,19 @@ Design rules:
 """
 
 import os
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass
+class ScenarioConfig:
+    direction: str
+    entry_price: float
+    sl: float
+    tp: float
+    df: Any
+    fee_bps: float = 10.0
+    slippage_bps: float = 5.0
 
 
 def scen_enabled():
@@ -115,8 +128,7 @@ def _scenario_volume_drop(df):
     return True, "Volume healthy"
 
 
-def run_scenarios(direction, entry_price, sl, tp, df,
-                  fee_bps=10.0, slippage_bps=5.0):
+def run_scenarios(config: ScenarioConfig):
     """Badha scenarios run kari verdict aape.
 
     Returns dict:
@@ -125,10 +137,14 @@ def run_scenarios(direction, entry_price, sl, tp, df,
       scenarios: list of (name, ok, reason)
       reason: summary string
     """
-    direction = (direction or "").upper()
-    entry = float(entry_price or 0)
-    sl = float(sl or 0)
-    tp = float(tp or 0)
+    direction = (config.direction or "").upper()
+    entry = float(config.entry_price or 0)
+    sl = float(config.sl or 0)
+    tp = float(config.tp or 0)
+    df = config.df
+    fee_bps = config.fee_bps
+    slippage_bps = config.slippage_bps
+
     if direction not in ("CALL", "PUT") or entry <= 0 or sl <= 0 or tp <= 0 or df is None or len(df) == 0:
         return {"action": "pass", "passed": 0, "total": 0,
                 "scenarios": [], "reason": "insufficient inputs (fail-open pass)"}
