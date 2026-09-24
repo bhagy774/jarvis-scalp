@@ -92,22 +92,21 @@ def enforce_entry_lots(
     ``safe_qty`` is floored (never rounded up), capped at the configured max,
     and aligned downward to explicit order-size step metadata.  A quantity
     below the configured minimum is rejected, including after step alignment.
-    ``reduce_only`` validates quantity/balance inputs but skips all entry
-    bounds and step constraints so protective exits remain unconstrained.
+    ``reduce_only`` validates only that the requested quantity is positive
+    and whole; entry limits, balance checks, and order-step metadata are
+    irrelevant to a protective exit and are deliberately skipped.
     """
     qty_number = _finite_positive_number(safe_qty, "safe quantity")
     qty = int(math.floor(qty_number))
     if qty < 1:
         raise ValueError("safe quantity must contain at least one whole lot")
+    if reduce_only:
+        return qty
 
     if available_balance is not None:
         _finite_positive_number(available_balance, "available balance")
 
-    # Validate metadata even for exits, but deliberately do not apply any
-    # entry policy to reduce-only quantities.
     step = _order_size_step(metadata)
-    if reduce_only:
-        return qty
 
     minimum, maximum = entry_lot_limits()
     if minimum is not None and qty < minimum:

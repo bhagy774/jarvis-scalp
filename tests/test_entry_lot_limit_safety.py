@@ -66,8 +66,10 @@ def test_invalid_config_quantity_balance_and_explicit_step_fail_closed(monkeypat
 def test_reduce_only_quantity_is_not_limited_by_entry_minimum_or_step(monkeypatch):
     monkeypatch.setenv("JARVIS_MIN_ENTRY_LOTS", "4")
     monkeypatch.setenv("JARVIS_MAX_ENTRY_LOTS", "8")
+    # Entry balance and order-step metadata, even when malformed, must not
+    # block a protective exit.
     assert enforce_entry_lots(
-        1, metadata={"size_increment": 7}, available_balance=1, reduce_only=True
+        1, metadata={"size_increment": 0}, available_balance=0, reduce_only=True
     ) == 1
 
 
