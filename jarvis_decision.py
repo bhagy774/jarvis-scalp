@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import numbers
 from typing import Any, Dict, Iterable, Optional
+from dataclasses import dataclass, field
 
 
 _NA = {"", "N/A", "NA", "NONE", "NULL", "UNKNOWN", "UNAVAILABLE", "MISSING", "REJECTED"}
@@ -92,26 +93,30 @@ def _opinion_direction(value: Any) -> Optional[str]:
     return direction if direction in {"BUY", "SELL"} else None
 
 
+@dataclass
+class DecisionContext:
+    symbol: str
+    price: Any = None
+    reasons: Iterable[Any] = field(default_factory=tuple)
+    opinions: Iterable[Any] = field(default_factory=tuple)
+    options_context: Optional[Dict[str, Any]] = None
+    require_options: bool = False
+    gate_reason: str = ""
+    blocking_reasons: Iterable[Any] = field(default_factory=tuple)
+    plan: Optional[Dict[str, Any]] = None
+
+
 def build_final_decision(
     signal: Dict[str, Any] | None,
-    *,
-    symbol: str,
-    price: Any = None,
-    reasons: Iterable[Any] = (),
-    opinions: Iterable[Any] = (),
-    options_context: Dict[str, Any] | None = None,
-    require_options: bool = False,
-    gate_reason: str = "",
-    blocking_reasons: Iterable[Any] = (),
-    plan: Dict[str, Any] | None = None,
+    context: DecisionContext,
 ) -> Dict[str, Any]:
     """Produce the one authoritative decision snapshot consumed downstream."""
     signal = signal if isinstance(signal, dict) else {}
     direction = canonical_direction(signal.get("direction"))
     confidence = normalize_confidence(signal.get("confidence_score", signal.get("confidence")))
-    clean_reasons = [str(x) for x in reasons if x not in (None, "")]
+    clean_reasons = [str(x) for x in context.reasons if x not in (None, "")]
     conflict = False
-    votes = {_opinion_direction(op) for op in opinions}
+    votes = {_opinion_direction(op) for op in context.opinions}
     votes.discard(None)
     if len(votes) > 1:
         conflict = True
@@ -120,38 +125,38 @@ def build_final_decision(
     if confidence is None and direction in {"BUY", "SELL"}:
         direction = "NO_TRADE"
         clean_reasons.append("Confidence unavailable")
-    context = options_context if isinstance(options_context, dict) else {}
-    if require_options and direction in {"BUY", "SELL"} and (
-        not context.get("available", False) or context.get("role") != "asset_primary"
+    options_ctx = context.options_context if isinstance(context.options_context, dict) else {}
+    if context.require_options and direction in {"BUY", "SELL"} and (
+        not options_ctx.get("available", False) or options_ctx.get("role") != "asset_primary"
     ):
         direction = "NO_TRADE"
         clean_reasons.append("Required selected-asset options context unavailable or non-primary")
-    blockers = [str(x) for x in blocking_reasons if x not in (None, "")]
+    blockers = [str(x) for x in context.blocking_reasons if x not in (None, "")]
     if blockers and direction in {"BUY", "SELL"}:
         direction = "NO_TRADE"
     clean_reasons.extend(blockers)
-    if gate_reason and direction in {"BUY", "SELL"}:
+    if context.gate_reason and direction in {"BUY", "SELL"}:
         direction = "NO_TRADE"
-        clean_reasons.append(str(gate_reason))
-    if direction == "NO_TRADE" and gate_reason:
-        clean_reasons.append(str(gate_reason))
+        clean_reasons.append(str(context.gate_reason))
+    if direction == "NO_TRADE" and context.gate_reason:
+        clean_reasons.append(str(context.gate_reason))
     unique_reasons = list(dict.fromkeys(clean_reasons))
-    p = plan if isinstance(plan, dict) else {}
+    p = context.plan if isinstance(context.plan, dict) else {}
     allowed = direction in {"BUY", "SELL"} and confidence is not None and not conflict
     return {
         "direction": direction,
         "execution_direction": execution_direction(direction) if allowed else None,
         "confidence": confidence,
         "confidence_display": confidence_text(confidence),
-        "symbol": str(symbol or "").upper().replace("-", "").replace("_", ""),
-        "price": float(price) if isinstance(price, (int, float)) and float(price) > 0 else None,
+        "symbol": str(context.symbol or "").upper().replace("-", "").replace("_", ""),
+        "price": float(context.price) if isinstance(context.price, (int, float)) and float(context.price) > 0 else None,
         "entry": p.get("entry", signal.get("entry_price")),
         "tp1": p.get("tp1", signal.get("take_profit_1")),
         "tp2": p.get("tp2", signal.get("take_profit_2")),
         "sl": p.get("sl", signal.get("stop_loss")),
         "expiry": p.get("expiry", signal.get("recommended_expiry", "N/A")),
         "reasons": unique_reasons,
-        "options_context": context,
+        "options_context": options_ctx,
         "status": "READY" if allowed else ("CONFLICT" if conflict else "WAIT"),
         "execution_allowed": allowed,
     }
