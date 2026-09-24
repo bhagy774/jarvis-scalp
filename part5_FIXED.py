@@ -87,7 +87,7 @@ except (ImportError, OSError):
         def __add__(self, other): return DummyTensor(self._data + (other._data if isinstance(other, DummyTensor) else other))
         def __sub__(self, other): return DummyTensor(self._data - (other._data if isinstance(other, DummyTensor) else other))
         def __mul__(self, other): return DummyTensor(self._data * (other._data if isinstance(other, DummyTensor) else other))
-        def __truediv__(self, other): return DummyTensor(self._data / (other._data if isinstance(other, DummyTensor) else 1e-8))
+        def __truediv__(self, other): return DummyTensor(self._data / (other._data if isinstance(other, DummyTensor) else (other + 1e-8)))
 
     class DummyModule:
         def __init__(self, *args, **kwargs): pass
@@ -137,17 +137,20 @@ except (ImportError, OSError):
         
         @staticmethod
         def zeros(*args, **kwargs):
-            shape = args[0] if args else (1,)
+            shape = args if args else (1,)
+            if len(shape) == 1 and isinstance(shape[0], (tuple, list)): shape = shape[0]
             return DummyTensor(np.zeros(shape, dtype=np.float32))
 
         @staticmethod
         def ones(*args, **kwargs):
-            shape = args[0] if args else (1,)
+            shape = args if args else (1,)
+            if len(shape) == 1 and isinstance(shape[0], (tuple, list)): shape = shape[0]
             return DummyTensor(np.ones(shape, dtype=np.float32))
 
         @staticmethod
         def randn(*args, **kwargs):
-            shape = args[0] if args else (1,)
+            shape = args if args else (1,)
+            if len(shape) == 1 and isinstance(shape[0], (tuple, list)): shape = shape[0]
             return DummyTensor(np.random.randn(*shape).astype(np.float32))
 
         @staticmethod

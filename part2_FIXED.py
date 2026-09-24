@@ -9,53 +9,67 @@ except (ImportError, OSError):
     TORCH_AVAILABLE = False
     import numpy as np
     class DummyTensor:
-        def __init__(self, data=0, *args, **kwargs):
+        def __init__(self, data=0.0, *args, **kwargs):
             if isinstance(data, (list, tuple, np.ndarray)):
-                self.arr = np.array(data, dtype=np.float32)
-            elif isinstance(data, (int, float)):
-                self.arr = np.array([data], dtype=np.float32)
+                self._data = np.array(data, dtype=np.float32)
+            elif isinstance(data, (int, float, bool, np.number)):
+                self._data = np.array([float(data)], dtype=np.float32)
             elif isinstance(data, DummyTensor):
-                self.arr = data.arr.copy()
+                self._data = data._data.copy()
             else:
-                self.arr = np.array([0.0], dtype=np.float32)
-            self.shape = self.arr.shape
-            self.dtype = 'float32'
+                self._data = np.zeros((1,), dtype=np.float32)
+            self.shape = self._data.shape
+            self.dtype = self._data.dtype
             self.device = 'cpu'
 
         def to(self, *args, **kwargs): return self
         def cpu(self): return self
-        def numpy(self): return self.arr
-        def item(self): return float(self.arr.flat[0]) if self.arr.size > 0 else 0.0
+        def numpy(self): return self._data
+        def item(self): return float(self._data.flat[0]) if self._data.size > 0 else 0.0
+        def float(self): return self
+        def long(self): return self
+        def int(self): return self
+        def detach(self): return self
+        def clone(self): return DummyTensor(self._data.copy())
+        def reshape(self, *shape): return DummyTensor(self._data.reshape(*shape))
+        def unsqueeze(self, dim=0): return DummyTensor(np.expand_dims(self._data, axis=dim))
+
         def __getitem__(self, key):
-            res = self.arr[key]
-            return DummyTensor(res) if isinstance(res, np.ndarray) else res
-        def __len__(self): return len(self.arr)
-        def dim(self): return self.arr.ndim
-        def size(self, dim=None): return self.arr.shape[dim] if dim is not None else self.arr.shape
-        def unsqueeze(self, dim): return DummyTensor(np.expand_axis(self.arr, dim) if hasattr(np, 'expand_axis') else np.expand_dims(self.arr, dim))
+            res = self._data[key]
+            if isinstance(res, np.ndarray):
+                dt = DummyTensor(res)
+                dt.shape = res.shape
+                return dt
+            return float(res)
+
+        def __len__(self): return len(self._data)
+        def __float__(self): return self.item()
+        def __int__(self): return int(self.item())
+        def __bool__(self): return bool(self.item()) if self._data.size == 1 else self._data.size > 0
+        def __repr__(self): return f"DummyTensor({self._data})"
+        def dim(self): return self._data.ndim
+        def size(self, dim=None): return self._data.shape[dim] if dim is not None else self._data.shape
         def expand(self, *sizes): return self
-        def mean(self, *args, **kwargs): return float(np.mean(self.arr)) if self.arr.size > 0 else 0.0
-        def std(self, *args, **kwargs): return float(np.std(self.arr)) if self.arr.size > 1 else 0.0
-        def sum(self, *args, **kwargs): return float(np.sum(self.arr))
-        def max(self, *args, **kwargs): return float(np.max(self.arr)) if self.arr.size > 0 else 0.0
-        def min(self, *args, **kwargs): return float(np.min(self.arr)) if self.arr.size > 0 else 0.0
-        def abs(self): return DummyTensor(np.abs(self.arr))
-        def __add__(self, other): return DummyTensor(self.arr + (other.arr if isinstance(other, DummyTensor) else other))
+        def std(self, *args, **kwargs): return float(np.std(self._data)) if self._data.size > 1 else 0.0
+        def max(self, *args, **kwargs): return float(np.max(self._data)) if self._data.size > 0 else 0.0
+        def min(self, *args, **kwargs): return float(np.min(self._data)) if self._data.size > 0 else 0.0
+        def abs(self): return DummyTensor(np.abs(self._data))
         def __radd__(self, other): return self.__add__(other)
-        def __sub__(self, other): return DummyTensor(self.arr - (other.arr if isinstance(other, DummyTensor) else other))
-        def __rsub__(self, other): return DummyTensor((other.arr if isinstance(other, DummyTensor) else other) - self.arr)
-        def __mul__(self, other): return DummyTensor(self.arr * (other.arr if isinstance(other, DummyTensor) else other))
+        def __rsub__(self, other): return DummyTensor((other._data if isinstance(other, DummyTensor) else other) - self._data)
         def __rmul__(self, other): return self.__mul__(other)
-        def __truediv__(self, other):
-            denom = other.arr if isinstance(other, DummyTensor) else other
-            return DummyTensor(self.arr / (denom + 1e-8))
         def __rtruediv__(self, other):
-            num = other.arr if isinstance(other, DummyTensor) else other
-            return DummyTensor(num / (self.arr + 1e-8))
-        def __gt__(self, other): return self.arr > (other.arr if isinstance(other, DummyTensor) else other)
-        def __lt__(self, other): return self.arr < (other.arr if isinstance(other, DummyTensor) else other)
-        def __ge__(self, other): return self.arr >= (other.arr if isinstance(other, DummyTensor) else other)
-        def __le__(self, other): return self.arr <= (other.arr if isinstance(other, DummyTensor) else other)
+            num = other._data if isinstance(other, DummyTensor) else other
+            return DummyTensor(num / (self._data + 1e-8))
+        def __gt__(self, other): return self._data > (other._data if isinstance(other, DummyTensor) else other)
+        def __lt__(self, other): return self._data < (other._data if isinstance(other, DummyTensor) else other)
+        def __ge__(self, other): return self._data >= (other._data if isinstance(other, DummyTensor) else other)
+        def __le__(self, other): return self._data <= (other._data if isinstance(other, DummyTensor) else other)
+
+
+        def __add__(self, other): return DummyTensor(self._data + (other._data if isinstance(other, DummyTensor) else other))
+        def __sub__(self, other): return DummyTensor(self._data - (other._data if isinstance(other, DummyTensor) else other))
+        def __mul__(self, other): return DummyTensor(self._data * (other._data if isinstance(other, DummyTensor) else other))
+        def __truediv__(self, other): return DummyTensor(self._data / (other._data if isinstance(other, DummyTensor) else (other + 1e-8)))
 
     class DummyModule:
         def __init__(self, *args, **kwargs): pass
@@ -70,7 +84,6 @@ except (ImportError, OSError):
 
     class torch:
         Tensor = DummyTensor
-        FloatTensor = DummyTensor
         device = lambda x: 'cpu'
         float32 = 'float32'
         long = 'long'
@@ -97,6 +110,7 @@ except (ImportError, OSError):
             MSELoss = DummyModule
             CrossEntropyLoss = DummyModule
 
+
         class optim:
             Adam = DummyModule
             SGD = DummyModule
@@ -107,18 +121,62 @@ except (ImportError, OSError):
             @staticmethod
             def device_count(): return 0
             @staticmethod
-            def get_device_name(idx=0): return 'CPU'
+            def get_device_name(idx=0): return "CPU_Fallback"
+            @staticmethod
+            def empty_cache(): pass
+            @staticmethod
+            def set_per_process_memory_fraction(*args, **kwargs): pass
+            @staticmethod
+            def memory_allocated(): return 0
+
+        @staticmethod
+        def tensor(data, **kwargs):
+            if isinstance(data, DummyTensor): return data
+            return DummyTensor(data)
+
+        @staticmethod
+        def zeros(*args, **kwargs):
+            shape = args if args else (1,)
+            if len(shape) == 1 and isinstance(shape[0], (tuple, list)): shape = shape[0]
+            return DummyTensor(np.zeros(shape, dtype=np.float32))
+
+        @staticmethod
+        def ones(*args, **kwargs):
+            shape = args if args else (1,)
+            if len(shape) == 1 and isinstance(shape[0], (tuple, list)): shape = shape[0]
+            return DummyTensor(np.ones(shape, dtype=np.float32))
+
+        @staticmethod
+        def randn(*args, **kwargs):
+            shape = args if args else (1,)
+            if len(shape) == 1 and isinstance(shape[0], (tuple, list)): shape = shape[0]
+            return DummyTensor(np.random.randn(*shape).astype(np.float32))
+
+        @staticmethod
+        def mean(tensor, *args, **kwargs):
+            arr = tensor._data if isinstance(tensor, DummyTensor) else np.array(tensor)
+            return DummyTensor(np.mean(arr))
+
+        @staticmethod
+        def sum(tensor, *args, **kwargs):
+            arr = tensor._data if isinstance(tensor, DummyTensor) else np.array(tensor)
+            return DummyTensor(np.sum(arr))
+
+        @staticmethod
+        def softmax(tensor, dim=0, *args, **kwargs):
+            arr = tensor._data if isinstance(tensor, DummyTensor) else np.array(tensor)
+            e_x = np.exp(arr - np.max(arr))
+            return DummyTensor(e_x / (e_x.sum() + 1e-8))
+
+        @staticmethod
+        def clamp(tensor, min_val, max_val):
+            val = tensor.item() if isinstance(tensor, DummyTensor) else float(tensor)
+            return DummyTensor(max(min_val, min(max_val, val)))
 
         class no_grad:
             def __enter__(self): pass
             def __exit__(self, exc_type, exc_val, exc_tb): pass
 
-        @staticmethod
-        def tensor(data, **kwargs): return DummyTensor(data)
-        @staticmethod
-        def zeros(*args, **kwargs): return DummyTensor()
-        @staticmethod
-        def randn(*args, **kwargs): return DummyTensor()
         @staticmethod
         def cat(tensors, dim=0): return DummyTensor()
         @staticmethod
@@ -132,17 +190,13 @@ except (ImportError, OSError):
         @staticmethod
         def all(*args, **kwargs): return DummyTensor([True])
         @staticmethod
-        def sum(*args, **kwargs): return DummyTensor([0])
-        @staticmethod
         def stack(tensors, dim=0): return DummyTensor()
         @staticmethod
         def is_tensor(x): return isinstance(x, DummyTensor)
         @staticmethod
-        def mean(x, *args, **kwargs): return np.mean(x.arr) if isinstance(x, DummyTensor) else np.mean(x)
+        def std(x, *args, **kwargs): return np.std(x._data) if isinstance(x, DummyTensor) else np.std(x)
         @staticmethod
-        def std(x, *args, **kwargs): return np.std(x.arr) if isinstance(x, DummyTensor) else np.std(x)
-        @staticmethod
-        def diff(x, *args, **kwargs): return DummyTensor(np.diff(x.arr)) if isinstance(x, DummyTensor) else DummyTensor(np.diff(x))
+        def diff(x, *args, **kwargs): return DummyTensor(np.diff(x._data)) if isinstance(x, DummyTensor) else DummyTensor(np.diff(x))
 
         class F:
             @staticmethod
@@ -158,9 +212,11 @@ except (ImportError, OSError):
             @staticmethod
             def dropout(x, p=0.5, training=True): return x
 
+
     nn = torch.nn
     F = torch.F
     optim = torch.optim
+
 
 # CuPy fallback — if CUDA/CuPy not installed, fall back to NumPy
 try:
