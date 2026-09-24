@@ -12,3 +12,4 @@ data/
 *.log
 *.txt
 !requirements.txt
+jarvis_rust/target/
