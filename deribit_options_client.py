@@ -8,7 +8,10 @@ import requests
 import time
 import logging
 import math
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
+
+from options_expiry import group_current_expiries
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +86,16 @@ class DeribitOptionsClient:
                 headers['Authorization'] = f'Bearer {self.access_token}'
         return headers
         
+    def summarize_current_expiries(self, instruments=None) -> Dict:
+        """Return all listed, unexpired matching-underlying expiries as of now."""
+        if instruments is None:
+            try:
+                response = requests.get(f"{self.base_url}/public/get_book_summary_by_currency", params={"currency": self.currency, "kind": "option"}, timeout=10)
+                response.raise_for_status(); instruments = response.json().get("result", [])
+            except Exception as exc:
+                return {"underlying": self.currency.upper(), "as_of": datetime.now(timezone.utc).isoformat(), "expiry_count": 0, "expiries": [], "error": str(exc)}
+        return group_current_expiries(instruments, self.currency)
+
     def get_option_chain(self, use_cache=True) -> Optional[Dict]:
         """
         Fetch current Option Chain data
@@ -654,7 +667,8 @@ class DeribitOptionsClient:
                     'max_pain': max_pain,
                     'support': support,
                     'resistance': resistance,
-                    'current_price': current_price
+                    'current_price': current_price,
+                    'expiry_coverage': self.summarize_current_expiries()
                 }
             }
             
