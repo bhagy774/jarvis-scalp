@@ -1,12 +1,13 @@
 import pandas as pd
-from jarvis_backtester import JarvisFullBacktester
+from jarvis_backtester import JarvisFullBacktester, BacktestConfig
 
 print("Loading data...")
 df = pd.read_csv("data/BTCUSDT_1m_20260716_20260914.csv", nrows=2000)
 df['timestamp'] = pd.to_datetime(df['timestamp'])
 
 print("Initializing backtester...")
-backtester = JarvisFullBacktester(starting_capital=1000.0, fee_bps=10.0, slippage_bps=5.0)
+config = BacktestConfig(starting_capital=1000.0, fee_bps=10.0, slippage_bps=5.0)
+backtester = JarvisFullBacktester(config=config)
 print("Running backtest on 2000 candles...")
 results = backtester.run_backtest(df, 'BTCUSDT', '1m')
 
