@@ -749,6 +749,39 @@ Respond in 1 short sentence validating or questioning this fused signal. State [
                 adjusted_weights = performance_normalized * (1.0 + momentum)
                 final_weights = adjusted_weights / (torch.sum(adjusted_weights) + 1e-8)
                 self.strategy_weights_gpu = final_weights
+
+                # --- Advanced Math: Online Learning / Training Step ---
+                # We apply a simple online learning step to update our MLP weights
+                # using the realized performance of the strategies as a proxy for the true target.
+                if self.use_neural and self.neural_fusion is not None and hasattr(self, 'last_neural_inputs'):
+                    try:
+                        sig_batch, conf_batch = self.last_neural_inputs
+                        self.neural_fusion.train()
+
+                        # Forward pass
+                        probs = self.neural_fusion(sig_batch, conf_batch)
+
+                        # Pseudo-target based on top performing strategy
+                        best_strat_idx = torch.argmax(final_weights).item()
+                        target_direction = sig_batch[0, best_strat_idx].item()
+
+                        target_class = 1 # NO_TRADE
+                        if target_direction > 0.5: target_class = 2 # CALL
+                        elif target_direction < -0.5: target_class = 0 # PUT
+
+                        target_tensor = torch.tensor([target_class], device=self.device, dtype=torch.long)
+
+                        # Loss and optimizer step
+                        loss_fn = nn.CrossEntropyLoss()
+                        optimizer = optim.Adam(self.neural_fusion.parameters(), lr=0.01)
+                        optimizer.zero_grad()
+                        loss = loss_fn(probs, target_tensor)
+                        loss.backward()
+                        optimizer.step()
+
+                        self.neural_fusion.eval() # revert back to inference mode
+                    except Exception as train_e:
+                        self.neural_fusion.eval() # ensure we revert if training fails
         except Exception:
             pass
 
