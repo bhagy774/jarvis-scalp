@@ -1,4 +1,5 @@
  # JARVIS_MAGIC_STRING_12345
+import math
 # jarvis_trade_elite_integrated.py
 # JARVIS TRADE ELITE v7.0 - FULLY INTEGRATED WITH ALL 4 ENGINES
 # Complete system with AutoBacktest, AutoTraining, AutoOptimizer, LiveTrading
@@ -3777,6 +3778,24 @@ Follow the tag with a 1-sentence options analyst insight.
             
             max_pain_raw = bias_data.get('max_pain') or bias_data.get('raw_data', {}).get('max_pain')
             max_pain_float = float(max_pain_raw) if max_pain_raw is not None and str(max_pain_raw).replace('.', '', 1).isdigit() else None
+            # Descriptive, deterministic chain math: only derive relative distances
+            # when both observed prices are finite and positive. Never infer a
+            # missing wall, PCR, or selected instrument from another asset.
+            def _observed_price(value):
+                try:
+                    value = float(value)
+                    return value if math.isfinite(value) and value > 0 else None
+                except (TypeError, ValueError, OverflowError):
+                    return None
+            support_raw = bias_data.get('support_wall') or bias_data.get('raw_data', {}).get('support')
+            resistance_raw = bias_data.get('resistance_wall') or bias_data.get('raw_data', {}).get('resistance')
+            support_price = _observed_price(support_raw)
+            resistance_price = _observed_price(resistance_raw)
+            current_price = _observed_price(current_price)
+            if current_price is None:
+                return {"signal": 0, "thought": "Invalid current price; options math unavailable", "telemetry": {"signal": 0, "available": False, "asset": self.asset}}
+            max_pain_float = _observed_price(max_pain_float)
+            pcr_float = pcr_float if pcr_float is not None and math.isfinite(pcr_float) and pcr_float >= 0 else None
 
             telemetry = {
                 "exchange": "Delta" if source == delta_source else "Deribit",
@@ -3785,9 +3804,13 @@ Follow the tag with a 1-sentence options analyst insight.
                 "bias_score": float(bias_data.get('score', 0)),
                 "pcr": pcr_float,
                 "signal": math_signal,
-                "support_wall": bias_data.get('support_wall') or bias_data.get('raw_data', {}).get('support'),
-                "resistance_wall": bias_data.get('resistance_wall') or bias_data.get('raw_data', {}).get('resistance'),
-                "max_pain": max_pain_float
+                "support_wall": support_price,
+                "resistance_wall": resistance_price,
+                "max_pain": max_pain_float,
+                "support_distance_pct": ((current_price - support_price) / current_price * 100) if support_price is not None else None,
+                "resistance_distance_pct": ((resistance_price - current_price) / current_price * 100) if resistance_price is not None else None,
+                "max_pain_distance_pct": ((max_pain_float - current_price) / current_price * 100) if max_pain_float is not None else None,
+                "math_model": "observed_chain_descriptive_v1"
             }
 
             # Ollama Smart Money & Whale Tracker Analysis
