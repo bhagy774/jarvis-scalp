@@ -19,8 +19,12 @@ import subprocess
 
 # --- ZERO LAG PURE ALGO MODE ---
 # Set to "True" to completely bypass all LLM/Ollama network calls during live trading
-os.environ["JARVIS_PURE_ALGO"] = "True"
+os.environ.setdefault("JARVIS_PURE_ALGO", "true")
 # -------------------------------
+def _pure_algorithm_mode():
+    """Explicit runtime policy: algorithm-only means model calls never decide or veto."""
+    return os.getenv("JARVIS_PURE_ALGO", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 import numpy as np
 import pandas as pd
 from professional_display import ProfessionalSignalDisplay
@@ -1751,7 +1755,7 @@ class LiveTradingEngine:
             if provenance:
                 print(f"Provenance: {provenance}")
             else:
-                print("Provenance: mixed/current pipeline; AI-assisted components may participate (not claimed pure algorithm)")
+                print("Provenance: pure algorithm mode (Part 1–12 math path; model synthesis, AI gate, and background consensus disabled)") if _pure_algorithm_mode() else print("Provenance: mixed/current pipeline; AI-assisted components may participate (not claimed pure algorithm)")
             reasons = decision.get('reasons') or []
             for reason in reasons:
                 print(f"Decision reason: {str(reason)[:300]}")
@@ -2255,7 +2259,7 @@ class LiveTradingEngine:
 
                         # 4b. Multi-AI Consensus (DeepSeek + Qwen + Mistral roundtable)
                         # FIX BUG 3: Run in background thread to prevent live loop freezing
-                        if cycle_count[0] % 5 == 0:
+                        if cycle_count[0] % 5 == 0 and not _pure_algorithm_mode():
                             def _run_consensus_bg():
                                 try:
                                     from multi_ai_consensus import run_ai_roundtable
@@ -3683,7 +3687,12 @@ Follow the tag with a 1-sentence options analyst insight.
         return prompt
 
     def analyze_options_with_ollama(self, telemetry: Dict, current_price: float) -> Tuple[str, str, int]:
-        """Run Ollama Smart Money & Whale Tracker analysis with 5-minute cooldown"""
+        """Run optional whale-model analysis; never participate in pure-algorithm mode."""
+        if _pure_algorithm_mode():
+            # Model-only auxiliary confirmation is unavailable, not a fabricated neutral/approval.
+            # Preserve the independently computed options math signal unchanged.
+            return "WHALE_UNAVAILABLE", "Model confirmation disabled in pure-algorithm mode", telemetry.get('signal', 0)
+
         now = time.time()
         if not OLLAMA_INTEGRATION_AVAILABLE:
             return self.last_ollama_whale_tag, self.last_ollama_insight, telemetry.get('signal', 0)
@@ -5912,7 +5921,8 @@ class JarvisElite:
             # Judge is now ENABLED and validates high-confidence signals (score >= 10)
             # System uses: Mathematical Analyst + Quantum V5 + DeepSeek Judge
             neural_res = None
-            if not self.is_backtest_mode and TRADE_CONFIG.get('use_neural_fusion', True):
+            if (not self.is_backtest_mode and not _pure_algorithm_mode()
+                    and TRADE_CONFIG.get('use_neural_fusion', True)):
                 # Always run AI (Full Power in both Live and Backtest)
                 if math_signal != 0 and math_confidence >= 20: # Run AI even on weak signals to let it filter them out
                     neural_res = self._neural_global_synthesis(full_telemetry, part_results, mtf_context, options_walls, math_signal, math_confidence, data)
@@ -6126,7 +6136,7 @@ class JarvisElite:
                 return self._get_no_trade_signal("Trading not allowed")
                 
             # --- MASTER AI SYNTHESIS --- ENABLED: DeepSeek AI Judge for signal validation
-            if score >= 10 and self.deepseek_enabled and not neural_res:
+            if score >= 10 and self.deepseek_enabled and not neural_res and not _pure_algorithm_mode():
                 ai_validation = self._get_deepseek_validation(data, score, detailed_scores, full_telemetry)
                 if not ai_validation.get('approved', False):
                     logger.warning(f"🧠 MASTER AI REJECTION: {ai_validation.get('reason', 'Unknown')}")
