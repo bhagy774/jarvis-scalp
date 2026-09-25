@@ -3672,7 +3672,12 @@ Follow the tag with a 1-sentence options analyst insight.
         return prompt
 
     def analyze_options_with_ollama(self, telemetry: Dict, current_price: float) -> Tuple[str, str, int]:
-        """Run Ollama Smart Money & Whale Tracker analysis with 5-minute cooldown"""
+        """Run optional whale-model analysis; never participate in pure-algorithm mode."""
+        if _pure_algorithm_mode():
+            # Model-only auxiliary confirmation is unavailable, not a fabricated neutral/approval.
+            # Preserve the independently computed options math signal unchanged.
+            return "WHALE_UNAVAILABLE", "Model confirmation disabled in pure-algorithm mode", telemetry.get('signal', 0)
+
         now = time.time()
         if not OLLAMA_INTEGRATION_AVAILABLE:
             return self.last_ollama_whale_tag, self.last_ollama_insight, telemetry.get('signal', 0)
