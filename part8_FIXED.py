@@ -1015,34 +1015,54 @@ class EnhancedGPUPatternRecognitionEngine:
             return {}
 
     async def _detect_advanced_institutional_patterns_gpu(self, candle_tensors: Dict[str, torch.Tensor]) -> Dict[str, Dict]:
-        """Advanced institutional pattern detection"""
+        """Advanced Math: Dynamic Time Warping (DTW) inspired similarity distance logic for pattern recognition"""
         try:
             institutional_patterns = {}
             _ctx = torch.cuda.device(self.device) if self.device.type == 'cuda' else nullcontext()
             with _ctx:
                 volume = candle_tensors['volume']
                 closes = candle_tensors['close']
+
+                # DTW simplified Euclidean distance heuristic for pattern matching
                 if len(closes) >= 10:
-                    vol_avg = torch.mean(volume[-10:])
-                    price_change = (closes[-1] - closes[-10]) / (closes[-10] + 1e-8)
-                    if volume[-1] > vol_avg * 1.5 and price_change > 0.005:
-                        institutional_patterns['smart_money_accumulation'] = {
-                            'score': 0.82,
-                            'position': len(closes) - 1,
-                            'type': 'institutional',
-                            'timestamp': time.time(),
-                            'volume_confidence': 0.85,
-                            'pattern_strength': 0.82
-                        }
-                    elif volume[-1] > vol_avg * 1.5 and price_change < -0.005:
-                        institutional_patterns['smart_money_distribution'] = {
-                            'score': 0.82,
-                            'position': len(closes) - 1,
-                            'type': 'institutional',
-                            'timestamp': time.time(),
-                            'volume_confidence': 0.85,
-                            'pattern_strength': 0.82
-                        }
+                    recent_prices = closes[-10:]
+                    recent_vol = volume[-10:]
+
+                    # Target Accumulation Template (Down, flat, up)
+                    acc_template = torch.tensor([1.0, 0.8, 0.5, 0.4, 0.4, 0.5, 0.6, 0.7, 0.9, 1.0], device=self.device)
+                    # Normalize recent prices 0 to 1
+                    min_p = torch.min(recent_prices)
+                    max_p = torch.max(recent_prices)
+                    if max_p > min_p:
+                        norm_prices = (recent_prices - min_p) / (max_p - min_p)
+
+                        # Calculate Euclidean distance (simplified DTW path)
+                        dtw_dist = torch.sqrt(torch.sum((norm_prices - acc_template) ** 2))
+
+                        # The closer to 0, the stronger the match
+                        pattern_strength = float(max(0.0, 1.0 - (dtw_dist.item() / 3.16))) # 3.16 is sqrt(10)
+
+                        vol_avg = torch.mean(volume[-10:])
+                        price_change = (closes[-1] - closes[-10]) / (closes[-10] + 1e-8)
+
+                        if volume[-1] > vol_avg * 1.5 and price_change > 0.005 and pattern_strength > 0.6:
+                            institutional_patterns['smart_money_accumulation'] = {
+                                'score': pattern_strength,
+                                'position': len(closes) - 1,
+                                'type': 'institutional',
+                                'timestamp': time.time(),
+                                'volume_confidence': 0.85,
+                                'pattern_strength': pattern_strength
+                            }
+                        elif volume[-1] > vol_avg * 1.5 and price_change < -0.005:
+                            institutional_patterns['smart_money_distribution'] = {
+                                'score': 0.82,
+                                'position': len(closes) - 1,
+                                'type': 'institutional',
+                                'timestamp': time.time(),
+                                'volume_confidence': 0.85,
+                                'pattern_strength': 0.82
+                            }
             return institutional_patterns
         except Exception as e:
             print(f"⚠️ Institutional pattern detection warning: {e}")
