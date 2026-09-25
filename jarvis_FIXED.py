@@ -1734,6 +1734,35 @@ class LiveTradingEngine:
             logger.debug('[OPTIONS] confirmation skipped: %s', options_error)
         return result
 
+    def _print_decision_audit(self, decision, symbol, parts=None, blockers=None):
+        """Best-effort terminal audit of observed decisions; never gates trading."""
+        try:
+            print("\n========== JARVIS DECISION AUDIT (observed intent; not an order/fill) ==========")
+            print(f"Selected symbol: {symbol}")
+            if isinstance(parts, dict):
+                for name, evidence in parts.items():
+                    # Print only actual returned diagnostics; absent Parts stay absent.
+                    summary = evidence.get('thought', evidence.get('reason', evidence.get('signal', evidence))) if isinstance(evidence, dict) else evidence
+                    text = str(summary).replace('\n', ' ')[:240]
+                    print(f"{name}: {text}")
+            decision = decision if isinstance(decision, dict) else {}
+            print(f"Final: {decision.get('direction', 'NO_TRADE')} | confidence={decision.get('confidence_display', 'N/A')} | status={decision.get('status', 'UNKNOWN')}")
+            provenance = decision.get('provenance') or decision.get('source')
+            if provenance:
+                print(f"Provenance: {provenance}")
+            else:
+                print("Provenance: mixed/current pipeline; AI-assisted components may participate (not claimed pure algorithm)")
+            reasons = decision.get('reasons') or []
+            for reason in reasons:
+                print(f"Decision reason: {str(reason)[:300]}")
+            for blocker in (blockers or []):
+                print(f"Entry gate: {str(blocker)[:300]}")
+            print("Order/fill/position status: not yet reported at this point in the loop")
+            print("==========================================================================")
+        except Exception as audit_error:
+            # Display failure is deliberately non-fatal and cannot affect safety gates.
+            logger.debug("[AUDIT] terminal summary unavailable: %s", type(audit_error).__name__)
+
     def _print_live_signal(self, result, current_price, symbol='BTCUSDT', df=None):
         """Print live signal in professional format"""
         signal = result.get('trade_signal', {})
@@ -2304,6 +2333,16 @@ class LiveTradingEngine:
                         else:
                             direction = _final_snapshot.get('execution_direction', 'NO_TRADE')
                         confidence = _final_snapshot.get('confidence') or 0
+                        _audit_blockers = []
+                        if entry_gate_1m and not entry_gate_1m.get('confirmed', True):
+                            _audit_blockers.append('1m confirmation pending')
+                        if not _final_snapshot.get('execution_allowed'):
+                            _audit_blockers.extend(_final_snapshot.get('reasons', []) or ['authoritative decision gate blocked'])
+                        self._print_decision_audit(
+                            _final_snapshot, symbol,
+                            parts=getattr(self.jarvis, 'latest_part_results', {}),
+                            blockers=_audit_blockers,
+                        )
 
                         # 6. AUTO-TRADE: Execute on Delta Exchange if enabled
                         if self.auto_trader and direction in ('CALL', 'PUT'):
