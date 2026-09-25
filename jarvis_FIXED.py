@@ -1734,10 +1734,10 @@ class LiveTradingEngine:
             logger.debug('[OPTIONS] confirmation skipped: %s', options_error)
         return result
 
-    def _print_decision_audit(self, decision, symbol, parts=None, blockers=None):
-        """Best-effort terminal audit of observed decisions; never gates trading."""
+    def _print_decision_audit(self, decision, symbol, parts=None, blockers=None, stage="FINAL_GATE", order_outcome=None):
+        """Best-effort reporting of observed pipeline stage; never gates trading."""
         try:
-            print("\n========== JARVIS DECISION AUDIT (observed intent; not an order/fill) ==========")
+            print(f"\n========== JARVIS DECISION AUDIT | stage={stage} (observed; not an order/fill) ==========")
             print(f"Selected symbol: {symbol}")
             if isinstance(parts, dict):
                 for name, evidence in parts.items():
@@ -1757,7 +1757,18 @@ class LiveTradingEngine:
                 print(f"Decision reason: {str(reason)[:300]}")
             for blocker in (blockers or []):
                 print(f"Entry gate: {str(blocker)[:300]}")
-            print("Order/fill/position status: not yet reported at this point in the loop")
+            if stage == "ORDER_SUBMISSION":
+                if isinstance(order_outcome, dict):
+                    # Report only raw return fields with conservative labels; success is not proof of fill.
+                    print(f"Submission return success field: {order_outcome.get('success', 'UNAVAILABLE')}")
+                    print(f"Submission return reason field: {str(order_outcome.get('reason', 'UNAVAILABLE'))[:300]}")
+                    print("Exchange-confirmed fill/close: UNVERIFIED (not inferred from execute return)")
+                else:
+                    print("Submission return: UNAVAILABLE")
+            elif stage == "FINAL_GATE":
+                print("Order submission/fill/close: not yet observed")
+            else:
+                print("Final gate/order/fill/close: not yet observed")
             print("==========================================================================")
         except Exception as audit_error:
             # Display failure is deliberately non-fatal and cannot affect safety gates.
@@ -2358,6 +2369,10 @@ class LiveTradingEngine:
                                     symbol=symbol,
                                     part_results=getattr(self.jarvis, 'latest_part_results', {}),
                                     trade_type=trade_type,
+                                )
+                                self._print_decision_audit(
+                                    _final_snapshot, symbol, stage="ORDER_SUBMISSION",
+                                    order_outcome=at_result,
                                 )
                                 if at_result.get('success'):
                                     pos = at_result.get('position', {})
