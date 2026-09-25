@@ -22,6 +22,7 @@ import os
 import sys
 import time
 import json
+import math
 import logging
 import threading
 from datetime import datetime, timedelta, date
@@ -457,14 +458,39 @@ class JarvisAutoTrader:
         leverage = int(size_info.get("leverage", 0))
         if margin <= 0 or contracts <= 0 or leverage <= 0:
             return {"success": False, "reason": "Risk budget cannot fund one contract"}
-        # Final gate immediately before any venue mutation/order. Never round up:
-        # a risk-safe quantity below the configured minimum is rejected.
+        # Final entry-only quantity gate. It can only reduce a risk-safe
+        # quantity; protective exits never pass through this helper.
         try:
-            contracts = enforce_entry_lots(contracts, metadata=product, available_balance=balance)
+            capped_contracts = enforce_entry_lots(
+                contracts, metadata=product, available_balance=balance
+            )
         except (TypeError, ValueError) as exc:
             return {"success": False, "reason": "Entry lot policy blocked", "error": str(exc)}
-        if contracts <= 0:
+        if capped_contracts <= 0:
             return {"success": False, "reason": "Entry lot policy blocked"}
+        if capped_contracts < contracts:
+            contract_value = size_info.get("contract_value_usdt", contract_value_usdt)
+            try:
+                contract_value = float(contract_value)
+                risk_budget = float(size_info.get("trade_risk_usdt", 0.0))
+            except (TypeError, ValueError):
+                return {"success": False, "reason": "Invalid risk sizing output"}
+            if (not math.isfinite(contract_value) or contract_value <= 0 or
+                    not math.isfinite(risk_budget) or risk_budget < 0):
+                return {"success": False, "reason": "Invalid risk sizing output"}
+            contracts = capped_contracts
+            actual_notional = float(contracts) * contract_value
+            margin = min(margin, actual_notional / leverage)
+            actual_trade_risk = min(risk_budget, actual_notional * sl_pct)
+            if margin <= 0 or not math.isfinite(margin):
+                return {"success": False, "reason": "Risk budget cannot fund capped quantity"}
+            size_info = {
+                **size_info,
+                "contracts": contracts,
+                "notional_usdt": actual_notional,
+                "margin_usdt": margin,
+                "trade_risk_usdt": actual_trade_risk,
+            }
 
         # ── Dynamic Oracle TP/SL Enhancement ────────────────────
         oracle_gate = self._oracle_gate or _get_oracle_gate()
