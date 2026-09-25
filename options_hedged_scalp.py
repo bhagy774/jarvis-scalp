@@ -13,6 +13,12 @@ import threading
 
 logger = logging.getLogger(__name__)
 
+
+def _pure_algorithm_mode():
+    """Match the main runtime's model-free default; models may advise only when explicitly enabled."""
+    import os
+    return os.getenv("JARVIS_PURE_ALGO", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 class OptionsHedgedScalpEngine:
     def __init__(self, delta_client, ai_hedge_advisor, ai_roundtable):
         self.delta = delta_client
@@ -60,16 +66,20 @@ class OptionsHedgedScalpEngine:
             return {"status": "skipped", "reason": "Invalid price, ATR, or confidence"}
         expected_profit = self._estimate_scalp_profit(current_price, atr)
         
-        # 1. Ask AI Hedge Advisor
-        hedge_decision = self.ai_advisor.evaluate_hedge_setup(
-            signal_direction=direction,
-            signal_confidence=confidence,
-            current_price=current_price,
-            atr=atr,
-            options_chain=options_chain,
-            expected_profit=expected_profit,
-            jarvis_result=jarvis_result
-        )
+        # Pure algorithm mode must not call an LLM advisor or accept stale/model output.
+        # Until a validated deterministic contract-risk policy exists, remain unhedged.
+        if _pure_algorithm_mode():
+            hedge_decision = {"hedge": "NO", "reason": "Model hedge advice disabled in pure-algorithm mode"}
+        else:
+            hedge_decision = self.ai_advisor.evaluate_hedge_setup(
+                signal_direction=direction,
+                signal_confidence=confidence,
+                current_price=current_price,
+                atr=atr,
+                options_chain=options_chain,
+                expected_profit=expected_profit,
+                jarvis_result=jarvis_result
+            )
         
         # 2. Extract and validate AI decision before it reaches state.
         if not isinstance(hedge_decision, dict):
@@ -204,7 +214,7 @@ class OptionsHedgedScalpEngine:
                     pos["net_pnl"] = f_pnl + h_pnl + pos.get("realized_hedge_pnl", 0.0)
 
                     # Ask AI Monitor if we have a hedge
-                    if h_leg:
+                    if h_leg and not _pure_algorithm_mode():
                         monitor_decision = self.ai_advisor.monitor_active_hedge(
                             hedge_position=h_leg,
                             current_price=current_price,

@@ -590,8 +590,9 @@ class PerformanceAnalyticsGPU:
         return balances_tensor, returns_tensor
 
     def _calculate_risk_metrics_gpu(self, returns_tensor: torch.Tensor) -> Dict:
+        """Advanced Math: Enhanced Risk Metrics including advanced CVaR and Drawdown distributions"""
         if len(returns_tensor) < 2:
-            return {'sharpe_ratio': 0.0, 'sortino_ratio': 0.0, 'calmar_ratio': 0.0, 'annual_volatility': 0.0, 'max_drawdown': 0.0, 'var_95': 0.0, 'cvar_95': 0.0}
+            return {'sharpe_ratio': 0.0, 'sortino_ratio': 0.0, 'calmar_ratio': 0.0, 'annual_volatility': 0.0, 'max_drawdown': 0.0, 'var_95': 0.0, 'cvar_95': 0.0, 'cvar_99': 0.0, 'tail_ratio': 0.0}
         
         try:
             with torch.no_grad():
@@ -609,9 +610,16 @@ class PerformanceAnalyticsGPU:
                 max_dd = torch.min(drawdowns)
                 calmar = ann_ret / (torch.abs(max_dd) + 1e-8)
                 
+                # Advanced CVaR Math
                 ret_np = returns_tensor.cpu().numpy()
                 var_95 = float(np.percentile(ret_np, 5))
+                var_99 = float(np.percentile(ret_np, 1))
                 cvar_95 = float(np.mean(ret_np[ret_np <= var_95])) if any(ret_np <= var_95) else var_95
+                cvar_99 = float(np.mean(ret_np[ret_np <= var_99])) if any(ret_np <= var_99) else var_99
+
+                # Tail Ratio (95th percentile profit vs 5th percentile loss)
+                perc_95 = float(np.percentile(ret_np, 95))
+                tail_ratio = abs(perc_95 / var_95) if var_95 != 0 else 0.0
             
             return {
                 'sharpe_ratio': float(sharpe.cpu()),
@@ -620,10 +628,12 @@ class PerformanceAnalyticsGPU:
                 'annual_volatility': float(ann_vol.cpu()),
                 'max_drawdown': float(max_dd.cpu()),
                 'var_95': var_95,
-                'cvar_95': cvar_95
+                'cvar_95': cvar_95,
+                'cvar_99': cvar_99,
+                'tail_ratio': tail_ratio
             }
         except Exception:
-            return {'sharpe_ratio': 0.0, 'sortino_ratio': 0.0, 'calmar_ratio': 0.0, 'annual_volatility': 0.0, 'max_drawdown': 0.0, 'var_95': 0.0, 'cvar_95': 0.0}
+            return {'sharpe_ratio': 0.0, 'sortino_ratio': 0.0, 'calmar_ratio': 0.0, 'annual_volatility': 0.0, 'max_drawdown': 0.0, 'var_95': 0.0, 'cvar_95': 0.0, 'cvar_99': 0.0, 'tail_ratio': 0.0}
 
     def _calculate_performance_metrics_gpu(self, balances_tensor: torch.Tensor, returns_tensor: torch.Tensor) -> Dict:
         if len(balances_tensor) < 2 or len(returns_tensor) < 1:

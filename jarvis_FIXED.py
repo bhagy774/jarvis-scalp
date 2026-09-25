@@ -1,4 +1,5 @@
  # JARVIS_MAGIC_STRING_12345
+import math
 # jarvis_trade_elite_integrated.py
 # JARVIS TRADE ELITE v7.0 - FULLY INTEGRATED WITH ALL 4 ENGINES
 # Complete system with AutoBacktest, AutoTraining, AutoOptimizer, LiveTrading
@@ -19,8 +20,12 @@ import subprocess
 
 # --- ZERO LAG PURE ALGO MODE ---
 # Set to "True" to completely bypass all LLM/Ollama network calls during live trading
-os.environ["JARVIS_PURE_ALGO"] = "True"
+os.environ.setdefault("JARVIS_PURE_ALGO", "true")
 # -------------------------------
+def _pure_algorithm_mode():
+    """Explicit runtime policy: algorithm-only means model calls never decide or veto."""
+    return os.getenv("JARVIS_PURE_ALGO", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 import numpy as np
 import pandas as pd
 from professional_display import ProfessionalSignalDisplay
@@ -1760,6 +1765,46 @@ class LiveTradingEngine:
             logger.debug('[OPTIONS] confirmation skipped: %s', options_error)
         return result
 
+    def _print_decision_audit(self, decision, symbol, parts=None, blockers=None, stage="FINAL_GATE", order_outcome=None):
+        """Best-effort reporting of observed pipeline stage; never gates trading."""
+        try:
+            print(f"\n========== JARVIS DECISION AUDIT | stage={stage} (observed; not an order/fill) ==========")
+            print(f"Selected symbol: {symbol}")
+            if isinstance(parts, dict):
+                for name, evidence in parts.items():
+                    # Print only actual returned diagnostics; absent Parts stay absent.
+                    summary = evidence.get('thought', evidence.get('reason', evidence.get('signal', evidence))) if isinstance(evidence, dict) else evidence
+                    text = str(summary).replace('\n', ' ')[:240]
+                    print(f"{name}: {text}")
+            decision = decision if isinstance(decision, dict) else {}
+            print(f"Final: {decision.get('direction', 'NO_TRADE')} | confidence={decision.get('confidence_display', 'N/A')} | status={decision.get('status', 'UNKNOWN')}")
+            provenance = decision.get('provenance') or decision.get('source')
+            if provenance:
+                print(f"Provenance: {provenance}")
+            else:
+                print("Provenance: pure algorithm mode (Part 1–12 math path; model synthesis, AI gate, and background consensus disabled)") if _pure_algorithm_mode() else print("Provenance: mixed/current pipeline; AI-assisted components may participate (not claimed pure algorithm)")
+            reasons = decision.get('reasons') or []
+            for reason in reasons:
+                print(f"Decision reason: {str(reason)[:300]}")
+            for blocker in (blockers or []):
+                print(f"Entry gate: {str(blocker)[:300]}")
+            if stage == "ORDER_SUBMISSION":
+                if isinstance(order_outcome, dict):
+                    # Report only raw return fields with conservative labels; success is not proof of fill.
+                    print(f"Submission return success field: {order_outcome.get('success', 'UNAVAILABLE')}")
+                    print(f"Submission return reason field: {str(order_outcome.get('reason', 'UNAVAILABLE'))[:300]}")
+                    print("Exchange-confirmed fill/close: UNVERIFIED (not inferred from execute return)")
+                else:
+                    print("Submission return: UNAVAILABLE")
+            elif stage == "FINAL_GATE":
+                print("Order submission/fill/close: not yet observed")
+            else:
+                print("Final gate/order/fill/close: not yet observed")
+            print("==========================================================================")
+        except Exception as audit_error:
+            # Display failure is deliberately non-fatal and cannot affect safety gates.
+            logger.debug("[AUDIT] terminal summary unavailable: %s", type(audit_error).__name__)
+
     def _print_live_signal(self, result, current_price, symbol='BTCUSDT', df=None):
         """Print live signal in professional format"""
         signal = result.get('trade_signal', {})
@@ -2254,7 +2299,7 @@ class LiveTradingEngine:
 
                         # 4b. Multi-AI Consensus (DeepSeek + Qwen + Mistral roundtable)
                         # FIX BUG 3: Run in background thread to prevent live loop freezing
-                        if cycle_count[0] % 5 == 0:
+                        if cycle_count[0] % 5 == 0 and not _pure_algorithm_mode():
                             def _run_consensus_bg():
                                 try:
                                     from multi_ai_consensus import run_ai_roundtable
@@ -2354,6 +2399,16 @@ class LiveTradingEngine:
                         else:
                             direction = _final_snapshot.get('execution_direction', 'NO_TRADE')
                         confidence = _final_snapshot.get('confidence') or 0
+                        _audit_blockers = []
+                        if entry_gate_1m and not entry_gate_1m.get('confirmed', True):
+                            _audit_blockers.append('1m confirmation pending')
+                        if not _final_snapshot.get('execution_allowed'):
+                            _audit_blockers.extend(_final_snapshot.get('reasons', []) or ['authoritative decision gate blocked'])
+                        self._print_decision_audit(
+                            _final_snapshot, symbol,
+                            parts=getattr(self.jarvis, 'latest_part_results', {}),
+                            blockers=_audit_blockers,
+                        )
 
                         # 6. AUTO-TRADE: Execute on Delta Exchange if enabled
                         if self.auto_trader and direction in ('CALL', 'PUT'):
@@ -2371,6 +2426,10 @@ class LiveTradingEngine:
                                         part_results=getattr(self.jarvis, 'latest_part_results', {}),
                                         trade_type=trade_type,
                                     )
+                                )
+                                self._print_decision_audit(
+                                    _final_snapshot, symbol, stage="ORDER_SUBMISSION",
+                                    order_outcome=at_result,
                                 )
                                 if at_result.get('success'):
                                     pos = at_result.get('position', {})
@@ -3687,7 +3746,12 @@ Follow the tag with a 1-sentence options analyst insight.
         return prompt
 
     def analyze_options_with_ollama(self, telemetry: Dict, current_price: float) -> Tuple[str, str, int]:
-        """Run Ollama Smart Money & Whale Tracker analysis with 5-minute cooldown"""
+        """Run optional whale-model analysis; never participate in pure-algorithm mode."""
+        if _pure_algorithm_mode():
+            # Model-only auxiliary confirmation is unavailable, not a fabricated neutral/approval.
+            # Preserve the independently computed options math signal unchanged.
+            return "WHALE_UNAVAILABLE", "Model confirmation disabled in pure-algorithm mode", telemetry.get('signal', 0)
+
         now = time.time()
         if not OLLAMA_INTEGRATION_AVAILABLE:
             return self.last_ollama_whale_tag, self.last_ollama_insight, telemetry.get('signal', 0)
@@ -3772,6 +3836,24 @@ Follow the tag with a 1-sentence options analyst insight.
             
             max_pain_raw = bias_data.get('max_pain') or bias_data.get('raw_data', {}).get('max_pain')
             max_pain_float = float(max_pain_raw) if max_pain_raw is not None and str(max_pain_raw).replace('.', '', 1).isdigit() else None
+            # Descriptive, deterministic chain math: only derive relative distances
+            # when both observed prices are finite and positive. Never infer a
+            # missing wall, PCR, or selected instrument from another asset.
+            def _observed_price(value):
+                try:
+                    value = float(value)
+                    return value if math.isfinite(value) and value > 0 else None
+                except (TypeError, ValueError, OverflowError):
+                    return None
+            support_raw = bias_data.get('support_wall') or bias_data.get('raw_data', {}).get('support')
+            resistance_raw = bias_data.get('resistance_wall') or bias_data.get('raw_data', {}).get('resistance')
+            support_price = _observed_price(support_raw)
+            resistance_price = _observed_price(resistance_raw)
+            current_price = _observed_price(current_price)
+            if current_price is None:
+                return {"signal": 0, "thought": "Invalid current price; options math unavailable", "telemetry": {"signal": 0, "available": False, "asset": self.asset}}
+            max_pain_float = _observed_price(max_pain_float)
+            pcr_float = pcr_float if pcr_float is not None and math.isfinite(pcr_float) and pcr_float >= 0 else None
 
             telemetry = {
                 "exchange": "Delta" if source == delta_source else "Deribit",
@@ -3780,9 +3862,13 @@ Follow the tag with a 1-sentence options analyst insight.
                 "bias_score": float(bias_data.get('score', 0)),
                 "pcr": pcr_float,
                 "signal": math_signal,
-                "support_wall": bias_data.get('support_wall') or bias_data.get('raw_data', {}).get('support'),
-                "resistance_wall": bias_data.get('resistance_wall') or bias_data.get('raw_data', {}).get('resistance'),
-                "max_pain": max_pain_float
+                "support_wall": support_price,
+                "resistance_wall": resistance_price,
+                "max_pain": max_pain_float,
+                "support_distance_pct": ((current_price - support_price) / current_price * 100) if support_price is not None else None,
+                "resistance_distance_pct": ((resistance_price - current_price) / current_price * 100) if resistance_price is not None else None,
+                "max_pain_distance_pct": ((max_pain_float - current_price) / current_price * 100) if max_pain_float is not None else None,
+                "math_model": "observed_chain_descriptive_v1"
             }
 
             # Ollama Smart Money & Whale Tracker Analysis
@@ -5918,7 +6004,8 @@ class JarvisElite:
             # Judge is now ENABLED and validates high-confidence signals (score >= 10)
             # System uses: Mathematical Analyst + Quantum V5 + DeepSeek Judge
             neural_res = None
-            if not self.is_backtest_mode and TRADE_CONFIG.get('use_neural_fusion', True):
+            if (not self.is_backtest_mode and not _pure_algorithm_mode()
+                    and TRADE_CONFIG.get('use_neural_fusion', True)):
                 # Always run AI (Full Power in both Live and Backtest)
                 if math_signal != 0 and math_confidence >= 20: # Run AI even on weak signals to let it filter them out
                     neural_res = self._neural_global_synthesis(full_telemetry, part_results, mtf_context, options_walls, math_signal, math_confidence, data)
@@ -6132,7 +6219,7 @@ class JarvisElite:
                 return self._get_no_trade_signal("Trading not allowed")
                 
             # --- MASTER AI SYNTHESIS --- ENABLED: DeepSeek AI Judge for signal validation
-            if score >= 10 and self.deepseek_enabled and not neural_res:
+            if score >= 10 and self.deepseek_enabled and not neural_res and not _pure_algorithm_mode():
                 ai_validation = self._get_deepseek_validation(data, score, detailed_scores, full_telemetry)
                 if not ai_validation.get('approved', False):
                     logger.warning(f"🧠 MASTER AI REJECTION: {ai_validation.get('reason', 'Unknown')}")

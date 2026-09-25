@@ -2073,7 +2073,7 @@ class CorrelationMatrixBrainGPU:
         )
 
     def analyze_correlations(self, primary_data, correlated_data_dict):
-        """Analyze correlations between primary asset and correlated assets"""
+        """Advanced Math: PCA-based Eigen-decomposition for inter-market correlation"""
         try:
             if len(primary_data) < 50:
                 return {}
@@ -2083,11 +2083,15 @@ class CorrelationMatrixBrainGPU:
             # Move primary data to GPU
             primary_returns = self._calculate_returns_gpu(primary_data)
             
+            # Gather all asset returns into a single matrix for PCA
+            valid_assets = []
+            return_matrix_cols = [primary_returns[-50:]]
+
             for asset_name, asset_data in correlated_data_dict.items():
                 if len(asset_data) < 50:
                     continue
                 
-                # Calculate correlation for different periods
+                # Calculate basic correlation for different periods (legacy support)
                 asset_correlations = {}
                 
                 for period in self.correlation_config['correlation_periods']:
@@ -2099,7 +2103,47 @@ class CorrelationMatrixBrainGPU:
                         asset_correlations[period] = correlation
                 
                 correlation_analysis[asset_name] = asset_correlations
+
+                # Prep for PCA
+                asset_returns = self._calculate_returns_gpu(asset_data)
+                if len(asset_returns) >= 50:
+                    valid_assets.append(asset_name)
+                    return_matrix_cols.append(asset_returns[-50:])
             
+            # Perform PCA (Eigen-decomposition) to find the principal market driver
+            if len(valid_assets) >= 2:
+                try:
+                    # Stack into (Time x Assets)
+                    matrix = torch.stack(return_matrix_cols, dim=1)
+
+                    # Mean centering
+                    mean_vec = torch.mean(matrix, dim=0)
+                    centered = matrix - mean_vec
+
+                    # Covariance matrix (Assets x Assets)
+                    cov_matrix = torch.matmul(centered.T, centered) / (centered.shape[0] - 1)
+
+                    # Eigen-decomposition
+                    eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrix)
+
+                    # Sort eigenvalues and eigenvectors in descending order
+                    sorted_indices = torch.argsort(eigenvalues, descending=True)
+                    eigenvalues = eigenvalues[sorted_indices]
+                    eigenvectors = eigenvectors[:, sorted_indices]
+
+                    # Extract the principal component vector
+                    pc1_vector = eigenvectors[:, 0]
+                    variance_explained = (eigenvalues[0] / torch.sum(eigenvalues)).item()
+
+                    pca_insights = {
+                        'primary_pc1_weight': pc1_vector[0].item(),
+                        'variance_explained': variance_explained,
+                        'asset_weights': {name: pc1_vector[i+1].item() for i, name in enumerate(valid_assets)}
+                    }
+                    correlation_analysis['pca_insights'] = pca_insights
+                except Exception as e:
+                    correlation_analysis['pca_insights'] = {'error': str(e)}
+
             # Detect regime changes
             regime_signals = self._detect_correlation_regime(correlation_analysis)
             correlation_analysis['regime_signals'] = regime_signals

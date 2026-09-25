@@ -576,23 +576,44 @@ Follow the tag with a 1-sentence risk justification.
             return {'status': 'error', 'reason': str(e)}
     
     async def _calculate_optimal_execution_price(self, signal_type: str, bid: float, ask: float) -> float:
-        """Calculate optimal execution price with slippage control"""
+        """Advanced Math: VWAP/TWAP inspired predictive optimal execution pricing"""
         try:
             mid_price = (bid + ask) / 2.0
             spread = ask - bid
             
+            # Predict short-term price movement based on execution buffer history (Pseudo-VWAP)
+            price_trend = 0.0
+            if hasattr(self, 'execution_analysis') and 'avg_spread' in self.execution_analysis:
+                if self.buffer_pointer > 5:
+                    recent_prices = self._get_recent_data(self.price_history_gpu, 10)
+                    if len(recent_prices) >= 2:
+                        # Linear regression slope of recent tick prices
+                        x = torch.arange(len(recent_prices), dtype=torch.float32, device=self.device)
+                        x_mean = torch.mean(x)
+                        y_mean = torch.mean(recent_prices)
+                        slope = torch.sum((x - x_mean) * (recent_prices - y_mean)) / (torch.sum((x - x_mean)**2) + 1e-8)
+                        price_trend = slope.item()
+
             if signal_type.upper() == 'CALL':
-                # For long positions, try to buy at or below mid-price
-                target_price = min(mid_price + spread * 0.1, ask)  # Maximum 10% of spread above mid
+                # If price is trending up rapidly, pay the spread to guarantee fill
+                if price_trend > spread * 0.5:
+                    target_price = ask
+                else:
+                    # Otherwise, try to buy at or below mid-price
+                    target_price = min(mid_price + spread * 0.1, ask)  # Maximum 10% of spread above mid
             else:  # PUT
-                # For short positions, try to sell at or above mid-price
-                target_price = max(mid_price - spread * 0.1, bid)  # Maximum 10% of spread below mid
+                # If price is trending down rapidly, cross the spread to guarantee fill
+                if price_trend < -spread * 0.5:
+                    target_price = bid
+                else:
+                    # Otherwise, try to sell at or above mid-price
+                    target_price = max(mid_price - spread * 0.1, bid)  # Maximum 10% of spread below mid
             
             return target_price
             
         except Exception as e:
             print(f"ERROR Execution price calculation error: {e}")
-            return mid_price
+            return (bid + ask) / 2.0
     
     async def _calculate_risk_levels(self, signal_type: str, entry_price: float, confidence: float) -> Tuple[float, float]:
         """Calculate adaptive stop loss and take profit levels"""
