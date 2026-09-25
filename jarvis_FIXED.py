@@ -1750,6 +1750,16 @@ class LiveTradingEngine:
         thoughts = result.get('intelligence_board', [])
         market_ctx = result.get('market_context', {})
 
+        try:
+            pro_display.display_full_signal(
+                signal_data=result,
+                current_price=current_price,
+                part_results=getattr(self.jarvis, 'latest_part_results', {}),
+                symbol=symbol
+            )
+        except Exception as e:
+            logger.debug(f"Professional display error: {e}")
+
         # ── SMART ENTRY: Compute optimal limit entry based on ATR ──
         entry_price, entry_type = self._calculate_smart_entry(direction, current_price, result)
 
