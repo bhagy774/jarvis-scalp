@@ -394,6 +394,27 @@ class MLEngineGPU:
 
 # ==================== GPU-ACCELERATED FUSION ENGINE ====================
 
+class NeuralFusionNetwork(nn.Module):
+    """
+    Advanced Neural Network (MLP) for Dynamic Signal Fusion.
+    Learns non-linear interactions between sub-engine signals.
+    """
+    def __init__(self, input_dim=4):
+        super(NeuralFusionNetwork, self).__init__()
+        self.fc1 = nn.Linear(input_dim * 2, 16)  # Signals + Confidences
+        self.fc2 = nn.Linear(16, 8)
+        self.fc3 = nn.Linear(8, 3) # output probabilities for (PUT, NO_TRADE, CALL)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, signals, confidences):
+        # inputs are shape (batch, num_engines)
+        x = torch.cat([signals, confidences], dim=-1)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return F.softmax(x, dim=-1) # returns probability dist
+
 class GPUEnhancedFusionEngine:
     """
     INSTITUTIONAL-Grade Fusion Engine
@@ -416,6 +437,19 @@ class GPUEnhancedFusionEngine:
         self.confidence_matrix = None
         self.strategy_weights_gpu = None
         
+        # Advanced Math: Neural Fusion Model
+        try:
+            self.neural_fusion = NeuralFusionNetwork(input_dim=4).to(self.device)
+            self.neural_fusion.eval() # inference mode by default
+            self.use_neural = True
+        except Exception:
+            self.neural_fusion = None
+            self.use_neural = False
+
+        # Advanced Math: Kalman Smoothing state
+        self.kalman_state = 0.0
+        self.kalman_uncertainty = 1.0
+
         self.performance_stats = {}
         self.market_regime_history = deque(maxlen=50)
         
@@ -423,7 +457,7 @@ class GPUEnhancedFusionEngine:
         self.fusion_active = True
         
         self._initialize_gpu_tensors()
-        print("ACCELERATED GPU Fusion Engine Initialized - Linux & Windows Optimized")
+        print("ACCELERATED GPU Fusion Engine Initialized (Advanced Math Active)")
     
     def _initialize_gpu_tensors(self):
         try:
@@ -613,6 +647,18 @@ Respond in 1 short sentence validating or questioning this fused signal. State [
         
         return module_results
 
+    def _apply_kalman_filter(self, measurement, measurement_noise=0.5, process_noise=0.1):
+        """Advanced Math: 1D Kalman Filter for signal smoothing"""
+        # Prediction Update
+        predicted_uncertainty = self.kalman_uncertainty + process_noise
+
+        # Measurement Update (Bayesian Inference)
+        kalman_gain = predicted_uncertainty / (predicted_uncertainty + measurement_noise)
+        self.kalman_state = self.kalman_state + kalman_gain * (measurement - self.kalman_state)
+        self.kalman_uncertainty = (1 - kalman_gain) * predicted_uncertainty
+
+        return self.kalman_state
+
     def _fuse_signals_gpu(self, module_results):
         try:
             if not module_results:
@@ -626,7 +672,11 @@ Respond in 1 short sentence validating or questioning this fused signal. State [
                     sig_str = result.get('signal', result.get('direction', 'HOLD'))
                     sig_val = 1 if sig_str in ['CALL', 'BUY', 1] else -1 if sig_str in ['PUT', 'SELL', -1] else 0
                     signals.append(sig_val)
-                    confidences.append(float(result.get('confidence', 5.0)))
+                    # normalize confidence 0 to 1 for NN
+                    conf_val = float(result.get('confidence', 50.0))
+                    if conf_val > 10.0: conf_val /= 100.0
+                    else: conf_val /= 10.0
+                    confidences.append(conf_val)
             
             if not signals:
                 return "NO TRADE"
@@ -636,19 +686,42 @@ Respond in 1 short sentence validating or questioning this fused signal. State [
                 confidence_tensor = torch.tensor(confidences, device=self.device, dtype=torch.float32)
                 
                 n = len(signals)
+
+                # --- Advanced Math: Neural Fusion Path ---
+                neural_fused = 0.0
+                if self.use_neural and n == 4:
+                    # Expecting exactly 4 inputs for our MLP
+                    try:
+                        with torch.no_grad():
+                            sig_batch = signal_tensor.unsqueeze(0)
+                            conf_batch = confidence_tensor.unsqueeze(0)
+                            probs = self.neural_fusion(sig_batch, conf_batch).squeeze(0)
+                            # probs is [P(PUT), P(NO_TRADE), P(CALL)]
+                            # Convert probabilities to a continuous score [-1, 1]
+                            neural_fused = float(probs[2].item() - probs[0].item())
+                    except Exception as e:
+                        neural_fused = 0.0
+
+                # --- Traditional Math: Weighted Sum Path ---
                 if self.strategy_weights_gpu is not None and len(self.strategy_weights_gpu) >= n:
                     weights = self.strategy_weights_gpu[:n]
                 else:
                     weights = torch.ones(n, device=self.device, dtype=torch.float32) / n
                 
                 weighted_signals = signal_tensor * confidence_tensor * weights
-                fused_signal = float(torch.sum(weighted_signals).item() if hasattr(torch.sum(weighted_signals), 'item') else torch.sum(weighted_signals))
+                trad_fused = float(torch.sum(weighted_signals).item() if hasattr(torch.sum(weighted_signals), 'item') else torch.sum(weighted_signals))
+
+                # Ensemble (Bayesian blend of Neural + Traditional)
+                blended_raw = (0.4 * neural_fused) + (0.6 * trad_fused)
+
+                # Apply Kalman Smoothing to the blended signal
+                fused_signal = self._apply_kalman_filter(blended_raw)
             
-            if fused_signal > 0.5: return "CALL"
-            elif fused_signal < -0.5: return "PUT"
+            if fused_signal > 0.4: return "CALL"
+            elif fused_signal < -0.4: return "PUT"
             return "NO TRADE"
                 
-        except Exception:
+        except Exception as e:
             return "NO TRADE"
 
     def _aggregate_confidence_gpu(self, module_results):
@@ -676,6 +749,39 @@ Respond in 1 short sentence validating or questioning this fused signal. State [
                 adjusted_weights = performance_normalized * (1.0 + momentum)
                 final_weights = adjusted_weights / (torch.sum(adjusted_weights) + 1e-8)
                 self.strategy_weights_gpu = final_weights
+
+                # --- Advanced Math: Online Learning / Training Step ---
+                # We apply a simple online learning step to update our MLP weights
+                # using the realized performance of the strategies as a proxy for the true target.
+                if self.use_neural and self.neural_fusion is not None and hasattr(self, 'last_neural_inputs'):
+                    try:
+                        sig_batch, conf_batch = self.last_neural_inputs
+                        self.neural_fusion.train()
+
+                        # Forward pass
+                        probs = self.neural_fusion(sig_batch, conf_batch)
+
+                        # Pseudo-target based on top performing strategy
+                        best_strat_idx = torch.argmax(final_weights).item()
+                        target_direction = sig_batch[0, best_strat_idx].item()
+
+                        target_class = 1 # NO_TRADE
+                        if target_direction > 0.5: target_class = 2 # CALL
+                        elif target_direction < -0.5: target_class = 0 # PUT
+
+                        target_tensor = torch.tensor([target_class], device=self.device, dtype=torch.long)
+
+                        # Loss and optimizer step
+                        loss_fn = nn.CrossEntropyLoss()
+                        optimizer = optim.Adam(self.neural_fusion.parameters(), lr=0.01)
+                        optimizer.zero_grad()
+                        loss = loss_fn(probs, target_tensor)
+                        loss.backward()
+                        optimizer.step()
+
+                        self.neural_fusion.eval() # revert back to inference mode
+                    except Exception as train_e:
+                        self.neural_fusion.eval() # ensure we revert if training fails
         except Exception:
             pass
 

@@ -177,14 +177,35 @@ class OrderflowEngineGPU:
             delta_ratios = (2.0 * (closes - lows) - candle_ranges) / candle_ranges
             deltas = vols * delta_ratios
 
+            # --- Advanced Math: Poisson Order Arrival Probability ---
+            # Estimate lambda (average volume arrival rate)
+            avg_vol_rate = np.mean(vols[-20:])
+            # Calculate the probability that the current volume spike is a rare outlier
+            # using a simplified Poisson mass function proxy P(X > k) approx
+            import math
+            k = vols[-1]
+            if k > avg_vol_rate and avg_vol_rate > 0:
+                try:
+                    # Using Stirling's approx for log factorial to prevent overflow
+                    log_k_fact = k * math.log(k) - k + 0.5 * math.log(2 * math.pi * k) if k > 0 else 0
+                    log_poisson = -avg_vol_rate + k * math.log(avg_vol_rate) - log_k_fact
+                    poisson_prob = math.exp(log_poisson)
+                except:
+                    poisson_prob = 1.0
+            else:
+                poisson_prob = 1.0
+
+            # If the volume is an extreme outlier (prob < 0.05), amplify the delta impact
+            delta_multiplier = 1.5 if poisson_prob < 0.05 else 1.0
+
             # 2. Cumulative Volume Delta (CVD-20)
             N = 20
-            cvd_20 = float(np.sum(deltas[-N:]))
+            cvd_20 = float(np.sum(deltas[-N:])) * delta_multiplier
             tot_vol_20 = float(np.sum(vols[-N:])) + 1e-8
             cvd_ratio = cvd_20 / tot_vol_20
 
             # Short-term CVD-5
-            cvd_5 = float(np.sum(deltas[-5:]))
+            cvd_5 = float(np.sum(deltas[-5:])) * delta_multiplier
             tot_vol_5 = float(np.sum(vols[-5:])) + 1e-8
             cvd_ratio_5 = cvd_5 / tot_vol_5
 

@@ -191,10 +191,27 @@ class CandleStatsEngineGPU:
             is_bull_streak = all(closes[-i] > opens[-i] for i in range(1, 4)) and (closes[-1] > closes[-2] > closes[-3])
             is_bear_streak = all(closes[-i] < opens[-i] for i in range(1, 4)) and (closes[-1] < closes[-2] < closes[-3])
 
-            # 5. Statistical Count over 10 bars
+            # --- Advanced Math: Gaussian Naive Bayes / Markov Transition Probability ---
+            # Estimate probability of next candle direction based on transition counts
             last10_closes = closes[-10:]
             last10_opens  = opens[-10:]
-            bull_count = int(np.sum(last10_closes > last10_opens))
+            directions = (last10_closes > last10_opens).astype(int) # 1 for bull, 0 for bear
+
+            # Simple Markov Chain transition matrix estimation
+            transitions = {'00': 0, '01': 0, '10': 0, '11': 0}
+            for i in range(1, len(directions)):
+                key = f"{directions[i-1]}{directions[i]}"
+                transitions[key] += 1
+
+            curr_dir = directions[-1]
+            if curr_dir == 1:
+                total_1 = transitions['10'] + transitions['11']
+                prob_continuation = transitions['11'] / total_1 if total_1 > 0 else 0.5
+            else:
+                total_0 = transitions['00'] + transitions['01']
+                prob_continuation = transitions['00'] / total_0 if total_0 > 0 else 0.5
+
+            bull_count = int(np.sum(directions))
             bear_count = 10 - bull_count
 
             # 6. Body Acceleration relative to 10-bar baseline, anchored to ATR

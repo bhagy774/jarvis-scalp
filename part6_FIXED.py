@@ -626,6 +626,7 @@ class GPUComprehensiveBacktester:
             return 5
 
     async def _simulate_portfolio_gpu(self, trades, initial_balance):
+        """Advanced Math: Monte Carlo Path Simulation for trade sequencing"""
         equity_curve = [initial_balance]
         current_balance = initial_balance
         
@@ -649,6 +650,32 @@ class GPUComprehensiveBacktester:
                 trade['balance_after'] = current_balance
             except Exception:
                 continue
+
+        # Advanced Monte Carlo Confidence Intervals (1000 simulated paths)
+        if len(trades) > 10:
+            try:
+                outcomes = np.array([t['profit'] for t in trades])
+                paths = 1000
+                sim_lengths = len(outcomes)
+
+                # Resample with replacement to generate paths
+                simulated_paths = np.random.choice(outcomes, size=(paths, sim_lengths), replace=True)
+                cumulative_paths = np.cumsum(simulated_paths, axis=1) + initial_balance
+
+                final_balances = cumulative_paths[:, -1]
+                mc_5th_perc = float(np.percentile(final_balances, 5))
+                mc_95th_perc = float(np.percentile(final_balances, 95))
+                mc_median = float(np.median(final_balances))
+
+                self.mc_sim_stats = {
+                    'mc_5th_perc': mc_5th_perc,
+                    'mc_95th_perc': mc_95th_perc,
+                    'mc_median': mc_median
+                }
+            except Exception as e:
+                self.mc_sim_stats = None
+        else:
+            self.mc_sim_stats = None
         
         return equity_curve
 
