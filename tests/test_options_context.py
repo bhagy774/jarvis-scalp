@@ -47,3 +47,23 @@ def test_btc_never_becomes_the_altcoin_contract_or_strike_source():
     adjusted, note = apply_options_confirmation("CALL", 70, result)
     assert adjusted == 66
     assert "BTC" in note
+
+
+def test_empty_or_incomplete_chain_is_unavailable_not_neutral_confirmation():
+    empty_chain = {"bias": "NEUTRAL", "score": 0, "reasons": ["No Data"]}
+    result = resolve_options_context(Delta({"ETH": empty_chain}), "ETHUSDT")
+    assert result.role == "unavailable"
+    assert not result.available
+
+    missing_metrics = {"bias": "NEUTRAL", "score": 0, "reasons": ["chain signal"]}
+    result = resolve_options_context(Delta({"ETH": missing_metrics, "BTC": missing_metrics}), "ETHUSDT")
+    assert result.role == "unavailable"
+    assert not result.available
+
+
+def test_zero_open_interest_is_not_usable_options_evidence():
+    no_interest = {"bias": "NEUTRAL", "score": 0, "pcr": 0.0,
+                   "reasons": ["chain signal"], "raw_data": {"total_oi": 0}}
+    result = resolve_options_context(Delta({"ETH": no_interest}), "ETHUSDT")
+    assert result.role == "unavailable"
+    assert not result.available

@@ -1272,7 +1272,14 @@ class LiveTradingEngine:
         """Publish one state snapshot; signal/reason/plan/risk never use separate blocks."""
         try:
             result = self.last_jarvis_result or {}
-            signal = self._dashboard_signal or result.get('trade_signal', {}) or {}
+            _decision = getattr(self, 'last_decision', None)
+            prediction = result.get('trade_signal', {}) or {}
+            signal = (
+                {'direction': _decision.get('direction', 'NO_TRADE'),
+                 'confidence_score': _decision.get('confidence')}
+                if isinstance(_decision, dict)
+                else (self._dashboard_signal or prediction)
+            )
             plan = dict(self._dashboard_plan or {})
             if action:
                 plan['action'] = action
@@ -1300,15 +1307,23 @@ class LiveTradingEngine:
                 'native_engines': getattr(self.jarvis, 'native_engine_status', {}),
                 'ai_suggestion': getattr(self.jarvis, 'last_ollama_decision', {'decision': 'unavailable'}),
                 'part7': part7,
+                # Raw part outputs are displayed as diagnostics, not treated
+                # as independent votes or causal attribution.
+                'part_results': getattr(self.jarvis, 'latest_part_results', {}),
+                'analysis_execution_allowed': _decision.get('execution_allowed') if isinstance(_decision, dict) else None,
+                'execution': getattr(self, 'last_execution_result', None),
             }
             reasons = (result.get('intelligence_board', []) or [])[:3]
+            if isinstance(_decision, dict) and _decision.get('reasons'):
+                reasons = list(dict.fromkeys(list(_decision.get('reasons', [])) + reasons))[:5]
             if part7.get('entry_blocked'):
                 reasons = [part7.get('reason', 'Part7 entry gate blocked')] + reasons
             self.dashboard.update(
                 timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                symbol=(_decision.get('symbol') if _decision else None) or symbol or self.active_symbol,
+                symbol=(_decision.get('symbol') if isinstance(_decision, dict) else None) or symbol or self.active_symbol,
                 price=f"${float(current_price):,.2f}" if current_price else '—',
-                signal={'direction': signal.get('direction', 'NO_TRADE'), 'confidence': signal.get('confidence_score', signal.get('confidence', 0))},
+                prediction={'direction': prediction.get('direction', 'NO_TRADE'), 'confidence': prediction.get('confidence_score', prediction.get('confidence', 'N/A'))},
+                signal={'direction': signal.get('direction', 'NO_TRADE'), 'confidence': signal.get('confidence_score', signal.get('confidence', 'N/A'))},
                 reasons=reasons or [result.get('no_trade_reason', 'Awaiting analysis')],
                 plan=plan,
                 status=status,
@@ -2169,6 +2184,7 @@ class LiveTradingEngine:
                     direction = 'NO_TRADE'
                     confidence = None
                     self.last_decision = None
+                    self.last_execution_result = None
                     self._dashboard_signal = {}
                     self._dashboard_plan = {}
 
@@ -2359,6 +2375,7 @@ class LiveTradingEngine:
                                     part_results=getattr(self.jarvis, 'latest_part_results', {}),
                                     trade_type=trade_type,
                                 )
+                                self.last_execution_result = at_result
                                 if at_result.get('success'):
                                     pos = at_result.get('position', {})
                                     self._dashboard_account = {
@@ -2372,6 +2389,7 @@ class LiveTradingEngine:
                                 else:
                                     self._dashboard_events.append(f"Auto-trade blocked: {at_result.get('reason', 'gate failed')}")
                             except Exception as at_err:
+                                self.last_execution_result = {"success": False, "reason": str(at_err)}
                                 self._dashboard_events.append(f"AutoTrader error: {at_err}")
                         elif direction in ('CALL', 'PUT') and self.can_trade():
                             # PreSim was already applied in the authoritative gate above.
@@ -2405,6 +2423,10 @@ class LiveTradingEngine:
                                     confidence, expiry, tp1, tp2, sl, current_price=current_price,
                                     symbol=symbol
                                 )
+                                self.last_execution_result = (
+                                    {"success": True, "paper": True, "position": trade}
+                                    if trade else {"success": False, "paper": True, "reason": "paper entry blocked"}
+                                )
                                 if trade:
                                     self._dashboard_events.append(
                                         f"Paper trade #{trade['id']} {trade['status']} | "
@@ -2422,10 +2444,26 @@ class LiveTradingEngine:
                     else:
                         logger.warning("[LIVE] No delta_data available")
                     
+                    _dashboard_decision = getattr(self, 'last_decision', None) or {}
+                    _dashboard_execution = getattr(self, 'last_execution_result', None)
+                    if isinstance(_dashboard_execution, dict) and not _dashboard_execution.get('success'):
+                        _dashboard_action = 'BLOCKED'
+                        _dashboard_gate_reason = str(
+                            _dashboard_execution.get('reason') or _dashboard_execution.get('error') or 'execution rejected'
+                        )
+                    elif isinstance(_dashboard_execution, dict) and _dashboard_execution.get('success'):
+                        _dashboard_action = 'PAPER TRACKED' if _dashboard_execution.get('paper') else 'ORDER ACCEPTED'
+                        _dashboard_gate_reason = 'venue response accepted; fill is not inferred' if not _dashboard_execution.get('paper') else 'paper only; no venue order'
+                    elif direction in ('CALL', 'PUT'):
+                        _dashboard_action = 'ENTRY SIGNAL'
+                        _dashboard_gate_reason = 'analysis gate passed; no execution result'
+                    else:
+                        _dashboard_action = 'WAIT'
+                        _dashboard_gate_reason = '; '.join(_dashboard_decision.get('reasons', [])) or 'no eligible entry'
                     self._render_unified_dashboard(
                         symbol=symbol, current_price=current_price,
-                        action=(getattr(self, 'last_decision', None) or {}).get('direction') or ('WAIT' if direction == 'NO_TRADE' else direction),
-                        gate_reason='; '.join((getattr(self, 'last_decision', None) or {}).get('reasons', [])) or ('risk/venue gates passed' if direction in ('CALL', 'PUT') else 'no eligible entry'),
+                        action=_dashboard_action,
+                        gate_reason=_dashboard_gate_reason,
                     )
                     self._dashboard_events = []
                     time.sleep(float(os.getenv('JARVIS_POLL_SECONDS', '60')))  # Poll every candle

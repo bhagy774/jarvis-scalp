@@ -96,7 +96,8 @@ def reconcile_state(exchange_client=None, state_path: str = STATE_FILE) -> Dict[
     report: Dict[str, Any] = {
         "checked_at": datetime.now().isoformat(),
         "exchange_ok": False,
-        "exchange_positions": 0,
+        # Unknown is not flat: remain null until an exchange query succeeds.
+        "exchange_positions": None,
         "local_trades": 0,
         "mismatches": [],
         "error": None,

@@ -7,6 +7,7 @@ produce an altcoin strike, price target, or hedge contract.
 """
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Tuple
@@ -35,8 +36,36 @@ def _base(symbol_or_asset: str) -> str:
     return value
 
 
+def _unusable_evidence(raw: Any) -> bool:
+    """Reject missing or explicitly empty option evidence, not neutral signals."""
+    if not isinstance(raw, dict) or raw.get("score") is None or raw.get("pcr") is None:
+        return True
+    try:
+        int(raw["score"])
+        pcr = float(raw["pcr"])
+    except (TypeError, ValueError, OverflowError):
+        return True
+    if not math.isfinite(pcr) or pcr < 0:
+        return True
+    reasons = raw.get("reasons", [])
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    if not isinstance(reasons, (list, tuple)):
+        reasons = []
+    if any("no data" in str(reason).strip().lower() for reason in reasons):
+        return True
+    raw_data = raw.get("raw_data")
+    if isinstance(raw_data, dict) and raw_data.get("total_oi") is not None:
+        try:
+            if float(raw_data["total_oi"]) <= 0:
+                return True
+        except (TypeError, ValueError, OverflowError):
+            return True
+    return not reasons and not raw_data
+
+
 def _valid_bias(raw: Any, asset: str) -> OptionsContext | None:
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or _unusable_evidence(raw):
         return None
     bias = str(raw.get("bias", "NEUTRAL")).upper()
     if bias not in {"BULLISH", "BEARISH", "NEUTRAL"}:
