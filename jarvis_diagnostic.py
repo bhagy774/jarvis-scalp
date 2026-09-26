@@ -92,47 +92,11 @@ for mod, cls, label in ENGINES:
         fail(f"[  ] {label:<24} → {str(e)[:45]}")
 results['engines'] = engine_pass
 
-# ══ 4. OLLAMA / AI BRAIN ═════════════════════════════════════
-hdr("4 / 8  │  OLLAMA AI BRAIN (deepseek-r1:14b)")
-try:
-    import requests
-    t0 = time.time()
-    r = requests.get("http://localhost:11434/api/tags", timeout=5)
-    if r.status_code == 200:
-        models = [m['name'] for m in r.json().get('models', [])]
-        ok(f"Ollama server running ✅  (latency: {(time.time()-t0)*1000:.0f}ms)")
-        info(f"Models available: {', '.join(models[:5])}")
-        has_ds = any('deepseek' in m for m in models)
-        if has_ds:
-            ok("deepseek-r1:14b found ✅")
-            results['ollama'] = 'OK'
-        else:
-            warn(f"deepseek-r1 NOT found. Available: {models}")
-            results['ollama'] = 'NO_MODEL'
-
-        # Quick inference test
-        print(f"\n  {DG}Testing AI response (quick prompt)...{RST}")
-        t1 = time.time()
-        test_r = requests.post("http://localhost:11434/api/generate", json={
-            "model": "deepseek-r1:14b",
-            "prompt": 'Reply with only valid JSON: {"signal":"CALL","confidence":75}',
-            "stream": False,
-            "options": {"num_predict": 30}
-        }, timeout=60)
-        elapsed = time.time() - t1
-        if test_r.status_code == 200:
-            resp = test_r.json().get('response','')
-            ok(f"AI responded in {elapsed:.1f}s  →  {resp[:60].strip()}")
-            results['ollama_inference'] = 'OK'
-        else:
-            warn(f"Inference test failed: {test_r.status_code}")
-            results['ollama_inference'] = 'FAIL'
-    else:
-        fail(f"Ollama not running (HTTP {r.status_code})")
-        results['ollama'] = 'OFFLINE'
-except Exception as e:
-    fail(f"Ollama offline: {e}")
-    results['ollama'] = 'OFFLINE'
+# ══ 4. EXPERIMENTAL ADVISORY STATUS ════════════════════════════
+hdr("4 / 8  │  LAYA ADVISORY (OPTIONAL)")
+info("No model inference or checkpoint probe: Laya availability is unverified.")
+results['ollama'] = 'RETIRED'
+results['ollama_inference'] = 'SKIP'
 
 # ══ 5. NEURAL CORTEX ══════════════════════════════════════════
 hdr("5 / 8  │  JARVIS NEURAL CORTEX")
@@ -218,7 +182,7 @@ total_ok = 0
 checks = [
     ("GPU/CUDA",         results.get('gpu'),             ['OK','CPU']),
     ("GPU Engines",      f"{results.get('engines',0)}/11",['11']),
-    ("Ollama Server",    results.get('ollama'),           ['OK']),
+    ("Laya Advisory",    results.get('ollama'),           ['RETIRED']),
     ("AI Inference",     results.get('ollama_inference'), ['OK']),
     ("Neural Cortex",    results.get('cortex'),           ['OK']),
     ("Delta Price Feed", results.get('delta_price'),      ['OK']),
