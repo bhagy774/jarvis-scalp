@@ -127,13 +127,12 @@ from collections import deque, defaultdict
 from typing import Dict, List, Tuple, Any, Optional, Union
 
 # Import Ollama Local AI Integration
-try:
-    from ollama_integration import call_ollama
-    OLLAMA_INTEGRATION_AVAILABLE = True
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
-        return None, "ollama_integration module not found"
+# Retired model interface. Trade logic must not import or probe Ollama.
+OLLAMA_INTEGRATION_AVAILABLE = False
+
+def call_ollama(*args, **kwargs):
+    return None, "Ollama retired; Laya commentary is isolated"
+
 
 
 # ==================== GPU-ACCELERATED CANDLESTICK STATS ENGINE ====================
@@ -513,46 +512,8 @@ class DeepSeekValidator:
         self.validation_cache = deque(maxlen=100)  # Cache recent validations
         
     async def validate_signal(self, signal_data: Dict) -> Dict[str, Any]:
-        """Comprehensive signal validation with AI reasoning"""
-        import os
-        if os.environ.get("JARVIS_PURE_ALGO", "True") == "True":
-            return {"status": "VALID", "reason": "Pure Algo Mode Bypassed DeepSeek", "verdict": "EXECUTE"}
-            
-        if not self.enabled:
-            return {"status": "disabled", "reason": "DeepSeek validation disabled"}
-            
-        try:
-            # Build intelligent prompt
-            prompt = self._build_validation_prompt(signal_data)
-            
-            url = f"{self.http_client.config.openrouter_base_url}/chat/completions"
-            payload = {
-                "model": "deepseek/deepseek-reasoner",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 300,
-                "temperature": 0.3
-            }
-            
-            response = await self.http_client.post_json(url, payload, "openrouter")
-            
-            if response and "choices" in response:
-                ai_reasoning = response["choices"][0]["message"]["content"]
-                validation_result = self._parse_validation_result(ai_reasoning, signal_data)
-                
-                # Cache result
-                self.validation_cache.append({
-                    "timestamp": datetime.now(),
-                    "signal": signal_data,
-                    "validation": validation_result
-                })
-                
-                return validation_result
-            else:
-                return {"status": "error", "reason": "AI validation failed"}
-                
-        except Exception as e:
-            logging.error(f"DeepSeek validation error: {e}")
-            return {"status": "error", "reason": str(e)}
+        """Retired DeepSeekValidator model judge; unavailable never means approved."""
+        return {"status": "UNAVAILABLE", "verdict": "NO_TRADE", "reasoning": "DeepSeekValidator retired"}
             
     def _build_validation_prompt(self, signal_data: Dict) -> str:
         """Build comprehensive validation prompt"""
@@ -663,42 +624,8 @@ Follow the tag with a 1-sentence institutional risk justification.
         return prompt
 
     async def validate_signal(self, signal_data: Dict) -> Dict[str, Any]:
-        """Validate signal locally using Ollama Local AI"""
-        import os
-        if os.environ.get("JARVIS_PURE_ALGO", "True") == "True":
-            return {"status": "VALID", "reasoning": "Pure Algo Mode Bypassed Ollama", "verdict": "EXECUTE"}
-
-        if not OLLAMA_INTEGRATION_AVAILABLE:
-            return {"status": "DISABLED", "reasoning": "Ollama integration not available", "verdict": "EXECUTE"}
-
-        try:
-            prompt = self._build_validation_prompt(signal_data)
-            response, err = call_ollama(prompt, timeout=10)
-            if response and not err:
-                raw_text = response.strip()
-                if "[VETO]" in raw_text.upper():
-                    verdict = "VETO"
-                    status = "VETO"
-                else:
-                    verdict = "EXECUTE"
-                    status = "VALID"
-
-                print(f"[PART 10 OLLAMA FINAL VERDICT] Verdict: [{verdict}] | {raw_text}")
-                result = {
-                    "status": status,
-                    "verdict": verdict,
-                    "reasoning": raw_text,
-                    "timestamp": datetime.now().isoformat()
-                }
-                self.validation_cache.append(result)
-                self._append_verdict_log(result)
-                return result
-            else:
-                print(f"[PART 10 OLLAMA FINAL VERDICT] Ollama skipped or unavailable: {err}")
-                return {"status": "SKIPPED", "reasoning": f"Ollama call skipped: {err}", "verdict": "EXECUTE"}
-        except Exception as e:
-            logging.error(f"Ollama validation error: {e}")
-            return {"status": "ERROR", "reasoning": str(e), "verdict": "EXECUTE"}
+        """Retired OllamaLocalValidator model judge; unavailable never means approved."""
+        return {"status": "UNAVAILABLE", "verdict": "NO_TRADE", "reasoning": "OllamaLocalValidator retired"}
 
     def _append_verdict_log(self, result: Dict):
         try:
@@ -1192,28 +1119,12 @@ class FinalExecutionEngine:
         self.system_stats["trades_executed"] += 1
         
         try:
-            # Step 1: AI Validation (DeepSeek primary if key configured, Ollama local validator fallback/judge)
-            validation_result = await self.deepseek_validator.validate_signal(signal)
-            
-            # Run Ollama Local AI Judge validation
-            ollama_result = await self.ollama_validator.validate_signal(signal)
-            
-            # If DeepSeek is disabled/failed, use Ollama result as primary validation
-            if validation_result.get("status") in ["disabled", "error", "UNKNOWN"]:
-                validation_result = ollama_result
-            elif ollama_result.get("verdict") == "VETO":
-                # Ollama Judge has ultimate VETO power!
-                validation_result = ollama_result
-
-            # Check for VETO
-            if validation_result.get("verdict") == "VETO" or validation_result.get("status") == "VETO":
-                logging.warning(f"🛑 [PART 10 VETO] Trade signal VETOED by AI Judge: {validation_result.get('reasoning')}")
-                await self.telegram_notifier.send_message(
-                    f"🛑 TRADE VETOED BY AI JUDGE\nReason: {validation_result.get('reasoning', 'Risk threshold exceeded')}"
-                )
-                return {"status": "vetoed", "reason": validation_result.get('reasoning')}
-
-            self.system_stats["trades_executed"] += 1
+            # This legacy independent execution pipeline had no audited deterministic
+            # replacement for its two model judges. Fail CLOSED for new entries.
+            # Do not send a pre-trade alert or place an order; protective exit
+            # handling lives elsewhere and is unaffected.
+            logging.warning("Part 10 legacy trade entry disabled: model judges retired")
+            return {"status": "no_trade", "reason": "legacy entry lacks deterministic validation"}
 
             # Step 2: Pre-trade notification
             await self._send_pre_trade_alert(signal, validation_result)
