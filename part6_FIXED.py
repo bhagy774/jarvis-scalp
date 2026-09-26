@@ -35,13 +35,12 @@ if hasattr(sys.stdout, 'reconfigure'):
         pass
 
 # Import Ollama Local AI Integration
-try:
-    from ollama_integration import call_ollama
-    OLLAMA_INTEGRATION_AVAILABLE = True
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
-        return None, "ollama_integration module not found"
+# Retired model interface. Trade logic must not import or probe Ollama.
+OLLAMA_INTEGRATION_AVAILABLE = False
+
+def call_ollama(*args, **kwargs):
+    return None, "Ollama retired; Laya commentary is isolated"
+
 
 # uvloop with fallback
 try:
@@ -854,30 +853,7 @@ Strategy Improvements: {len(learning_insights.get('strategy_improvements', []))}
             risk_adj = learning_insights.get('risk_adjustments', {})
             report += f"- Risk Adjustment: {risk_adj.get('suggestion', 'Maintain current')} (Confidence: {risk_adj.get('confidence', 'LOW')})\n"
 
-            # Ollama AI Local Backtest Evaluation
-            if OLLAMA_INTEGRATION_AVAILABLE:
-                try:
-                    wr = metrics.get('win_rate', 0) * 100
-                    pnl = metrics.get('total_profit', 0)
-                    dd = metrics.get('max_drawdown', 0) * 100
-                    sharpe = metrics.get('sharpe_ratio', 0)
-                    prompt = f"""You are a quantitative trading director evaluating a GPU backtest report.
-Backtest Metrics:
-- Total Trades: {metrics.get('total_trades', 0)}
-- Win Rate: {wr:.1f}%
-- Total Profit: ${pnl:.2f}
-- Max Drawdown: {dd:.1f}%
-- Sharpe Ratio: {sharpe:.2f}
-
-Provide a 2-sentence executive summary and verdict (APPROVED FOR LIVE / REQUIRES OPTIMIZATION)."""
-                    
-                    resp, err = call_ollama(prompt, model=__import__('os').environ.get('OLLAMA_MODEL', 'deepseek-r1:14b'), timeout=10)
-                    if resp:
-                        clean_resp = resp.strip()
-                        print(f"\n[PART 6 OLLAMA BACKTEST EVALUATION] 🧠\n{clean_resp}\n")
-                        report += f"\n  OLLAMA AI EVALUATION:\n----------------------\n{clean_resp}\n"
-                except Exception:
-                    pass
+            # Report only measured backtest performance, not fictional AI approval.
 
             report += f"""
   HARDWARE UTILIZATION:
