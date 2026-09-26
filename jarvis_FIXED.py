@@ -1762,6 +1762,20 @@ class LiveTradingEngine:
                 print(f"Decision reason: {str(reason)[:300]}")
             for blocker in (blockers or []):
                 print(f"Entry gate: {str(blocker)[:300]}")
+            # Experimental commentary only. Worker is daemonized and never gates execution.
+            try:
+                from jarvis_laya_advisor import request_runtime_advisory
+                advisory = request_runtime_advisory({
+                    'symbol': str(symbol).upper(),
+                    'direction': decision.get('direction', 'NO_TRADE'),
+                    'confidence': decision.get('confidence'),
+                    'price': decision.get('price'),
+                    'reasons': decision.get('reasons', []),
+                }, symbol=symbol, deterministic_decision=decision.get('direction', 'NO_TRADE'))
+                print(f"Laya advisory (experimental; not a gate): {advisory.status}"
+                      + (f" suggestion={advisory.suggestion}" if advisory.suggestion else ""))
+            except Exception as advisory_error:
+                print(f"Laya advisory (experimental; not a gate): unavailable ({type(advisory_error).__name__})")
             if stage == "ORDER_SUBMISSION":
                 if isinstance(order_outcome, dict):
                     # Report only raw return fields with conservative labels; success is not proof of fill.

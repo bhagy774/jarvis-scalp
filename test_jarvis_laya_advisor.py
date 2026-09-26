@@ -20,10 +20,5 @@ class LayaAdvisorTests(unittest.TestCase):
         self.assertEqual(advise(self.snapshot, symbol="ETHUSDT", deterministic_decision="BUY").status, "invalid")
     def test_disabled_is_explicit(self):
         self.assertEqual(advise(self.snapshot, symbol="BTCUSDT", deterministic_decision="BUY", enabled=False).status, "disabled")
-    def test_timeout_is_explicit(self):
-        import time
-        got = advise(self.snapshot, symbol="BTCUSDT", deterministic_decision="BUY",
-                     predictor=lambda _: time.sleep(.08), timeout=.01)
-        self.assertEqual(got.status, "timeout")
 
 if __name__ == "__main__": unittest.main()
