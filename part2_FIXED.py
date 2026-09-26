@@ -187,13 +187,12 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Import Ollama Local AI Integration
-try:
-    from ollama_integration import call_ollama
-    OLLAMA_INTEGRATION_AVAILABLE = True
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
-        return None, "ollama_integration module not found"
+# Retired model interface. Trade logic must not import or probe Ollama.
+OLLAMA_INTEGRATION_AVAILABLE = False
+
+def call_ollama(*args, **kwargs):
+    return None, "Ollama retired; Laya commentary is isolated"
+
 
 
 # [FIX] Removed broken import from non-existent 'deepseek_missing_brains' module.
@@ -525,7 +524,8 @@ class NeuralNetworkManager:
         return np.mean((data - mean) ** 4) / (std ** 4) - 3
 
     def predict(self, price_sequence, volume_sequence):
-        """Get predictions from all AI models"""
+        """Retired compatibility hook: no unvalidated model outputs in trading."""
+        return {}
         try:
             predictions = {}
             
@@ -4125,7 +4125,7 @@ class AdvancedAnalysisSystem:
         }
         
         # AI/ML System
-        self.neural_network_manager = NeuralNetworkManager(self)
+        self.neural_network_manager = None  # retired model inference; mathematical brains remain active
         
         # Auto Update System
         self.auto_update_system = AutoUpdateSystem(self)
@@ -4147,7 +4147,7 @@ class AdvancedAnalysisSystem:
         }
         
         print("ADVANCED ANALYSIS SYSTEM INITIALIZED WITH 16 BRAINS")
-        print(f"AI/ML System: {len(self.neural_network_manager.models)} Neural Networks")
+        print("Model inference: retired (deterministic signal fusion only)")
         print(f"Auto Update System: ACTIVE")
 
     def _generate_ollama_prompt(self, context, current_signals):
@@ -4308,30 +4308,9 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
             )
             
             # 16. AI/ML Enhancement
-            ai_enhanced_signals = self._enhance_with_ai(fused_signals, df_1min)
+            ai_enhanced_signals = fused_signals  # deterministic signals only; no model score boost
             
-            # 17. Ollama Local AI Reasoning (Option C: Final Validator)
-            if OLLAMA_INTEGRATION_AVAILABLE:
-                prompt = self._generate_ollama_prompt(self.current_context, ai_enhanced_signals)
-                resp, err = call_ollama(prompt, model=__import__('os').environ.get('OLLAMA_MODEL', 'deepseek-r1:14b'), timeout=10)
-                if resp:
-                    ollama_reasoning = resp.strip()
-                    resp_upper = resp.upper()
-                    
-                    print(f"\n[PART 2 OLLAMA LIVE THOUGHTS] 🧠\n{ollama_reasoning}\n")
-                    
-                    ollama_signal = 0
-                    if "[BUY]" in resp_upper or "BUY" in resp_upper:
-                        ollama_signal = 1
-                    elif "[SELL]" in resp_upper or "SELL" in resp_upper:
-                        ollama_signal = -1
-                        
-                    if ollama_signal != 0:
-                        direction = "CALL" if ollama_signal == 1 else "PUT"
-                        ai_enhanced_signals.append((direction, 9.5, f"Ollama Strong Signal: {ollama_reasoning[:50]}..."))
-                elif err:
-                    print(f"\n[PART 2 OLLAMA ERROR] {err}\n")
-            
+            # No model may append a synthetic trade signal to the fused math.
             # Check for system updates
             self.auto_update_system.check_for_updates()
             
@@ -4342,7 +4321,8 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
             return []
 
     def _enhance_with_ai(self, signals, df):
-        """Enhance signals with AI/ML predictions"""
+        """Compatibility hook: model boosts cannot influence signal confidence."""
+        return signals
         try:
             if not signals or len(df) < 50:
                 return signals
@@ -4396,8 +4376,7 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
         
         # AI/ML Status
         report += f"\nAI/ML SYSTEM:\n"
-        report += f"Models: {len(self.neural_network_manager.models)} neural networks\n"
-        report += f"Training Samples: {len(self.neural_network_manager.training_data['price_sequences'])}\n"
+        report += "Model inference: retired; deterministic signals only\n"
         
         # Fusion Report
         fusion_report = self.brains['signal_fusion'].get_fusion_report()

@@ -220,7 +220,7 @@ class CognitiveBus:
         self.logger.log('TRACEBACK', part_name, tb_str.replace('\n', ' | '))
         
         # Try Ollama diagnosis in background (non-blocking)
-        if try_ollama:
+        if False:  # Retired model diagnosis; do not spawn a thread.
             threading.Thread(
                 target=self._ollama_diagnose,
                 args=(part_name, type(error).__name__, str(error), context, severity),
@@ -241,31 +241,11 @@ class CognitiveBus:
         self.health_monitor.record_ok(part_name)
         self.logger.log('HEALTH', part_name, f"[RECOVERED] {part_name} is working again. Context: {context}")
         
-    def _ollama_diagnose(self, part_name: str, error_type: str, error_msg: str, context: str, severity: str):
-        """
-        Background thread: Asks Ollama to diagnose the error.
-        Uses tinyllama or qwen2 (fast models) so it doesn't block anything.
-        """
-        try:
-            import requests
-            prompt = (
-                f"You are an expert Python trading system debugger. "
-                f"A module called '{part_name}' (context: '{context}') threw a '{error_type}': '{error_msg}'. "
-                f"In 2-3 sentences, explain what likely caused this error and what the developer should check."
-            )
-            response = requests.post(
-                "http://localhost:11434/api/generate",
-                json={"model": "tinyllama", "prompt": prompt, "stream": False},
-                timeout=15
-            )
-            if response.status_code == 200:
-                analysis = response.json().get('response', '').strip()
-                if analysis:
-                    self.logger.log('HEALTH_AI', part_name,
-                        f"[OLLAMA DIAGNOSIS] {severity} in {part_name}: {analysis}")
-        except Exception:
-            pass  # Ollama not running is fine, silent fail
-    
+    def _ollama_diagnose(self, part_name: str, error_type: str, error_msg: str,
+                         context: str, severity: str):
+        """Retired model diagnosis. Structured local HEALTH event is sufficient."""
+        return None
+
     def get_system_health(self) -> dict:
         """Returns a snapshot of all part health statuses."""
         return self.health_monitor.get_status()

@@ -79,11 +79,7 @@ LIVE_EXECUTION_ENABLED = (
 )
 HEDGE_ENABLED       = os.environ.get("JARVIS_HEDGE", "true").lower() == "true"
 
-# ── Gemini Supreme Advisor (lazy import) ─────────────────────
-try:
-    from gemini_supreme_advisor import get_advisor as _get_gemini_advisor
-except ImportError:
-    _get_gemini_advisor = lambda: None
+# Standalone Gemini advisor is deliberately not imported by the execution path.
 
 # ── Market Oracle Trade Gate (lazy import) ───────────────────
 try:
@@ -199,12 +195,8 @@ class JarvisAutoTrader:
         if date.today() != self.today_date:
             self._reset_daily()
 
-        # ─ Gate 0: Gemini Supreme Advisor override ───────────────
-        gemini = self._gemini_advisor or _get_gemini_advisor()
-        if gemini:
-            allowed, reason = gemini.is_trading_allowed(direction)
-            if not allowed:
-                return self._skip(f"Gate0 GEMINI OVERRIDE: {reason}")
+        # No Gemini/model result may veto, approve, or alter a trading threshold.
+        # Standalone advisory clients do not participate in this execution path.
 
         # ─ Gate 0.5: JARVIS Market Oracle Gate ───────────────────
         oracle_gate = self._oracle_gate or _get_oracle_gate()
@@ -218,15 +210,13 @@ class JarvisAutoTrader:
                 return self._skip(f"Gate0.5 ORACLE ENTRY ZONE: {zone_reason}")
 
         # ─ Gate 1: Risk checks ───────────────────────────────────
-        gate1 = self._check_risk_gates(confidence, gemini)
+        gate1 = self._check_risk_gates(confidence)
         if not gate1["ok"]:
             return self._skip(f"Gate1 FAIL: {gate1['reason']}")
 
         # ─ Gate 2: Hedge decision ────────────────────────────────
-        hedge_plan = {"do_hedge": False, "reason": "Hedge disabled"}
-        if HEDGE_ENABLED and self.hedge_advisor:
-            hedge_plan = self._get_hedge_plan(
-                direction, confidence, current_price, part_results, symbol)
+        # Model-generated strike/ratio and confidence fallback are unsupported.
+        hedge_plan = {"do_hedge": False, "reason": "No validated deterministic hedge policy"}
 
         # ─ Gate 3: Execute ───────────────────────────────────────
         return self._place_trade(
@@ -295,12 +285,11 @@ class JarvisAutoTrader:
     # ──────────────────────────────────────────────────────────────
 
     def _check_risk_gates(self, confidence: int, gemini_advisor=None) -> Dict:
-        # Confidence threshold — use Gemini's recommendation if available
+        # Compatibility argument is ignored: only the fixed configured threshold
+        # may participate in sizing/risk even if an external advisor is injected.
         effective_min = MIN_CONFIDENCE
-        if gemini_advisor:
-            effective_min = gemini_advisor.get_confidence_threshold(MIN_CONFIDENCE)
         if confidence < effective_min:
-            return {"ok": False, "reason": f"Confidence {confidence}% < {effective_min}% (Gemini threshold)"}
+            return {"ok": False, "reason": f"Confidence {confidence}% < {effective_min}% (fixed threshold)"}
 
         # Emergency stop
         if self.emergency_stop:
@@ -341,40 +330,8 @@ class JarvisAutoTrader:
     # ──────────────────────────────────────────────────────────────
 
     def _get_hedge_plan(self, direction, confidence, price, part_results, symbol: str) -> Dict:
-        try:
-            options_chain = {}
-            try:
-                options_chain = self.delta.get_options_chain(symbol.removesuffix("USDT").removesuffix("USD"))
-            except Exception:
-                pass
-
-            atr = price * 0.004  # default 0.4% ATR
-            expected_profit = (MAX_RISK_USDT / max(SCALP_SL_PCT, 1e-9)) * SCALP_TP_PCT
-
-            result = self.hedge_advisor.evaluate_hedge_setup(
-                signal_direction=direction,
-                signal_confidence=confidence,
-                current_price=price,
-                atr=atr,
-                options_chain=options_chain,
-                expected_profit=expected_profit
-            )
-            return {
-                "do_hedge":     result.get("hedge", "NO") == "YES",
-                "strike":       result.get("strike"),
-                "expiry":       result.get("expiry", "nearest"),
-                "hedge_ratio":  result.get("hedge_ratio", 0.5),
-                "option_type":  "PUT" if direction in ("CALL","BUY") else "CALL",
-                "reason":       result.get("reason", "AI hedge decision"),
-            }
-        except Exception as e:
-            logger.warning(f"[HEDGE] Advisor error: {e}")
-            # Default: always hedge if confidence < 80
-            return {
-                "do_hedge": confidence < 80,
-                "option_type": "PUT" if direction in ("CALL","BUY") else "CALL",
-                "reason": "Fallback hedge rule (conf < 80%)",
-            }
+        """Compatibility hook. No model-selected option leg or fallback position."""
+        return {"do_hedge": False, "reason": "No validated deterministic hedge policy"}
 
     # ──────────────────────────────────────────────────────────────
     #  GATE 3: TRADE EXECUTION
@@ -386,6 +343,9 @@ class JarvisAutoTrader:
         symbol = str(symbol or "").upper().replace("-", "").replace("_", "").strip()
         if not symbol:
             return {"success": False, "reason": "Execution symbol is missing"}
+        # Defense in depth: even a direct legacy caller cannot inject a
+        # model-selected option leg into execution. No hedge policy is validated.
+        hedge_plan = {"do_hedge": False, "reason": "No validated deterministic hedge policy"}
 
         is_call    = direction in ("CALL", "BUY")
         futures_side = "buy" if is_call else "sell"
@@ -471,7 +431,7 @@ class JarvisAutoTrader:
         oracle_plan = None
         hold_minutes = 5 if trade_type == "SCALP" else 60
         if oracle_gate:
-            oracle_plan = oracle_gate.get_oracle_tp_sl(price, direction)
+            oracle_plan = oracle_gate.get_oracle_tp_sl(price, direction, symbol=symbol)
             if oracle_plan and oracle_plan.get("use_oracle"):
                 tp_price = oracle_plan["tp_price"]
                 sl_price = oracle_plan["sl_price"]

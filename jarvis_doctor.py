@@ -49,7 +49,9 @@ logger = logging.getLogger("JarvisDoctor")
 DOCTOR_API_KEY  = os.environ.get("DOCTOR_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 DOCTOR_MODEL    = os.environ.get("DOCTOR_GEMINI_MODEL", "gemini-3.6-flash")
 DOCTOR_ENABLED  = os.environ.get("DOCTOR_ENABLED", "true").lower() == "true"
-DOCTOR_AUTO_FIX = os.environ.get("DOCTOR_AUTO_FIX", "true").lower() == "true"
+# Health observations may be reported, but model-produced plans must never
+# pip-install packages or mutate live-trading environment/configuration.
+DOCTOR_AUTO_FIX = False
 DOCTOR_INTERVAL = int(os.environ.get("DOCTOR_CHECK_INTERVAL", "60"))
 DOCTOR_COOLDOWN = int(os.environ.get("DOCTOR_COOLDOWN", "600"))
 STALE_THRESHOLD = int(os.environ.get("DOCTOR_STALE_THRESHOLD", "300"))
@@ -280,15 +282,7 @@ class DoctorMonitor:
     # ── LAYER 4: Dependency Check ──────────────────────────────────
     def _check_dependencies(self) -> List[DoctorIssue]:
         issues = []
-        # Ollama
-        try:
-            import requests
-            r = requests.get("http://localhost:11434/api/tags", timeout=4)
-            if r.status_code != 200:
-                issues.append(DoctorIssue("Ollama","CRITICAL","SERVICE_DOWN",
-                    f"HTTP {r.status_code}"))
-        except Exception as e:
-            issues.append(DoctorIssue("Ollama","CRITICAL","CONNECTION_FAILED", str(e)))
+        # Ollama retired; dependency is not required by the deterministic runtime.
 
         # Delta API
         try:
@@ -305,6 +299,8 @@ class DoctorMonitor:
 
     # ── LAYER 5: Gemini Diagnosis ──────────────────────────────────
     def _diagnose_with_gemini(self, issue: DoctorIssue) -> Optional[dict]:
+        """Legacy diagnosis retired; no model call or model-proposed auto-fix."""
+        return None
         if not DOCTOR_API_KEY:
             return None
         try:

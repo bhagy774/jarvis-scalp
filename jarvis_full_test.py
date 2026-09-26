@@ -173,31 +173,8 @@ test("jarvis_position_manager.py", test_position_manager)
 section("4. OLLAMA CONNECTIVITY (Local AI)")
 # ================================================================
 
-def test_ollama_ping():
-    import requests
-    url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    r = requests.get(f"{url}/api/tags", timeout=5)
-    if r.status_code == 200:
-        models = [m["name"] for m in r.json().get("models", [])]
-        return f"Ollama running. Models: {', '.join(models[:4]) or 'none loaded'}"
-    return f"HTTP {r.status_code}"
-
-def test_ollama_models():
-    import requests
-    url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    r = requests.get(f"{url}/api/tags", timeout=5)
-    models = [m["name"] for m in r.json().get("models", [])]
-    needed = os.environ.get("OLLAMA_MODEL", "deepseek-r1:14b")
-    if any(needed.split(":")[0] in m for m in models):
-        return f"{needed} available"
-    raise Exception(f"{needed} NOT found in Ollama. Run: ollama pull {needed}")
-
-ollama_up = test("Ollama server reachable", test_ollama_ping)
-if ollama_up:
-    test(f"Required model available", test_ollama_models)
-else:
-    print(f"  {Y}SKIP{RST}  Model check (Ollama not running)")
-    results.append(("SKIP", "Model available", "Ollama not running"))
+print("  SKIP  Ollama checks retired; Laya inference/checkpoint not verified")
+results.append(("SKIP", "Laya model inference", "No local checkpoint validated"))
 
 # ================================================================
 section("5. MARKET DATA PIPELINE")
@@ -500,5 +477,5 @@ if failed == 0:
 else:
     print(f"{Y}{BD}  Some tests failed. Fix above issues before trading.{RST}")
 
-print(f"\n{DG}  Ollama AI: {'ONLINE' if any(r[0]=='PASS' and 'Ollama server' in r[1] for r in results) else 'OFFLINE (fallback mode)'}")
+print(f'\n{DG}  Ollama retired; Laya inference unverified')
 print(f"  Real trading: {os.environ.get('JARVIS_AUTO_TRADE','false').upper()}{RST}\n")

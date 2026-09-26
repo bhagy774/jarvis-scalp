@@ -165,13 +165,12 @@ import logging
 from typing import Dict, List, Optional, Union
 
 # Import Ollama Local AI Integration
-try:
-    from ollama_integration import call_ollama
-    OLLAMA_INTEGRATION_AVAILABLE = True
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
-        return None, "ollama_integration module not found"
+# Retired model interface. Trade logic must not import or probe Ollama.
+OLLAMA_INTEGRATION_AVAILABLE = False
+
+def call_ollama(*args, **kwargs):
+    return None, "Ollama retired; Laya commentary is isolated"
+
 
 # ==================== ENHANCED LOGGING SETUP ====================
 
@@ -1488,34 +1487,8 @@ Follow the tag with a brief 1-2 sentence institutional risk assessment.
                 self.logger.error(f"❌ Signal generation error: {e}")
                 market_data['trading_signal'] = None
         
-        # Periodic Ollama Volatility Analysis (cooldown to avoid blocking websocket loop)
-        now = time.time()
-        if OLLAMA_INTEGRATION_AVAILABLE and (now - self.last_ollama_time >= self.ollama_cooldown):
-            self.last_ollama_time = now
-            try:
-                prompt = self._generate_ollama_volatility_prompt(market_data)
-                response, err = call_ollama(prompt, timeout=10)
-                if response and not err:
-                    raw_text = response.strip()
-                    if "[ANOMALY]" in raw_text.upper():
-                        risk_state = "ANOMALY"
-                    elif "[HIGH_VOLATILITY]" in raw_text.upper():
-                        risk_state = "HIGH_VOLATILITY"
-                    else:
-                        risk_state = "NORMAL"
-
-                    self.last_ollama_risk_state = risk_state
-                    self.last_ollama_insight = raw_text
-                    
-                    print(f"[PART 7 OLLAMA VOLATILITY ALERT] State: [{risk_state}] | {raw_text}")
-                else:
-                    self.logger.warning(f"Ollama call skipped or failed: {err}")
-            except Exception as e:
-                self.logger.error(f"❌ Ollama volatility analysis error: {e}")
-
-        # Attach Ollama Live Insight & Risk State to market_data
-        market_data['ollama_live_insight'] = self.last_ollama_insight
-        market_data['ollama_risk_state'] = self.last_ollama_risk_state
+        # No cached model risk label: stale commentary must never enter market_data.
+        market_data['advisory_status'] = 'unavailable'
 
         return market_data
     

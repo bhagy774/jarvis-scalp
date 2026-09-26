@@ -37,13 +37,12 @@ except ImportError:
     resource = None
 
 # Import Ollama Local AI Integration
-try:
-    from ollama_integration import call_ollama
-    OLLAMA_INTEGRATION_AVAILABLE = True
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
-        return None, "ollama_integration module not found"
+# Retired model interface. Trade logic must not import or probe Ollama.
+OLLAMA_INTEGRATION_AVAILABLE = False
+
+def call_ollama(*args, **kwargs):
+    return None, "Ollama retired; Laya commentary is isolated"
+
 
 # Optional CuPy fallback
 try:
@@ -946,36 +945,8 @@ class ReportGeneratorGPU:
         )
 
     def _generate_ollama_executive_insight(self, analytics_data: Dict) -> str:
-        """Generate Ollama AI executive backtest insight"""
-        if not OLLAMA_INTEGRATION_AVAILABLE:
-            return "Ollama Local AI not available for backtest insights."
-            
-        try:
-            exec_summary = analytics_data.get('executive_summary', {})
-            score = exec_summary.get('overall_score', 7.0)
-            rec = exec_summary.get('recommendation', 'HOLD')
-            
-            perf = analytics_data.get('performance_analysis', {}).get('efficiency_metrics', {})
-            wr = perf.get('win_rate', 0.60) * 100
-            pf = perf.get('profit_factor', 1.5)
-            
-            prompt = f"""You are a legendary institutional hedge fund manager reviewing a trading system backtest report.
-Analyze the following backtest performance metrics:
-- Overall System Score: {score:.1f}/10
-- Win Rate: {wr:.1f}%
-- Profit Factor: {pf:.2f}
-- Current Strategy Recommendation: {rec}
-
-Task: Provide a concise 2-sentence executive summary of the backtest performance and your top recommendation for live deployment."""
-            
-            resp, err = call_ollama(prompt, model=__import__('os').environ.get('OLLAMA_MODEL', 'deepseek-r1:14b'), timeout=10)
-            if resp:
-                insight = resp.strip()
-                print(f"\n[PART 4 OLLAMA BACKTEST INSIGHTS] 🧠\n{insight}\n")
-                return insight
-            return f"Ollama AI offline: {err}"
-        except Exception as e:
-            return f"Ollama insight error: {e}"
+        """Retired backtest prose; never imply model review or deployment approval."""
+        return "Model review unavailable; use observed backtest metrics only."
 
     def _generate_report_sync(self, analytics_data: Dict) -> Dict:
         try:
@@ -991,7 +962,7 @@ Task: Provide a concise 2-sentence executive summary of the backtest performance
             }
             
             # Inject Ollama AI Executive Insight
-            report['ollama_executive_insight'] = self._generate_ollama_executive_insight(report)
+            report['advisory_note'] = self._generate_ollama_executive_insight(report)
             return report
         except Exception as e:
             logging.error(f"Report generation error: {e}")

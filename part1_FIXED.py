@@ -206,13 +206,12 @@ except (ImportError, OSError):
     F = torch.F
 
 # Import Ollama Local AI Integration
-try:
-    from ollama_integration import call_ollama
-    OLLAMA_INTEGRATION_AVAILABLE = True
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
-        return None, "ollama_integration module not found"
+# Retired model interface. Trade logic must not import or probe Ollama.
+OLLAMA_INTEGRATION_AVAILABLE = False
+
+def call_ollama(*args, **kwargs):
+    return None, "Ollama retired; Laya commentary is isolated"
+
 
 def _safe_std(tensor):
     try:
@@ -1622,36 +1621,10 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
                 "confidence": confidence
             }
 
-            # Call Ollama Local AI Integration
-            ollama_reasoning = "Ollama disabled / unavailable"
+            # Model text cannot cast a vote. Preserve only mathematical signal.
+            ollama_reasoning = "Legacy model disabled; experimental Laya is audit-only"
             ollama_signal = 0
-            
-            if OLLAMA_INTEGRATION_AVAILABLE:
-                prompt = self._generate_ollama_prompt(market_data, temp_result)
-                resp, err = call_ollama(prompt, timeout=10)
-                if resp:
-                    ollama_reasoning = resp.strip()
-                    resp_upper = resp.upper()
-                    if "[BUY]" in resp_upper or "BUY" in resp_upper:
-                        ollama_signal = 1
-                    elif "[SELL]" in resp_upper or "SELL" in resp_upper:
-                        ollama_signal = -1
-                    else:
-                        ollama_signal = 0
-                    
-                    print(f"\n[PART 1 OLLAMA LIVE THOUGHTS] 🧠\n{ollama_reasoning}\n")
-                elif err:
-                    ollama_reasoning = f"Ollama error: {err}"
 
-            # Option B: Combine Ollama signal as a strong brain vote in final signal calculation
-            if ollama_signal != 0:
-                signal, confidence = self._generate_signal(
-                    breakout_data, fakeout_data, pullback_data, momentum_data,
-                    orderflow_data, regime_data, all_brain_support,
-                    cloud_r1_data, cloud_v3_data, liquidity_data,
-                    ollama_signal=ollama_signal
-                )
-            
             result = {
                 "signal": signal,
                 "breakout": breakout_data,

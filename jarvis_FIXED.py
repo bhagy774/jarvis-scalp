@@ -33,7 +33,7 @@ from jarvis_dashboard import UnifiedDashboard
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
 from jarvis_decision import normalize_confidence, confidence_text, build_final_decision
 from jarvis_runtime import detect_backend, torch_device
-from jarvis_ollama_context import build_snapshot, decision_prompt, snapshot_usable, validate_decision
+# Legacy Ollama context removed; deterministic gates are authoritative.
 pro_display = ProfessionalSignalDisplay()
 import warnings
 from collections import deque, defaultdict
@@ -57,12 +57,6 @@ except ImportError:
 # FIX #4: Deribit removed — using Delta Exchange only for options data
 # from deribit_options_client import DeribitOptionsClient  # REMOVED
 from jarvis_neural_cortex import JarvisNeuralCortex  # NEW: Jarvis Unified AI Brain
-try:
-    from gemini_supreme_advisor import init_advisor as _init_gemini_advisor
-    GEMINI_ADVISOR_AVAILABLE = True
-except ImportError:
-    _init_gemini_advisor = None
-    GEMINI_ADVISOR_AVAILABLE = False
 try:
     from jarvis_live_trader import JarvisAutoTrader
     LIVE_TRADER_AVAILABLE = True
@@ -192,8 +186,8 @@ except ImportError as _de:
 
 # Import Ollama Local AI Integration
 try:
-    from ollama_integration import call_ollama, runtime_metadata
-    OLLAMA_INTEGRATION_AVAILABLE = True
+    raise ImportError("Ollama integration retired")
+    OLLAMA_INTEGRATION_AVAILABLE = False
 except ImportError:
     OLLAMA_INTEGRATION_AVAILABLE = False
     runtime_metadata = lambda: {"available": False, "reason": "integration unavailable"}
@@ -419,31 +413,14 @@ TRADING_SESSIONS = {
     'ny_close': {'start': 16, 'end': 20, 'quality': 'MEDIUM'}
 }
 
-# ==================== AI API SETUP (Ollama) ====================
-# Use LOCAL Ollama instead of cloud APIs for privacy and cost efficiency
-try:
-    from ollama_integration import call_ollama, call_ollama_chat, OLLAMA_ENABLED, analyze_trade_signal
-    print("[JARVIS CORE] ✅ Ollama Integration Loaded")
-except ImportError:
-    print("[JARVIS CORE] ⚠️ Ollama integration not available")
-    OLLAMA_ENABLED = False
-    call_ollama = lambda p, m="mistral", timeout=60: (None, "Ollama not available")
-    call_ollama_chat = lambda msgs, m="mistral", timeout=60: (None, "Ollama not available")
-    analyze_trade_signal = lambda p, s, m="mistral": (None, "Ollama not available")
+# Retired compatibility API. No model call is made by generic helpers.
+OLLAMA_ENABLED = False
+call_ollama = lambda *a, **k: (None, "Ollama retired")
+call_ollama_chat = lambda *a, **k: (None, "Ollama retired")
+analyze_trade_signal = lambda *a, **k: (None, "Ollama retired")
 
 def call_ai_for_analysis(prompt, timeout=30):
-    """Call AI analysis - uses Ollama (local) for privacy"""
-    if OLLAMA_ENABLED:
-        try:
-            response, error = call_ollama(prompt, timeout=timeout)
-            if response:
-                return response, None
-        except Exception as e:
-            logger.debug(f"Ollama call error: {e}")
-    
-    # Fallback: Return generic analysis if Ollama unavailable
-    logger.debug("ℹ️ Using rule-based analysis (Ollama unavailable)")
-    return None, "Ollama not available"
+    return None, "Model analysis retired; Laya is audit-only"
 
 # ==================== 1. AUTO BACKTEST ENGINE ====================
 
@@ -629,7 +606,8 @@ class AutoTrainingEngine:
         self.training_history = {}
         
     def train_models(self, historical_data):
-        """Train multiple ML models for signal prediction"""
+        """Retired compatibility hook: training does not produce trading models."""
+        return {'status': 'unavailable', 'reason': 'model prediction retired'}
         logger.info("🧠 Starting Auto Training Engine...")
         
         try:
@@ -772,7 +750,8 @@ class AutoTrainingEngine:
             return None
 
     def predict_signal(self, data):
-        """Use trained models to predict signals"""
+        """Retired compatibility hook: no local model predicts a trade."""
+        return 0
         try:
             if 'random_forest' not in self.models:
                 return 0
@@ -1140,30 +1119,9 @@ class LiveTradingEngine:
                 print(f"[JARVIS CORE] AutoTrader init error: {at_err}")
                 self.auto_trader = None
 
-        # === GEMINI SUPREME ADVISOR (10-min strategic brain) ===
+        # No model strategy advisor is wired into execution.
         self.gemini_advisor = None
-        # LOCAL-ONLY AI: Gemini is opt-in. Requires BOTH JARVIS_ENABLE_GEMINI=1
-        # and GEMINI_API_KEY; otherwise JARVIS runs Ollama-only.
-        _gemini_enabled = (
-            os.environ.get("JARVIS_ENABLE_GEMINI", "0") == "1"
-            and bool(os.environ.get("GEMINI_API_KEY", "").strip())
-        )
-        if not _gemini_enabled:
-            print("[JARVIS CORE] Gemini advisor disabled (Ollama-only mode)")
-        if _gemini_enabled and GEMINI_ADVISOR_AVAILABLE and _init_gemini_advisor:
-            try:
-                bus = getattr(self, 'cognitive_bus', None)
-                self.gemini_advisor = _init_gemini_advisor(
-                    bus=bus,
-                    trader_ref=self.auto_trader
-                )
-                # Wire advisor into auto_trader for gate checks
-                if self.auto_trader and self.gemini_advisor:
-                    self.auto_trader._gemini_advisor = self.gemini_advisor
-                print("[JARVIS CORE] Gemini Supreme Advisor started (10-min cycle)")
-            except Exception as ga_err:
-                print(f"[JARVIS CORE] Gemini Advisor init error: {ga_err}")
-                self.gemini_advisor = None
+        print("[JARVIS CORE] Model strategy advisor retired; Laya is audit-only")
 
         # === JARVIS MARKET ORACLE (5-min multi-timeframe market map) ===
         self.market_oracle = None
@@ -1762,6 +1720,22 @@ class LiveTradingEngine:
                 print(f"Decision reason: {str(reason)[:300]}")
             for blocker in (blockers or []):
                 print(f"Entry gate: {str(blocker)[:300]}")
+            # Experimental commentary only at FINAL_GATE, never repeated for order return.
+            # Worker is daemonized and never gates execution.
+            try:
+                from jarvis_laya_advisor import request_runtime_advisory
+                if stage == "FINAL_GATE":
+                    advisory = request_runtime_advisory({
+                        'symbol': str(symbol).upper(),
+                        'direction': decision.get('direction', 'NO_TRADE'),
+                        'confidence': decision.get('confidence'),
+                        'price': decision.get('price'),
+                        'reasons': decision.get('reasons', []),
+                    }, symbol=symbol, deterministic_decision=decision.get('direction', 'NO_TRADE'))
+                    print(f"Laya advisory (experimental; not a gate): {advisory.status}"
+                          + (f" suggestion={advisory.suggestion}" if advisory.suggestion else ""))
+            except Exception as advisory_error:
+                print(f"Laya advisory (experimental; not a gate): unavailable ({type(advisory_error).__name__})")
             if stage == "ORDER_SUBMISSION":
                 if isinstance(order_outcome, dict):
                     # Report only raw return fields with conservative labels; success is not proof of fill.
@@ -2258,33 +2232,9 @@ class LiveTradingEngine:
                         if self.auto_trader:
                             self.auto_trader._df_ref = df.copy()
 
-                        # 4b. Multi-AI Consensus (DeepSeek + Qwen + Mistral roundtable)
-                        # FIX BUG 3: Run in background thread to prevent live loop freezing
-                        if cycle_count[0] % 5 == 0 and not _pure_algorithm_mode():
-                            def _run_consensus_bg():
-                                try:
-                                    from multi_ai_consensus import run_ai_roundtable
-                                    market_ctx = result.get('market_context', {})
-                                    signal_data = result.get('trade_signal', {})
-                                    consensus = run_ai_roundtable(
-                                        market_context={
-                                            'symbol': f'{symbol[:-4]}/USDT' if symbol.endswith('USDT') else symbol,
-                                            'current_price': current_price,
-                                            'trend': market_ctx.get('trend', 'NEUTRAL'),
-                                            'volatility': market_ctx.get('volatility', 'MEDIUM'),
-                                        },
-                                        signal_data=signal_data
-                                    )
-                                    if consensus and consensus.get('final_verdict'):
-                                        consensus['_symbol'] = symbol
-                                        self.last_consensus = consensus
-                                        logger.info(f"[CONSENSUS] {consensus.get('final_verdict','?')} | Agree: {consensus.get('agreement_pct','?')}%")
-                                except Exception as ce:
-                                    logger.debug(f"[CONSENSUS] Skipped: {ce}")
-                            
-                            import threading
-                            threading.Thread(target=_run_consensus_bg, daemon=True).start()
-                        
+                        # No model consensus may flow into the final decision.
+                        self.last_consensus = {}
+
                         # 5. Apply selected-asset options intelligence before
                         # the displayed final decision and any order path.
                         result = self._apply_options_confirmation(result, symbol)
@@ -2324,11 +2274,6 @@ class LiveTradingEngine:
                                 direction = 'NO_TRADE'
                         _options_ctx = (result.get('market_context', {}) or {}).get('options_context', {})
                         _opinions = list(result.get('decision_opinions', []) or [])
-                        _consensus = getattr(self, 'last_consensus', None)
-                        if isinstance(_consensus, dict) and _consensus.get('_symbol') == symbol:
-                            _verdict = _consensus.get('final_verdict') or _consensus.get('direction')
-                            if _verdict:
-                                _opinions.append(_verdict)
                         _live_execution_enabled = bool(
                             self.auto_trader and getattr(self.auto_trader, 'is_enabled', False)
                         )
@@ -3035,25 +2980,8 @@ class Part5ML:
             except Exception as e:
                 logger.debug(f"Part5 MLEngine error: {e}")
 
-        # ── 2. Try neural predictions from context ────────────────────────
-        if context and 'neural_prediction' in context:
-            preds = context.get('neural_prediction')
-            if preds and isinstance(preds, dict):
-                try:
-                    bullish = sum(1 for v in preds.values()
-                                  if isinstance(v, (int, float)) and v > 0.5)
-                    bearish = sum(1 for v in preds.values()
-                                  if isinstance(v, (int, float)) and v < -0.5)
-                    total = len(preds)
-                    if total > 0:
-                        if bullish / total > 0.6:
-                            return {"signal": 1,  "thought": f"Neural-Engine: {bullish}/{total} Bullish"}
-                        if bearish / total > 0.6:
-                            return {"signal": -1, "thought": f"Neural-Engine: {bearish}/{total} Bearish"}
-                except Exception:
-                    pass
-
-        # ── 3. Fallback: High-Conviction Statistical Feature Check ─────────
+        # Neural context is retired: only observed-data statistical features may vote.
+        # ── 2. High-Conviction Statistical Feature Check ─────────
         try:
             if len(data) >= 30:
                 closes = data['close'].tail(30).astype(float).values
@@ -3688,45 +3616,13 @@ Follow the tag with a 1-sentence options analyst insight.
         return prompt
 
     def analyze_options_with_ollama(self, telemetry: Dict, current_price: float) -> Tuple[str, str, int]:
-        """Run optional whale-model analysis; never participate in pure-algorithm mode."""
-        if _pure_algorithm_mode():
-            # Model-only auxiliary confirmation is unavailable, not a fabricated neutral/approval.
-            # Preserve the independently computed options math signal unchanged.
-            return "WHALE_UNAVAILABLE", "Model confirmation disabled in pure-algorithm mode", telemetry.get('signal', 0)
-
-        now = time.time()
-        if not OLLAMA_INTEGRATION_AVAILABLE:
-            return self.last_ollama_whale_tag, self.last_ollama_insight, telemetry.get('signal', 0)
-
-        if now - self.last_ollama_time < self.ollama_cooldown:
-            ai_sig = 1 if self.last_ollama_whale_tag == "WHALE_BULLISH" else (-1 if self.last_ollama_whale_tag == "WHALE_BEARISH" else 0)
-            return self.last_ollama_whale_tag, self.last_ollama_insight, ai_sig
-
-        self.last_ollama_time = now
+        """Compatibility name; return only the deterministic observed-chain signal."""
+        signal = telemetry.get('signal', 0)
         try:
-            prompt = self._generate_ollama_options_prompt(telemetry, current_price)
-            response, err = call_ollama(prompt, timeout=120)
-            if response and not err:
-                raw_text = response.strip()
-                if "[WHALE_BULLISH]" in raw_text.upper() or "WHALE_BULLISH" in raw_text.upper():
-                    tag = "WHALE_BULLISH"
-                elif "[WHALE_BEARISH]" in raw_text.upper() or "WHALE_BEARISH" in raw_text.upper():
-                    tag = "WHALE_BEARISH"
-                elif "[RETAIL_TRAP]" in raw_text.upper() or "RETAIL_TRAP" in raw_text.upper():
-                    tag = "RETAIL_TRAP"
-                else:
-                    tag = "WHALE_NEUTRAL"
-
-                self.last_ollama_whale_tag = tag
-                self.last_ollama_insight = raw_text
-                print(f"[PART 14 OLLAMA WHALE TRACKER] Tag: [{tag}] | {raw_text}")
-            else:
-                print(f"[PART 14 OLLAMA WHALE TRACKER] Ollama call skipped or unavailable: {err}")
-        except Exception as e:
-            logging.error(f"Ollama options tracker error: {e}")
-
-        ai_sig = 1 if self.last_ollama_whale_tag == "WHALE_BULLISH" else (-1 if self.last_ollama_whale_tag == "WHALE_BEARISH" else 0)
-        return self.last_ollama_whale_tag, self.last_ollama_insight, ai_sig
+            signal = int(signal) if int(signal) in (-1, 0, 1) else 0
+        except (TypeError, ValueError, OverflowError):
+            signal = 0
+        return "MODEL_ADVISORY_DISABLED", "Options result is deterministic observed-chain math", signal
 
     def analyze(self, data, context=None):
         """Unified selected-asset options analysis; BTC Deribit is never an alt substitute."""
@@ -3813,10 +3709,10 @@ Follow the tag with a 1-sentence options analyst insight.
                 "math_model": "observed_chain_descriptive_v1"
             }
 
-            # Ollama Smart Money & Whale Tracker Analysis
+            # Deterministic options math; optional model commentary cannot change signal.
             whale_tag, insight, final_signal = self.analyze_options_with_ollama(telemetry, current_price)
-            telemetry['ollama_whale_tag'] = whale_tag
-            telemetry['ollama_insight'] = insight
+            telemetry['advisory_status'] = whale_tag
+            telemetry['advisory_note'] = insight
 
             combined_thought = f"[{whale_tag}] " + (" | ".join(thoughts) if thoughts else f"Institutional: {bias_data.get('bias', 'NEUTRAL')}")
             
@@ -3831,33 +3727,8 @@ Follow the tag with a 1-sentence options analyst insight.
 
 # FIX #6: Properly calling local Ollama (GPU) instead of Gemini cloud
 def _call_ollama_local(prompt, model=None, timeout=30):
-    """Call local Ollama GPU model — uses OLLAMA_BASE_URL from .env.
-
-    model=None auto-detects the installed model (or OLLAMA_MODEL env override).
-    """
-    import requests, os
-    if model is None:
-        try:
-            from ollama_integration import resolve_ollama_model
-            model = resolve_ollama_model()
-        except Exception as e:
-            return None, f"Ollama model resolution failed: {e}"
-        if not model:
-            return None, "No Ollama model found (math fallback)"
-    base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    try:
-        resp = requests.post(
-            f"{base_url}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False},
-            timeout=timeout
-        )
-        if resp.status_code == 200:
-            return resp.json().get("response", ""), None
-        return None, f"Ollama HTTP {resp.status_code}"
-    except requests.exceptions.ConnectionError:
-        return None, "Ollama not reachable (is GPU server running?)"
-    except Exception as e:
-        return None, str(e)
+    """Legacy compatibility shim: Ollama routing is retired; never make a request."""
+    return None, "Ollama retired; use isolated Laya advisory only"
 
 class DeepSeekV3Brain:
     def __init__(self):
@@ -4935,34 +4806,12 @@ class JarvisCNS:
         # Get the latest sensory data
         last_feeling = self.sensory_buffer[-1] if self.sensory_buffer else {}
         
-        # Format diagnostic prompt for local AI
-        prompt = f"""
-        [SYSTEM DIAGNOSTIC MODE]
-        A trade just lost. PnL: {trade_result.get('pnl')}
-        
-        SENSORY TELEMETRY:
-        {json.dumps(last_feeling.get('telemetry'), indent=2, cls=NumpyEncoder)}
-        
-        TRADE DECISION:
-        {json.dumps(last_feeling.get('signal'), indent=2, cls=NumpyEncoder)}
-        
-        TASK:
-        Aapdi system na logic ma kyank 'pain' che. Telemetry joi ne Gujlish ma samjav ke kaya Part na logic ma gadbad che ane tene su improve karvu joyiye?
-        Khali suggestion aapje, code badalto nai. Friendly and expert tone rakhje.
-        """
-        
-        try:
-            diagnosis, _ = self.ai_brain.call_multi_ai(prompt, system_voice="System Auditor")
-            self.last_diagnostic = diagnosis
-            logger.info(f"🧠 CNS DIAGNOSIS: {diagnosis}")
-            
-            # Auto-sync to HUD on diagnosis
-            if self.parent:
-                self.parent._sync_to_hud({})
-            return diagnosis
-        except Exception as e:
-            logger.error(f"CNS Diagnostic Error: {e}")
-            return "Diagnosis failed."
+        # Preserve observed health information without sending telemetry to a
+        # retired model or treating an unverified diagnosis as trading input.
+        diagnostic = "Loss observed; model diagnosis unavailable; manual review required"
+        self.last_diagnostic = diagnostic
+        logger.warning("CNS: %s (snapshot=%s)", diagnostic, bool(last_feeling))
+        return diagnostic
 
 # ==================== ENHANCED JARVIS TRADE ELITE ====================
 
@@ -4984,7 +4833,7 @@ class JarvisElite:
         self.trade_manager = TradeManager()
         self.expiry_optimizer = TradeOptimizer()
         self.scalping_engine = ScalpingEngine() # NEW: Scalping Targets
-        self.deepseek_enabled = not self.is_backtest_mode  # Backtests are deterministic and Ollama-free.
+        self.deepseek_enabled = False  # Retired compatibility attribute; live non-pure mode is fail-closed.
         # The HUD is a local display channel, not a command interface.
         self.hud_enabled = not self.is_backtest_mode
         self.hud_url = "http://127.0.0.1:7788/api/telemetry"
@@ -5180,7 +5029,7 @@ class JarvisElite:
                         logger.warning("[GPU] %s unavailable; CPU/fallback path: %s", name, self.native_engine_status[name]['error'])
                         return None
                 self.engines['institutional'] = _native('institutional', lambda: InstitutionalTradingEngineGPU(self))
-                self.engines['neural'] = _native('neural', lambda: NeuralNetworkManager(self))
+                # Neural model engine retired: no unvalidated inference on the trade path.
                 self.engines['fusion'] = _native('fusion', lambda: GPUEnhancedFusionEngine(self.parts))
                 self.engines['confidence'] = _native('confidence', lambda: GPUUnifiedConfidenceEngine())
                 self.engines['pattern'] = _native('pattern', lambda: EnhancedGPUPatternRecognitionEngine())
@@ -5509,8 +5358,8 @@ class JarvisElite:
                 'regime': 'NEUTRAL'
             })
             self.market_context.setdefault('institutional_fused', [])
-            self.market_context.setdefault('neural_prediction', None)
-            self.market_context.setdefault('neural_mtf', {})
+            self.market_context['neural_prediction'] = None
+            self.market_context['neural_mtf'] = {}
             self.market_context.setdefault('pattern_mtf', {})
             self.market_context.setdefault('fusion_mtf', {})
             self.market_context.setdefault('mtf_datasets', {})
@@ -5557,7 +5406,7 @@ class JarvisElite:
                             self.market_context['institutional_fused'] = inst_res.get('signals', [])
                     
                     # 2. Neural Analysis (analyze multiple timeframes) - WITH SAFE ERROR HANDLING
-                    neural_engine = self.engines.get('neural')
+                    neural_engine = None  # do not run legacy sklearn/torch predictions
                     if neural_engine:
                         neural_mtf = {}
                         for tf_name, tf_df in engine_tf_data.items():
@@ -5944,35 +5793,10 @@ class JarvisElite:
             # Judge is now ENABLED and validates high-confidence signals (score >= 10)
             # System uses: Mathematical Analyst + Quantum V5 + DeepSeek Judge
             neural_res = None
-            if (not self.is_backtest_mode and not _pure_algorithm_mode()
-                    and TRADE_CONFIG.get('use_neural_fusion', True)):
-                # Always run AI (Full Power in both Live and Backtest)
-                if math_signal != 0 and math_confidence >= 20: # Run AI even on weak signals to let it filter them out
-                    neural_res = self._neural_global_synthesis(full_telemetry, part_results, mtf_context, options_walls, math_signal, math_confidence, data)
-                else:
-                    neural_res = None
-                
-            if neural_res:
-                logic_signal = 1 if neural_res.get('bias') == 'CALL' else (-1 if neural_res.get('bias') == 'PUT' else 0)
-                confidence = neural_res.get('confidence', 0)
-                ai_thought = neural_res.get('reasoning', '')
-                
-                # SAFETY SHIELD: Hallucination Guard (relaxed threshold)
-                if math_confidence < 10 and confidence > 80:
-                    logger.warning(f"🛡️ SAFETY SHIELD: AI Overconfidence ({confidence}%) vs Weak Math ({math_confidence}%). Vetoed.")
-                    # Force downgrade to match Math's caution
-                    confidence = math_confidence 
-                    logic_signal = 0 # Safety Veto
-                    ai_thought = "Judge Vetoed by Safety Shield (Math score too low)"
-            else:
-                # Fallback to Analyst if Judge is silent/slow
-                logic_signal = math_signal
-                confidence = math_confidence
-                if getattr(self, 'is_backtest_mode', False):
-                    ai_thought = "Using Mathematical Analyst (AI Judge bypassed in backtest to save API limits)"
-                else:
-                    ai_thought = "Using Mathematical Analyst (Judge unavailable)"
-            
+            logic_signal = math_signal
+            confidence = math_confidence
+            ai_thought = "Deterministic mathematical fusion (model judge retired)"
+
             # Map thoughts for final synthesis
             thoughts = [res['thought'] for k, res in part_results.items() 
                         if res['signal'] != 0 and k not in ['part11_fusion', 'part12_confidence']]
@@ -6073,7 +5897,7 @@ class JarvisElite:
                     logger.info(f"🔍 PATTERN ENGINE: {pattern_tf_count} timeframes with patterns (+{pattern_boost}%)")
             
             # 3E. Supplementary Intelligence (ExtraBrains, SmartBreakout, AdvancedAnalysis)
-            supplementary = getattr(self, 'supplementary_intelligence', {})
+            supplementary = {}  # externally supplied model/brain votes cannot change core score
             if supplementary:
                 # ExtraBrains: Trend/Volatility/Risk modifiers
                 extra_brains_data = supplementary.get('ExtraBrains', {})
@@ -6158,17 +5982,17 @@ class JarvisElite:
             if not self.trade_manager.can_trade():
                 return self._get_no_trade_signal("Trading not allowed")
                 
-            # --- MASTER AI SYNTHESIS --- ENABLED: DeepSeek AI Judge for signal validation
-            if score >= 10 and self.deepseek_enabled and not neural_res and not _pure_algorithm_mode():
-                ai_validation = self._get_deepseek_validation(data, score, detailed_scores, full_telemetry)
-                if not ai_validation.get('approved', False):
-                    logger.warning(f"🧠 MASTER AI REJECTION: {ai_validation.get('reason', 'Unknown')}")
-                    return self._get_no_trade_signal(f"AI rejection: {ai_validation.get('reason', 'Unknown')}")
-                else:
-                    detailed_scores['ai_synthesis'] = ai_validation.get('reason', 'No reasoning provided')
-                    logger.info(f"🧠 MASTER AI APPROVED: {ai_validation.get('reason')[:100]}...")
+            # The legacy non-pure live workflow required a DeepSeek approval
+            # for scores >=10 and used model fusion elsewhere. There is no proven
+            # deterministic equivalent for either path. Fail closed for this
+            # unsupported configuration, including lower scores, rather than
+            # treating model unavailability as approval. The pre-existing pure-
+            # algorithm and backtest workflows remain deterministic. Laya
+            # commentary cannot satisfy this gate.
+            if not self.is_backtest_mode and not _pure_algorithm_mode():
+                return self._get_no_trade_signal(
+                    "Legacy model-required entry unsupported; use reviewed pure-algorithm policy")
 
-            
             # Generate final signal
             final_decision = self._generate_trade_signal(data, score, detailed_scores, options_intel, logic_signal)
 
@@ -6328,19 +6152,7 @@ class JarvisElite:
                     self._sync_to_hud(final_decision)
                 return final_decision
                 
-            elif ai_signal in ['CALL', 'PUT', 'BUY', 'SELL']:
-                # Override Low Score if AI is Convincingly Directional
-                logger.info(f"🧠 JARVIS UNLEASHED: Overriding Score {score} (<{self.scoring_matrix.minimum_trade_score}) because Advisor says {ai_signal}")
-                
-                # Boost confidence slightly to represent "Autonomy"
-                if score < 75:
-                   final_decision['trade_signal']['confidence_score'] = f"{score}/100 (Autonomy)"
-                
-                if self.hud_enabled:
-                    self._sync_to_hud(final_decision)
-                return final_decision
-                
-            else:
+            else:  # Never override a deterministic minimum score with an advisor's direction.
                 if part7_gate.get('entry_blocked'):
                     return final_decision
                 return self._get_no_trade_signal(f"Score too low: {score}/100")
@@ -6564,36 +6376,11 @@ Follow the tag with a 1-sentence CEO executive directive.
 
 
     def _get_deepseek_validation(self, data, score, detailed_scores, telemetry=None):
-        """Get AI validation for trade setup using local Supreme Commander AI (CEO) via Ollama"""
-        try:
-            prompt = self._generate_ollama_ceo_prompt(score, detailed_scores, telemetry, data=data)
-            usable, snapshot_reason = snapshot_usable(getattr(self, 'last_ollama_snapshot', None))
-            if not usable:
-                self.last_ollama_decision = {'decision': 'WAIT', 'confidence': 0,
-                                              'rationale': snapshot_reason}
-                return {'approved': False, 'reason': snapshot_reason, 'verdict': 'WAIT'}
-            response, err = call_ollama(prompt, timeout=120)
-            if response and not err:
-                raw_text = response.strip()
-                parsed, parse_err = validate_decision(raw_text)
-                if parsed is not None:
-                    self.last_ollama_decision = parsed
-                    approved = parsed['decision'] in {'BUY', 'SELL'} and parsed['confidence'] >= 50
-                    return {'approved': approved, 'reason': parsed['rationale'],
-                            'verdict': parsed['decision'], 'suggestion': parsed}
-                # Legacy tag output remains advisory but cannot bypass validation.
-                upper = raw_text.upper()
-                verdict = 'EXECUTE' if '[CEO_VERDICT: EXECUTE]' in upper else ('ABORT' if '[CEO_VERDICT: ABORT]' in upper else 'STANDBY')
-                self.last_ollama_decision = {'decision': 'WAIT', 'confidence': 0, 'rationale': parse_err or 'invalid Ollama response'}
-                return {'approved': False, 'reason': 'Invalid Ollama response; fail closed', 'verdict': verdict}
-            self.last_ollama_decision = {'decision': 'WAIT', 'confidence': 0, 'rationale': err or 'Ollama unavailable'}
-            logger.warning("[OLLAMA] AI-required validation unavailable; entry vetoed: %s", err)
-            return {'approved': False, 'reason': 'Ollama unavailable; AI-required workflow fails closed', 'verdict': 'WAIT'}
-        except Exception as e:
-            logger.error(f"Supreme Commander AI validation error: {type(e).__name__}")
-            self.last_ollama_decision = {'decision': 'WAIT', 'confidence': 0, 'rationale': 'validation error'}
-            return {'approved': False, 'reason': 'AI validation error; fail closed', 'verdict': 'WAIT'}
-            
+        """Retired compatibility hook; model output is never an entry gate."""
+        result = {'approved': False, 'reason': 'Retired legacy model gate unavailable; unsupported callers must reject', 'verdict': 'NO_TRADE'}
+        self.last_ollama_decision = {'decision': 'UNAVAILABLE', 'confidence': 0, 'rationale': result['reason']}
+        return result
+
     def _create_deepseek_prompt(self, data, score, detailed_scores, telemetry=None):
         """Create prompt for DeepSeek ASI synthesis with Universal MTF and Sensory Telemetry"""
         current_candle = data.iloc[-1]
@@ -7407,7 +7194,7 @@ class Jarvis4EngineSystem:
         
         logger.info(f"🎯 TRADE TRADING: ACTIVE")
         logger.info(f"⏱️  TRADE OPTIMIZATION: Scalp & Swing")
-        logger.info(f"🤖 DEEPSEEK AI JUDGE: ENABLED (validates signals with score >= 10)")  # Judge now active
+        logger.info('Model judge retired; deterministic scoring and entry gates authoritative')  # Judge now active
         logger.info("=" * 60)
 
 # ==================== MAIN EXECUTION ====================

@@ -162,13 +162,12 @@ from typing import Any, Dict, List, Optional, Union, Tuple
 from contextlib import nullcontext  # FIX BUG #7: needed for CPU-safe cuda.device() context
 
 # Import Ollama Local AI Integration
-try:
-    from ollama_integration import call_ollama
-    OLLAMA_INTEGRATION_AVAILABLE = True
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
-        return None, "ollama_integration module not found"
+# Retired model interface. Trade logic must not import or probe Ollama.
+OLLAMA_INTEGRATION_AVAILABLE = False
+
+def call_ollama(*args, **kwargs):
+    return None, "Ollama retired; Laya commentary is isolated"
+
 
 
 # ==================== ENHANCED GPU PATTERN MEMORY MANAGER ====================
@@ -1145,36 +1144,8 @@ Follow the tag with a 1-2 sentence institutional technical analysis validation.
         return prompt
 
     def validate_patterns_with_ollama(self, market_context: Dict, detected_patterns: Dict) -> Tuple[str, str]:
-        """Run Ollama validation on detected patterns with cooldown"""
-        now = time.time()
-        if not OLLAMA_INTEGRATION_AVAILABLE or not detected_patterns:
-            return self.last_ollama_validation, self.last_ollama_insight
-
-        if now - self.last_ollama_time < self.ollama_cooldown:
-            return self.last_ollama_validation, self.last_ollama_insight
-
-        self.last_ollama_time = now
-        try:
-            prompt = self._generate_ollama_pattern_prompt(market_context, detected_patterns)
-            response, err = call_ollama(prompt, timeout=10)
-            if response and not err:
-                raw_text = response.strip()
-                if "[CONFIRM_PATTERN]" in raw_text.upper() or "[CONFIRM]" in raw_text.upper():
-                    vote = "CONFIRM_PATTERN"
-                elif "[REJECT_PATTERN]" in raw_text.upper() or "[REJECT]" in raw_text.upper():
-                    vote = "REJECT_PATTERN"
-                else:
-                    vote = "WAIT"
-
-                self.last_ollama_validation = vote
-                self.last_ollama_insight = raw_text
-                print(f"[PART 8 OLLAMA PATTERN VALIDATION] Vote: [{vote}] | {raw_text}")
-            else:
-                print(f"[PART 8 OLLAMA PATTERN VALIDATION] Ollama call skipped or unavailable: {err}")
-        except Exception as e:
-            print(f"❌ Ollama pattern validation error: {e}")
-
-        return self.last_ollama_validation, self.last_ollama_insight
+        """Legacy compatibility: model pattern verdicts cannot change a signal."""
+        return "UNAVAILABLE", "Pattern advisory unavailable; deterministic patterns unchanged"
     
     def _calculate_enhanced_confidence(self, base_score: float, volume_confidence: float, 
                                      pattern_type: str, pattern_name: str) -> float:
@@ -1474,11 +1445,7 @@ Follow the tag with a 1-2 sentence institutional technical analysis validation.
                 s_copy = dict(s)
                 s_copy['ollama_pattern_validation'] = vote
                 s_copy['ollama_insight'] = insight
-                if vote == "REJECT_PATTERN":
-                    s_copy['confidence'] = max(0.0, float(s_copy.get('confidence', 5.0)) * 0.5)
-                    s_copy['reason'] = f"{s_copy.get('reason', '')} (Ollama Warning: Pattern Rejected)"
-                elif vote == "CONFIRM_PATTERN":
-                    s_copy['confidence'] = min(10.0, float(s_copy.get('confidence', 5.0)) * 1.15)
+                # Model commentary cannot boost or penalize mathematical confidence.
                 annotated_signals.append(s_copy)
 
             return annotated_signals

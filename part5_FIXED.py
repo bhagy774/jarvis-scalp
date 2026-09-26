@@ -26,13 +26,12 @@ if hasattr(sys.stdout, 'reconfigure'):
         pass
 
 # Import Ollama Local AI Integration
-try:
-    from ollama_integration import call_ollama
-    OLLAMA_INTEGRATION_AVAILABLE = True
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
-        return None, "ollama_integration module not found"
+# Retired model interface. Trade logic must not import or probe Ollama.
+OLLAMA_INTEGRATION_AVAILABLE = False
+
+def call_ollama(*args, **kwargs):
+    return None, "Ollama retired; Laya commentary is isolated"
+
 
 # ---- PyTorch with complete NumPy Fallback for Windows/WSL compatibility ----
 try:
@@ -516,42 +515,8 @@ class GPUEnhancedFusionEngine:
             return self._create_gpu_signal("NO TRADE", 0, error_msg)
 
     def _call_ollama_fusion_sanity_check(self, module_results, fused_signal, confidence):
-        """Call Ollama Local AI (phi3.5:3.8b) for Fusion Sanity Check"""
-        import os
-        if os.environ.get("JARVIS_PURE_ALGO", "True") == "True":
-            return "APPROVED_BY_PURE_ALGO", 9.9
-            
-        if not OLLAMA_INTEGRATION_AVAILABLE:
-            return None, None
-            
-        try:
-            summary = []
-            for k, v in module_results.items():
-                if isinstance(v, dict):
-                    summary.append(f"{k}: signal={v.get('signal', v.get('direction', 'HOLD'))}, conf={v.get('confidence', 5.0)}")
-            
-            prompt = f"""You are the Chief AI Risk Officer analyzing a trading signal fusion package.
-Input Module Signals:
-{chr(10).join(summary) if summary else 'No individual module signals available'}
-
-Current Fused Signal: {fused_signal} (Confidence: {confidence:.2f})
-
-Respond in 1 short sentence validating or questioning this fused signal. State [BUY], [SELL], or [NO-TRADE] at the beginning."""
-            
-            resp, err = call_ollama(prompt, model=__import__('os').environ.get('OLLAMA_MODEL', 'deepseek-r1:14b'), timeout=10)
-            if resp:
-                clean_resp = resp.strip()
-                print(f"\n[PART 5 OLLAMA FUSION THOUGHTS] 🧠\n{clean_resp}\n")
-                
-                sig = "NO TRADE"
-                if "[BUY]" in clean_resp.upper() or "BUY" in clean_resp.upper():
-                    sig = "CALL"
-                elif "[SELL]" in clean_resp.upper() or "SELL" in clean_resp.upper():
-                    sig = "PUT"
-                return clean_resp, sig
-            return None, None
-        except Exception:
-            return None, None
+        """Compatibility hook: unavailable is not an approval or vote."""
+        return None, None
 
     def fuse_modules_mtf(self, mtf_data):
         """Multi-Timeframe GPU Fusion"""

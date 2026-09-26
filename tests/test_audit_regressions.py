@@ -184,29 +184,17 @@ class AuditRegressionTests(unittest.TestCase):
         self.assertEqual(venue.calls, [])  # paper close never reaches venue
         clear_registry()
 
-    def test_ollama_structured_output_is_schema_validated(self):
+    def test_retired_ollama_never_calls_model_and_schema_validator_rejects_invalid(self):
         import ollama_integration as oi
-
-        class Response:
-            status_code = 200
-            def __init__(self, text):
-                self.text = text
-            def json(self):
-                return {"response": self.text}
-
-        schema = {
-            "type": "object", "required": ["direction"],
-            "properties": {"direction": {"type": "string", "enum": ["BUY", "SELL"]}},
-        }
-        with patch.object(oi, "OLLAMA_ENABLED", True), patch.object(oi, "_select_model", return_value="local-test"):
-            with patch.object(oi.requests, "post", return_value=Response('{"direction":"BUY"}')):
-                text, err = oi.call_gemini_structured("prompt", schema)
-                self.assertIsNone(err)
-                self.assertEqual(json.loads(text)["direction"], "BUY")
-            with patch.object(oi.requests, "post", return_value=Response('{"direction":"MAYBE"}')):
-                text, err = oi.call_gemini_structured("prompt", schema)
-                self.assertIsNone(text)
-                self.assertIn("invalid structured", err)
+        schema = {"type": "object", "required": ["direction"],
+                  "properties": {"direction": {"type": "string", "enum": ["BUY", "SELL"]}}}
+        with patch('requests.post', side_effect=AssertionError('retired model request')):
+            text, err = oi.call_gemini_structured('prompt', schema)
+            self.assertIsNone(text)
+            self.assertIn('retired', err.lower())
+        self.assertEqual(oi._validate_structured_response('{"direction":"BUY"}', schema),
+                         {"direction":"BUY"})
+        self.assertIsNone(oi._validate_structured_response('{"direction":"MAYBE"}', schema))
 
     def test_ambiguous_close_is_not_retried_or_reversed(self):
         from jarvis_live_trader import JarvisAutoTrader
