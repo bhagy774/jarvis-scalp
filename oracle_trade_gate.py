@@ -44,11 +44,24 @@ class OracleTradeGate:
             return None
 
     def get_forecast(self) -> Dict[str, Any]:
-        """Fetch latest Oracle forecast."""
+        """Only a fresh, locally computed observed-data map may reach execution."""
+        from datetime import datetime, timezone
         oracle = self._get_oracle()
-        if oracle and hasattr(oracle, "get_latest_forecast"):
-            return oracle.get_latest_forecast()
-        return {}
+        if not oracle or not hasattr(oracle, "get_latest_forecast"):
+            return {}
+        forecast = oracle.get_latest_forecast()
+        if not isinstance(forecast, dict) or forecast.get("model_used") != "local_synthesizer":
+            return {}
+        try:
+            timestamp = datetime.fromisoformat(forecast["generated_at"].replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+            if not 0 <= age <= 600:
+                return {}
+        except (ValueError, KeyError, TypeError):
+            return {}
+        return forecast
 
     # ──────────────────────────────────────────────────────────
     #  GATE CHECK: DIRECTION ALIGNMENT
@@ -71,17 +84,15 @@ class OracleTradeGate:
         forecast = self.get_forecast()
         if not isinstance(direction, str) or direction.upper() not in ("CALL", "BUY", "LONG", "PUT", "SELL", "SHORT"):
             return False, "Invalid trade direction"
-        if not isinstance(forecast, dict) or not forecast or forecast.get("model_used") == "startup_default":
-            if self.hard_gate:
-                return False, "Oracle forecast unavailable or initializing"
-            return True, "Oracle unavailable; hard gate is off"
+        if not forecast:
+            return False, "Fresh deterministic Oracle forecast unavailable"
 
         is_call = direction.upper() in ("CALL", "BUY", "LONG")
         tf5 = forecast.get("5min")
         tf30 = forecast.get("30min")
         suggestion = forecast.get("trade_suggestion", "WAIT")
         if not isinstance(tf5, dict) or not isinstance(tf30, dict) or not isinstance(suggestion, str):
-            return (False, "Oracle forecast is incomplete") if self.hard_gate else (True, "Oracle forecast incomplete; hard gate is off")
+            return False, "Oracle forecast is incomplete"
         dir_5m = str(tf5.get("direction", "")).upper()
         dir_30m = str(tf30.get("direction", "")).upper()
         sugg = suggestion.upper()
@@ -129,8 +140,8 @@ class OracleTradeGate:
             return False, "Invalid price"
 
         forecast = self.get_forecast()
-        if not isinstance(forecast, dict) or not forecast or forecast.get("model_used") == "startup_default":
-            return (False, "Oracle forecast unavailable or initializing") if self.hard_gate else (True, "Oracle unavailable; hard gate is off")
+        if not forecast:
+            return False, "Fresh deterministic Oracle forecast unavailable"
 
         ez = forecast.get("entry_zone")
         if not isinstance(ez, dict):
@@ -164,11 +175,11 @@ class OracleTradeGate:
     #  DYNAMIC TAKE-PROFIT & STOP-LOSS
     # ──────────────────────────────────────────────────────────
 
-    def get_oracle_tp_sl(self, current_price: float, direction: str) -> Dict[str, Any]:
-        """
-        Provides Oracle's suggested exit target and stop loss.
-        Validates logical geometry before allowing use.
-        """
+    def get_oracle_tp_sl(self, current_price: float, direction: str, symbol: str = "BTCUSDT") -> Dict[str, Any]:
+        """Only same-asset, fresh deterministic Oracle exits can replace TP/SL."""
+        requested = str(symbol or "").upper().replace("-", "").replace("_", "")
+        if requested not in ("BTCUSDT", "BTCUSD"):
+            return {"use_oracle": False, "reason": "BTC Oracle exits unavailable for selected asset"}
         forecast = self.get_forecast()
         if not isinstance(direction, str) or direction.upper() not in ("CALL", "BUY", "LONG", "PUT", "SELL", "SHORT"):
             return {"use_oracle": False, "reason": "Invalid direction"}
