@@ -95,11 +95,15 @@ except ImportError as e:
     print(f"[AI-CHAIN] ⚠️  AI Chain not available: {e}")
     AIChainSequentialBrain = None
 
-# Global AI Chain instance
+# Legacy model chain must not start even if an external module is installed.
+AI_CHAIN_AVAILABLE = False
 ai_chain_instance = None
 
 def run_all_parts(ai_brain=None, predictor=None):
     """Run all 13 parts in a coordinated manner after an explicit paper opt-in."""
+    # Caller-supplied model votes/predictions cannot enter the trading graph.
+    ai_brain = None
+    predictor = None
     if os.environ.get("JARVIS_START_PAPER") != "1" or any(
         os.environ.get(flag, "").lower() == "true"
         for flag in ("JARVIS_AUTO_TRADE", "JARVIS_LIVE_EXECUTION", "DELTA_ORDER_EXECUTION_ENABLED")
@@ -650,6 +654,7 @@ def run_all_parts(ai_brain=None, predictor=None):
         # ============================================================
         _ai_active = False
         try:
+            raise ImportError("Legacy predictive strategy/size pipeline retired")
             from regime_detector import MarketRegimeDetector
             from feature_engineering import FeatureEngineer
             from probability_engine import ProbabilityEngine
@@ -690,7 +695,7 @@ def run_all_parts(ai_brain=None, predictor=None):
             ai_brain = None
             try:
                 import jarvis_FIXED
-                jarvis_FIXED._call_ollama_local = lambda prompt, model="phi3.5:3.8b", timeout=30: ("AI Disabled for Backtest", None)
+                jarvis_FIXED._call_ollama_local = lambda *args, **kwargs: (None, "Model unavailable in backtest")
             except Exception:
                 pass
             
@@ -850,7 +855,8 @@ def run_all_parts(ai_brain=None, predictor=None):
                 matrix_data["d12_adv_ai"] = make_detail("d12_adv_ai", "Adv AI", True, {"votes": "3-1 Bullish"})
 
                 # Part 13: Consensus
-                signal_score = getattr(system_ref, 'latest_confidence_score', 0) * 100
+                signal_score = 0  # never reuse a prior cycle's decision on analysis failure
+                core_decision = {}
                 matrix_data["d13_master"] = make_detail("d13_master", "Master", signal_score > 60, {"score": int(signal_score)})
                 
                 # Part 14: Guardian (New)
@@ -943,14 +949,12 @@ def run_all_parts(ai_brain=None, predictor=None):
                                         df_analysis[col] = pd.to_numeric(df_analysis[col], errors='coerce')
                                 print(f"📡 [LIVE DATA] Fetched {len(df_analysis)} real candles from Delta Exchange")
                             else:
-                                # Fallback dummy df with DatetimeIndex
-                                idx = pd.date_range(end=pd.Timestamp.now(), periods=500, freq='1min')
-                                df_analysis = pd.DataFrame({'close': [live_price]*500, 'volume': [1000]*500, 'high': [live_price]*500, 'low': [live_price]*500, 'open': [live_price]*500}, index=idx)
-                                print("⚠️ [DATA] Delta returned no candles, using price-based fallback")
+                                # Missing observations cannot be fabricated into a trade setup.
+                                df_analysis = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+                                print("⚠️ [DATA] No observed candles; entry unavailable")
                     except Exception as e:
                         print(f"[WARNING] Data fetch for analysis failed: {e}")
-                        idx = pd.date_range(end=pd.Timestamp.now(), periods=500, freq='1min')
-                        df_analysis = pd.DataFrame({'close': [live_price]*500, 'volume': [1000]*500, 'high': [live_price]*500, 'low': [live_price]*500, 'open': [live_price]*500}, index=idx)
+                        df_analysis = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
 
                     # ============================================================
                     # STEP 2: ANALYZE WITH EXTRA BRAINS (Using REAL Delta OHLCV)
@@ -1075,15 +1079,22 @@ def run_all_parts(ai_brain=None, predictor=None):
                     # STEP 6: JARVIS CORE ANALYSIS (analyze_trade_setup with REAL data)
                     # ============================================================
                     # Inject supplementary intelligence from sleeping brains
-                    jarvis_main.jarvis.supplementary_intelligence = parts_data
+                    jarvis_main.jarvis.supplementary_intelligence = {}  # no external model votes
                     
                     # Run the REAL analysis
                     ai_result_full = jarvis_main.jarvis.analyze_trade_setup(df_analysis)
                     
                     # Extract Master Decision
-                    master_bias = ai_result_full.get('neural_synthesis', {}).get('bias', 'NO-TRADE')
-                    master_conf = ai_result_full.get('neural_synthesis', {}).get('confidence', 0)
-                    master_reason = ai_result_full.get('neural_synthesis', {}).get('reasoning', 'Processing...')
+                    core_decision = ai_result_full.get('trade_signal', {})
+                    master_bias = core_decision.get('direction', 'NO_TRADE')
+                    raw_conf = core_decision.get('confidence_score', '0/100')
+                    try:
+                        master_conf = float(str(raw_conf).split('/')[0])
+                    except (TypeError, ValueError):
+                        master_conf = 0.0
+                    if master_bias not in ('BUY', 'SELL', 'CALL', 'PUT'):
+                        master_conf = 0.0
+                    master_reason = ai_result_full.get('no_trade_reason', 'Core deterministic decision')
                     
                     ai_result = {
                         "master_decision": {
@@ -1097,12 +1108,10 @@ def run_all_parts(ai_brain=None, predictor=None):
                     }
                     
                     # Update signal score from the REAL analysis
-                    signal_score = master_conf if master_bias != 'NO-TRADE' else 0
+                    signal_score = master_conf if master_bias in ('BUY', 'SELL', 'CALL', 'PUT') else 0
                     
                     # Generate prediction - FIX: predict() accepts 1 arg only
-                    prediction = prediction_engine.predict(
-                        ai_result.get("ai_opinions", {})
-                    )
+                    prediction = None  # no model predictor on the coordinator path
                     
                     # Store for HUD
                     ai_consensus = {
@@ -1124,29 +1133,31 @@ def run_all_parts(ai_brain=None, predictor=None):
                 
                 # === NEW: MERGE SIGNALS INTO ONE ===
                 # Get Jarvis mathematical signal
-                jarvis_signal = {
-                    "score": int(signal_score),
-                    "direction": "BUY" if signal_score > 50 else "SELL",
-                    "entry_price": int(live_price) if live_price else 87000,
-                    "take_profit_1": int(live_price * 1.02) if live_price else 88740,
-                    "stop_loss": int(live_price * 0.98) if live_price else 85260
-                }
-                
-                # Merge with AI analysis
-                if ai_consensus and ai_consensus.get("master_decision"):
-                    # Get P15 Delta options chain data
-                    p15_options_data = parts_data.get("P15_DeltaOptions", {})
-                    
-                    unified_signal = merge_signals(
-                        jarvis_signal=jarvis_signal,
-                        ai_decision=ai_consensus.get("master_decision", {}),
-                        ai_prediction=ai_consensus.get("prediction", {}),
-                        options_chain_data=p15_options_data  # NEW: Pass options chain
-                    )
+                # Authoritative core result only. A missing result/price/exit is NO_TRADE;
+                # never manufacture a SELL, price, TP or stop from display telemetry.
+                core_direction = core_decision.get('direction', 'NO_TRADE')
+                if core_direction in ('CALL', 'BUY'):
+                    core_direction = 'BUY'
+                elif core_direction in ('PUT', 'SELL'):
+                    core_direction = 'SELL'
                 else:
-                    # Fallback: Use Jarvis signal only
-                    unified_signal = jarvis_signal
-                    unified_signal["confidence"] = int(signal_score)
+                    core_direction = 'NO_TRADE'
+                core_entry = core_decision.get('entry_price')
+                core_tp = core_decision.get('take_profit_1')
+                core_sl = core_decision.get('stop_loss')
+                if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                           and 0 < value < float('inf')
+                           for value in (live_price, core_entry, core_tp, core_sl)):
+                    core_direction = 'NO_TRADE'
+                jarvis_signal = {
+                    "score": int(signal_score) if core_direction != 'NO_TRADE' else 0,
+                    "confidence": int(signal_score) if core_direction != 'NO_TRADE' else 0,
+                    "direction": core_direction,
+                    "entry_price": core_entry,
+                    "take_profit_1": core_tp,
+                    "stop_loss": core_sl,
+                }
+                unified_signal = jarvis_signal  # no model merge or prediction boosts
 
                 # ============================================================
                 # EVOLUTION PIPELINE: Weights → Normalize → Filter → Risk
@@ -1334,7 +1345,9 @@ def run_all_parts(ai_brain=None, predictor=None):
                                 _evo_block_reason = "AI_PORTFOLIO_LIMIT"
                         
                         # EXECUTE TRADES
-                        if sig_score >= MIN_CONFIDENCE and _evo_trade_allowed:
+                        if (sig_score >= MIN_CONFIDENCE and _evo_trade_allowed
+                                and unified_signal.get('direction') in ('BUY', 'SELL')
+                                and core_direction in ('BUY', 'SELL')):
                             _regime_tag = f"[{unified_signal.get('regime', '?').upper()}]" if _ai_active else ""
                             _prob_tag = f"P={unified_signal.get('trade_probability', 0):.2f}" if _ai_active else ""
                             mode_tag = "[NORMAL]" if not AGGRESSIVE_MODE else "[AGGRESSIVE]"
@@ -1556,6 +1569,7 @@ def start_hud_backend():
     print("=" * 60)
 
     try:
+        raise ImportError("Legacy distributed model retired")
         from distributed_ai_engine import DistributedAISystem
         ai_brain = DistributedAISystem()
         print("[INFO] Distributed AI System initialized (Standalone Mode)")
@@ -1610,60 +1624,8 @@ def start_hud_backend():
         return None, ai_brain
 
 def ensure_ollama_running():
-    """Check if Ollama is running, if not start it"""
-    import requests
-    print("="*60)
-    print("🧠 CHECKING LOCAL BRAIN (OLLAMA)")
-    print("="*60)
-    
-    url = "http://localhost:11434/api/tags"
-    try:
-        # 1. Connection Check
-        resp = requests.get(url, timeout=2)
-        if resp.status_code == 200:
-            print("[OK] Ollama Service is Active")
-            
-            # 2. Model Check
-            models = [m['name'] for m in resp.json().get('models', [])]
-            if any(m_name in m for m in models for m_name in ['phi3.5', 'deepseek-r1', 'llama3']):
-                print(f"[OK] AI Model found. Brain is ready.")
-                return True
-            else:
-                print(f"[WARNING] Ollama is running but no AI model found.")
-                print("👉 Please run: wsl ollama pull phi3.5:3.8b")
-                return True # Service is up at least
-                
-    except Exception:
-        print("[INFO] Ollama not responding. Attempting to start...")
-        
-    # 3. Auto-Start
-    try:
-        # FIX #11: Cross-platform Ollama start
-        if sys.platform == 'win32':
-            subprocess.Popen(["ollama", "serve"], 
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           creationflags=subprocess.CREATE_NO_WINDOW)
-        else:
-            subprocess.Popen("nohup ollama serve > /dev/null 2>&1 &", shell=True)
-        print("[INFO] Sent start command to Ollama...")
-        
-        # Wait for startup
-        for i in range(10):
-            time.sleep(1)
-            try:
-                if requests.get(url, timeout=1).status_code == 200:
-                    print("[SUCCESS] Ollama started successfully!")
-                    return True
-            except:
-                print(f"   Waiting for brain... {i+1}/10")
-                pass
-                
-        print("[WARNING] Could not auto-start Ollama. Chat might be offline.")
-        print("👉 Try running 'wsl ollama serve' manually in another terminal.")
-        return False
-    except Exception as e:
-        print(f"[ERROR] Failed to launch Ollama: {e}")
-        return False
+    """Retired compatibility hook: never launch, probe, or pull Ollama."""
+    return False
 
 def main():
     """Main function to run all parts."""
@@ -1686,8 +1648,7 @@ def main():
         hud_proc, ai_brain = start_hud_backend()
 
         # Get predictor (defined in start_hud_backend)
-        from prediction_engine import PredictionEngine
-        predictor = PredictionEngine()
+        predictor = None  # retired independent model/prediction engine
 
         result = run_all_parts(ai_brain, predictor)
         # FIX: run_all_parts may return None,None on failure - handle safely
@@ -1723,10 +1684,8 @@ def check_requirements():
     """Verify that all system requirements are met"""
     print("Checking system requirements...")
     
-    # 1. Local AI Check (Ollama)
-    print("Checking Local Brain (Ollama)...")
-    # Ollama is handled by ensure_ollama_running if needed
-    print("[OK] Local AI Mode: Active")
+    # 1. Model status: no probe, launch, download, or implied availability.
+    print("[SKIP] Ollama retired; Laya optional advisory availability unverified")
 
     # 2. Internet Connection
     try:

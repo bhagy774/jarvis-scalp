@@ -2,7 +2,12 @@ import unittest
 from jarvis_laya_advisor import advise
 
 class LayaAdvisorTests(unittest.TestCase):
-    def setUp(self): self.snapshot = {"symbol": "BTCUSDT", "last": 1}
+    def setUp(self):
+        self.snapshot = {"symbol": "BTCUSDT", "last": 1}
+        from unittest.mock import patch
+        self.enabled = patch.dict('os.environ', {'JARVIS_LAYA_ADVISORY': 'true'})
+        self.enabled.start()
+        self.addCleanup(self.enabled.stop)
     def test_valid_advice_does_not_change_deterministic_decision(self):
         got = advise(self.snapshot, symbol="BTCUSDT", deterministic_decision="SELL",
                      predictor=lambda _: {"suggestion":"BUY", "confidence":.8})
