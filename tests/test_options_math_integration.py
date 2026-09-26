@@ -50,7 +50,8 @@ class OptionsMathIntegration(unittest.TestCase):
         self.assertAlmostEqual(t["resistance_distance_pct"],10.0)
         self.assertAlmostEqual(t["max_pain_distance_pct"],2.0)
         self.assertEqual(t["math_model"],"observed_chain_descriptive_v1")
-        self.assertEqual(t["ollama_whale_tag"],"WHALE_UNAVAILABLE")
+        self.assertEqual(t["advisory_status"],"MODEL_ADVISORY_DISABLED")
+        self.assertNotIn("ollama_whale_tag", t)
         self.assertEqual(self.calls,[])
     def test_invalid_price_fails_closed(self):
         out=self._run(float('nan'))

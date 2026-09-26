@@ -1,7 +1,7 @@
 # jarvis_neural_cortex.py
 # Jarvis Neural Cortex - Continuous AI Brain with Memory
 # Replaces: ai_chain_brain.py + _get_deepseek_validation()
-# Uses: Ollama /api/chat - rolling 20-message history for live market memory
+# Model path retired; deterministic mathematical fallback only.
 
 import os, re, json, logging, requests
 from datetime import datetime
@@ -80,29 +80,14 @@ class JarvisNeuralCortex:
     # PUBLIC API
     # -------------------------------------------------------------------------
 
-    def analyze(self,
-                part_results: Dict,
-                current_price: float,
+    def analyze(self, part_results: Dict, current_price: float,
                 market_context: Optional[Dict] = None,
                 quantum_data: Optional[Dict] = None,
                 mtf_context: Optional[Dict] = None) -> Dict:
-        self._call_count += 1
-        try:
-            report = self._build_market_report(part_results, current_price, market_context, quantum_data, mtf_context)
-            self.chat_history.append({"role": "user", "content": report})
-            raw_response = self._call_ollama_chat()
-            self.chat_history.append({"role": "assistant", "content": raw_response or "{}"})
-            max_messages = self.max_history_pairs * 2
-            if len(self.chat_history) > max_messages:
-                self.chat_history = self.chat_history[-max_messages:]
-            result = self._parse_decision(raw_response, part_results)
-            self._last_result = result
-            logger.info(f"[CORTEX] Decision: {result['signal']} | Conf: {result['confidence']}% | {result['rationale'][:60]}")
-            return result
-        except Exception as e:
-            self._error_count += 1
-            logger.error(f"[CORTEX] analyze() error: {e}")
-            return self._fallback_from_math(part_results)
+        """Retired model judge. Preserve deterministic mathematical fusion only."""
+        result = self._fallback_from_math(part_results)
+        self._last_result = result
+        return result
 
     def reset_memory(self):
         self.chat_history = []
@@ -189,32 +174,8 @@ class JarvisNeuralCortex:
     # -------------------------------------------------------------------------
 
     def _call_ollama_chat(self) -> Optional[str]:
-        messages = [{"role": "system", "content": self.SYSTEM_PROMPT}]
-        messages.extend(self.chat_history)
-        try:
-            resp = requests.post(
-                f"{self.ollama_url}/api/chat",
-                json={"model": self.model, "messages": messages, "stream": False,
-                      "options": {"temperature": 0.1}},
-                timeout=120  # increased to 120s for 14b
-            )
-            if resp.status_code == 200:
-                return resp.json().get("message", {}).get("content", "").strip()
-            logger.error(f"[CORTEX] Ollama HTTP {resp.status_code}: {resp.text[:100]}")
-            return None
-        except requests.exceptions.ConnectionError:
-            logger.warning("[CORTEX] Ollama not reachable -- is GPU server running?")
-            return None
-        except requests.exceptions.Timeout:
-            logger.warning("[CORTEX] Ollama timeout (>90s)")
-            return None
-        except Exception as e:
-            logger.error(f"[CORTEX] Chat call error: {e}")
-            return None
-
-    # -------------------------------------------------------------------------
-    # JSON RESPONSE PARSER
-    # -------------------------------------------------------------------------
+        """Compatibility shim; never contact a model service."""
+        return None
 
     def _parse_decision(self, raw: Optional[str], part_results: Dict) -> Dict:
         if not raw:
@@ -328,16 +289,7 @@ class JarvisNeuralCortex:
     # -------------------------------------------------------------------------
 
     def analyze_holistic_context(self, prompt: str, system_voice: str = "Assistant"):
-        try:
-            resp = requests.post(f"{self.ollama_url}/api/generate",
-                json={"model": self.model, "prompt": prompt, "stream": False, "format": "json"}, timeout=90)
-            if resp.status_code == 200:
-                return resp.json().get("response", "").strip(), None
-            return "", f"HTTP {resp.status_code}"
-        except requests.exceptions.ConnectionError:
-            return "", "Ollama not reachable"
-        except Exception as e:
-            return "", str(e)
+        return "", "Model-generated analysis retired; Laya is audit-only"
 
     @property
     def part_results(self):

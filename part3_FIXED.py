@@ -25,13 +25,12 @@ if hasattr(sys.stdout, 'reconfigure'):
         pass
 
 # Import Ollama Local AI Integration
-try:
-    from ollama_integration import call_ollama
-    OLLAMA_INTEGRATION_AVAILABLE = True
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
-        return None, "ollama_integration module not found"
+# Retired model interface. Trade logic must not import or probe Ollama.
+OLLAMA_INTEGRATION_AVAILABLE = False
+
+def call_ollama(*args, **kwargs):
+    return None, "Ollama retired; Laya commentary is isolated"
+
 
 
 # ---- PyTorch with complete NumPy Fallback for Windows/WSL compatibility ----
@@ -670,44 +669,9 @@ Provide a concise 1-2 sentence institutional analysis, then end your response wi
                 'regime': current_regime
             }
             
-            # Ollama Local AI Integration (Option B: Strong Institutional Vote)
-            if OLLAMA_INTEGRATION_AVAILABLE:
-                try:
-                    prompt = self._generate_ollama_prompt(current_price, current_regime, components)
-                    resp, err = call_ollama(prompt, model=__import__('os').environ.get('OLLAMA_MODEL', 'deepseek-r1:14b'), timeout=10)
-                    if resp:
-                        ollama_reasoning = resp.strip()
-                        resp_upper = resp.upper()
-                        
-                        print(f"\n[PART 3 OLLAMA LIVE THOUGHTS] 🧠\n{ollama_reasoning}\n")
-                        
-                        ollama_sig = None
-                        if "[BUY]" in resp_upper or "BUY" in resp_upper:
-                            ollama_sig = "CALL"
-                        elif "[SELL]" in resp_upper or "SELL" in resp_upper:
-                            ollama_sig = "PUT"
-                            
-                        if ollama_sig:
-                            ollama_trade_signal = {
-                                'type': 'OLLAMA_AI',
-                                'signal': ollama_sig,
-                                'confidence': 8.8,
-                                'reason': f"Part 3 Ollama Local AI Strong Vote ({ollama_sig}): {ollama_reasoning[:100]}",
-                                'timestamp': time.time(),
-                                'strategy_type': f"OLLAMA_{ollama_sig}"
-                            }
-                            filtered_signals.append(ollama_trade_signal)
-                            
-                        components['ollama_reasoning'] = ollama_reasoning
-                        components['ollama_signal'] = ollama_sig if ollama_sig else 'NO-TRADE'
-                    else:
-                        components['ollama_reasoning'] = f"Ollama unavailable: {err}"
-                        components['ollama_signal'] = 'NO-TRADE'
-                except Exception as oe:
-                    print(f"WARNING Part 3 Ollama call error: {oe}")
-                    components['ollama_reasoning'] = f"Error: {oe}"
-                    components['ollama_signal'] = 'NO-TRADE'
-            
+            # No model may append a high-confidence institutional vote.
+            components['advisory_status'] = 'unavailable'
+
             for signal in filtered_signals:
                 if isinstance(signal, dict):
                     signal['regime'] = current_regime

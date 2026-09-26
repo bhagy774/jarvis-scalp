@@ -120,13 +120,12 @@ import random
 from typing import Dict, List, Tuple, Any, Optional, Union
 
 # Import Ollama Local AI Integration
-try:
-    from ollama_integration import call_ollama
-    OLLAMA_INTEGRATION_AVAILABLE = True
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
-        return None, "ollama_integration module not found"
+# Retired model interface. Trade logic must not import or probe Ollama.
+OLLAMA_INTEGRATION_AVAILABLE = False
+
+def call_ollama(*args, **kwargs):
+    return None, "Ollama retired; Laya commentary is isolated"
+
 
 
 # ==================== GPU-ACCELERATED ORDERFLOW & CVD DELTA ENGINE ====================
@@ -1155,36 +1154,8 @@ Follow the tag with a 1-2 sentence Chief Strategy Officer executive recommendati
         return prompt
 
     def validate_strategy_weights_with_ollama(self, learning_summary: Dict) -> Tuple[str, str]:
-        """Run Ollama Chief Strategy Officer recommendation with cooldown"""
-        now = time.time()
-        if not OLLAMA_INTEGRATION_AVAILABLE or not learning_summary:
-            return self.last_ollama_recommendation, self.last_ollama_insight
-
-        if now - self.last_ollama_time < self.ollama_cooldown:
-            return self.last_ollama_recommendation, self.last_ollama_insight
-
-        self.last_ollama_time = now
-        try:
-            prompt = self._generate_ollama_learning_prompt(learning_summary)
-            response, err = call_ollama(prompt, timeout=10)
-            if response and not err:
-                raw_text = response.strip()
-                if "[BOOST_TREND_STRATEGY]" in raw_text.upper() or "[BOOST_TREND]" in raw_text.upper():
-                    recommendation = "BOOST_TREND_STRATEGY"
-                elif "[PENALIZE_BREAKOUTS]" in raw_text.upper() or "[PENALIZE]" in raw_text.upper():
-                    recommendation = "PENALIZE_BREAKOUTS"
-                else:
-                    recommendation = "MAINTAIN_WEIGHTS"
-
-                self.last_ollama_recommendation = recommendation
-                self.last_ollama_insight = raw_text
-                print(f"[PART 9 OLLAMA ADAPTIVE LEARNING] Recommendation: [{recommendation}] | {raw_text}")
-            else:
-                print(f"[PART 9 OLLAMA ADAPTIVE LEARNING] Ollama call skipped or unavailable: {err}")
-        except Exception as e:
-            print(f"❌ Ollama adaptive learning error: {e}")
-
-        return self.last_ollama_recommendation, self.last_ollama_insight
+        """No model-generated adaptive weight recommendation or cached vote."""
+        return "UNAVAILABLE", "Model strategy recommendation unavailable"
 
     def get_comprehensive_analysis(self):
         """Get comprehensive AI learning analysis"""

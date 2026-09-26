@@ -62,96 +62,17 @@ class AIHedgeAdvisor:
         self._call_count = 0
         logger.info(f"[HEDGE-AI] Initialized -- model={self.model} memory={self.max_history_pairs} trades")
 
-    def evaluate_hedge_setup(self, 
-                             signal_direction: str, 
-                             signal_confidence: int,
-                             current_price: float,
-                             atr: float,
-                             options_chain: Dict,
-                             expected_profit: float,
-                             jarvis_result: dict = None) -> Dict:
-        """
-        Evaluate if and how a new trade should be hedged.
-        """
-        self._call_count += 1
-        try:
-            report = self._build_pre_trade_report(
-                direction=signal_direction, 
-                confidence=signal_confidence, 
-                price=current_price, 
-                atr=atr, 
-                options_chain=options_chain, 
-                expected_profit=expected_profit,
-                jarvis_result=jarvis_result
-            )
-            
-            self.chat_history.append({"role": "user", "content": report})
-            raw_response = self._call_ollama_chat()
-            self.chat_history.append({"role": "assistant", "content": raw_response or "{}"})
-            
-            # Prune memory
-            max_messages = self.max_history_pairs * 2
-            if len(self.chat_history) > max_messages:
-                self.chat_history = self.chat_history[-max_messages:]
-                
-            decision = self._parse_hedge_decision(raw_response, current_price)
-            logger.info(f"[HEDGE-AI] Decision: {decision['hedge']} | Strike: {decision['strike']} | {decision['reason'][:60]}")
-            return decision
-            
-        except Exception as e:
-            logger.error(f"[HEDGE-AI] Evaluation error: {e}")
-            return self._fallback_decision(signal_direction, signal_confidence, current_price, atr)
+    def evaluate_hedge_setup(self, signal_direction: str, signal_confidence: int,
+                             current_price: float, atr: float, options_chain: Dict,
+                             expected_profit: float, jarvis_result: dict = None) -> Dict:
+        """No model-selected strike, budget, ratio or hedge direction."""
+        return {"hedge": "NO", "strike": None, "hedge_ratio": 0,
+                "reason": "Model hedge adviser retired; no validated deterministic hedge policy"}
 
-    def monitor_active_hedge(self, 
-                             hedge_position: Dict, 
-                             current_price: float, 
-                             main_trade_pnl: float, 
-                             hedge_pnl: float) -> Dict:
-        """
-        Mid-trade evaluation: should we adjust or close the hedge?
-        """
-        try:
-            now = datetime.now().strftime('%H:%M:%S')
-            report = (
-                f"\n{now} | ACTIVE HEDGE MONITOR\n"
-                f"BTC Price: ${current_price:,.2f}\n"
-                f"Main Trade PnL: ${main_trade_pnl:,.2f}\n"
-                f"Hedge Option PnL: ${hedge_pnl:,.2f}\n"
-                f"Net PnL: ${(main_trade_pnl + hedge_pnl):,.2f}\n"
-                f"Hedge Details: {hedge_position.get('type')} Strike {hedge_position.get('strike')}\n\n"
-                f"RULES:\n"
-                f"- If Option PnL > +50%, CLOSE_HEDGE_EARLY to lock in profit\n"
-                f"- If Main Trade near TP and Option almost worthless, HOLD\n"
-                f"- If both losing, EVALUATE_EXIT\n\n"
-                f"Reply JSON ONLY:\n"
-                f'{{"action": "HOLD/CLOSE_HEDGE_EARLY/ROLL_OUT", "reason": "..."}}'
-            )
-            
-            # We don't save monitor calls to main memory to avoid cluttering it
-            # Just do a one-off completion
-            resp = requests.post(
-                f"{self.ollama_url}/api/generate",
-                json={
-                    "model": self.model, 
-                    "prompt": self.SYSTEM_PROMPT + "\n" + report, 
-                    "stream": False,
-                    "format": "json"
-                },
-                timeout=60
-            )
-            
-            if resp.status_code == 200:
-                raw = resp.json().get("response", "").strip()
-                data = json.loads(raw)
-                return {
-                    "action": data.get("action", "HOLD"),
-                    "reason": data.get("reason", "AI logic")
-                }
-            return {"action": "HOLD", "reason": "API Error"}
-            
-        except Exception as e:
-            logger.error(f"[HEDGE-AI] Monitor error: {e}")
-            return {"action": "HOLD", "reason": f"Fallback due to error: {e}"}
+    def monitor_active_hedge(self, hedge_position: Dict, current_price: float,
+                             main_trade_pnl: float, hedge_pnl: float) -> Dict:
+        """Protective futures TP/SL remains in the paper monitor; no model exit."""
+        return {"action": "HOLD", "reason": "Model exit adviser retired"}
 
     def _build_pre_trade_report(self, direction, confidence, price, atr, options_chain, expected_profit, jarvis_result) -> str:
         now = datetime.now().strftime('%H:%M:%S')
@@ -196,26 +117,7 @@ class AIHedgeAdvisor:
         return report
 
     def _call_ollama_chat(self) -> Optional[str]:
-        messages = [{"role": "system", "content": self.SYSTEM_PROMPT}]
-        messages.extend(self.chat_history)
-        try:
-            resp = requests.post(
-                f"{self.ollama_url}/api/chat",
-                json={
-                    "model": self.model, 
-                    "messages": messages, 
-                    "stream": False,
-                    "options": {"temperature": 0.1},
-                    "format": "json" # Force JSON
-                },
-                timeout=120
-            )
-            if resp.status_code == 200:
-                return resp.json().get("message", {}).get("content", "").strip()
-            return None
-        except Exception as e:
-            logger.error(f"[HEDGE-AI] Chat call error: {e}")
-            return None
+        return None
 
     def _parse_hedge_decision(self, raw: Optional[str], current_price: float) -> Dict:
         if not raw:

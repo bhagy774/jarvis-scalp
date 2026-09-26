@@ -161,13 +161,12 @@ import re
 from typing import Dict, List, Tuple, Any, Optional, Union
 
 # Import Ollama Local AI Integration
-try:
-    from ollama_integration import call_ollama
-    OLLAMA_INTEGRATION_AVAILABLE = True
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
-        return None, "ollama_integration module not found"
+# Retired model interface. Trade logic must not import or probe Ollama.
+OLLAMA_INTEGRATION_AVAILABLE = False
+
+def call_ollama(*args, **kwargs):
+    return None, "Ollama retired; Laya commentary is isolated"
+
 
 
 # ==================== GPU CONFIDENCE MEMORY MANAGER ====================
@@ -348,10 +347,10 @@ class GPUUnifiedConfidenceEngine:
             validation_result = await self._validate_signal_gpu(final_confidence, signal_data)
             
             if hasattr(self, 'bus') and self.bus:
-                msg = f"Confidence Engine: Final Score = {final_confidence:.1f}%. {validation_result} | Ollama Adj: {ollama_adj:+d}"
+                msg = f"Confidence Engine: Final Score = {final_confidence:.1f}%. {validation_result} | Model adj unavailable: {ollama_adj:+d}"
                 self.bus.publish('THOUGHTS', 'Part11_Confidence', msg)
                 
-            return final_confidence, f"{validation_result} | Ollama Adj: {ollama_adj:+d}"
+            return final_confidence, f"{validation_result} | Model adj unavailable: {ollama_adj:+d}"
             
         except Exception as e:
             if hasattr(self, 'bus') and self.bus:
@@ -809,44 +808,8 @@ Follow the tag with a 1-sentence risk analyst justification.
         return prompt
 
     def adjust_confidence_with_ollama(self, raw_confidence: float, signal_data: Dict) -> Tuple[float, int, str]:
-        """Run Ollama Chief Risk Analyst confidence score adjustment with cooldown"""
-        now = time.time()
-        if not OLLAMA_INTEGRATION_AVAILABLE:
-            return raw_confidence, self.last_ollama_adjustment, self.last_ollama_insight
-
-        if now - self.last_ollama_time < self.ollama_cooldown:
-            adj = self.last_ollama_adjustment
-            adjusted = max(0.0, min(10.0 if raw_confidence <= 10.0 else 100.0, raw_confidence + (adj / 10.0 if raw_confidence <= 10.0 else adj)))
-            return adjusted, adj, self.last_ollama_insight
-
-        self.last_ollama_time = now
-        try:
-            prompt = self._generate_ollama_confidence_prompt(raw_confidence, signal_data)
-            response, err = call_ollama(prompt, timeout=10)
-            if response and not err:
-                raw_text = response.strip()
-                match = re.search(r'\[ADJUST:\s*([+-]?\d+)\]', raw_text, re.IGNORECASE)
-                if match:
-                    adj_val = int(match.group(1))
-                    adj_val = max(-20, min(20, adj_val))
-                else:
-                    adj_val = 0
-
-                self.last_ollama_adjustment = adj_val
-                self.last_ollama_insight = raw_text
-                print(f"[PART 11 OLLAMA CONFIDENCE ADJUSTMENT] Adjustment: [{adj_val:+d}] | {raw_text}")
-            else:
-                print(f"[PART 11 OLLAMA CONFIDENCE ADJUSTMENT] Ollama call skipped or unavailable: {err}")
-        except Exception as e:
-            print(f"❌ Ollama confidence adjustment error: {e}")
-
-        adj = self.last_ollama_adjustment
-        if raw_confidence <= 10.0:
-            adjusted = max(0.0, min(10.0, raw_confidence + (adj / 10.0)))
-        else:
-            adjusted = max(0.0, min(100.0, raw_confidence + adj))
-
-        return adjusted, adj, self.last_ollama_insight
+        """Legacy hook: no stale adjustment and no model-derived confidence."""
+        return raw_confidence, 0, "Model adjustment unavailable; mathematical score unchanged"
     
     # ==================== REAL-TIME CONFIDENCE MONITORING ====================
     

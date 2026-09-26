@@ -159,13 +159,12 @@ import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Import Ollama Local AI Integration
-try:
-    from ollama_integration import call_ollama
-    OLLAMA_INTEGRATION_AVAILABLE = True
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    def call_ollama(prompt, model=None, timeout=10):
-        return None, "ollama_integration module not found"
+# Retired model interface. Trade logic must not import or probe Ollama.
+OLLAMA_INTEGRATION_AVAILABLE = False
+
+def call_ollama(*args, **kwargs):
+    return None, "Ollama retired; Laya commentary is isolated"
+
 
 
 # ==================== GPU TRADE EXECUTION MEMORY MANAGER ====================
@@ -498,40 +497,8 @@ Follow the tag with a 1-sentence risk justification.
         return prompt
 
     def get_ollama_position_multiplier(self, confidence: float, current_price: float) -> Tuple[float, str, str]:
-        """Run Ollama Chief Position Sizer recommendation with cooldown"""
-        now = time.time()
-        if not OLLAMA_INTEGRATION_AVAILABLE:
-            return self.last_ollama_multiplier, self.last_ollama_size_tag, self.last_ollama_insight
-
-        if now - self.last_ollama_time < self.ollama_cooldown:
-            return self.last_ollama_multiplier, self.last_ollama_size_tag, self.last_ollama_insight
-
-        self.last_ollama_time = now
-        try:
-            prompt = self._generate_ollama_sizing_prompt(confidence, current_price)
-            response, err = call_ollama(prompt, timeout=10)
-            if response and not err:
-                raw_text = response.strip()
-                if "[SIZE: QUARTER]" in raw_text.upper() or "QUARTER" in raw_text.upper():
-                    size_tag = "SIZE: QUARTER"
-                    multiplier = 0.25
-                elif "[SIZE: HALF]" in raw_text.upper() or "HALF" in raw_text.upper():
-                    size_tag = "SIZE: HALF"
-                    multiplier = 0.5
-                else:
-                    size_tag = "SIZE: FULL"
-                    multiplier = 1.0
-
-                self.last_ollama_size_tag = size_tag
-                self.last_ollama_multiplier = multiplier
-                self.last_ollama_insight = raw_text
-                print(f"[PART 12 OLLAMA POSITION SIZER] Tag: [{size_tag}] | Multiplier: {multiplier}x | {raw_text}")
-            else:
-                print(f"[PART 12 OLLAMA POSITION SIZER] Ollama call skipped or unavailable: {err}")
-        except Exception as e:
-            print(f"❌ Ollama position sizing error: {e}")
-
-        return self.last_ollama_multiplier, self.last_ollama_size_tag, self.last_ollama_insight
+        """Legacy hook: preserve deterministic risk sizing, never reuse a cached multiplier."""
+        return 1.0, "UNAVAILABLE", "Model sizing disabled; deterministic risk sizing only"
     
     # ==================== INTELLIGENT ORDER EXECUTION ====================
     

@@ -225,13 +225,7 @@ async def chat_status() -> Dict[str, str]:
 
 
 def _call_jarvis_chat(user_text: str) -> str:
-    try:
-        from ollama_integration import call_ollama
-        context = f"JARVIS Trading System. Active parts: {len(state.get('parts', {}))}. User asks: {user_text}"
-        response, error = call_ollama(context, model="qwen2.5:14b", timeout=15)
-        return response.strip() if response else f"Ollama unavailable: {error}"
-    except Exception:
-        return "Chat unavailable."
+    return "Model chat retired; Laya is limited to isolated market audit."
 
 
 @app.get("/")

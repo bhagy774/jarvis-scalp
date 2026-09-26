@@ -66,21 +66,8 @@ class OptionsHedgedScalpEngine:
             return {"status": "skipped", "reason": "Invalid price, ATR, or confidence"}
         expected_profit = self._estimate_scalp_profit(current_price, atr)
         
-        # Pure algorithm mode must not call an LLM advisor or accept stale/model output.
-        # Until a validated deterministic contract-risk policy exists, remain unhedged.
-        if _pure_algorithm_mode():
-            hedge_decision = {"hedge": "NO", "reason": "Model hedge advice disabled in pure-algorithm mode"}
-        else:
-            hedge_decision = self.ai_advisor.evaluate_hedge_setup(
-                signal_direction=direction,
-                signal_confidence=confidence,
-                current_price=current_price,
-                atr=atr,
-                options_chain=options_chain,
-                expected_profit=expected_profit,
-                jarvis_result=jarvis_result
-            )
-        
+        hedge_decision = {"hedge": "NO", "reason": "No validated deterministic hedge policy"}
+
         # 2. Extract and validate AI decision before it reaches state.
         if not isinstance(hedge_decision, dict):
             hedge_decision = {}
@@ -213,25 +200,8 @@ class OptionsHedgedScalpEngine:
                         
                     pos["net_pnl"] = f_pnl + h_pnl + pos.get("realized_hedge_pnl", 0.0)
 
-                    # Ask AI Monitor if we have a hedge
-                    if h_leg and not _pure_algorithm_mode():
-                        monitor_decision = self.ai_advisor.monitor_active_hedge(
-                            hedge_position=h_leg,
-                            current_price=current_price,
-                            main_trade_pnl=f_pnl,
-                            hedge_pnl=h_pnl
-                        )
-                        if not isinstance(monitor_decision, dict):
-                            monitor_decision = {}
+                    # Futures TP/SL remains deterministic; no model may close a hedge.
 
-                        if monitor_decision.get("action") == "CLOSE_HEDGE_EARLY":
-                            logger.info(f"🤖 AI advised taking hedge profit: {monitor_decision.get('reason')}")
-                            # Close hedge leg only in the paper ledger.  Carry
-                            # its realized result forward exactly once.
-                            pos["realized_hedge_pnl"] = pos.get("realized_hedge_pnl", 0.0) + h_pnl
-                            pos["hedge_leg"] = None
-                            pos["net_pnl"] = f_pnl + pos["realized_hedge_pnl"]
-                            
                     # Check Futures TP / SL
                     close_reason = None
                     if f_dir in ['BUY', 'CALL']:
