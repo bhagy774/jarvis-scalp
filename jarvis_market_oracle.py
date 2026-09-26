@@ -330,7 +330,7 @@ class JarvisMarketOracle:
                     "funding_rate": funding.get("description", "+0.0100%"),
                     "funding_countdown": funding.get("countdown_str", "unknown"),
                     "binance_oi_contracts": oi_binance.get("open_interest", 0.0),
-                    "imbalance_pct": depth.get("imbalance_pct", 0.0),
+                    "imbalance_pct": depth.get("imbalance_pct"),
                     "imbalance_bias": depth.get("bias", "NEUTRAL"),
                     "bid_wall": depth.get("major_bid_wall", {}).get("price", 0.0),
                     "ask_wall": depth.get("major_ask_wall", {}).get("price", 0.0),
@@ -343,8 +343,9 @@ class JarvisMarketOracle:
                 logger.warning(f"[Oracle] Binance data collection warning: {e}")
 
         # Fallback spot if 0
-        if data["btc_spot"] <= 0:
-            data["btc_spot"] = 94250.0
+        # Never fabricate a live spot price. Unavailable data yields WAIT.
+        if not isinstance(data["btc_spot"], (int, float)) or data["btc_spot"] <= 0:
+            data["btc_spot"] = 0.0
 
         spot = data["btc_spot"]
 
@@ -363,8 +364,8 @@ class JarvisMarketOracle:
                 top_puts = [s for s, _ in sorted(zip(strikes, put_oi), key=lambda x: x[1], reverse=True)[:3]] if strikes and put_oi else []
 
                 data["deribit"] = {
-                    "max_pain": chain.get("max_pain", round(spot / 1000) * 1000),
-                    "pcr": chain.get("pcr", 0.75),
+                    "max_pain": chain.get("max_pain"),
+                    "pcr": chain.get("pcr"),
                     "gamma_wall_call": chain.get("resistance_wall", round(spot * 1.02 / 1000) * 1000),
                     "gamma_wall_put": chain.get("support_wall", round(spot * 0.98 / 1000) * 1000),
                     "call_iv": greeks.get("call_iv", 55.0),
@@ -448,16 +449,7 @@ class JarvisMarketOracle:
                 except Exception:
                     pass
 
-        # Default fallback if systems haven't generated lines yet
-        if not opinions:
-            opinions = {
-                "Part1_Breakout": "Breakout Analysis: Momentum steady near EMA20",
-                "Part2_Neural": "Neural Ensemble: 68% probability upward bias",
-                "Part3_Institutional": "Institutional Orderflow: Accumulation at support",
-                "Part5_Fusion": "Fusion Engine: CALL bias confirmed on 5m",
-                "Part8_Pattern": "Pattern Recognition: Double bottom test on 15m",
-            }
-
+        # No synthetic opinions: absent published diagnostics remain absent.
         return opinions
 
     # ──────────────────────────────────────────────────────────
@@ -465,170 +457,13 @@ class JarvisMarketOracle:
     # ──────────────────────────────────────────────────────────
 
     def _run_ollama_board(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Run 3 models in parallel via ThreadPoolExecutor:
-          - Analyst: Technical + Pattern analysis
-          - Validator: Options flow interpretation
-          - Risk: Risk + timing assessment
-        Followed by Chairman synthesis.
-        Falls back to local heuristic if Ollama is not running.
-        """
-        spot = market_data.get("btc_spot", 0.0)
-        deribit = market_data.get("deribit", {})
-        micro = market_data.get("microstructure", {})
-        candles = market_data.get("candles", {})
-
-        # Test if Ollama is reachable
-        ollama_active = False
-        try:
-            import requests
-            r = requests.get(os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434") + "/api/tags", timeout=1.5)
-            if r.status_code == 200:
-                ollama_active = True
-        except Exception:
-            ollama_active = False
-
-        if not ollama_active:
-            # Algorithmic synthetic board fallback
-            pcr = deribit.get("pcr", 0.75)
-            imbalance = micro.get("imbalance_pct", 0.0)
-            direction = "CALL" if pcr < 0.75 and imbalance > -5 else ("PUT" if pcr > 1.1 or imbalance < -15 else "NEUTRAL")
-            conf = 72 if direction != "NEUTRAL" else 60
-            return {
-                "status": "heuristic_fallback",
-                "analyst": f"Price ${spot:,.0f} testing key levels. 5m closes suggest {direction} bias.",
-                "validator": f"Options PCR ({pcr}) indicates {'bullish call accumulation' if pcr < 0.8 else 'hedging'}. Gamma wall at ${deribit.get('gamma_wall_call', 0):,.0f}.",
-                "risk_officer": f"Orderbook imbalance at {imbalance:+.1f}%. Volatility within scalping tolerance.",
-                "chairman": f"CONSENSUS_EXECUTE ({direction}, {conf}% confidence)",
-                "verdict": direction,
-                "confidence": conf,
-            }
-
-        # Ollama is active -> Run 3 models in parallel
-        from ollama_integration import call_ollama
-
-        def _ask(role_prompt: str, model: str) -> str:
-            resp, err = call_ollama(role_prompt, model=model, timeout=35)
-            if resp and not err:
-                return resp.strip()
-            return f"[Offline: {err}]"
-
-        context_summary = f"""
-BTC Spot Price: ${spot:,.2f}
-Deribit Max Pain: ${deribit.get('max_pain', 'N/A')}
-Put/Call Ratio: {deribit.get('pcr', 'N/A')}
-Gamma Wall (Call): ${deribit.get('gamma_wall_call', 'N/A')} | Put: ${deribit.get('gamma_wall_put', 'N/A')}
-Binance Funding: {micro.get('funding_rate', 'N/A')}
-Order Book Imbalance: {micro.get('imbalance_pct', 0.0)}% ({micro.get('imbalance_bias', 'NEUTRAL')})
-Recent 5m Closes: {candles.get('5m', [])[-6:]}
-Recent 1h Closes: {candles.get('1h', [])[-4:]}
-"""
-        prompts = {
-            "analyst": f"{context_summary}\nYou are Technical Analyst AI ({MODEL_ANALYST}). Analyze technical trend and candlestick patterns. In 2 sentences, give your verdict (BULLISH/BEARISH/NEUTRAL) and key support/resistance.",
-            "validator": f"{context_summary}\nYou are Options Flow Validator AI ({MODEL_VALIDATOR}). Interpret options PCR, max pain gravity, and gamma ceiling/floor. In 2 sentences, state if institutional positioning supports a breakout or range-bound fade.",
-            "risk_officer": f"{context_summary}\nYou are Risk Officer AI ({MODEL_RISK}). Assess order book imbalance and execution timing risk. In 2 sentences, state if entry is safe or if liquidity traps are present.",
-        }
-
-        opinions = {}
-        import threading
-        
-        def run_model(role, prompt, model):
-            try:
-                opinions[role] = _ask(prompt, model)
-            except Exception as e:
-                opinions[role] = f"[Unavailable: {e}]"
-                
-        t1 = threading.Thread(target=run_model, args=("analyst", prompts["analyst"], MODEL_ANALYST))
-        t2 = threading.Thread(target=run_model, args=("validator", prompts["validator"], MODEL_VALIDATOR))
-        t3 = threading.Thread(target=run_model, args=("risk_officer", prompts["risk_officer"], MODEL_RISK))
-        
-        t1.start(); t2.start(); t3.start()
-        t1.join(timeout=40)
-        t2.join(timeout=40)
-        t3.join(timeout=40)
-
-        # Chairman synthesis
-        chairman_prompt = f"""You are the Board Chairman ({MODEL_CHAIRMAN}).
-Expert Board Opinions:
-1. Analyst: {opinions.get('analyst', 'N/A')}
-2. Validator: {opinions.get('validator', 'N/A')}
-3. Risk Officer: {opinions.get('risk_officer', 'N/A')}
-
-In 1 concise sentence, issue your final verdict: CONSENSUS_EXECUTE (CALL or PUT, confidence %) or CONSENSUS_WAIT.
-"""
-        chairman_resp, _ = call_ollama(chairman_prompt, model=MODEL_CHAIRMAN, timeout=20)
-        opinions["chairman"] = chairman_resp.strip() if chairman_resp else "CONSENSUS_EXECUTE (NEUTRAL, 65%)"
-
-        verdict = "CALL" if "CALL" in opinions["chairman"].upper() else ("PUT" if "PUT" in opinions["chairman"].upper() else "WAIT")
-        opinions["verdict"] = verdict
-        opinions["confidence"] = 75 if verdict != "WAIT" else 60
-        opinions["status"] = "ollama_active"
-        return opinions
-
-    # ──────────────────────────────────────────────────────────
-    #  LAYER 3: GEMINI ORACLE (gemini-3.6-flash)
-    # ──────────────────────────────────────────────────────────
+        """Retired multi-model vote; leave a neutral, non-confirming board."""
+        return {"status": "unavailable", "analyst": "Model committee retired",
+                "validator": "Model committee retired", "risk_officer": "Model committee retired",
+                "chairman": "CONSENSUS_WAIT", "verdict": "WAIT", "confidence": 0}
 
     def _call_gemini_oracle(self, market_data: Dict[str, Any], ollama_board: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Builds the prompt per specification and queries gemini-3.6-flash
-        to obtain the complete structured Market Map JSON.
-        """
-        if not self._gemini_client:
-            logger.warning("[Oracle] Gemini client unavailable — using smart local generator")
-            return self._generate_local_forecast(market_data, ollama_board)
-
-        prompt = self._build_gemini_prompt(market_data, ollama_board)
-
-        models_to_try = [ORACLE_GEMINI_MODEL, "gemini-3.6-flash", "gemini-2.5-flash"]
-        seen = set()
-        models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
-
-        for model in models_to_try:
-            for retry in range(2):
-                try:
-                    logger.info(f"[Oracle] Requesting Market Map from {model} (try {retry+1})...")
-                    config = self._gemini_types.GenerateContentConfig(
-                        system_instruction=ORACLE_SYSTEM_PROMPT,
-                        temperature=0.2,
-                        response_mime_type="application/json",
-                    )
-                    resp = self._gemini_client.models.generate_content(
-                        model=model,
-                        contents=prompt,
-                        config=config
-                    )
-
-                    raw_text = resp.text.strip()
-                    if raw_text.startswith("```"):
-                        raw_text = raw_text.split("```")[1]
-                        if raw_text.startswith("json"):
-                            raw_text = raw_text[4:]
-                    raw_text = raw_text.strip()
-
-                    forecast = json.loads(raw_text)
-                    # Validate top keys
-                    required_keys = ["5min", "30min", "1hour", "4hour", "day", "options_intel", "trade_suggestion"]
-                    if all(k in forecast for k in required_keys):
-                        forecast["model_used"] = model
-                        forecast["generated_at"] = datetime.now().isoformat()
-                        logger.info(f"[Oracle] Market Map generated successfully by {model}")
-                        return forecast
-                    else:
-                        logger.warning(f"[Oracle] Incomplete keys in response from {model}")
-
-                except json.JSONDecodeError as je:
-                    logger.warning(f"[Oracle] JSON decode failure from {model}: {je}")
-                except Exception as e:
-                    err_str = str(e)
-                    logger.warning(f"[Oracle] Call error on {model}: {err_str[:120]}")
-                    if "503" in err_str or "UNAVAILABLE" in err_str:
-                        time.sleep(5)
-                        continue
-                    elif "429" in err_str:
-                        break  # try next model
-
-        logger.warning("[Oracle] All Gemini models exhausted. Falling back to local synthesizer.")
+        """Compatibility shim: derive from observed data; no model forecast."""
         return self._generate_local_forecast(market_data, ollama_board)
 
     def _build_gemini_prompt(self, market_data: Dict[str, Any], ollama_board: Dict[str, Any]) -> str:
@@ -712,79 +547,28 @@ Provide JSON market forecast for ALL timeframes matching the requested schema.
 
 
     def _call_ollama_oracle(self, market_data: Dict[str, Any], ollama_board: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        PRIMARY: Use Ollama (deepseek-r1:14b) to generate the structured Market Map JSON.
-        Replaces Gemini completely. Falls back to local synthesizer if Ollama unavailable.
-        """
-        try:
-            import requests as _req
-            ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-            model      = os.environ.get("OLLAMA_MODEL", "deepseek-r1:14b")
-            _req.get(f"{ollama_url}/api/tags", timeout=3)
-        except Exception:
-            logger.warning("[Oracle] Ollama not reachable — using local synthesizer")
-            return self._generate_local_forecast(market_data, ollama_board)
-
-        prompt = self._build_gemini_prompt(market_data, ollama_board)
-        full_prompt = (
-            ORACLE_SYSTEM_PROMPT + "\n\n" + prompt +
-            "\n\nRespond ONLY with valid JSON matching the schema above. No markdown, no commentary."
-        )
-
-        try:
-            from ollama_integration import call_ollama
-            logger.info("[Oracle] Calling Ollama (%s) for Market Map...", model)
-            resp, err = call_ollama(full_prompt, model=model, timeout=120)
-            if err or not resp:
-                logger.warning("[Oracle] Ollama call failed: %s", err)
-                return self._generate_local_forecast(market_data, ollama_board)
-
-            raw = resp.strip()
-            # Strip markdown fences if present
-            if raw.startswith("```"):
-                parts = raw.split("```")
-                raw = parts[1] if len(parts) > 1 else raw
-                if raw.lower().startswith("json"):
-                    raw = raw[4:]
-            raw = raw.strip()
-
-            # Find JSON object start
-            start = raw.find("{")
-            end   = raw.rfind("}") + 1
-            if start >= 0 and end > start:
-                raw = raw[start:end]
-
-            forecast = {}
-            try:
-                forecast = json.loads(raw)
-            except json.JSONDecodeError:
-                # Try to extract just the JSON portion
-                import re
-                json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-                if json_match:
-                    forecast = json.loads(json_match.group())
-
-            required_keys = ["5min", "30min", "1hour", "4hour", "day", "options_intel", "trade_suggestion"]
-            if not all(k in forecast for k in required_keys):
-                logger.warning("[Oracle] Ollama response missing required keys — using synthesizer")
-                return self._generate_local_forecast(market_data, ollama_board)
-
-            forecast["model_used"]    = f"ollama:{model}"
-            forecast["generated_at"]  = datetime.now().isoformat()
-            logger.info("[Oracle] Market Map generated by Ollama (%s)", model)
-            return forecast
-
-        except Exception as e:
-            logger.error("[Oracle] Ollama oracle error: %s", e)
-            return self._generate_local_forecast(market_data, ollama_board)
+        """Observed-market local synthesizer; never use model or cached model result."""
+        return self._generate_local_forecast(market_data, ollama_board)
 
     def _generate_local_forecast(self, market_data: Dict[str, Any], ollama_board: Dict[str, Any]) -> Dict[str, Any]:
-        """High-accuracy fallback generator when Ollama or network is unavailable."""
-        spot = market_data.get("btc_spot", 94250.0)
-        deribit = market_data.get("deribit", {})
-        micro = market_data.get("microstructure", {})
-        pcr = deribit.get("pcr", 0.72)
-        imbalance = micro.get("imbalance_pct", 0.0)
+        """Unvalidated deterministic heuristic; only observed BTC data may produce a map."""
+        # Incomplete, invalid, or unobserved sources cannot manufacture a CALL/PUT.
+        import math
+        spot = market_data.get("btc_spot") if isinstance(market_data, dict) else None
+        deribit = market_data.get("deribit") if isinstance(market_data, dict) else None
+        micro = market_data.get("microstructure") if isinstance(market_data, dict) else None
+        deribit = deribit if isinstance(deribit, dict) else {}
+        micro = micro if isinstance(micro, dict) else {}
+        pcr = deribit.get("pcr")
+        imbalance = micro.get("imbalance_pct")
+        observed = (all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                        and math.isfinite(v) for v in (spot, pcr, imbalance))
+                    and spot > 0 and 0 < pcr < 5 and -100 <= imbalance <= 100
+                    and isinstance(deribit.get("max_pain"), (int, float))
+                    and not isinstance(deribit.get("max_pain"), bool)
+                    and math.isfinite(deribit["max_pain"]) and deribit["max_pain"] > 0)
+        if not observed:
+            return self._get_fallback_forecast()
         max_pain = deribit.get("max_pain", round(spot / 500) * 500)
         g_call = deribit.get("gamma_wall_call", round(spot * 1.015 / 100) * 100)
         g_put = deribit.get("gamma_wall_put", round(spot * 0.985 / 100) * 100)
@@ -802,9 +586,8 @@ Provide JSON market forecast for ALL timeframes matching the requested schema.
         spread_1h = spot * 0.012
         spread_4h = spot * 0.02
 
-        trade_dir = suggestion if suggestion != "WAIT" else "CALL"
-        tp = round(spot * 1.006 if trade_dir == "CALL" else spot * 0.994, 1)
-        sl = round(spot * 0.996 if trade_dir == "CALL" else spot * 1.004, 1)
+        tp = round(spot * 1.006, 1) if suggestion == "CALL" else (round(spot * 0.994, 1) if suggestion == "PUT" else 0)
+        sl = round(spot * 0.996, 1) if suggestion == "CALL" else (round(spot * 1.004, 1) if suggestion == "PUT" else 0)
 
         return {
             "5min": {
@@ -872,10 +655,10 @@ Provide JSON market forecast for ALL timeframes matching the requested schema.
         logger.info("[Oracle] Starting Layer 1 Data Collection...")
         data = self._collect_data()
 
-        logger.info("[Oracle] Starting Layer 2 Ollama Multi-AI Analysis...")
+        logger.info("[Oracle] Model committee retired; deriving from observed data only...")
         board = self._run_ollama_board(data)
 
-        logger.info("[Oracle] Starting Layer 3 Local AI Oracle Generation (Ollama)...")
+        logger.info("[Oracle] Building deterministic local market map...")
         forecast = self._call_ollama_oracle(data, board)
 
         # Store spot & raw meta in forecast for display
