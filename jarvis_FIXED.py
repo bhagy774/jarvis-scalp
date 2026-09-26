@@ -33,7 +33,7 @@ from jarvis_dashboard import UnifiedDashboard
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
 from jarvis_decision import normalize_confidence, confidence_text, build_final_decision
 from jarvis_runtime import detect_backend, torch_device
-from jarvis_ollama_context import build_snapshot, decision_prompt, snapshot_usable, validate_decision
+# Legacy Ollama context removed; deterministic gates are authoritative.
 pro_display = ProfessionalSignalDisplay()
 import warnings
 from collections import deque, defaultdict
@@ -192,8 +192,8 @@ except ImportError as _de:
 
 # Import Ollama Local AI Integration
 try:
-    from ollama_integration import call_ollama, runtime_metadata
-    OLLAMA_INTEGRATION_AVAILABLE = True
+    raise ImportError("Ollama integration retired")
+    OLLAMA_INTEGRATION_AVAILABLE = False
 except ImportError:
     OLLAMA_INTEGRATION_AVAILABLE = False
     runtime_metadata = lambda: {"available": False, "reason": "integration unavailable"}
@@ -422,14 +422,14 @@ TRADING_SESSIONS = {
 # ==================== AI API SETUP (Ollama) ====================
 # Use LOCAL Ollama instead of cloud APIs for privacy and cost efficiency
 try:
-    from ollama_integration import call_ollama, call_ollama_chat, OLLAMA_ENABLED, analyze_trade_signal
+    raise ImportError("Ollama integration retired")
     print("[JARVIS CORE] ✅ Ollama Integration Loaded")
 except ImportError:
     print("[JARVIS CORE] ⚠️ Ollama integration not available")
     OLLAMA_ENABLED = False
-    call_ollama = lambda p, m="mistral", timeout=60: (None, "Ollama not available")
-    call_ollama_chat = lambda msgs, m="mistral", timeout=60: (None, "Ollama not available")
-    analyze_trade_signal = lambda p, s, m="mistral": (None, "Ollama not available")
+    call_ollama = lambda *a, **k: (None, "Ollama retired")
+    call_ollama_chat = lambda *a, **k: (None, "Ollama retired")
+    analyze_trade_signal = lambda *a, **k: (None, "Ollama retired")
 
 def call_ai_for_analysis(prompt, timeout=30):
     """Call AI analysis - uses Ollama (local) for privacy"""
@@ -3702,45 +3702,13 @@ Follow the tag with a 1-sentence options analyst insight.
         return prompt
 
     def analyze_options_with_ollama(self, telemetry: Dict, current_price: float) -> Tuple[str, str, int]:
-        """Run optional whale-model analysis; never participate in pure-algorithm mode."""
-        if _pure_algorithm_mode():
-            # Model-only auxiliary confirmation is unavailable, not a fabricated neutral/approval.
-            # Preserve the independently computed options math signal unchanged.
-            return "WHALE_UNAVAILABLE", "Model confirmation disabled in pure-algorithm mode", telemetry.get('signal', 0)
-
-        now = time.time()
-        if not OLLAMA_INTEGRATION_AVAILABLE:
-            return self.last_ollama_whale_tag, self.last_ollama_insight, telemetry.get('signal', 0)
-
-        if now - self.last_ollama_time < self.ollama_cooldown:
-            ai_sig = 1 if self.last_ollama_whale_tag == "WHALE_BULLISH" else (-1 if self.last_ollama_whale_tag == "WHALE_BEARISH" else 0)
-            return self.last_ollama_whale_tag, self.last_ollama_insight, ai_sig
-
-        self.last_ollama_time = now
+        """Compatibility name; return only the deterministic observed-chain signal."""
+        signal = telemetry.get('signal', 0)
         try:
-            prompt = self._generate_ollama_options_prompt(telemetry, current_price)
-            response, err = call_ollama(prompt, timeout=120)
-            if response and not err:
-                raw_text = response.strip()
-                if "[WHALE_BULLISH]" in raw_text.upper() or "WHALE_BULLISH" in raw_text.upper():
-                    tag = "WHALE_BULLISH"
-                elif "[WHALE_BEARISH]" in raw_text.upper() or "WHALE_BEARISH" in raw_text.upper():
-                    tag = "WHALE_BEARISH"
-                elif "[RETAIL_TRAP]" in raw_text.upper() or "RETAIL_TRAP" in raw_text.upper():
-                    tag = "RETAIL_TRAP"
-                else:
-                    tag = "WHALE_NEUTRAL"
-
-                self.last_ollama_whale_tag = tag
-                self.last_ollama_insight = raw_text
-                print(f"[PART 14 OLLAMA WHALE TRACKER] Tag: [{tag}] | {raw_text}")
-            else:
-                print(f"[PART 14 OLLAMA WHALE TRACKER] Ollama call skipped or unavailable: {err}")
-        except Exception as e:
-            logging.error(f"Ollama options tracker error: {e}")
-
-        ai_sig = 1 if self.last_ollama_whale_tag == "WHALE_BULLISH" else (-1 if self.last_ollama_whale_tag == "WHALE_BEARISH" else 0)
-        return self.last_ollama_whale_tag, self.last_ollama_insight, ai_sig
+            signal = int(signal) if int(signal) in (-1, 0, 1) else 0
+        except (TypeError, ValueError, OverflowError):
+            signal = 0
+        return "MODEL_ADVISORY_DISABLED", "Options result is deterministic observed-chain math", signal
 
     def analyze(self, data, context=None):
         """Unified selected-asset options analysis; BTC Deribit is never an alt substitute."""
@@ -3827,10 +3795,10 @@ Follow the tag with a 1-sentence options analyst insight.
                 "math_model": "observed_chain_descriptive_v1"
             }
 
-            # Ollama Smart Money & Whale Tracker Analysis
+            # Deterministic options math; optional model commentary cannot change signal.
             whale_tag, insight, final_signal = self.analyze_options_with_ollama(telemetry, current_price)
-            telemetry['ollama_whale_tag'] = whale_tag
-            telemetry['ollama_insight'] = insight
+            telemetry['advisory_status'] = whale_tag
+            telemetry['advisory_note'] = insight
 
             combined_thought = f"[{whale_tag}] " + (" | ".join(thoughts) if thoughts else f"Institutional: {bias_data.get('bias', 'NEUTRAL')}")
             
@@ -3845,33 +3813,8 @@ Follow the tag with a 1-sentence options analyst insight.
 
 # FIX #6: Properly calling local Ollama (GPU) instead of Gemini cloud
 def _call_ollama_local(prompt, model=None, timeout=30):
-    """Call local Ollama GPU model — uses OLLAMA_BASE_URL from .env.
-
-    model=None auto-detects the installed model (or OLLAMA_MODEL env override).
-    """
-    import requests, os
-    if model is None:
-        try:
-            from ollama_integration import resolve_ollama_model
-            model = resolve_ollama_model()
-        except Exception as e:
-            return None, f"Ollama model resolution failed: {e}"
-        if not model:
-            return None, "No Ollama model found (math fallback)"
-    base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    try:
-        resp = requests.post(
-            f"{base_url}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False},
-            timeout=timeout
-        )
-        if resp.status_code == 200:
-            return resp.json().get("response", ""), None
-        return None, f"Ollama HTTP {resp.status_code}"
-    except requests.exceptions.ConnectionError:
-        return None, "Ollama not reachable (is GPU server running?)"
-    except Exception as e:
-        return None, str(e)
+    """Legacy compatibility shim: Ollama routing is retired; never make a request."""
+    return None, "Ollama retired; use isolated Laya advisory only"
 
 class DeepSeekV3Brain:
     def __init__(self):
@@ -6172,17 +6115,10 @@ class JarvisElite:
             if not self.trade_manager.can_trade():
                 return self._get_no_trade_signal("Trading not allowed")
                 
-            # --- MASTER AI SYNTHESIS --- ENABLED: DeepSeek AI Judge for signal validation
-            if score >= 10 and self.deepseek_enabled and not neural_res and not _pure_algorithm_mode():
-                ai_validation = self._get_deepseek_validation(data, score, detailed_scores, full_telemetry)
-                if not ai_validation.get('approved', False):
-                    logger.warning(f"🧠 MASTER AI REJECTION: {ai_validation.get('reason', 'Unknown')}")
-                    return self._get_no_trade_signal(f"AI rejection: {ai_validation.get('reason', 'Unknown')}")
-                else:
-                    detailed_scores['ai_synthesis'] = ai_validation.get('reason', 'No reasoning provided')
-                    logger.info(f"🧠 MASTER AI APPROVED: {ai_validation.get('reason')[:100]}...")
+            # Model commentary is strictly advisory; deterministic score, Part 7,
+            # ownership, sizing and freshness gates below remain authoritative.
+            # In particular no unavailable LLM is allowed to veto or approve an entry.
 
-            
             # Generate final signal
             final_decision = self._generate_trade_signal(data, score, detailed_scores, options_intel, logic_signal)
 
@@ -6578,36 +6514,11 @@ Follow the tag with a 1-sentence CEO executive directive.
 
 
     def _get_deepseek_validation(self, data, score, detailed_scores, telemetry=None):
-        """Get AI validation for trade setup using local Supreme Commander AI (CEO) via Ollama"""
-        try:
-            prompt = self._generate_ollama_ceo_prompt(score, detailed_scores, telemetry, data=data)
-            usable, snapshot_reason = snapshot_usable(getattr(self, 'last_ollama_snapshot', None))
-            if not usable:
-                self.last_ollama_decision = {'decision': 'WAIT', 'confidence': 0,
-                                              'rationale': snapshot_reason}
-                return {'approved': False, 'reason': snapshot_reason, 'verdict': 'WAIT'}
-            response, err = call_ollama(prompt, timeout=120)
-            if response and not err:
-                raw_text = response.strip()
-                parsed, parse_err = validate_decision(raw_text)
-                if parsed is not None:
-                    self.last_ollama_decision = parsed
-                    approved = parsed['decision'] in {'BUY', 'SELL'} and parsed['confidence'] >= 50
-                    return {'approved': approved, 'reason': parsed['rationale'],
-                            'verdict': parsed['decision'], 'suggestion': parsed}
-                # Legacy tag output remains advisory but cannot bypass validation.
-                upper = raw_text.upper()
-                verdict = 'EXECUTE' if '[CEO_VERDICT: EXECUTE]' in upper else ('ABORT' if '[CEO_VERDICT: ABORT]' in upper else 'STANDBY')
-                self.last_ollama_decision = {'decision': 'WAIT', 'confidence': 0, 'rationale': parse_err or 'invalid Ollama response'}
-                return {'approved': False, 'reason': 'Invalid Ollama response; fail closed', 'verdict': verdict}
-            self.last_ollama_decision = {'decision': 'WAIT', 'confidence': 0, 'rationale': err or 'Ollama unavailable'}
-            logger.warning("[OLLAMA] AI-required validation unavailable; entry vetoed: %s", err)
-            return {'approved': False, 'reason': 'Ollama unavailable; AI-required workflow fails closed', 'verdict': 'WAIT'}
-        except Exception as e:
-            logger.error(f"Supreme Commander AI validation error: {type(e).__name__}")
-            self.last_ollama_decision = {'decision': 'WAIT', 'confidence': 0, 'rationale': 'validation error'}
-            return {'approved': False, 'reason': 'AI validation error; fail closed', 'verdict': 'WAIT'}
-            
+        """Retired compatibility hook; model output is never an entry gate."""
+        result = {'approved': None, 'reason': 'LLM validation retired; deterministic gates remain authoritative', 'verdict': 'ADVISORY_ONLY'}
+        self.last_ollama_decision = {'decision': 'UNAVAILABLE', 'confidence': 0, 'rationale': result['reason']}
+        return result
+
     def _create_deepseek_prompt(self, data, score, detailed_scores, telemetry=None):
         """Create prompt for DeepSeek ASI synthesis with Universal MTF and Sensory Telemetry"""
         current_candle = data.iloc[-1]
