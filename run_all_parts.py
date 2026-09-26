@@ -84,19 +84,10 @@ def post_hud_telemetry(payload, token=None):
         return False
 
 
-# ==================== AI CHAIN INTEGRATION ====================
-# Import AI Chain for intelligent part analysis
-try:
-    from ai_chain_brain import AIChainSequentialBrain
-    AI_CHAIN_AVAILABLE = True
-    print("[AI-CHAIN] ✅ AI Chain module loaded")
-except ImportError as e:
-    AI_CHAIN_AVAILABLE = False
-    print(f"[AI-CHAIN] ⚠️  AI Chain not available: {e}")
-    AIChainSequentialBrain = None
-
-# Legacy model chain must not start even if an external module is installed.
+# Legacy AI chain is retired; do not import even if installed (module import
+# itself may start an inference service or cause an unwanted network request).
 AI_CHAIN_AVAILABLE = False
+AIChainSequentialBrain = None
 ai_chain_instance = None
 
 def run_all_parts(ai_brain=None, predictor=None):
