@@ -1698,29 +1698,37 @@ class LiveTradingEngine:
         return result
 
     def _print_decision_audit(self, decision, symbol, parts=None, blockers=None, stage="FINAL_GATE", order_outcome=None):
-        """Best-effort reporting of observed pipeline stage; never gates trading."""
+        """Best-effort display of observed values; formatting never gates trading."""
         try:
-            print(f"\n========== JARVIS DECISION AUDIT | stage={stage} (observed; not an order/fill) ==========")
-            print(f"Selected symbol: {symbol}")
-            if isinstance(parts, dict):
-                for name, evidence in parts.items():
-                    # Print only actual returned diagnostics; absent Parts stay absent.
-                    summary = evidence.get('thought', evidence.get('reason', evidence.get('signal', evidence))) if isinstance(evidence, dict) else evidence
-                    text = str(summary).replace('\n', ' ')[:240]
-                    print(f"{name}: {text}")
             decision = decision if isinstance(decision, dict) else {}
-            print(f"Final: {decision.get('direction', 'NO_TRADE')} | confidence={decision.get('confidence_display', 'N/A')} | status={decision.get('status', 'UNKNOWN')}")
+            last_result = getattr(self, 'last_jarvis_result', {})
+            last_result = last_result if isinstance(last_result, dict) else {}
+            candidate = last_result.get('trade_signal', {})
+            market_context = last_result.get('market_context', {})
+            jarvis = getattr(self, 'jarvis', None)
+            snapshot = getattr(jarvis, '_active_candle_snapshot', None) if jarvis is not None else None
+            trader = getattr(self, 'auto_trader', None)
+            execution_mode = 'LIVE' if trader is not None and getattr(trader, 'is_enabled', False) else 'PAPER'
+            position_state = {
+                'live': getattr(trader, 'open_positions', None) if trader is not None else None,
+                'paper': getattr(self, 'paper_open_trades', None),
+            }
             provenance = decision.get('provenance') or decision.get('source')
-            if provenance:
-                print(f"Provenance: {provenance}")
-            else:
-                print("Provenance: pure algorithm mode (Part 1–12 math path; model synthesis, AI gate, and background consensus disabled)") if _pure_algorithm_mode() else print("Provenance: mixed/current pipeline; AI-assisted components may participate (not claimed pure algorithm)")
-            reasons = decision.get('reasons') or []
-            for reason in reasons:
-                print(f"Decision reason: {str(reason)[:300]}")
-            for blocker in (blockers or []):
-                print(f"Entry gate: {str(blocker)[:300]}")
-            # Experimental commentary only at FINAL_GATE, never repeated for order return.
+            if not provenance:
+                provenance = (
+                    'pure algorithm mode (Part 1–12 math path; model synthesis, AI gate, and background consensus disabled)'
+                    if _pure_algorithm_mode()
+                    else 'mixed/current pipeline; AI-assisted components may participate (not claimed pure algorithm)'
+                )
+            from terminal_decision_display import format_decision_audit
+            print(format_decision_audit(
+                decision, symbol, parts=parts, blockers=blockers,
+                candidate=candidate, analysis_result=last_result,
+                market_context=market_context, snapshot=snapshot,
+                position_state=position_state, execution_mode=execution_mode,
+                stage=stage, order_outcome=order_outcome, provenance=provenance,
+            ))
+            # Experimental commentary only at FINAL_GATE; never repeated for order return.
             # Worker is daemonized and never gates execution.
             try:
                 from jarvis_laya_advisor import request_runtime_advisory
@@ -1736,19 +1744,6 @@ class LiveTradingEngine:
                           + (f" suggestion={advisory.suggestion}" if advisory.suggestion else ""))
             except Exception as advisory_error:
                 print(f"Laya advisory (experimental; not a gate): unavailable ({type(advisory_error).__name__})")
-            if stage == "ORDER_SUBMISSION":
-                if isinstance(order_outcome, dict):
-                    # Report only raw return fields with conservative labels; success is not proof of fill.
-                    print(f"Submission return success field: {order_outcome.get('success', 'UNAVAILABLE')}")
-                    print(f"Submission return reason field: {str(order_outcome.get('reason', 'UNAVAILABLE'))[:300]}")
-                    print("Exchange-confirmed fill/close: UNVERIFIED (not inferred from execute return)")
-                else:
-                    print("Submission return: UNAVAILABLE")
-            elif stage == "FINAL_GATE":
-                print("Order submission/fill/close: not yet observed")
-            else:
-                print("Final gate/order/fill/close: not yet observed")
-            print("==========================================================================")
         except Exception as audit_error:
             # Display failure is deliberately non-fatal and cannot affect safety gates.
             logger.debug("[AUDIT] terminal summary unavailable: %s", type(audit_error).__name__)
