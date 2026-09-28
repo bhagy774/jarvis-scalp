@@ -8,7 +8,7 @@ indicators; ``current`` is explicitly unconfirmed metadata only.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from threading import RLock
+from threading import BoundedSemaphore, RLock
 import math
 import time
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
@@ -36,6 +36,9 @@ class CandleFrame:
     closed: pd.DataFrame
     current: Optional[Dict[str, Any]]
     fetched_at: float
+    venue: str = "unknown"
+    market_type: str = "unknown"
+    instrument_id: str = ""
 
     @property
     def current_is_confirmed(self) -> bool:
@@ -58,6 +61,14 @@ class CandleSnapshot:
     symbol: str
     frames: Mapping[str, CandleFrame]
     fetched_at: float
+    venue: str = "unknown"
+    market_type: str = "unknown"
+    instrument_id: str = ""
+
+    @property
+    def identity(self) -> Tuple[str, str, str, str]:
+        """Request identity; provider source remains explicit per timeframe."""
+        return (self.venue, self.market_type, self.instrument_id, self.symbol)
 
     @property
     def current_candles(self) -> Dict[str, Optional[Dict[str, Any]]]:
@@ -70,6 +81,10 @@ class CandleSnapshot:
     def context(self) -> Dict[str, Any]:
         return {
             "symbol": self.symbol,
+            "venue": self.venue,
+            "market_type": self.market_type,
+            "instrument_id": self.instrument_id,
+            "identity": self.identity,
             "source_by_timeframe": {tf: f.source for tf, f in self.frames.items()},
             "current_candles": self.current_candles,
             "current_is_confirmed": False,
@@ -78,7 +93,15 @@ class CandleSnapshot:
 
 
 class DirectCandleCache:
-    """Bounded, symbol/source/timeframe keyed cache of native exchange candles."""
+    """Bounded, full-request-identity/native-timeframe candle cache.
+
+    A snapshot request is isolated by (venue, market_type, instrument_id,
+    canonical_symbol). ``source`` is still recorded for every timeframe because
+    a multi-provider adapter can legitimately fall back between providers.
+    Per-identity locks let analysis jobs validate different markets without
+    sharing mutable snapshot state. A separate bounded semaphore protects a
+    shared client from excessive simultaneous network calls.
+    """
 
     def __init__(
         self,
@@ -87,14 +110,41 @@ class DirectCandleCache:
         clock: Callable[[], float] = time.time,
         ttl_seconds: float = 45.0,
         stale_intervals: float = 2.0,
+        max_concurrent_fetches: int = 1,
+        max_cached_identities: int = 64,
     ) -> None:
         self.client = client
         self.clock = clock
         self.ttl_seconds = float(ttl_seconds)
         self.stale_intervals = float(stale_intervals)
-        self._cache: Dict[Tuple[str, str, str], CandleFrame] = {}
-        self._snapshots: Dict[str, CandleSnapshot] = {}
+        self.max_cached_identities = max(1, min(256, int(max_cached_identities)))
+        self._cache: Dict[Tuple[Tuple[str, str, str, str], str], CandleFrame] = {}
+        self._snapshots: Dict[Tuple[str, str, str, str], CandleSnapshot] = {}
+        self._identity_locks: Dict[Tuple[str, str, str, str], RLock] = {}
         self._lock = RLock()
+        self._fetch_semaphore = BoundedSemaphore(max(1, min(4, int(max_concurrent_fetches))))
+
+    def _identity_key(
+        self, symbol: str, venue: str, market_type: str, instrument_id: Optional[str]
+    ) -> Tuple[str, str, str, str]:
+        canonical = self._canonical_symbol(symbol)
+        venue_key = str(venue or "unknown").strip().lower()
+        market_key = str(market_type or "unknown").strip().lower()
+        instrument_key = str(instrument_id or canonical).strip()
+        if not venue_key or not market_key or not instrument_key:
+            raise CandleDataError("venue, market type, and instrument identity are required")
+        return venue_key, market_key, instrument_key, canonical
+
+    def _identity_lock(self, key: Tuple[str, str, str, str]) -> RLock:
+        with self._lock:
+            lock = self._identity_locks.get(key)
+            if lock is not None:
+                return lock
+            if len(self._identity_locks) >= self.max_cached_identities:
+                raise CandleDataError("bounded candle identity capacity reached")
+            lock = RLock()
+            self._identity_locks[key] = lock
+            return lock
 
     @staticmethod
     def _canonical_symbol(symbol: str) -> str:
@@ -113,6 +163,13 @@ class DirectCandleCache:
         raise CandleDataError(f"missing candle field: {name}")
 
     def _fetch(self, symbol: str, timeframe: str) -> Tuple[Iterable[Mapping[str, Any]], str, str]:
+        # The client may hold mutable source metadata on itself; serialize the
+        # complete request and metadata read unless explicitly configured for a
+        # small bounded amount of concurrency.
+        with self._fetch_semaphore:
+            return self._fetch_unlocked(symbol, timeframe)
+
+    def _fetch_unlocked(self, symbol: str, timeframe: str) -> Tuple[Iterable[Mapping[str, Any]], str, str]:
         method = getattr(self.client, "get_historical_candles_with_metadata", None)
         if callable(method):
             result = method(symbol=symbol, resolution=timeframe, limit=FETCH_CANDLES)
@@ -140,6 +197,9 @@ class DirectCandleCache:
         source: str,
         instrument: str,
         now: float,
+        venue: str = "unknown",
+        market_type: str = "unknown",
+        instrument_id: str = "",
     ) -> CandleFrame:
         if timeframe not in INTERVAL_SECONDS:
             raise CandleDataError(f"unsupported native timeframe: {timeframe}")
@@ -198,35 +258,75 @@ class DirectCandleCache:
         frame = pd.DataFrame(prior_closed, columns=["time", "open", "high", "low", "close", "volume"])
         frame.index = pd.to_datetime(frame.pop("time"), unit="s", utc=True)
         frame.index.name = "timestamp"
-        return CandleFrame(symbol=symbol, source=source, timeframe=timeframe, closed=frame, current=current, fetched_at=now)
+        return CandleFrame(
+            symbol=symbol, source=source, timeframe=timeframe, closed=frame,
+            current=current, fetched_at=now, venue=venue,
+            market_type=market_type, instrument_id=instrument_id or symbol,
+        )
 
-    def refresh(self, symbol: str, *, force: bool = False) -> CandleSnapshot:
-        symbol = self._canonical_symbol(symbol)
-        now = float(self.clock())
-        with self._lock:
-            cached = self._snapshots.get(symbol)
+    def refresh(
+        self,
+        symbol: str,
+        *,
+        force: bool = False,
+        venue: str = "unknown",
+        market_type: str = "unknown",
+        instrument_id: Optional[str] = None,
+    ) -> CandleSnapshot:
+        identity = self._identity_key(symbol, venue, market_type, instrument_id)
+        venue_key, market_key, instrument_key, symbol_key = identity
+        identity_lock = self._identity_lock(identity)
+        with identity_lock:
+            now = float(self.clock())
+            with self._lock:
+                cached = self._snapshots.get(identity)
             if not force and cached and now - cached.fetched_at < self.ttl_seconds:
                 return cached
             frames: Dict[str, CandleFrame] = {}
             for timeframe in LIVE_TIMEFRAMES:
-                candles, source, instrument = self._fetch(symbol, timeframe)
-                frame = self._normalize(symbol, timeframe, candles, source, instrument, now)
-                # The key includes source so a source fallback cannot overwrite a
-                # different-source frame for the same symbol/timeframe.
-                self._cache[(symbol, frame.source, timeframe)] = frame
+                candles, source, instrument = self._fetch(symbol_key, timeframe)
+                # Validate freshness at the time each response arrives rather
+                # than anchoring all eight sequential requests to cycle start.
+                frame_now = float(self.clock())
+                frame = self._normalize(
+                    symbol_key, timeframe, candles, source, instrument, frame_now,
+                    venue=venue_key, market_type=market_key,
+                    instrument_id=instrument_key,
+                )
+                with self._lock:
+                    # One current provider frame per request identity/timeframe;
+                    # provider provenance remains attached to that frame.
+                    self._cache[(identity, timeframe)] = frame
                 frames[timeframe] = frame
-            snapshot = CandleSnapshot(symbol=symbol, frames=frames, fetched_at=now)
-            self._snapshots[symbol] = snapshot
+            completed_at = float(self.clock())
+            snapshot = CandleSnapshot(
+                symbol=symbol_key, frames=frames, fetched_at=completed_at,
+                venue=venue_key, market_type=market_key,
+                instrument_id=instrument_key,
+            )
+            with self._lock:
+                self._snapshots[identity] = snapshot
             return snapshot
 
-    def get_snapshot(self, symbol: str) -> Optional[CandleSnapshot]:
+    def get_snapshot(
+        self,
+        symbol: str,
+        *,
+        venue: str = "unknown",
+        market_type: str = "unknown",
+        instrument_id: Optional[str] = None,
+    ) -> Optional[CandleSnapshot]:
+        identity = self._identity_key(symbol, venue, market_type, instrument_id)
         with self._lock:
-            return self._snapshots.get(self._canonical_symbol(symbol))
+            return self._snapshots.get(identity)
 
     def clear_symbol(self, symbol: str) -> None:
         symbol = self._canonical_symbol(symbol)
         with self._lock:
-            self._snapshots.pop(symbol, None)
-            for key in list(self._cache):
-                if key[0] == symbol:
-                    del self._cache[key]
+            identities = [key for key in self._snapshots if key[3] == symbol]
+            for identity in identities:
+                self._snapshots.pop(identity, None)
+                self._identity_locks.pop(identity, None)
+                for key in list(self._cache):
+                    if key[0] == identity:
+                        del self._cache[key]

@@ -154,6 +154,13 @@ except Exception:
     LIVE_TIMEFRAMES = ()
     DIRECT_CANDLE_CACHE_AVAILABLE = False
 try:
+    from jarvis_multicoin_analysis import MultiCoinPart7Shadow, multicoin_analysis_enabled
+    MULTICOIN_SHADOW_AVAILABLE = True
+except Exception:
+    MultiCoinPart7Shadow = None
+    multicoin_analysis_enabled = lambda value=None: False
+    MULTICOIN_SHADOW_AVAILABLE = False
+try:
     from part7_signal import analyze_timeframe as _analyze_part7_timeframe, aggregate_results as _aggregate_part7_results
     PART7_SHARED_ANALYZER_AVAILABLE = True
 except Exception:
@@ -1190,6 +1197,33 @@ class LiveTradingEngine:
                 delta_client=getattr(self.jarvis, 'delta_data', None),
             )
 
+        # Optional multi-coin work is isolated as Part7 shadow diagnostics and
+        # is disabled by default. It cannot influence the selected route or any
+        # decision/order path. The single selected-symbol pipeline remains the
+        # only source of trade decisions.
+        self.multicoin_shadow = None
+        self.multicoin_shadow_status = {
+            'enabled': multicoin_analysis_enabled(),
+            'status': 'DISABLED' if not multicoin_analysis_enabled() else 'UNAVAILABLE',
+            'results': {},
+        }
+        if (multicoin_analysis_enabled() and not getattr(self.jarvis, 'is_backtest_mode', False)
+                and MULTICOIN_SHADOW_AVAILABLE and getattr(self.jarvis, 'direct_candle_cache', None) is not None):
+            try:
+                self.multicoin_shadow = MultiCoinPart7Shadow(
+                    self.jarvis.direct_candle_cache,
+                    self._multicoin_candidate_symbols,
+                    enabled=True,
+                    max_workers=int(os.getenv('JARVIS_MULTICOIN_MAX_WORKERS', '2')),
+                    max_candidates=int(os.getenv('JARVIS_MULTICOIN_MAX_CANDIDATES', '15')),
+                    refresh_interval_seconds=float(os.getenv('JARVIS_MULTICOIN_CANDIDATE_REFRESH_SEC', '300')),
+                    result_max_age_seconds=float(os.getenv('JARVIS_MULTICOIN_RESULT_MAX_AGE_SEC', '120')),
+                )
+                self.multicoin_shadow_status = {'enabled': True, 'status': 'IDLE', 'results': {}}
+            except Exception as _multi_error:
+                logger.warning('[MULTICOIN-SHADOW] Initialization unavailable: %s', type(_multi_error).__name__)
+                self.multicoin_shadow_status = {'enabled': True, 'status': 'UNAVAILABLE', 'results': {}}
+
         # ═══ PRE-TRADE SIMULATOR STATS (fail-open; JARVIS_PRESIM=0 disables) ═══
         self.presim_stats = {'checks': 0, 'vetoes': 0, 'adjustments': 0}
         
@@ -1987,6 +2021,35 @@ class LiveTradingEngine:
             'updated_at': datetime.now().isoformat(),
         }
 
+    def _multicoin_candidate_symbols(self):
+        """Return only exact, volume-qualified scanner symbols in Delta products.
+
+        No USDT/USD equivalence, market-kind conversion, or ticker substitution
+        is performed. This candidate list is advisory and analysis-only.
+        """
+        try:
+            scanner = getattr(self.market_router, 'scanner', None)
+            delta = getattr(self.market_router, 'delta', None)
+            if scanner is None or delta is None:
+                return ()
+            from jarvis_coin_scanner import DELTA_SYMBOL_MAP, MIN_VOLUME_USDT
+            scores = scanner.get_all_scores()
+            available = {str(value).strip().upper() for value in delta.get_available_symbols() or ()}
+            candidates = []
+            for coin, score in (scores or {}).items():
+                try:
+                    if float(score.get('volume_24h_usdt', 0.0)) < float(MIN_VOLUME_USDT):
+                        continue
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                symbol = DELTA_SYMBOL_MAP.get(str(coin).upper())
+                if symbol and symbol in available:
+                    candidates.append(symbol)
+            return tuple(candidates)
+        except Exception as _candidate_error:
+            logger.warning('[MULTICOIN-SHADOW] Candidate discovery unavailable: %s', type(_candidate_error).__name__)
+            return ()
+
     def stop_live_trading(self, timeout=None):
         """Request a bounded, orderly stop without touching open positions."""
         self.is_running = False
@@ -2001,6 +2064,11 @@ class LiveTradingEngine:
         try:
             if getattr(self, 'executor', None):
                 self.executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        try:
+            if getattr(self, 'multicoin_shadow', None) is not None:
+                self.multicoin_shadow.close()
         except Exception:
             pass
         self._set_readiness('STOPPED', 'stopped; positions require independent reconciliation')
@@ -2201,7 +2269,13 @@ class LiveTradingEngine:
                     snapshot = None
                     if getattr(self.jarvis, 'direct_candle_cache', None) is not None:
                         try:
-                            snapshot = self.jarvis.direct_candle_cache.refresh(symbol)
+                            # Exact Delta-listed symbol is the product identity;
+                            # product type is deliberately marked unverified because
+                            # the adapter exposes no authoritative type/product ID.
+                            snapshot = self.jarvis.direct_candle_cache.refresh(
+                                symbol, venue='delta', market_type='unverified',
+                                instrument_id=symbol,
+                            )
                         except Exception as candle_error:
                             self._set_readiness('NOT_READY', f'candle feed rejected: {candle_error}')
                             logger.warning('[CANDLES] Cycle blocked for %s: %s', symbol, candle_error)
@@ -2210,6 +2284,12 @@ class LiveTradingEngine:
                     if snapshot is not None and '1m' in snapshot.frames:
                         self._set_readiness('READY', f'verified route {symbol}; direct native candles available')
                         self.jarvis._active_candle_snapshot = snapshot
+                        if self.multicoin_shadow is not None:
+                            # Results are shadow diagnostics only: never pass
+                            # them into analyze_trade_setup or decision/order APIs.
+                            self.multicoin_shadow_status = self.multicoin_shadow.poll(
+                                selected_symbol=symbol, selected_snapshot=snapshot,
+                            )
                         df = snapshot.frames['1m'].closed.copy()
                         # The forming candle is deliberately not appended to df.
                         # It is carried as metadata for display/current price only.
@@ -3622,7 +3702,7 @@ Follow the tag with a 1-sentence options analyst insight.
     def analyze(self, data, context=None):
         """Unified selected-asset options analysis; BTC Deribit is never an alt substitute."""
         try:
-            requested = context.get('symbol') if isinstance(context, dict) else None
+            requested = (context.get('selected_symbol') or context.get('symbol')) if isinstance(context, dict) else None
             asset = str(requested or self.asset or '').upper().replace('USDT', '').replace('USD', '')
             if asset:
                 self.asset = asset
@@ -3647,6 +3727,25 @@ Follow the tag with a 1-sentence options analyst insight.
             except Exception as e:
                 logging.warning(f"Options client API fetch warning: {e}")
                 bias_data = {'bias': 'NEUTRAL', 'score': 0, 'reasons': [str(e)]}
+
+            # Do not turn Delta's ordinary {bias: NEUTRAL, reasons: [No Data]}
+            # payload, a provider error, or a partial/stale chain into a usable
+            # Part14 vote. Only the selected asset's validated chain is primary.
+            raw_data = bias_data.get('raw_data', {}) if isinstance(bias_data, dict) else {}
+            options_validation = raw_data.get('options_validation', {}) if isinstance(raw_data, dict) else {}
+            if not (isinstance(options_validation, dict)
+                    and options_validation.get('usable') is True
+                    and options_validation.get('complete') is True
+                    and options_validation.get('fresh') is True
+                    and options_validation.get('identity_valid') is True
+                    and options_validation.get('underlying') == self.asset):
+                return {
+                    "signal": 0,
+                    "thought": f"Selected-asset options unavailable or unvalidated ({self.asset})",
+                    "telemetry": {"signal": 0, "available": False, "asset": self.asset,
+                                  "validation": options_validation or None,
+                                  "greeks_model_derived": False},
+                }
             
             # Additional detailed analysis if available (Deribit specific)
             thoughts = []
@@ -3689,9 +3788,14 @@ Follow the tag with a 1-sentence options analyst insight.
             pcr_float = pcr_float if pcr_float is not None and math.isfinite(pcr_float) and pcr_float >= 0 else None
 
             telemetry = {
-                "exchange": "Delta" if source == delta_source else "Deribit",
+                "exchange": raw_data.get('source_provider') or ("Delta" if source == delta_source else "Deribit"),
                 "asset": self.asset,
                 "available": True,
+                "chain_validation": options_validation,
+                "chain_coverage": raw_data.get('coverage'),
+                "greeks_source": "exchange_observed_only",
+                "greeks_model_derived": False,
+                "dealer_gamma_direction": {"available": False, "reason": "unsigned open interest does not identify dealer positioning"},
                 "bias_score": float(bias_data.get('score', 0)),
                 "pcr": pcr_float,
                 "signal": math_signal,
@@ -5569,22 +5673,27 @@ class JarvisElite:
                     try:
                         # 🎓 TEACHER FIX #1: Data Pollution (Pass-by-reference mutation bug)
                         # Ensure each part receives a pristine, independent copy of the dataframe.
-                        # Part 7 also receives the selected symbol/timeframe identity so it
-                        # cannot silently analyze a BTC/default or mixed-symbol frame.
+                        # Part 7 and Part 14 receive the routed symbol explicitly; options must
+                        # never fall back to Part14's historical BTC constructor default.
                         part_context = self.market_context
-                        if name == 'part7_volatility':
+                        if name in ('part7_volatility', 'part14_options_chain'):
+                            selected_symbol = getattr(self, 'active_symbol', None) or getattr(data, 'attrs', {}).get('symbol')
                             part_context = dict(self.market_context)
                             part_context.update({
-                                'selected_symbol': getattr(self, 'active_symbol', None),
+                                'selected_symbol': selected_symbol,
+                                'symbol': selected_symbol,
                                 'timeframe': tf_name,
-                                'is_backtest_mode': self.is_backtest_mode,
-                                'shared_candle_source': 'historical_replay' if self.is_backtest_mode else 'shared_exchange',
                             })
-                            tf_data = tf_data.copy()
-                            tf_data.attrs = dict(getattr(tf_data, 'attrs', {}) or {})
-                            if getattr(self, 'active_symbol', None):
-                                tf_data.attrs['symbol'] = self.active_symbol
-                            tf_data.attrs['timeframe'] = tf_name
+                            if name == 'part7_volatility':
+                                part_context.update({
+                                    'is_backtest_mode': self.is_backtest_mode,
+                                    'shared_candle_source': 'historical_replay' if self.is_backtest_mode else 'shared_exchange',
+                                })
+                                tf_data = tf_data.copy()
+                                tf_data.attrs = dict(getattr(tf_data, 'attrs', {}) or {})
+                                if selected_symbol:
+                                    tf_data.attrs['symbol'] = selected_symbol
+                                tf_data.attrs['timeframe'] = tf_name
                         res = part.analyze(tf_data, context=part_context)
                         if isinstance(res, dict):
                             tf_results[name] = res
