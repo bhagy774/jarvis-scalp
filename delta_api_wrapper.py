@@ -696,34 +696,77 @@ class DeltaExchangeData:
         than sending an unsupported ``symbol`` query parameter or making a
         broad positions request.
         """
-        resolved_symbol = symbol
+        resolved_symbol = None
+        product_id = None
         if not symbol:
+            # Preserve the explicit unscoped query for callers that intentionally
+            # ask for all positions. Instrument-specific reconciliation below
+            # must always resolve and scope by a known Delta product ID.
             res = self._request("GET", "/v2/positions", None, authorized=True)
         else:
-            product_id = self.get_product_id(symbol)
-            if product_id is None:
-                logger.error("[DELTA API] Product ID not found for requested positions")
+            product = self._resolve_product(symbol)
+            if not isinstance(product, dict):
+                logger.error("[DELTA API] Product not found for requested positions")
                 return []
-            resolved_symbol = product.get("symbol", symbol)
+            raw_symbol = product.get("symbol")
+            if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+                logger.error("[DELTA API] Invalid product symbol for requested positions")
+                return []
+            resolved_symbol = raw_symbol.strip().upper()
+            requested = symbol.strip().upper() if isinstance(symbol, str) else ""
+            accepted_symbols = {requested}
+            if requested.endswith("USDT"):
+                accepted_symbols.add(requested[:-4] + "USD")
+            elif requested.endswith("USD"):
+                accepted_symbols.add(requested[:-3] + "USDT")
+            if resolved_symbol not in accepted_symbols:
+                logger.error("[DELTA API] Resolved product does not match requested positions symbol")
+                return []
             try:
-                pid = int(product_id)
-            except (TypeError, ValueError):
+                pid = int(product["id"])
+                if pid <= 0:
+                    raise ValueError("non-positive product ID")
+            except (KeyError, TypeError, ValueError):
                 logger.error("[DELTA API] Invalid product ID for requested positions")
                 return []
-            # Build signed URL with product_id as query param (Delta requirement)
-            endpoint_with_param = f"/v2/positions?product_id={pid}"
-            res = self._request("GET", endpoint_with_param, None, authorized=True)
-        if res["success"]:
-            try:
-                positions = res["data"].get("result", [])
-                if resolved_symbol:
-                    positions = [p for p in positions
-                                 if p.get("product", {}).get("symbol") == resolved_symbol
-                                 or p.get("symbol") == resolved_symbol]
-                return positions
-            except Exception:
-                return []
-        return []
+            product_id = pid
+            # Build signed URL with product_id as query param (Delta requirement).
+            res = self._request("GET", f"/v2/positions?product_id={pid}", None, authorized=True)
+        if not isinstance(res, dict) or not res.get("success"):
+            return []
+        data = res.get("data")
+        positions = data.get("result") if isinstance(data, dict) else None
+        if not isinstance(positions, list):
+            return []
+        if resolved_symbol is None:
+            return positions
+
+        matched = []
+        for position in positions:
+            if not isinstance(position, dict):
+                continue
+            raw_product = position.get("product")
+            if raw_product is not None and not isinstance(raw_product, dict):
+                continue
+            raw_product = raw_product if isinstance(raw_product, dict) else {}
+            raw_position_id = raw_product.get("id", position.get("product_id"))
+            if raw_position_id is not None:
+                try:
+                    if int(raw_position_id) != product_id:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            raw_position_symbol = (raw_product.get("symbol") or position.get("symbol")
+                                   or position.get("product_symbol"))
+            if raw_position_symbol is not None:
+                if not isinstance(raw_position_symbol, str) or raw_position_symbol.strip().upper() != resolved_symbol:
+                    continue
+            elif raw_position_id is None:
+                # The endpoint is scoped, but a record with no instrument identity
+                # cannot safely be assigned to this caller's product.
+                continue
+            matched.append(position)
+        return matched
 
     def close_all_positions(self, symbol: str = "BTCUSDT") -> List[Dict]:
         """
