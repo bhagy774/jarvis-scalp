@@ -1,9 +1,10 @@
-"""Opt-in full Part1--Part12 analysis pipeline with fail-closed paper handoff.
+"""Opt-in full Part1--Part12 analysis with fail-closed execution handoffs.
 
-The live Delta route and background analysis namespace are separate. A caller
-must supply complete product identities and an isolated analysis owner. Analysis
-outputs are never live-order eligible; an isolated paper adapter may accept only
-an explicitly supplied plan after separate contract/policy validation.
+The selected-symbol Delta route and background analysis namespace are separate.
+A caller must supply complete product identities and an isolated analysis owner.
+Analysis outputs are never live-order eligible by themselves: the paper or
+protected-Delta consumer must independently validate a complete plan, current
+quotes, per-asset policy, risk, lot limits, and account state.
 """
 from __future__ import annotations
 
@@ -27,6 +28,8 @@ class InstrumentKey:
     market_type: str
     instrument_id: str
     symbol: str
+    execution_identity: Optional[Tuple[str, str, str, str]] = None
+    mapping_policy_id: Optional[str] = None
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> "InstrumentKey":
@@ -36,7 +39,20 @@ class InstrumentKey:
             raise CandleDataError("candidate is missing venue/market/product/symbol identity")
         if values[0].lower() not in {"delta", "binance"}:
             raise CandleDataError("unsupported analysis venue")
-        return cls(values[0].lower(), values[1].lower(), values[2], values[3].upper())
+        execution_raw = record.get("execution_identity")
+        execution_identity = None
+        if execution_raw is not None:
+            if not isinstance(execution_raw, Mapping):
+                raise CandleDataError("execution identity must be a complete mapping")
+            exec_values = [str(execution_raw.get(k) or "").strip() for k in ("venue", "market_type", "instrument_id", "symbol")]
+            if any(not v for v in exec_values) or exec_values[0].lower() != "delta":
+                raise CandleDataError("mapped execution identity must be a full Delta product key")
+            execution_identity = (exec_values[0].lower(), exec_values[1].lower(), exec_values[2], exec_values[3].upper())
+        mapping_policy_id = str(record.get("mapping_policy_id") or "").strip() or None
+        if execution_identity and not mapping_policy_id:
+            raise CandleDataError("cross-venue product mapping policy ID is required")
+        return cls(values[0].lower(), values[1].lower(), values[2], values[3].upper(),
+                   execution_identity, mapping_policy_id)
 
     def as_tuple(self) -> Tuple[str, str, str, str]:
         return self.venue, self.market_type, self.instrument_id, self.symbol
@@ -44,6 +60,11 @@ class InstrumentKey:
     def as_dict(self) -> Dict[str, str]:
         return {"venue": self.venue, "market_type": self.market_type,
                 "instrument_id": self.instrument_id, "symbol": self.symbol}
+
+    def mapped_execution_dict(self) -> Optional[Dict[str, str]]:
+        if self.execution_identity is None:
+            return None
+        return dict(zip(("venue", "market_type", "instrument_id", "symbol"), self.execution_identity))
 
 
 class DeltaNativeCandleClient:
@@ -185,7 +206,9 @@ class MultiCoinPipeline:
             # such records instead of assigning one ticker's data to a contract.
             symbols: Dict[Tuple[str, str], set] = {}
             for item in discovered:
-                symbols.setdefault((item.venue, item.symbol), set()).add((item.market_type, item.instrument_id))
+                symbols.setdefault((item.venue, item.symbol), set()).add(
+                    (item.market_type, item.instrument_id, item.execution_identity)
+                )
             ambiguous = {pair for pair, identities in symbols.items() if len(identities) > 1}
             self._ambiguous_symbol_count = len(ambiguous)
             discovered = [item for item in discovered if (item.venue, item.symbol) not in ambiguous]
@@ -321,16 +344,21 @@ class MultiCoinPipeline:
             version = hashlib.sha256(json.dumps({"identity": key.as_tuple(), "frames": versions}, sort_keys=True).encode()).hexdigest()[:24]
             return {
                 "symbol": key.symbol, "request_identity": key.as_dict(),
+                "execution_identity": key.mapped_execution_dict(),
+                "mapping_policy_id": key.mapping_policy_id,
                 "status": "COMPLETE" if complete else "PARTIAL",
                 "scope": "parts1-12-analysis-only", "coverage": [f"Part{i}" for i in range(1, 13)],
                 "parts_by_timeframe": parts_by_tf if isinstance(parts_by_tf, Mapping) else {},
                 "once_per_symbol_parts": raw.get("once_per_symbol_parts", {}),
+                "part7_gate": raw.get("part7_gate"),
+                "deterministic_decision": raw.get("deterministic_decision"),
+                "analysis_reference": raw.get("analysis_reference"),
                 "part14": "not_in_scope",
                 "snapshot_version": version, "snapshot_fetched_at": float(snapshot.fetched_at),
                 "analysis_completed_at": completed,
-                # No entry/stop/target/size may be inferred from Parts 1-12. A
-                # downstream paper adapter may validate only an explicit plan
-                # returned by the analyzer; current Jarvis output has none.
+                # No entry/stop/target/size may be inferred from Parts 1-12.
+                # Downstream adapters may consume only an explicit, independently
+                # validated execution plan; current Jarvis analysis supplies none.
                 "execution_plan": dict(raw["execution_plan"]) if isinstance(raw.get("execution_plan"), Mapping) else None,
                 "execution_candidate_status": "PLAN_PRESENT_REQUIRES_VALIDATION" if isinstance(raw.get("execution_plan"), Mapping) else "BLOCKED_MISSING_EXPLICIT_PLAN",
                 "analysis_only": True, "decision_authority": "none", "execution_eligible": False,
@@ -342,8 +370,9 @@ class MultiCoinPipeline:
     @staticmethod
     def _blocked(key: InstrumentKey, reason: str) -> Dict[str, Any]:
         return {
-            "symbol": key.symbol, "request_identity": key.as_dict(), "status": "BLOCKED",
-            "scope": "parts1-12-analysis-only", "coverage": [], "reason": reason[:180],
+            "symbol": key.symbol, "request_identity": key.as_dict(),
+            "execution_identity": key.mapped_execution_dict(), "mapping_policy_id": key.mapping_policy_id,
+            "status": "BLOCKED", "scope": "parts1-12-analysis-only", "coverage": [], "reason": reason[:180],
             "analysis_only": True, "decision_authority": "none", "execution_eligible": False,
         }
 

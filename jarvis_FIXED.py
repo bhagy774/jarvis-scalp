@@ -170,6 +170,37 @@ except Exception:
     LIVE_TIMEFRAMES = ()
     DIRECT_CANDLE_CACHE_AVAILABLE = False
 try:
+    from jarvis_multicoin_analysis import multicoin_analysis_enabled
+except Exception:
+    multicoin_analysis_enabled = lambda value=None: False
+try:
+    from jarvis_multicoin_pipeline import (
+        BinanceSpotCandleClient, DeltaNativeCandleClient, MultiCoinPipeline,
+    )
+    MULTICOIN_PIPELINE_AVAILABLE = True
+except Exception:
+    BinanceSpotCandleClient = None
+    DeltaNativeCandleClient = None
+    MultiCoinPipeline = None
+    MULTICOIN_PIPELINE_AVAILABLE = False
+try:
+    from jarvis_multicoin_execution import (
+        PortfolioCoordinator, DeterministicPaperAdapter, candidate_from_analysis,
+    )
+    MULTICOIN_EXECUTION_AVAILABLE = True
+except Exception:
+    PortfolioCoordinator = None
+    DeterministicPaperAdapter = None
+    candidate_from_analysis = None
+    MULTICOIN_EXECUTION_AVAILABLE = False
+try:
+    from jarvis_delta_execution import DeltaExecutionAdapter, build_delta_candidate
+    DELTA_MULTICOIN_EXECUTION_AVAILABLE = True
+except Exception:
+    DeltaExecutionAdapter = None
+    build_delta_candidate = None
+    DELTA_MULTICOIN_EXECUTION_AVAILABLE = False
+try:
     from part7_signal import analyze_timeframe as _analyze_part7_timeframe, aggregate_results as _aggregate_part7_results
     PART7_SHARED_ANALYZER_AVAILABLE = True
 except Exception:
@@ -1206,6 +1237,121 @@ class LiveTradingEngine:
                 delta_client=getattr(self.jarvis, 'delta_data', None),
             )
 
+        # Optional full Parts 1-12 analysis is default-off. Delta's eligible
+        # active products are joined to one exact Binance spot symbol, and the
+        # analysis cache is Binance-only. The distinct Delta execution identity
+        # is carried through the pipeline and cannot be inferred from a ticker.
+        # The selected-symbol execution path remains independent.
+        self.multicoin_pipeline = None
+        self.multicoin_pipeline_status = {
+            'enabled': multicoin_analysis_enabled(),
+            'status': 'DISABLED' if not multicoin_analysis_enabled() else 'UNAVAILABLE',
+            'results': {},
+        }
+        if (multicoin_analysis_enabled() and not getattr(self.jarvis, 'is_backtest_mode', False)
+                and MULTICOIN_PIPELINE_AVAILABLE and getattr(self.jarvis, 'delta_data', None) is not None
+                and getattr(self.jarvis, 'binance_data', None) is not None and BinanceSpotCandleClient is not None):
+            try:
+                _multi_cache = DirectCandleCache(
+                    BinanceSpotCandleClient(self.jarvis.binance_data),
+                    ttl_seconds=float(os.getenv('JARVIS_MULTICOIN_CANDLE_TTL_SEC', '60')),
+                    max_concurrent_fetches=1,
+                    max_cached_identities=max(64, min(256, int(os.getenv('JARVIS_MULTICOIN_MAX_CANDIDATES', '100')))),
+                )
+                self.multicoin_pipeline = MultiCoinPipeline(
+                    _multi_cache,
+                    self._multicoin_candidate_instruments,
+                    self._analyze_multicoin_instrument,
+                    enabled=True,
+                    max_workers=int(os.getenv('JARVIS_MULTICOIN_MAX_WORKERS', '1')),
+                    max_candidates=int(os.getenv('JARVIS_MULTICOIN_MAX_CANDIDATES', '100')),
+                    discovery_interval_seconds=float(os.getenv('JARVIS_MULTICOIN_CANDIDATE_REFRESH_SEC', '300')),
+                    retry_interval_seconds=float(os.getenv('JARVIS_MULTICOIN_RETRY_SEC', '60')),
+                    result_max_age_seconds=float(os.getenv('JARVIS_MULTICOIN_RESULT_MAX_AGE_SEC', '180')),
+                )
+                self.multicoin_pipeline_status = {'enabled': True, 'status': 'IDLE', 'results': {}}
+            except Exception as _multi_error:
+                logger.warning('[MULTICOIN] Initialization unavailable: %s', type(_multi_error).__name__)
+                self.multicoin_pipeline_status = {'enabled': True, 'status': 'UNAVAILABLE', 'results': {}}
+
+        # Optional isolated paper-only execution of an explicitly supplied plan.
+        # The Parts 1-12 adapter currently emits no entry/stop/size plan, so the
+        # fail-closed validator ordinarily refuses candidates. This never routes
+        # to Delta/Binance orders or modifies the selected-symbol execution path.
+        self.multicoin_paper_coordinator = None
+        self.multicoin_paper_adapter = None
+        self.multicoin_paper_status = {'enabled': False, 'submitted': 0, 'blocked': 0}
+        if (os.getenv('JARVIS_MULTICOIN_PAPER_EXECUTION', '0').strip() == '1'
+                and MULTICOIN_EXECUTION_AVAILABLE and not getattr(self.jarvis, 'is_backtest_mode', False)):
+            try:
+                _policies = json.loads(os.getenv('JARVIS_MULTICOIN_PAPER_POLICY_REGISTRY', '{}'))
+                if not isinstance(_policies, dict):
+                    raise ValueError('policy registry must be an asset-to-policy object')
+                _budget = float(os.environ['JARVIS_MULTICOIN_PAPER_MAX_NOTIONAL'])
+                _risk_budget = float(os.environ['JARVIS_MULTICOIN_PAPER_MAX_RISK'])
+                self.multicoin_paper_coordinator = PortfolioCoordinator(
+                    journal_path=os.getenv('JARVIS_MULTICOIN_PAPER_JOURNAL', '.jarvis_state/multicoin_paper_execution.json'),
+                    enabled=True, max_positions=int(os.getenv('JARVIS_MULTICOIN_PAPER_MAX_POSITIONS', '2')),
+                    max_total_notional=_budget, max_total_risk=_risk_budget,
+                    per_asset_caps=json.loads(os.getenv('JARVIS_MULTICOIN_PAPER_ASSET_CAPS', '{}')),
+                    correlation_groups=json.loads(os.getenv('JARVIS_MULTICOIN_PAPER_CORRELATION_GROUPS', '{}')),
+                    max_per_correlation_group=int(os.getenv('JARVIS_MULTICOIN_PAPER_MAX_PER_GROUP', '1')),
+                )
+                self.multicoin_paper_adapter = DeterministicPaperAdapter()
+                self._multicoin_paper_policies = {str(k).upper(): str(v) for k, v in _policies.items()}
+                self.multicoin_paper_status = {'enabled': True, 'submitted': 0, 'blocked': 0, 'last_status': 'IDLE'}
+            except Exception as _paper_error:
+                logger.warning('[MULTICOIN-PAPER] Initialization fail-closed: %s', type(_paper_error).__name__)
+                self.multicoin_paper_status = {'enabled': False, 'status': 'UNAVAILABLE'}
+
+        # Real Delta handoff is a separate, explicit opt-in. It requires an
+        # asset-specific exact Binance->Delta policy, staged entry plus
+        # separately attached/verified protection, and complete reconciliation.
+        # This is deliberately not described as atomic: Delta's documented
+        # bracket endpoint is a post-fill operation and must fail closed if it
+        # cannot be verified.
+        self.multicoin_delta_coordinator = None
+        self.multicoin_delta_adapter = None
+        self._multicoin_delta_policies = {}
+        self.multicoin_delta_status = {'enabled': False, 'submitted': 0, 'blocked': 0, 'last_status': 'DISABLED'}
+        if (os.getenv('JARVIS_MULTICOIN_DELTA_EXECUTION', '0').strip() == '1'
+                and DELTA_MULTICOIN_EXECUTION_AVAILABLE and MULTICOIN_EXECUTION_AVAILABLE
+                and not getattr(self.jarvis, 'is_backtest_mode', False)):
+            try:
+                _delta_policies = json.loads(os.getenv('JARVIS_MULTICOIN_DELTA_POLICY_REGISTRY', '{}'))
+                if not isinstance(_delta_policies, dict) or not _delta_policies:
+                    raise ValueError('explicit asset-specific Delta policy registry required')
+                _delta_client = getattr(self.jarvis, 'delta_data', None)
+                _needed = ('place_protected_order', 'place_reduce_only_order', 'get_complete_account_snapshot',
+                           'get_delta_executable_quote', 'get_available_balance')
+                if _delta_client is None or any(not callable(getattr(_delta_client, name, None)) for name in _needed):
+                    raise ValueError('Delta broker lacks protective order, quote, or complete reconciliation capability')
+                self._multicoin_delta_policies = {str(k).upper(): dict(v) for k, v in _delta_policies.items() if isinstance(v, dict)}
+                _policy_ids = {asset: str(policy.get('policy_id') or '') for asset, policy in self._multicoin_delta_policies.items()}
+                if any(not value for value in _policy_ids.values()):
+                    raise ValueError('each asset policy requires a nonempty policy_id')
+                self.multicoin_delta_adapter = DeltaExecutionAdapter(
+                    _delta_client, policy_registry=self._multicoin_delta_policies)
+                self.multicoin_delta_coordinator = PortfolioCoordinator(
+                    journal_path=os.getenv('JARVIS_MULTICOIN_DELTA_JOURNAL', '.jarvis_state/multicoin_delta_execution.json'),
+                    enabled=True, require_reconciliation=True,
+                    require_protective_reconciliation=True,
+                    max_positions=int(os.getenv('JARVIS_MULTICOIN_DELTA_MAX_POSITIONS', '2')),
+                    max_total_notional=float(os.environ['JARVIS_MULTICOIN_DELTA_MAX_NOTIONAL']),
+                    max_total_risk=float(os.environ['JARVIS_MULTICOIN_DELTA_MAX_RISK']),
+                    per_asset_caps=json.loads(os.getenv('JARVIS_MULTICOIN_DELTA_ASSET_CAPS', '{}')),
+                    correlation_groups=json.loads(os.getenv('JARVIS_MULTICOIN_DELTA_CORRELATION_GROUPS', '{}')),
+                    max_per_correlation_group=int(os.getenv('JARVIS_MULTICOIN_DELTA_MAX_PER_GROUP', '1')),
+                )
+                if not self.multicoin_delta_adapter.reconcile(self.multicoin_delta_coordinator):
+                    raise ValueError('authoritative Delta startup reconciliation failed')
+                self.multicoin_delta_status = {'enabled': True, 'submitted': 0, 'blocked': 0, 'last_status': 'RECONCILED'}
+            except Exception as _delta_exec_error:
+                logger.warning('[MULTICOIN-DELTA] Initialization fail-closed: %s', type(_delta_exec_error).__name__)
+                self.multicoin_delta_coordinator = None
+                self.multicoin_delta_adapter = None
+                self.multicoin_delta_status = {'enabled': False, 'status': 'UNAVAILABLE', 'reason': str(_delta_exec_error)[:160]}
+
         # ═══ PRE-TRADE SIMULATOR STATS (fail-open; JARVIS_PRESIM=0 disables) ═══
         self.presim_stats = {'checks': 0, 'vetoes': 0, 'adjustments': 0}
         
@@ -2003,6 +2149,248 @@ class LiveTradingEngine:
             'updated_at': datetime.now().isoformat(),
         }
 
+    def _multicoin_candidate_instruments(self):
+        """Join scanner-qualified Binance spot assets to explicit active Delta perps.
+
+        This is discovery only. The Delta base, quoting, and settling assets all
+        come from product metadata; no DELTA_SYMBOL_MAP, ticker suffix, quote
+        currency, or BTC-only assumption is used. Products lacking supported
+        risk units, explicit assets, or a unique eligible id are excluded.
+        """
+        try:
+            scanner = getattr(self.market_router, 'scanner', None)
+            delta = getattr(self.market_router, 'delta', None)
+            if scanner is None or delta is None:
+                return ()
+            from jarvis_coin_scanner import MIN_VOLUME_USDT
+            snapshot_getter = getattr(delta, 'get_available_products_snapshot', None)
+            if callable(snapshot_getter):
+                snapshot = snapshot_getter()
+                if not isinstance(snapshot, dict) or snapshot.get('complete') is not True:
+                    return ()
+                product_rows = snapshot.get('products', ())
+            else:
+                product_getter = getattr(delta, 'get_available_products', None)
+                if not callable(product_getter):
+                    return ()
+                product_rows = product_getter() or ()
+            scores = {}
+            for coin, row in (scanner.get_all_scores() or {}).items():
+                asset = str(coin).strip().upper()
+                try:
+                    volume = float(row.get('volume_24h_usdt', 0.0))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if asset and volume >= float(MIN_VOLUME_USDT) and volume < float('inf'):
+                    scores[asset] = max(volume, scores.get(asset, 0.0))
+            eligible_by_asset = {}
+            accepted_types = {'perpetual', 'perpetual_futures', 'perpetual_swap', 'perpetual_swaps'}
+            from jarvis_risk import contract_quote_value_in_currency
+            for product in product_rows:
+                if not isinstance(product, dict):
+                    continue
+                state = str(product.get('state') or product.get('status') or '').strip().lower()
+                marker = str(product.get('product_type') or product.get('market_type') or
+                             product.get('contract_type') or '').strip().lower()
+                if state not in {'active', 'live', 'trading', 'listed'} or marker not in accepted_types:
+                    continue
+                def asset_symbol(value):
+                    if isinstance(value, dict):
+                        value = value.get('symbol') or value.get('asset_symbol') or value.get('name')
+                    return str(value or '').strip().upper()
+                base = asset_symbol(product.get('underlying_asset_symbol') or product.get('underlying_asset')
+                                    or product.get('base_asset'))
+                quote = asset_symbol(product.get('quoting_asset') or product.get('quote_asset')
+                                     or product.get('quote_currency'))
+                settle = asset_symbol(product.get('settling_asset') or product.get('settlement_asset')
+                                      or product.get('settlement_currency'))
+                symbol = str(product.get('symbol') or '').strip().upper()
+                pid = product.get('id', product.get('product_id'))
+                try:
+                    tick_size = float(product.get('tick_size'))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                notional_kind = str(product.get('notional_type') or '').strip().lower()
+                specs = product.get('product_specs') if isinstance(product.get('product_specs'), dict) else {}
+                trading_status = str(product.get('trading_status') or '').strip().lower()
+                if (not base or not quote or not settle or not symbol or pid is None
+                        or quote != settle or not math.isfinite(tick_size) or tick_size <= 0
+                        or notional_kind == 'inverse' or product.get('is_quanto') is True
+                        or specs.get('only_reduce_only_orders_allowed') is True
+                        or trading_status not in {'', 'operational'}
+                        or contract_quote_value_in_currency(product, 1.0, settle) is None):
+                    continue
+                if base in scores:
+                    eligible_by_asset.setdefault(base, []).append((product, quote, settle, marker))
+            candidates = []
+            for asset, volume in scores.items():
+                # Ambiguous active products for one underlying are excluded;
+                # operators may narrow via a reviewed product-specific policy.
+                matches = eligible_by_asset.get(asset, ())
+                if len(matches) != 1:
+                    continue
+                product, quote, settle, marker = matches[0]
+                symbol = str(product['symbol']).strip().upper()
+                binance_symbol = asset + 'USDT'
+                mapping_policy_id = f'binance_spot_usdt_to_delta_{quote.lower()}_{settle.lower()}_{marker}'
+                candidates.append({
+                    'venue': 'binance', 'market_type': 'spot',
+                    'instrument_id': binance_symbol, 'symbol': binance_symbol,
+                    'execution_identity': {
+                        'venue': 'delta', 'market_type': marker,
+                        'instrument_id': str(product.get('id', product.get('product_id'))).strip(),
+                        'symbol': symbol,
+                    },
+                    'mapping_policy_id': mapping_policy_id,
+                    'liquidity_24h_usdt': volume,
+                })
+            candidates.sort(key=lambda item: (-float(item['liquidity_24h_usdt']), item['symbol']))
+            return tuple(candidates)
+        except Exception as _candidate_error:
+            logger.warning('[MULTICOIN] Product discovery unavailable: %s', type(_candidate_error).__name__)
+            return ()
+
+    def _analyze_multicoin_instrument(self, key, snapshot):
+        """Run the real Part1-12 Jarvis method on an isolated analysis-only owner."""
+        owner = None
+        try:
+            if tuple(snapshot.identity) != key.as_tuple():
+                return {}
+            native_frames = snapshot.analysis_frames()
+            owner = JarvisElite(backtest_mode=True, analysis_only=True)
+            owner.active_symbol = key.symbol
+            owner.active_base_asset = key.symbol
+            for quote in ('USDT', 'USD', 'USDC'):
+                if owner.active_base_asset.endswith(quote):
+                    owner.active_base_asset = owner.active_base_asset[:-len(quote)]
+                    break
+            owner.engines = {}  # only the reviewed Part adapters run in this path
+            owner.direct_candle_cache = None
+            owner.delta_data = None
+            owner.deribit = None
+            owner.binance_data = None
+            owner.coin_scanner = None
+            owner._active_candle_snapshot = snapshot
+            native_frames = {tf: frame.copy(deep=True) for tf, frame in native_frames.items()}
+            for tf, frame in native_frames.items():
+                frame.attrs.update({'symbol': key.symbol, 'timeframe': tf})
+            owner.analyze_trade_setup(
+                native_frames['1m'].copy(deep=True), candle_snapshot=snapshot,
+                native_mtf=native_frames,
+            )
+            analysis = getattr(owner, 'latest_multicoin_analysis', None)
+            if not isinstance(analysis, dict):
+                return {}
+            one_minute = snapshot.frames.get('1m')
+            if one_minute is None or one_minute.closed.empty:
+                return {}
+            reference_open = float(pd.Timestamp(one_minute.closed.index[-1]).timestamp())
+            analysis_reference = {
+                'source': 'binance', 'symbol': key.symbol, 'timeframe': '1m',
+                # Candle indexes mark the open; the confirmed close instant is
+                # one native interval later and never after snapshot retrieval.
+                'timestamp': reference_open + 60.0,
+                'price': float(one_minute.closed['close'].iloc[-1]),
+            }
+            return {
+                'parts_by_timeframe': analysis.get('parts_by_timeframe', {}),
+                'once_per_symbol_parts': analysis.get('once_per_symbol_parts', {}),
+                'part7_gate': analysis.get('part7_gate'),
+                'deterministic_decision': analysis.get('deterministic_decision'),
+                'analysis_reference': analysis_reference,
+                # Candidate creation is downstream of a fresh Delta quote,
+                # exact contract metadata, balance-based risk sizing, and policy.
+                'execution_plan': None,
+                'adapter_engine_status': {
+                    'part1_native': getattr(owner.parts.get('part1_breakout'), '_engine_factory', None) is not None,
+                    'part2_native': getattr(owner.parts.get('part2_zone'), '_engine', None) is not None,
+                },
+            }
+        except Exception as _analysis_error:
+            logger.warning('[MULTICOIN] Isolated pipeline failed for %s: %s', getattr(key, 'symbol', '?'), type(_analysis_error).__name__)
+            return {}
+
+    def _consume_multicoin_paper_results(self, pipeline_status):
+        """Consume only fresh, explicitly planned complete analysis in isolated paper mode."""
+        coordinator = getattr(self, 'multicoin_paper_coordinator', None)
+        adapter = getattr(self, 'multicoin_paper_adapter', None)
+        if coordinator is None or adapter is None or not isinstance(pipeline_status, dict):
+            return
+        for result in (pipeline_status.get('results') or {}).values():
+            if not isinstance(result, dict) or result.get('status') != 'COMPLETE':
+                continue
+            try:
+                candidate = candidate_from_analysis(
+                    result, policy_registry=getattr(self, '_multicoin_paper_policies', {}),
+                    now=time.time(), max_age_seconds=float(os.getenv('JARVIS_MULTICOIN_RESULT_MAX_AGE_SEC', '180')),
+                )
+                outcome = coordinator.submit(candidate, adapter)
+                self.multicoin_paper_status['last_status'] = outcome.get('status')
+                if outcome.get('duplicate'):
+                    continue
+                if outcome.get('status') in {'FILLED', 'PARTIAL', 'SUBMISSION_UNKNOWN'}:
+                    self.multicoin_paper_status['submitted'] = int(self.multicoin_paper_status.get('submitted', 0)) + 1
+                else:
+                    self.multicoin_paper_status['blocked'] = int(self.multicoin_paper_status.get('blocked', 0)) + 1
+            except Exception as _candidate_error:
+                self.multicoin_paper_status['last_status'] = 'BLOCKED_INVALID_CANDIDATE'
+                self.multicoin_paper_status['last_reason'] = str(_candidate_error)[:160]
+                self.multicoin_paper_status['blocked'] = int(self.multicoin_paper_status.get('blocked', 0)) + 1
+
+    def _consume_multicoin_delta_results(self, pipeline_status):
+        """Run the validated Binance-analysis -> Delta lifecycle when configured.
+
+        Background Parts outputs remain analysis-only. Only the strict bridge
+        may create a contract plan, and only a reconciled portfolio coordinator
+        may reserve and call the protected-order broker capability.
+        """
+        coordinator = getattr(self, 'multicoin_delta_coordinator', None)
+        adapter = getattr(self, 'multicoin_delta_adapter', None)
+        status = getattr(self, 'multicoin_delta_status', None)
+        if coordinator is None or adapter is None or not isinstance(status, dict):
+            return
+        try:
+            monitor = adapter.monitor_once(coordinator)
+        except Exception as monitor_error:
+            status.update({'last_status': 'RECONCILIATION_BLOCKED', 'last_reason': type(monitor_error).__name__})
+            status['blocked'] = int(status.get('blocked', 0)) + 1
+            return
+        status['monitor_status'] = monitor.get('status')
+        if monitor.get('status') != 'MONITORED':
+            status['last_status'] = 'RECONCILIATION_BLOCKED'
+            status['blocked'] = int(status.get('blocked', 0)) + 1
+            return
+        if not adapter.authorization_ready():
+            status['last_status'] = 'BLOCKED_LIVE_AUTHORIZATION'
+            return
+        if not isinstance(pipeline_status, dict):
+            return
+        max_age = float(os.getenv('JARVIS_MULTICOIN_RESULT_MAX_AGE_SEC', '180'))
+        for result in (pipeline_status.get('results') or {}).values():
+            if not isinstance(result, dict) or result.get('status') != 'COMPLETE':
+                continue
+            if result.get('freshness_status') != 'FRESH':
+                continue
+            try:
+                candidate = build_delta_candidate(
+                    result, delta=adapter.delta,
+                    policy_registry=getattr(self, '_multicoin_delta_policies', {}),
+                    now=time.time(), max_age_seconds=max_age,
+                )
+                outcome = coordinator.submit(candidate, adapter)
+                status['last_status'] = outcome.get('status')
+                if outcome.get('duplicate'):
+                    continue
+                if outcome.get('status') in {'FILLED', 'PARTIAL', 'SUBMISSION_UNKNOWN'}:
+                    status['submitted'] = int(status.get('submitted', 0)) + 1
+                else:
+                    status['blocked'] = int(status.get('blocked', 0)) + 1
+                    status['last_reason'] = str(outcome.get('reason') or '')[:160]
+            except Exception as candidate_error:
+                status['last_status'] = 'BLOCKED_INVALID_CANDIDATE'
+                status['last_reason'] = str(candidate_error)[:160]
+                status['blocked'] = int(status.get('blocked', 0)) + 1
+
     def stop_live_trading(self, timeout=None):
         """Request a bounded, orderly stop without touching open positions."""
         self.is_running = False
@@ -2172,6 +2560,14 @@ class LiveTradingEngine:
                     self.last_decision = None
                     self._dashboard_signal = {}
                     self._dashboard_plan = {}
+
+                    # Full multicoin analysis is scheduled independently of the
+                    # selected route and continues while positions hold the route.
+                    # Status is diagnostics-only and never enters decision logic.
+                    if self.multicoin_pipeline is not None:
+                        self.multicoin_pipeline_status = self.multicoin_pipeline.poll()
+                        self._consume_multicoin_paper_results(self.multicoin_pipeline_status)
+                        self._consume_multicoin_delta_results(self.multicoin_pipeline_status)
 
                     # 1. Select a verified crypto contract before collecting any
                     # data. A route is locked for the entire life of an open
@@ -6184,7 +6580,37 @@ class JarvisElite:
             # --- AI AUTONOMY (JARVIS UNLEASHED) ---
             # User Request: Trust AI logic over hard thresholds
             ai_signal = final_decision.get('trade_signal', {}).get('direction', 'NEUTRAL')
-            
+
+            # Publish only the genuine deterministic Parts11/12-selected
+            # direction and target values from this isolated run. The bridge
+            # may later replace the Binance reference entry with a fresh Delta
+            # executable quote; it never derives missing targets or sizes.
+            if native_mtf is not None and isinstance(getattr(self, 'latest_multicoin_analysis', None), dict):
+                _raw_signal = final_decision.get('trade_signal', {}) or {}
+                _dir = str(_raw_signal.get('direction') or 'NO_TRADE').upper()
+                if score < self.scoring_matrix.minimum_trade_score or _dir not in {'CALL', 'PUT'}:
+                    _dir = 'NO_TRADE'
+                _raw_conf = _raw_signal.get('confidence_score', score)
+                try:
+                    _conf = int(float(str(_raw_conf).split('/', 1)[0]))
+                except (TypeError, ValueError, OverflowError):
+                    _conf = int(score)
+                self.latest_multicoin_analysis['deterministic_decision'] = {
+                    'origin': 'jarvis_deterministic_parts11_12',
+                    'direction': {'CALL': 'BUY', 'PUT': 'SELL'}.get(_dir, 'NO_TRADE'),
+                    'confidence': max(0, min(100, _conf)),
+                    'entry_price': _raw_signal.get('entry_price'),
+                    # TP1 is the explicit nearer target produced by Jarvis'
+                    # existing deterministic scalping target function.
+                    'take_profit': _raw_signal.get('take_profit_1'),
+                    'stop_loss': _raw_signal.get('stop_loss'),
+                    'part11_signal': (self.latest_multicoin_analysis.get('once_per_symbol_parts', {})
+                                      .get('part11', {}).get('signal')),
+                    'part12_confidence': (self.latest_multicoin_analysis.get('once_per_symbol_parts', {})
+                                          .get('part12', {}).get('confidence')),
+                }
+                self.latest_multicoin_analysis['part7_gate'] = dict(part7_gate)
+
             if score >= self.scoring_matrix.minimum_trade_score:
                 if self.hud_enabled:
                     self._sync_to_hud(final_decision)

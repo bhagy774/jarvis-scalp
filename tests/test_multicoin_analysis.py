@@ -223,13 +223,14 @@ def test_feature_flag_defaults_off_and_runtime_wiring_is_shadow_only():
     # Full background pipeline results remain diagnostic-only; they are not
     # passed into selected-route analysis or the decision/order builder.
     assert "multicoin_pipeline_status" in loop_text
+    pipeline_handoffs = []
     for node in ast.walk(methods["start_live_trading"]):
-        if isinstance(node, ast.Call):
-            paper_handoff = isinstance(node.func, ast.Attribute) and node.func.attr == "_consume_multicoin_paper_results"
-            if not paper_handoff:
-                assert all("multicoin_pipeline_status" not in ast.unparse(arg) for arg in node.args)
-                assert all("multicoin_pipeline_status" not in ast.unparse(keyword.value) for keyword in node.keywords)
+        if isinstance(node, ast.Call) and any("multicoin_pipeline_status" in ast.unparse(arg) for arg in node.args):
+            if isinstance(node.func, ast.Attribute):
+                pipeline_handoffs.append(node.func.attr)
+    assert sorted(pipeline_handoffs) == ["_consume_multicoin_delta_results", "_consume_multicoin_paper_results"]
     assert "self._consume_multicoin_paper_results(self.multicoin_pipeline_status)" in loop_text
+    assert "self._consume_multicoin_delta_results(self.multicoin_pipeline_status)" in loop_text
 
 
 def test_existing_router_position_lock_remains_immutable():
