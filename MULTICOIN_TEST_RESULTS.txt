@@ -1,0 +1,30 @@
+MULTICOIN PIPELINE TEST RESULTS
+Repository: bhagy774/jarvis-scalp
+Base SHA: 09f1d8aba01e6ac66a4e45e182ccb9d7eea934f4
+Test mode: offline synthetic fixtures; no live exchange access, bot launch, orders, or deployment.
+
+Focused implementation/regression suite:
+  PYTHONPATH=/tmp/multicoin-test-deps:$PWD PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 \
+    python -m pytest -p no:cacheprovider -q \
+      tests/test_multicoin_pipeline.py tests/test_multicoin_analysis.py \
+      tests/test_direct_candle_cache.py tests/test_market_router.py
+  RESULT (final rerun): 39 passed in 28.51 s.
+
+Syntax checks:
+  python -m py_compile direct_candle_cache.py jarvis_multicoin_pipeline.py \
+    jarvis_multicoin_admission.py jarvis_FIXED.py delta_api_wrapper.py part5_FIXED.py \
+    tests/test_multicoin_pipeline.py tests/test_multicoin_analysis.py \
+    tests/test_direct_candle_cache.py
+  RESULT: passed.
+
+Non-mutating safety tests:
+  PYTHONPATH=/tmp/multicoin-test-deps:$PWD PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 \
+    python -m pytest -p no:cacheprovider -q tests/test_execution_safety.py \
+      -k 'not live_paper_mode_never_sets_leverage_or_submits_order'
+  RESULT (final rerun): 9 passed, 1 deselected in 7.34 s.
+  REASON: excluded test has unchanged-base fixture mismatch (`_get_sizer(self.delta)` versus zero-argument monkeypatch); failure precedes order call.
+
+Synthetic full-pipeline timing (single sandbox run):
+  BTCUSDT 2.2553 s; ETHUSDT 1.0663 s; SOLUSDT 1.0809 s.
+  Each produced 8 timeframe results, 80 Parts 1–10 outputs, and Parts 11–12 once.
+  Not exchange/network/throughput/provider-quota or PC performance evidence.

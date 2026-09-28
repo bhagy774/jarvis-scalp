@@ -154,12 +154,18 @@ except Exception:
     LIVE_TIMEFRAMES = ()
     DIRECT_CANDLE_CACHE_AVAILABLE = False
 try:
-    from jarvis_multicoin_analysis import MultiCoinPart7Shadow, multicoin_analysis_enabled
-    MULTICOIN_SHADOW_AVAILABLE = True
+    from jarvis_multicoin_analysis import multicoin_analysis_enabled
 except Exception:
-    MultiCoinPart7Shadow = None
     multicoin_analysis_enabled = lambda value=None: False
-    MULTICOIN_SHADOW_AVAILABLE = False
+try:
+    from jarvis_multicoin_pipeline import (
+        DeltaNativeCandleClient, MultiCoinPipeline,
+    )
+    MULTICOIN_PIPELINE_AVAILABLE = True
+except Exception:
+    DeltaNativeCandleClient = None
+    MultiCoinPipeline = None
+    MULTICOIN_PIPELINE_AVAILABLE = False
 try:
     from part7_signal import analyze_timeframe as _analyze_part7_timeframe, aggregate_results as _aggregate_part7_results
     PART7_SHARED_ANALYZER_AVAILABLE = True
@@ -1197,32 +1203,39 @@ class LiveTradingEngine:
                 delta_client=getattr(self.jarvis, 'delta_data', None),
             )
 
-        # Optional multi-coin work is isolated as Part7 shadow diagnostics and
-        # is disabled by default. It cannot influence the selected route or any
-        # decision/order path. The single selected-symbol pipeline remains the
-        # only source of trade decisions.
-        self.multicoin_shadow = None
-        self.multicoin_shadow_status = {
+        # Optional, full Parts 1-12 background analysis is diagnostic-only and
+        # default-off. It has its own Delta-only cache, isolated Jarvis owner per
+        # job, product identity, and never feeds the route/decision/order path.
+        self.multicoin_pipeline = None
+        self.multicoin_pipeline_status = {
             'enabled': multicoin_analysis_enabled(),
             'status': 'DISABLED' if not multicoin_analysis_enabled() else 'UNAVAILABLE',
             'results': {},
         }
         if (multicoin_analysis_enabled() and not getattr(self.jarvis, 'is_backtest_mode', False)
-                and MULTICOIN_SHADOW_AVAILABLE and getattr(self.jarvis, 'direct_candle_cache', None) is not None):
+                and MULTICOIN_PIPELINE_AVAILABLE and getattr(self.jarvis, 'delta_data', None) is not None):
             try:
-                self.multicoin_shadow = MultiCoinPart7Shadow(
-                    self.jarvis.direct_candle_cache,
-                    self._multicoin_candidate_symbols,
-                    enabled=True,
-                    max_workers=int(os.getenv('JARVIS_MULTICOIN_MAX_WORKERS', '2')),
-                    max_candidates=int(os.getenv('JARVIS_MULTICOIN_MAX_CANDIDATES', '15')),
-                    refresh_interval_seconds=float(os.getenv('JARVIS_MULTICOIN_CANDIDATE_REFRESH_SEC', '300')),
-                    result_max_age_seconds=float(os.getenv('JARVIS_MULTICOIN_RESULT_MAX_AGE_SEC', '120')),
+                _multi_cache = DirectCandleCache(
+                    DeltaNativeCandleClient(self.jarvis.delta_data),
+                    ttl_seconds=float(os.getenv('JARVIS_MULTICOIN_CANDLE_TTL_SEC', '60')),
+                    max_concurrent_fetches=1,
+                    max_cached_identities=max(64, min(256, int(os.getenv('JARVIS_MULTICOIN_MAX_CANDIDATES', '100')))),
                 )
-                self.multicoin_shadow_status = {'enabled': True, 'status': 'IDLE', 'results': {}}
+                self.multicoin_pipeline = MultiCoinPipeline(
+                    _multi_cache,
+                    self._multicoin_candidate_instruments,
+                    self._analyze_multicoin_instrument,
+                    enabled=True,
+                    max_workers=int(os.getenv('JARVIS_MULTICOIN_MAX_WORKERS', '1')),
+                    max_candidates=int(os.getenv('JARVIS_MULTICOIN_MAX_CANDIDATES', '100')),
+                    discovery_interval_seconds=float(os.getenv('JARVIS_MULTICOIN_CANDIDATE_REFRESH_SEC', '300')),
+                    retry_interval_seconds=float(os.getenv('JARVIS_MULTICOIN_RETRY_SEC', '60')),
+                    result_max_age_seconds=float(os.getenv('JARVIS_MULTICOIN_RESULT_MAX_AGE_SEC', '180')),
+                )
+                self.multicoin_pipeline_status = {'enabled': True, 'status': 'IDLE', 'results': {}}
             except Exception as _multi_error:
-                logger.warning('[MULTICOIN-SHADOW] Initialization unavailable: %s', type(_multi_error).__name__)
-                self.multicoin_shadow_status = {'enabled': True, 'status': 'UNAVAILABLE', 'results': {}}
+                logger.warning('[MULTICOIN] Initialization unavailable: %s', type(_multi_error).__name__)
+                self.multicoin_pipeline_status = {'enabled': True, 'status': 'UNAVAILABLE', 'results': {}}
 
         # ═══ PRE-TRADE SIMULATOR STATS (fail-open; JARVIS_PRESIM=0 disables) ═══
         self.presim_stats = {'checks': 0, 'vetoes': 0, 'adjustments': 0}
@@ -2021,11 +2034,12 @@ class LiveTradingEngine:
             'updated_at': datetime.now().isoformat(),
         }
 
-    def _multicoin_candidate_symbols(self):
-        """Return only exact, volume-qualified scanner symbols in Delta products.
+    def _multicoin_candidate_instruments(self):
+        """Return the full volume-qualified scanner/product intersection.
 
-        No USDT/USD equivalence, market-kind conversion, or ticker substitution
-        is performed. This candidate list is advisory and analysis-only.
+        Symbols are not converted across quotes or venues. Products without an
+        authoritative provider ID and explicit market/product type fail closed.
+        The scheduler enforces a hard capacity and round-robin fairness.
         """
         try:
             scanner = getattr(self.market_router, 'scanner', None)
@@ -2033,22 +2047,87 @@ class LiveTradingEngine:
             if scanner is None or delta is None:
                 return ()
             from jarvis_coin_scanner import DELTA_SYMBOL_MAP, MIN_VOLUME_USDT
-            scores = scanner.get_all_scores()
-            available = {str(value).strip().upper() for value in delta.get_available_symbols() or ()}
-            candidates = []
-            for coin, score in (scores or {}).items():
+            product_getter = getattr(delta, 'get_available_products', None)
+            if not callable(product_getter):
+                return ()
+            score_by_symbol = {}
+            for coin, score in (scanner.get_all_scores() or {}).items():
                 try:
-                    if float(score.get('volume_24h_usdt', 0.0)) < float(MIN_VOLUME_USDT):
-                        continue
+                    volume = float(score.get('volume_24h_usdt', 0.0))
+                    symbol = str(DELTA_SYMBOL_MAP.get(str(coin).upper()) or '').strip().upper()
+                    if symbol and volume >= float(MIN_VOLUME_USDT):
+                        score_by_symbol[symbol] = max(volume, score_by_symbol.get(symbol, 0.0))
                 except (TypeError, ValueError, AttributeError):
                     continue
-                symbol = DELTA_SYMBOL_MAP.get(str(coin).upper())
-                if symbol and symbol in available:
-                    candidates.append(symbol)
+            products = product_getter() or ()
+            candidates = []
+            for product in products:
+                if not isinstance(product, dict):
+                    continue
+                symbol = str(product.get('symbol') or '').strip().upper()
+                if symbol not in score_by_symbol:
+                    continue
+                product_id = product.get('id', product.get('product_id'))
+                market_type = (product.get('contract_type') or product.get('product_type')
+                               or product.get('market_type') or product.get('trading_mode'))
+                if product_id is None or not str(product_id).strip() or not market_type:
+                    continue
+                status = str(product.get('state') or product.get('status') or 'active').lower()
+                if status not in {'active', 'live', 'trading', 'listed'}:
+                    continue
+                candidates.append({
+                    'venue': 'delta', 'market_type': str(market_type).lower(),
+                    'instrument_id': str(product_id).strip(), 'symbol': symbol,
+                    'liquidity_24h_usdt': score_by_symbol[symbol],
+                })
+            candidates.sort(key=lambda item: (-float(item['liquidity_24h_usdt']), item['symbol']))
             return tuple(candidates)
         except Exception as _candidate_error:
-            logger.warning('[MULTICOIN-SHADOW] Candidate discovery unavailable: %s', type(_candidate_error).__name__)
+            logger.warning('[MULTICOIN] Product discovery unavailable: %s', type(_candidate_error).__name__)
             return ()
+
+    def _analyze_multicoin_instrument(self, key, snapshot):
+        """Run the real Part1-12 Jarvis method on an isolated analysis-only owner."""
+        owner = None
+        try:
+            if tuple(snapshot.identity) != key.as_tuple():
+                return {}
+            native_frames = snapshot.analysis_frames()
+            owner = JarvisElite(backtest_mode=True, analysis_only=True)
+            owner.active_symbol = key.symbol
+            owner.active_base_asset = key.symbol
+            for quote in ('USDT', 'USD', 'USDC'):
+                if owner.active_base_asset.endswith(quote):
+                    owner.active_base_asset = owner.active_base_asset[:-len(quote)]
+                    break
+            owner.engines = {}  # only the reviewed Part adapters run in this path
+            owner.direct_candle_cache = None
+            owner.delta_data = None
+            owner.deribit = None
+            owner.binance_data = None
+            owner.coin_scanner = None
+            owner._active_candle_snapshot = snapshot
+            native_frames = {tf: frame.copy(deep=True) for tf, frame in native_frames.items()}
+            for tf, frame in native_frames.items():
+                frame.attrs.update({'symbol': key.symbol, 'timeframe': tf})
+            owner.analyze_trade_setup(
+                native_frames['1m'].copy(deep=True), candle_snapshot=snapshot,
+                native_mtf=native_frames,
+            )
+            analysis = getattr(owner, 'latest_multicoin_analysis', None)
+            if not isinstance(analysis, dict):
+                return {}
+            return {
+                'parts_by_timeframe': analysis.get('parts_by_timeframe', {}),
+                'once_per_symbol_parts': analysis.get('once_per_symbol_parts', {}),
+                'adapter_engine_status': {
+                    'part1_native': getattr(owner.parts.get('part1_breakout'), '_engine_factory', None) is not None,
+                    'part2_native': getattr(owner.parts.get('part2_zone'), '_engine', None) is not None,
+                },
+            }
+        except Exception as _analysis_error:
+            logger.warning('[MULTICOIN] Isolated pipeline failed for %s: %s', getattr(key, 'symbol', '?'), type(_analysis_error).__name__)
+            return {}
 
     def stop_live_trading(self, timeout=None):
         """Request a bounded, orderly stop without touching open positions."""
@@ -2067,8 +2146,8 @@ class LiveTradingEngine:
         except Exception:
             pass
         try:
-            if getattr(self, 'multicoin_shadow', None) is not None:
-                self.multicoin_shadow.close()
+            if getattr(self, 'multicoin_pipeline', None) is not None:
+                self.multicoin_pipeline.close()
         except Exception:
             pass
         self._set_readiness('STOPPED', 'stopped; positions require independent reconciliation')
@@ -2225,6 +2304,12 @@ class LiveTradingEngine:
                     self._dashboard_signal = {}
                     self._dashboard_plan = {}
 
+                    # Full multicoin analysis is scheduled independently of the
+                    # selected route and continues while positions hold the route.
+                    # Status is diagnostics-only and never enters decision logic.
+                    if self.multicoin_pipeline is not None:
+                        self.multicoin_pipeline_status = self.multicoin_pipeline.poll()
+
                     # 1. Select a verified crypto contract before collecting any
                     # data. A route is locked for the entire life of an open
                     # position, so analysis, paper ledger and execution cannot
@@ -2284,12 +2369,6 @@ class LiveTradingEngine:
                     if snapshot is not None and '1m' in snapshot.frames:
                         self._set_readiness('READY', f'verified route {symbol}; direct native candles available')
                         self.jarvis._active_candle_snapshot = snapshot
-                        if self.multicoin_shadow is not None:
-                            # Results are shadow diagnostics only: never pass
-                            # them into analyze_trade_setup or decision/order APIs.
-                            self.multicoin_shadow_status = self.multicoin_shadow.poll(
-                                selected_symbol=symbol, selected_snapshot=snapshot,
-                            )
                         df = snapshot.frames['1m'].closed.copy()
                         # The forming candle is deliberately not appended to df.
                         # It is carried as metadata for display/current price only.
@@ -2779,23 +2858,38 @@ def _df_to_market_data(df):
 
 
 class Part1Breakout:
-    """Breakout Analysis — backed by SmartBreakoutAI (13 brains, Part1)"""
+    """Breakout Analysis with state partitioned by native timeframe."""
     def __init__(self):
+        self._engine_factory = None
+        self._engines = {}
+        self._engine_lock = threading.RLock()
         try:
             from part1_FIXED import SmartBreakoutAI
+            self._engine_factory = SmartBreakoutAI
             self._engine = SmartBreakoutAI()
+            self._engines['1m'] = self._engine
         except Exception as e:
             import logging
             logging.getLogger().debug(f"Part1 import error: {e}")
             self._engine = None
 
+    def _engine_for_timeframe(self, context):
+        timeframe = str((context or {}).get('timeframe') or '1m')
+        if self._engine_factory is None:
+            return None
+        with self._engine_lock:
+            if timeframe not in self._engines:
+                self._engines[timeframe] = self._engine_factory()
+            return self._engines[timeframe]
+
     def analyze(self, data, context=None):
-        # ── Try real Part1 engine (13-brain SmartBreakoutAI) ──────────────
-        if self._engine is not None:
+        # Each retained learning/history deque is tied to its own native frame.
+        engine = self._engine_for_timeframe(context)
+        if engine is not None:
             try:
                 market_data = _df_to_market_data(data)
                 if len(market_data['price_action']) >= 20:
-                    result = self._engine.analyze(market_data)
+                    result = engine.analyze(market_data)
                     brk = result.get('breakout', {})
                     is_breakout = bool(brk.get('breakout_detected', False))
                     brk_dir = int(brk.get('direction', 0))
@@ -2833,8 +2927,11 @@ class Part1Breakout:
 
 
 class Part2Zone:
-    """Supply/Demand Zone Analysis — backed by AdvancedAnalysisSystem (Part2)"""
+    """Supply/Demand MTF analysis with one state update per snapshot version."""
     def __init__(self):
+        self._last_snapshot_version = None
+        self._last_result = None
+        self._snapshot_lock = threading.RLock()
         try:
             from part2_FIXED import AdvancedAnalysisSystem
             self._engine = AdvancedAnalysisSystem()
@@ -2845,51 +2942,57 @@ class Part2Zone:
             self._engine = None
 
     def analyze(self, data, context=None):
-        # ── Try real Part2 engine (16-brain AdvancedAnalysisSystem) ──────────────
-        if self._engine is not None and context and 'mtf_datasets' in context:
-            try:
-                mtf = context['mtf_datasets']
-                df_1m = mtf.get('1m', data)
-                df_5m = mtf.get('5m', data)
-                df_15m = mtf.get('15m', data)
-                
-                if len(df_1m) > 0:
-                    current_candle = df_1m.iloc[-1].to_dict()
-                    signals = self._engine.process_market_data(df_1m, df_5m, df_15m, current_candle)
-                    
-                    if signals and isinstance(signals, list):
-                        # Filter out invalid tuples
-                        valid = [s for s in signals if isinstance(s, tuple) and len(s) >= 3]
-                        if valid:
-                            # Pick strongest confidence signal
-                            best = max(valid, key=lambda x: x[1])
-                            sig_dir = 1 if str(best[0]).upper() in ['CALL', 'BUY', 'LONG'] else -1
-                            return {"signal": sig_dir, "thought": f"Part2: {best[2]}"}
-            except Exception as e:
-                import logging
-                logging.getLogger().debug(f"Part2 execution error: {e}")
-
-        # ── Fallback: proximity to multi-lookback range extremes (20, 60, 100 bars) ──────
-        try:
-            if len(data) < 20:
-                return {"signal": 0, "thought": "Insufficient data"}
-            current = float(data['close'].iloc[-1])
-            for lookback in [20, 60, 100]:
-                if len(data) < lookback:
-                    continue
-                h = float(data['high'].tail(lookback).max())
-                l = float(data['low'].tail(lookback).min())
-                rng = h - l
-                if rng <= 0:
-                    continue
-                pct = (current - l) / rng   # 0=at support, 1=at resistance
-                if pct >= 0.92:
-                    return {"signal": -1, "thought": f"Resistance Zone top {pct*100:.0f}% ({lookback}-bar)"}
-                elif pct <= 0.08:
-                    return {"signal": 1,  "thought": f"Support Zone bottom {pct*100:.0f}% ({lookback}-bar)"}
-        except Exception:
-            pass
-        return {"signal": 0, "thought": "No Zones (fallback)"}
+        context = context or {}
+        version = context.get('snapshot_version')
+        with self._snapshot_lock:
+            if version and version == self._last_snapshot_version and self._last_result is not None:
+                return dict(self._last_result)
+            result = None
+            if self._engine is not None and 'mtf_datasets' in context:
+                try:
+                    mtf = context['mtf_datasets']
+                    df_1m = mtf.get('1m', data)
+                    df_5m = mtf.get('5m', data)
+                    df_15m = mtf.get('15m', data)
+                    if len(df_1m) > 0:
+                        current_candle = df_1m.iloc[-1].to_dict()
+                        signals = self._engine.process_market_data(df_1m, df_5m, df_15m, current_candle)
+                        if signals and isinstance(signals, list):
+                            valid = [s for s in signals if isinstance(s, tuple) and len(s) >= 3]
+                            if valid:
+                                best = max(valid, key=lambda x: x[1])
+                                sig_dir = 1 if str(best[0]).upper() in ['CALL', 'BUY', 'LONG'] else -1
+                                result = {"signal": sig_dir, "thought": f"Part2: {best[2]}"}
+                except Exception as e:
+                    logger.debug(f"Part2 execution error: {e}")
+            if result is None:
+                try:
+                    if len(data) < 20:
+                        result = {"signal": 0, "thought": "Insufficient data"}
+                    else:
+                        current = float(data['close'].iloc[-1])
+                        result = {"signal": 0, "thought": "No Zones (fallback)"}
+                        for lookback in [20, 60, 100]:
+                            if len(data) < lookback:
+                                continue
+                            high = float(data['high'].tail(lookback).max())
+                            low = float(data['low'].tail(lookback).min())
+                            span = high - low
+                            if span <= 0:
+                                continue
+                            pct = (current - low) / span
+                            if pct >= 0.92:
+                                result = {"signal": -1, "thought": f"Resistance Zone top {pct*100:.0f}% ({lookback}-bar)"}
+                                break
+                            if pct <= 0.08:
+                                result = {"signal": 1, "thought": f"Support Zone bottom {pct*100:.0f}% ({lookback}-bar)"}
+                                break
+                except Exception:
+                    result = {"signal": 0, "thought": "No Zones (fallback)"}
+            if version:
+                self._last_snapshot_version = version
+                self._last_result = dict(result)
+            return result
 
 
 class Part3Psychology:
@@ -4917,10 +5020,11 @@ class JarvisCNS:
 class JarvisElite:
     """JARVIS TRADE ELITE v7.0 - Complete SwingScalp Trading System"""
     
-    def __init__(self, backtest_mode=False):
-        """Backtests retain GPU analysis but block AI and live-data side effects."""
+    def __init__(self, backtest_mode=False, analysis_only=False):
+        """Backtests block live side effects; analysis-only owners skip native GPU engines."""
         env_backtest = os.environ.get("JARVIS_BACKTEST_MODE", "").lower() in ("1", "true", "yes")
-        self.is_backtest_mode = bool(backtest_mode or env_backtest)
+        self.is_backtest_mode = bool(backtest_mode or env_backtest or analysis_only)
+        self.analysis_only = bool(analysis_only)
         # All native modules see one normalized device contract.  Telemetry
         # records detection/fallback separately; no GPU availability is faked.
         self.runtime = detect_backend()
@@ -5100,7 +5204,7 @@ class JarvisElite:
         # an offline wiring check wait on model/accelerator initialization.
         self.engines = {}
         self.native_engine_status = {}
-        if EXTERNAL_ENGINES_AVAILABLE and self.runtime.torch_available:
+        if EXTERNAL_ENGINES_AVAILABLE and self.runtime.torch_available and not self.analysis_only:
             try:
                 logger.info("🚀 Initializing External GPU Engines...")
                 self.native_engine_status = {}
@@ -5253,6 +5357,9 @@ class JarvisElite:
         else:
             _part2_zone = object.__new__(Part2Zone)
             _part2_zone._engine = None
+            _part2_zone._last_snapshot_version = None
+            _part2_zone._last_result = None
+            _part2_zone._snapshot_lock = threading.RLock()
         self.parts = {
             'part1_breakout': Part1Breakout(),
             'part2_zone': _part2_zone,
@@ -5372,8 +5479,10 @@ class JarvisElite:
             logger.warning('[MTF-API] Direct native fetch rejected: %s', error)
             return {}
 
-    def analyze_trade_setup(self, data, mtf_context=None, candle_snapshot=None):
+    def analyze_trade_setup(self, data, mtf_context=None, candle_snapshot=None, native_mtf=None):
         """Analyze verified closed native candles; current candle stays metadata-only."""
+        if native_mtf is not None:
+            self.latest_multicoin_analysis = None
         try:
             if candle_snapshot is not None:
                 self._active_candle_snapshot = candle_snapshot
@@ -5600,10 +5709,37 @@ class JarvisElite:
             # Reuse the shared direct snapshot for Parts 1-12 and external engines.
             # ============================================================
             
-            # Historical replay must rebuild every timeframe from the local
-            # pre-decision window on every step. Reusing a previous cache would make
-            # higher timeframes stale; fetching a feed would contaminate the replay.
-            if self.is_backtest_mode:
+            # A background full-pipeline job supplies immutable, exact native
+            # frames. It is never resampled or mixed with the selected route.
+            if native_mtf is not None:
+                if not isinstance(native_mtf, dict) or set(native_mtf) != set(LIVE_TIMEFRAMES):
+                    return self._get_no_trade_signal('WAIT/NO-DATA: incomplete native multicoin frames')
+                mtf_data = {}
+                selected_symbol = str(getattr(self, 'active_symbol', '') or '').upper()
+                for tf_name in LIVE_TIMEFRAMES:
+                    frame = native_mtf[tf_name]
+                    if (not isinstance(frame, pd.DataFrame) or len(frame) != 500
+                            or not isinstance(frame.index, pd.DatetimeIndex)
+                            or not frame.index.is_monotonic_increasing or frame.index.has_duplicates):
+                        return self._get_no_trade_signal(f'WAIT/NO-DATA: invalid native frame {tf_name}')
+                    frame_copy = frame.copy(deep=True)
+                    frame_copy.attrs = dict(getattr(frame, 'attrs', {}) or {})
+                    frame_copy.attrs.update({'symbol': selected_symbol, 'timeframe': tf_name})
+                    mtf_data[tf_name] = frame_copy
+                data = mtf_data['1m'].copy(deep=True)
+                self._api_mtf_cache = mtf_data
+                self.market_context['mtf_datasets'] = mtf_data
+                self.market_context['analysis_identity'] = (
+                    candle_snapshot.identity if candle_snapshot is not None else None
+                )
+                self.market_context['snapshot_version'] = (
+                    f"{getattr(candle_snapshot, 'identity', None)}:{getattr(candle_snapshot, 'fetched_at', 0)}"
+                )
+                if candle_snapshot is not None:
+                    self.market_context['current_candles'] = candle_snapshot.current_candles
+                    self.market_context['current_candle_is_confirmed'] = False
+            elif self.is_backtest_mode:
+                # Historical replay retains its existing local resampling path.
                 if not isinstance(data.index, pd.DatetimeIndex):
                     data = data.copy()
                     data.index = pd.to_datetime(data.index)
@@ -5613,23 +5749,15 @@ class JarvisElite:
                     '3m': '3min', '5m': '5min', '15m': '15min', '30m': '30min',
                     '1h': '1h', '2h': '2h', '4h': '4h'
                 }.items():
-                    resampled = data.resample(tf_rule).agg(ohlcv_agg).dropna()
-                    # Keep every configured timeframe explicit.  A short replay
-                    # window must produce an invalid/missing Part 7 result and
-                    # block entries, rather than silently omitting that identity.
-                    mtf_data[tf_name] = resampled
-                
-                # OPTIMIZATION: Truncate to 500 rows to prevent massive slowdown in backtest
+                    mtf_data[tf_name] = data.resample(tf_rule).agg(ohlcv_agg).dropna()
                 for k in list(mtf_data.keys()):
                     if len(mtf_data[k]) > 500:
                         mtf_data[k] = mtf_data[k].iloc[-500:]
-                        
                 self._api_mtf_cache = mtf_data
                 self.market_context['mtf_datasets'] = mtf_data
             else:
                 # Live mode is strict: the shared snapshot is refreshed by the
-                # live loop and reused here.  A direct-fetch failure blocks the
-                # cycle; there is no synthetic/resampled fallback or BTC swap.
+                # live loop and reused here. No synthetic fallback or BTC swap.
                 mtf_data = self._fetch_mtf_from_api(getattr(self, 'active_symbol', None))
                 if set(mtf_data) != set(LIVE_TIMEFRAMES):
                     return self._get_no_trade_signal('WAIT/NO-DATA: incomplete native timeframe snapshot')
@@ -5638,6 +5766,10 @@ class JarvisElite:
                 if self._active_candle_snapshot is not None:
                     self.market_context['current_candles'] = self._active_candle_snapshot.current_candles
                     self.market_context['current_candle_is_confirmed'] = False
+                    self.market_context['analysis_identity'] = self._active_candle_snapshot.identity
+                    self.market_context['snapshot_version'] = (
+                        f"{self._active_candle_snapshot.identity}:{self._active_candle_snapshot.fetched_at}"
+                    )
             
             logger.info(f"📊 MTF Analysis: {len(mtf_data)} timeframes active: {list(mtf_data.keys())}")
             
@@ -5671,30 +5803,32 @@ class JarvisElite:
                         continue
                     
                     try:
-                        # 🎓 TEACHER FIX #1: Data Pollution (Pass-by-reference mutation bug)
-                        # Ensure each part receives a pristine, independent copy of the dataframe.
-                        # Part 7 and Part 14 receive the routed symbol explicitly; options must
-                        # never fall back to Part14's historical BTC constructor default.
-                        part_context = self.market_context
-                        if name in ('part7_volatility', 'part14_options_chain'):
-                            selected_symbol = getattr(self, 'active_symbol', None) or getattr(data, 'attrs', {}).get('symbol')
-                            part_context = dict(self.market_context)
+                        # Every adapter receives a pristine frame and context copy;
+                        # no part can mutate the next adapter's input or the canonical MTF set.
+                        selected_symbol = getattr(self, 'active_symbol', None) or getattr(data, 'attrs', {}).get('symbol')
+                        part_context = dict(self.market_context)
+                        part_context.update({
+                            'selected_symbol': selected_symbol,
+                            'symbol': selected_symbol,
+                            'timeframe': tf_name,
+                            'analysis_identity': getattr(candle_snapshot, 'identity', None),
+                        })
+                        if isinstance(part_context.get('mtf_datasets'), dict):
+                            part_context['mtf_datasets'] = {
+                                frame_name: frame.copy(deep=True)
+                                for frame_name, frame in part_context['mtf_datasets'].items()
+                            }
+                        part_input = tf_data.copy(deep=True)
+                        part_input.attrs = dict(getattr(tf_data, 'attrs', {}) or {})
+                        if selected_symbol:
+                            part_input.attrs['symbol'] = selected_symbol
+                        part_input.attrs['timeframe'] = tf_name
+                        if name == 'part7_volatility':
                             part_context.update({
-                                'selected_symbol': selected_symbol,
-                                'symbol': selected_symbol,
-                                'timeframe': tf_name,
+                                'is_backtest_mode': self.is_backtest_mode,
+                                'shared_candle_source': 'historical_replay' if self.is_backtest_mode else 'shared_exchange',
                             })
-                            if name == 'part7_volatility':
-                                part_context.update({
-                                    'is_backtest_mode': self.is_backtest_mode,
-                                    'shared_candle_source': 'historical_replay' if self.is_backtest_mode else 'shared_exchange',
-                                })
-                                tf_data = tf_data.copy()
-                                tf_data.attrs = dict(getattr(tf_data, 'attrs', {}) or {})
-                                if selected_symbol:
-                                    tf_data.attrs['symbol'] = selected_symbol
-                                tf_data.attrs['timeframe'] = tf_name
-                        res = part.analyze(tf_data, context=part_context)
+                        res = part.analyze(part_input, context=part_context)
                         if isinstance(res, dict):
                             tf_results[name] = res
                             raw_signal = res.get('signal', 0)
@@ -5889,6 +6023,24 @@ class JarvisElite:
             # --- MATHEMATICAL ANALYST OPINION (First) ---
             math_res = self.parts['part11_fusion'].analyze(part_results)
             math_conf_res = self.parts['part12_confidence'].analyze(list(part_results.values()))
+            if native_mtf is not None:
+                normalized_mtf_parts = {}
+                for tf_name, tf_values in mtf_breakdown.items():
+                    normalized_mtf_parts[tf_name] = {
+                        part_name.split('_', 1)[0]: dict(value)
+                        for part_name, value in tf_values.items()
+                        if isinstance(value, dict)
+                    }
+                self.latest_multicoin_analysis = {
+                    'parts_by_timeframe': normalized_mtf_parts,
+                    'once_per_symbol_parts': {
+                        'part11': dict(math_res) if isinstance(math_res, dict) else {},
+                        'part12': dict(math_conf_res) if isinstance(math_conf_res, dict) else {},
+                    },
+                    'part7_gate': dict(self.latest_part7) if isinstance(self.latest_part7, dict) else {},
+                    'analysis_identity': getattr(candle_snapshot, 'identity', None),
+                    'snapshot_version': self.market_context.get('snapshot_version'),
+                }
             
             math_signal = math_res.get('signal', 0)
             math_confidence = math_conf_res.get('confidence', 10)

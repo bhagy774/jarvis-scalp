@@ -217,16 +217,16 @@ def test_feature_flag_defaults_off_and_runtime_wiring_is_shadow_only():
     init_text = ast.unparse(methods["__init__"])
     loop_text = ast.unparse(methods["start_live_trading"])
     assert "multicoin_analysis_enabled()" in init_text
-    assert "MultiCoinPart7Shadow" in init_text
-    assert "self.multicoin_shadow.poll" in loop_text
+    assert "MultiCoinPipeline" in init_text
+    assert "self.multicoin_pipeline.poll" in loop_text
     assert "self.jarvis.analyze_trade_setup" in loop_text
-    # Shadow data is only assigned to diagnostics; it is not passed into the
-    # existing selected-symbol full analysis or decision builder.
-    assert "multicoin_shadow_status" in loop_text
+    # Full background pipeline results remain diagnostic-only; they are not
+    # passed into selected-route analysis or the decision/order builder.
+    assert "multicoin_pipeline_status" in loop_text
     for node in ast.walk(methods["start_live_trading"]):
         if isinstance(node, ast.Call):
-            assert all("multicoin_shadow_status" not in ast.unparse(arg) for arg in node.args)
-            assert all("multicoin_shadow_status" not in ast.unparse(keyword.value) for keyword in node.keywords)
+            assert all("multicoin_pipeline_status" not in ast.unparse(arg) for arg in node.args)
+            assert all("multicoin_pipeline_status" not in ast.unparse(keyword.value) for keyword in node.keywords)
 
 
 def test_existing_router_position_lock_remains_immutable():
