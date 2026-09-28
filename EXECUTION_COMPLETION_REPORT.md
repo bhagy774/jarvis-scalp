@@ -7,9 +7,10 @@
 - Repository: `bhagy774/jarvis-scalp`
 - PR: [#95](https://github.com/bhagy774/jarvis-scalp/pull/95)
 - Existing branch: `feat/multicoin-part7-shadow-foundation`
-- Latest PR head verified before this follow-up: `cef1e6a74c220d95941e57dc24e61d7c10ca271c`
+- PR head before follow-up: `cef1e6a74c220d95941e57dc24e61d7c10ca271c`
+- Tested source/test/report follow-up commit pushed to the existing PR branch: `3d7cdecd35db1df1d4115f4e253555de0a8ec7bb` (`fix: validate symbol-scoped position reconciliation`). The final report-only refresh is also pushed on this branch; the tested implementation is unchanged.
 - Base `main`: `09f1d8aba01e6ac66a4e45e182ccb9d7eea934f4`
-- PR #95 was open, draft, and unmerged. PR #94 was inspected and left untouched.
+- PR #95 was reverified open, draft, and unmerged after the source/test push. PR #94 was inspected and left untouched.
 - The local repository is a source snapshot, not a Git checkout. The 10 critical existing source/report files fetched from GitHub at the verified PR head were byte-identical to the local source snapshot (before the changes below); no unrelated remote source edits were overwritten.
 
 ## Implemented in this follow-up
@@ -68,6 +69,6 @@ Existing `MULTICOIN_COMPLETION_REPORT.md` records the prior Parts 1–12 analysi
 
 ## PR / deployment status
 
-The intended source/test/report update is to existing PR #95 only. No new PR or duplicate branch, merge, bot launch, workflow dispatch, order, credential use, or live-default change is authorized or performed. If the follow-up cannot be pushed/reverified, its code and tests remain only in this work snapshot; do not represent it as merged or deployed.
+The source, regression tests, and reports were pushed to existing PR #95 only (source/test commit `3d7cdecd35db1df1d4115f4e253555de0a8ec7bb`; report-only refresh followed). No new PR or duplicate branch, merge, bot launch, workflow dispatch, order, credential use, or live-default change was performed. The PR remained draft and unmerged when verified after the implementation push; this work is not merged or deployed.
 
 **Enablement status: disabled.** Safe implementation completion still requires an approved asset-matched decision policy and complete end-to-end candidate, atomic reservation, order/fill-state, restart reconciliation, ownership, and close coordination design and offline tests, followed by separately authorized venue validation. No claim of fully automated multi-coin trading, live coverage, or live speed is made here.
