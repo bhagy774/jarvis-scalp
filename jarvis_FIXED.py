@@ -1288,11 +1288,12 @@ class LiveTradingEngine:
                 logger.warning('[MULTICOIN-PAPER] Initialization fail-closed: %s', type(_paper_error).__name__)
                 self.multicoin_paper_status = {'enabled': False, 'status': 'UNAVAILABLE'}
 
-        # Real Delta handoff is a separate, explicit opt-in. It requires a
-        # per-asset exact Binance->Delta policy and broker support for atomic
-        # protective exits plus complete account reconciliation. The current
-        # Delta wrapper intentionally lacks those capabilities, so this stays
-        # UNAVAILABLE rather than degrading to market-only unprotected entry.
+        # Real Delta handoff is a separate, explicit opt-in. It requires an
+        # asset-specific exact Binance->Delta policy, staged entry plus
+        # separately attached/verified protection, and complete reconciliation.
+        # This is deliberately not described as atomic: Delta's documented
+        # bracket endpoint is a post-fill operation and must fail closed if it
+        # cannot be verified.
         self.multicoin_delta_coordinator = None
         self.multicoin_delta_adapter = None
         self._multicoin_delta_policies = {}
@@ -1305,8 +1306,8 @@ class LiveTradingEngine:
                 if not isinstance(_delta_policies, dict) or not _delta_policies:
                     raise ValueError('explicit asset-specific Delta policy registry required')
                 _delta_client = getattr(self.jarvis, 'delta_data', None)
-                _needed = ('place_protected_order', 'get_complete_account_snapshot', 'get_delta_executable_quote',
-                           'get_available_balance_usdt')
+                _needed = ('place_protected_order', 'place_reduce_only_order', 'get_complete_account_snapshot',
+                           'get_delta_executable_quote', 'get_available_balance')
                 if _delta_client is None or any(not callable(getattr(_delta_client, name, None)) for name in _needed):
                     raise ValueError('Delta broker lacks protective order, quote, or complete reconciliation capability')
                 self._multicoin_delta_policies = {str(k).upper(): dict(v) for k, v in _delta_policies.items() if isinstance(v, dict)}
@@ -2133,22 +2134,30 @@ class LiveTradingEngine:
         }
 
     def _multicoin_candidate_instruments(self):
-        """Join scanner-qualified assets to exact Delta products and Binance spot symbols.
+        """Join scanner-qualified Binance spot assets to explicit active Delta perps.
 
-        Binance is the analysis venue; Delta product identity is carried in a
-        separate execution mapping. Only active Delta perpetual products whose
-        mapped Binance ``BASEUSDT`` symbol is unambiguous enter the scheduler.
-        The scanner's configured liquidity universe remains finite by design.
+        This is discovery only. The Delta base, quoting, and settling assets all
+        come from product metadata; no DELTA_SYMBOL_MAP, ticker suffix, quote
+        currency, or BTC-only assumption is used. Products lacking supported
+        risk units, explicit assets, or a unique eligible id are excluded.
         """
         try:
             scanner = getattr(self.market_router, 'scanner', None)
             delta = getattr(self.market_router, 'delta', None)
             if scanner is None or delta is None:
                 return ()
-            from jarvis_coin_scanner import DELTA_SYMBOL_MAP, MIN_VOLUME_USDT
-            product_getter = getattr(delta, 'get_available_products', None)
-            if not callable(product_getter):
-                return ()
+            from jarvis_coin_scanner import MIN_VOLUME_USDT
+            snapshot_getter = getattr(delta, 'get_available_products_snapshot', None)
+            if callable(snapshot_getter):
+                snapshot = snapshot_getter()
+                if not isinstance(snapshot, dict) or snapshot.get('complete') is not True:
+                    return ()
+                product_rows = snapshot.get('products', ())
+            else:
+                product_getter = getattr(delta, 'get_available_products', None)
+                if not callable(product_getter):
+                    return ()
+                product_rows = product_getter() or ()
             scores = {}
             for coin, row in (scanner.get_all_scores() or {}).items():
                 asset = str(coin).strip().upper()
@@ -2156,46 +2165,65 @@ class LiveTradingEngine:
                     volume = float(row.get('volume_24h_usdt', 0.0))
                 except (TypeError, ValueError, AttributeError):
                     continue
-                if asset and volume >= float(MIN_VOLUME_USDT):
+                if asset and volume >= float(MIN_VOLUME_USDT) and volume < float('inf'):
                     scores[asset] = max(volume, scores.get(asset, 0.0))
-            product_rows = [p for p in (product_getter() or ()) if isinstance(p, dict)]
+            eligible_by_asset = {}
+            accepted_types = {'perpetual', 'perpetual_futures', 'perpetual_swap', 'perpetual_swaps'}
+            from jarvis_risk import contract_quote_value_in_currency
+            for product in product_rows:
+                if not isinstance(product, dict):
+                    continue
+                state = str(product.get('state') or product.get('status') or '').strip().lower()
+                marker = str(product.get('product_type') or product.get('market_type') or
+                             product.get('contract_type') or '').strip().lower()
+                if state not in {'active', 'live', 'trading', 'listed'} or marker not in accepted_types:
+                    continue
+                def asset_symbol(value):
+                    if isinstance(value, dict):
+                        value = value.get('symbol') or value.get('asset_symbol') or value.get('name')
+                    return str(value or '').strip().upper()
+                base = asset_symbol(product.get('underlying_asset_symbol') or product.get('underlying_asset')
+                                    or product.get('base_asset'))
+                quote = asset_symbol(product.get('quoting_asset') or product.get('quote_asset')
+                                     or product.get('quote_currency'))
+                settle = asset_symbol(product.get('settling_asset') or product.get('settlement_asset')
+                                      or product.get('settlement_currency'))
+                symbol = str(product.get('symbol') or '').strip().upper()
+                pid = product.get('id', product.get('product_id'))
+                try:
+                    tick_size = float(product.get('tick_size'))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                notional_kind = str(product.get('notional_type') or '').strip().lower()
+                specs = product.get('product_specs') if isinstance(product.get('product_specs'), dict) else {}
+                trading_status = str(product.get('trading_status') or '').strip().lower()
+                if (not base or not quote or not settle or not symbol or pid is None
+                        or quote != settle or not math.isfinite(tick_size) or tick_size <= 0
+                        or notional_kind == 'inverse' or product.get('is_quanto') is True
+                        or specs.get('only_reduce_only_orders_allowed') is True
+                        or trading_status not in {'', 'operational'}
+                        or contract_quote_value_in_currency(product, 1.0, settle) is None):
+                    continue
+                if base in scores:
+                    eligible_by_asset.setdefault(base, []).append((product, quote, settle, marker))
             candidates = []
             for asset, volume in scores.items():
-                delta_symbol = str(DELTA_SYMBOL_MAP.get(asset) or '').strip().upper()
-                if not delta_symbol:
+                # Ambiguous active products for one underlying are excluded;
+                # operators may narrow via a reviewed product-specific policy.
+                matches = eligible_by_asset.get(asset, ())
+                if len(matches) != 1:
                     continue
-                matching = [p for p in product_rows if str(p.get('symbol') or '').strip().upper() == delta_symbol]
-                # The symbol-only Delta product/order-book APIs cannot safely
-                # disambiguate multiple active product IDs with the same symbol.
-                matching = [p for p in matching if str(p.get('state') or p.get('status') or '').lower()
-                            in {'active', 'live', 'trading', 'listed'}]
-                if len(matching) != 1:
-                    continue
-                product = matching[0]
-                product_id = product.get('id', product.get('product_id'))
-                marker = str(product.get('contract_type') or product.get('product_type') or
-                             product.get('market_type') or '').strip().lower()
-                if product_id is None or not str(product_id).strip() or marker not in {
-                        'perpetual', 'perpetual_futures', 'perpetual_swap', 'perpetual_swaps'}:
-                    continue
-                explicit_base = str(product.get('base_asset') or product.get('underlying_asset') or '').strip().upper()
-                # No ticker suffix inference: missing underlying/quote metadata
-                # is not enough to assert Binance/Delta market compatibility.
-                if not explicit_base or explicit_base != asset:
-                    continue
-                quote = str(product.get('quote_asset') or product.get('quote_currency') or '').strip().upper()
-                if quote != 'USDT':
-                    # Binance source is BASEUSDT. Other Delta quote currencies
-                    # require a separately reviewed FX/conversion adapter.
-                    continue
+                product, quote, settle, marker = matches[0]
+                symbol = str(product['symbol']).strip().upper()
                 binance_symbol = asset + 'USDT'
-                mapping_policy_id = f'binance_spot_usdt_to_delta_linear_perpetual_{quote.lower()}'
+                mapping_policy_id = f'binance_spot_usdt_to_delta_{quote.lower()}_{settle.lower()}_{marker}'
                 candidates.append({
                     'venue': 'binance', 'market_type': 'spot',
                     'instrument_id': binance_symbol, 'symbol': binance_symbol,
                     'execution_identity': {
                         'venue': 'delta', 'market_type': marker,
-                        'instrument_id': str(product_id).strip(), 'symbol': delta_symbol,
+                        'instrument_id': str(product.get('id', product.get('product_id'))).strip(),
+                        'symbol': symbol,
                     },
                     'mapping_policy_id': mapping_policy_id,
                     'liquidity_24h_usdt': volume,

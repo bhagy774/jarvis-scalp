@@ -31,20 +31,47 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _active_product(product: Mapping[str, Any], expected: FullIdentity) -> bool:
+def _asset_symbol(value: Any) -> str:
+    if isinstance(value, Mapping):
+        value = value.get("symbol") or value.get("asset_symbol") or value.get("name")
+    return _text(value).upper()
+
+
+def _product_fields(product: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    base = _asset_symbol(product.get("underlying_asset_symbol") or product.get("underlying_asset")
+                         or product.get("base_asset"))
+    quote = _asset_symbol(product.get("quoting_asset") or product.get("quote_asset")
+                          or product.get("quote_currency"))
+    settle = _asset_symbol(product.get("settling_asset") or product.get("settlement_asset")
+                           or product.get("settlement_currency"))
+    marker = _text(product.get("product_type") or product.get("market_type")
+                   or product.get("contract_type")).lower()
+    return base, quote, settle, marker
+
+
+def _active_product(product: Mapping[str, Any], expected: FullIdentity,
+                    policy: Optional[Mapping[str, Any]] = None) -> bool:
     try:
         if str(product.get("id", product.get("product_id"))) != expected.instrument_id:
             return False
-        if str(product.get("symbol") or "").strip().upper() != expected.symbol:
+        if _text(product.get("symbol")).upper() != expected.symbol:
             return False
-        if str(product.get("state") or product.get("status") or "").strip().lower() not in {"active", "live", "trading", "listed"}:
+        if _text(product.get("state") or product.get("status")).lower() not in {"active", "live", "trading", "listed"}:
             return False
-        marker = str(product.get("contract_type") or product.get("product_type") or product.get("market_type") or "").strip().lower()
+        base, quote, settle, marker = _product_fields(product)
         if marker not in _ALLOWED_DELTA_TYPES or marker != expected.market_type:
             return False
-        base = str(product.get("base_asset") or product.get("underlying_asset") or "").strip().upper()
-        quote = str(product.get("quote_asset") or product.get("quote_currency") or "").strip().upper()
-        return base == _base_asset(expected.symbol) and quote in _ALLOWED_QUOTES
+        if base != _base_asset(expected.symbol) or not quote or quote != settle:
+            return False
+        # Risk and notional are held in the venue's actual settlement currency.
+        # A quote/settlement conversion is intentionally unsupported until a
+        # separately sourced, fresh, authoritative FX adapter exists.
+        if policy is not None and (
+                quote != _asset_symbol(policy.get("delta_quote_asset"))
+                or settle != _asset_symbol(policy.get("delta_settling_asset"))
+                or settle != _asset_symbol(policy.get("risk_currency"))):
+            return False
+        return True
     except (CandidateRejected, AttributeError):
         return False
 
@@ -218,41 +245,55 @@ def build_delta_candidate(
     if not callable(metadata_reader):
         raise CandidateRejected("Delta product metadata adapter is unavailable")
     metadata = metadata_reader(identity.symbol)
-    if not isinstance(metadata, Mapping) or not _active_product(metadata, identity):
-        raise CandidateRejected("Delta product is inactive, mismatched, or not explicit linear perpetual metadata")
+    if not isinstance(metadata, Mapping) or not _active_product(metadata, identity, policy):
+        raise CandidateRejected("Delta product is inactive, mismatched, or lacks exact quote/settlement metadata")
+    _base, quote_currency, settlement_currency, _kind = _product_fields(metadata)
+    if not settlement_currency or quote_currency != settlement_currency:
+        raise CandidateRejected("Delta quote and settlement currencies differ; validated FX conversion is unavailable")
+    risk_currency = _asset_symbol(policy.get("risk_currency"))
+    if risk_currency != settlement_currency:
+        raise CandidateRejected("asset policy risk currency does not match Delta settlement currency")
     bid, ask, quote_time = _quote_for(delta, identity, policy, current)
     entry = ask if direction == "BUY" else bid
     max_chase = _nonnegative_number(policy.get("max_chase_pct"), "max_chase_pct")
     max_slippage = _nonnegative_number(policy.get("max_slippage_pct"), "max_slippage_pct")
-    if abs(entry - reference_price) / reference_price * 100.0 > max_chase:
-        raise CandidateRejected("Delta executable quote is too far from Binance reference")
-    stop = _positive_number(decision.get("stop_loss"), "deterministic stop loss")
-    target = _positive_number(decision.get("take_profit"), "deterministic take profit")
+    if quote_currency == "USDT" and abs(entry - reference_price) / reference_price * 100.0 > max_chase:
+        raise CandidateRejected("Delta executable quote is too far from Binance USDT reference")
+    source_stop = _positive_number(decision.get("stop_loss"), "deterministic stop loss")
+    source_target = _positive_number(decision.get("take_profit"), "deterministic take profit")
+    # Map price levels by the exact same-asset Delta/Binance quote ratio. This
+    # preserves deterministic percent geometry when the actual Delta quote
+    # denomination differs (e.g. USD vs Binance USDT); it is not an FX rate.
+    scale = 1.0 if quote_currency == "USDT" else entry / reference_price
+    stop, target = source_stop * scale, source_target * scale
     if direction == "BUY" and not stop < entry < target:
-        raise CandidateRejected("Delta ask invalidates deterministic BUY stop/target geometry")
+        raise CandidateRejected("Delta ask invalidates scaled deterministic BUY stop/target geometry")
     if direction == "SELL" and not target < entry < stop:
-        raise CandidateRejected("Delta bid invalidates deterministic SELL stop/target geometry")
+        raise CandidateRejected("Delta bid invalidates scaled deterministic SELL stop/target geometry")
 
     try:
-        from jarvis_risk import calculate_trade_size, contract_quote_value_usdt
+        from jarvis_risk import calculate_trade_size, contract_quote_value_in_currency
         from jarvis_lot_limits import enforce_entry_lots
     except Exception as exc:
         raise CandidateRejected(f"deterministic risk/lot sizing unavailable: {type(exc).__name__}")
-    balance_reader = getattr(delta, "get_available_balance_usdt", None)
+    balance_reader = getattr(delta, "get_available_balance", None)
     if not callable(balance_reader):
-        raise CandidateRejected("Delta USDT-denominated available-balance adapter is unavailable")
-    balance = _positive_number(balance_reader(), "Delta available USDT balance")
-    contract_value = contract_quote_value_usdt(dict(metadata), entry)
+        raise CandidateRejected("Delta exact-currency available-balance adapter is unavailable")
+    balance = _positive_number(balance_reader(settlement_currency), f"Delta available {settlement_currency} balance")
+    contract_value = contract_quote_value_in_currency(dict(metadata), entry, settlement_currency)
     if contract_value is None or not math.isfinite(float(contract_value)) or float(contract_value) <= 0:
-        raise CandidateRejected("Delta contract value is not explicitly quote-convertible")
+        raise CandidateRejected("Delta contract value is not explicitly convertible to its settlement currency")
     stop_distance_fraction = abs(entry - stop) / entry
-    risk_budget = _positive_number(policy.get("max_trade_risk_usdt"), "max_trade_risk_usdt")
+    risk_budget = _positive_number(policy.get("max_trade_risk_currency"), "max_trade_risk_currency")
     leverage_value = metadata.get("max_leverage", metadata.get("max_leverage_allowed", metadata.get("leverage_max")))
+    # The current public Product schema exposes default_leverage and notional
+    # caps but does not expose a reliable tier-wide maximum. Never treat the
+    # default as the maximum: if no explicit max is in metadata, size at 1x.
     if leverage_value is None:
-        raise CandidateRejected("Delta maximum leverage metadata is missing")
+        leverage_value = 1
     size = calculate_trade_size(
         balance, confidence, stop_distance_fraction,
-        max_trade_risk_usdt=risk_budget,
+        max_trade_risk_currency=risk_budget, risk_currency=settlement_currency,
         product_max_leverage=leverage_value,
         contract_value_usdt=float(contract_value), require_contract_value=True,
     )
@@ -275,11 +316,15 @@ def build_delta_candidate(
         "direction": direction, "entry_price": entry, "stop_loss": stop, "take_profit": target,
         "quantity": quantity, "size_unit": "contracts", "contract_multiplier": contract_multiplier,
         "sizing_provenance": "jarvis_risk.calculate_trade_size+jarvis_lot_limits.enforce_entry_lots",
-        "risk_notional": stop_risk, "policy_id": policy_id,
-        "mapping_policy_id": mapping_policy_id,
+        "risk_notional": stop_risk, "risk_currency": settlement_currency,
+        "policy_id": policy_id, "mapping_policy_id": mapping_policy_id,
         "execution_identity": identity.to_dict(), "delta_quote_observed_at": quote_time,
-        "delta_bid": bid, "delta_ask": ask, "delta_product_value_usdt": float(contract_value),
-        "delta_risk_budget_usdt": risk_budget, "delta_available_balance": balance,
+        "delta_bid": bid, "delta_ask": ask,
+        "delta_product_value": float(contract_value), "delta_value_currency": settlement_currency,
+        "delta_risk_budget": risk_budget, "delta_available_balance": balance,
+        "delta_balance_currency": settlement_currency,
+        "leverage": int(size.get("leverage", 1)),
+        "analysis_to_delta_price_ratio": scale,
     }
     enriched = dict(result)
     enriched["execution_plan"] = plan
@@ -289,10 +334,12 @@ def build_delta_candidate(
         enriched, policy_registry=policy_ids, mapping_policy_registry=mapping_policy_ids,
         now=current, max_age_seconds=max_age_seconds,
     )
-    # Never route to a market-order-only client: the atomic protective-exit and
-    # full-account reconciliation capabilities are prerequisites for entry.
+    # Delta's documented bracket endpoint is a separate post-fill position
+    # attachment, not an atomic entry+protection order. The concrete wrapper
+    # implements this staged lifecycle and reports FILLED only after it sees
+    # both active protective exits; UNKNOWN keeps the reservation locked.
     if not callable(getattr(delta, "place_protected_order", None)):
-        raise CandidateRejected("Delta broker does not support atomic protective entry orders")
+        raise CandidateRejected("Delta staged entry/bracket lifecycle adapter is unavailable")
     if not callable(getattr(delta, "get_complete_account_snapshot", None)):
         raise CandidateRejected("Delta broker does not provide complete authoritative account reconciliation")
     return candidate
@@ -335,14 +382,41 @@ class DeltaExecutionAdapter:
         if not callable(getter):
             return False
         ledger = coordinator.snapshot().get("orders", {})
-        owned = {cid: {"order_id": row.get("order_id"), "identity": row.get("candidate", {}).get("identity")}
-                 for cid, row in ledger.items()}
+        owned = {}
+        for cid, row in ledger.items():
+            candidate = row.get("candidate", {})
+            client_id = "jme" + hashlib.sha256(str(cid).encode()).hexdigest()[:29]
+            owned[cid] = {"order_id": row.get("order_id"),
+                          "identity": candidate.get("identity"),
+                          "direction": candidate.get("direction"),
+                          "quantity": candidate.get("quantity"),
+                          "protective_exits": row.get("protective_exits"),
+                          "client_order_id": client_id,
+                          "close_order_id": row.get("close_order_id"),
+                          "close_client_order_id": row.get("close_client_order_id")}
         try:
             snapshot = getter(owned_orders=owned)
         except Exception:
             return False
         if not isinstance(snapshot, Mapping) or snapshot.get("complete") is not True:
             return False
+        try:
+            as_of = float(snapshot.get("as_of"))
+            if not math.isfinite(as_of) or as_of > self.clock() + 2 or self.clock() - as_of > 15:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if snapshot.get("external_orders"):
+            return False
+        policy_currencies = {_asset_symbol(p.get("risk_currency")) for p in self.policy_registry.values()}
+        policy_currencies.discard("")
+        if len(policy_currencies) != 1:
+            return False
+        if _asset_symbol(snapshot.get("risk_currency")) not in {"", next(iter(policy_currencies))}:
+            return False
+        for position in snapshot.get("positions", ()):
+            if not isinstance(position, Mapping) or _asset_symbol(position.get("risk_currency")) != next(iter(policy_currencies)):
+                return False
         return coordinator.reconcile(snapshot)
 
     def submit(self, candidate: ValidatedCandidate, idempotency_key: str) -> Mapping[str, Any]:
@@ -353,16 +427,18 @@ class DeltaExecutionAdapter:
         identity = candidate.identity
         meta_reader = getattr(self.delta, "get_product_metadata", None)
         metadata = meta_reader(identity.symbol) if callable(meta_reader) else None
-        if not isinstance(metadata, Mapping) or not _active_product(metadata, identity):
-            return {"status": "REJECTED", "authoritative": True, "reason": "Delta product identity/status changed"}
         policy = self.policy_registry.get(_base_asset(identity.symbol), {})
+        if not isinstance(metadata, Mapping) or not _active_product(metadata, identity, policy):
+            return {"status": "REJECTED", "authoritative": True, "reason": "Delta product identity/status/denomination changed"}
         try:
             bid, ask, _observed = _quote_for(self.delta, identity, policy, self.clock())
             current_entry = ask if candidate.direction == "BUY" else bid
             if abs(current_entry - candidate.entry_price) / candidate.entry_price * 100.0 > candidate.max_slippage_pct:
                 return {"status": "REJECTED", "authoritative": True, "reason": "Delta executable quote moved beyond allowed slippage"}
-            if abs(current_entry - candidate.reference_price) / candidate.reference_price * 100.0 > candidate.max_chase_pct:
-                return {"status": "REJECTED", "authoritative": True, "reason": "Delta quote exceeds Binance cross-market chase limit"}
+            _, quote_currency, _, _ = _product_fields(metadata)
+            if (quote_currency == "USDT"
+                    and abs(current_entry - candidate.reference_price) / candidate.reference_price * 100.0 > candidate.max_chase_pct):
+                return {"status": "REJECTED", "authoritative": True, "reason": "Delta quote exceeds Binance USDT reference chase limit"}
             if candidate.direction == "BUY" and not candidate.stop_loss < current_entry < candidate.take_profit:
                 return {"status": "REJECTED", "authoritative": True, "reason": "current quote invalidates BUY protective geometry"}
             if candidate.direction == "SELL" and not candidate.take_profit < current_entry < candidate.stop_loss:
@@ -372,14 +448,14 @@ class DeltaExecutionAdapter:
         submitter = getattr(self.delta, "place_protected_order", None)
         if not callable(submitter):
             return {"status": "REJECTED", "authoritative": True, "reason": "atomic Delta protective-order API unavailable"}
-        client_id = "jarvis-mc-entry-" + hashlib.sha256(str(idempotency_key).encode()).hexdigest()[:36]
+        client_id = "jme" + hashlib.sha256(str(idempotency_key).encode()).hexdigest()[:29]
         self._direction_by_candidate[str(idempotency_key)] = candidate.direction
         try:
             response = submitter(
                 product_id=int(identity.instrument_id), symbol=identity.symbol,
                 side="buy" if candidate.direction == "BUY" else "sell", size=int(candidate.quantity),
                 order_type="market", stop_loss=candidate.stop_loss, take_profit=candidate.take_profit,
-                client_order_id=client_id,
+                leverage=int(candidate.leverage), client_order_id=client_id,
             )
         except Exception:
             return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "reason": "Delta submit response lost"}
@@ -415,7 +491,9 @@ class DeltaExecutionAdapter:
         return {"status": state, "authoritative": response.get("authoritative") is True,
                 "order_id": _text(response.get("order_id")) or None, "filled_quantity": filled,
                 "average_fill_price": avg_price, "protection_state": response.get("protection_state"),
-                "protective_exits": response.get("protective_exits")}
+                "protective_exits": response.get("protective_exits"),
+                "close_order_id": response.get("close_order_id"),
+                "close_client_order_id": response.get("close_client_order_id")}
 
     def close(self, candidate_id: str, identity: FullIdentity, quantity: float) -> Mapping[str, Any]:
         # Close requests are identity-specific and reduce-only. If authorization
@@ -432,18 +510,21 @@ class DeltaExecutionAdapter:
             return {"status": "CLOSE_PENDING", "authoritative": False}
         if qty <= 0 or identity.venue != "delta":
             return {"status": "CLOSE_PENDING", "authoritative": False}
-        closer = getattr(self.delta, "place_order", None)
+        closer = getattr(self.delta, "place_reduce_only_order", None)
         if not callable(closer):
             return {"status": "CLOSE_PENDING", "authoritative": False}
-        cid = "jarvis-mc-close-" + hashlib.sha256(str(candidate_id).encode()).hexdigest()[:38]
+        cid = "jmc" + hashlib.sha256(str(candidate_id).encode()).hexdigest()[:29]
         try:
-            response = closer(symbol=identity.symbol, side="sell" if direction == "BUY" else "buy",
-                              size=qty, order_type="market", reduce_only=True, client_order_id=cid)
+            response = closer(product_id=int(identity.instrument_id), symbol=identity.symbol,
+                              side="sell" if direction == "BUY" else "buy",
+                              size=qty, client_order_id=cid)
         except Exception:
-            return {"status": "CLOSE_PENDING", "authoritative": False}
+            return {"status": "CLOSE_PENDING", "authoritative": False, "client_order_id": cid}
         if not isinstance(response, Mapping) or response.get("success") is not True:
-            return {"status": "CLOSE_PENDING", "authoritative": False}
-        return {"status": "CLOSE_PENDING", "authoritative": False, "order_id": _text(response.get("order_id")) or None}
+            return {"status": "CLOSE_PENDING", "authoritative": False, "client_order_id": cid,
+                    "order_id": _text(response.get("order_id")) or None if isinstance(response, Mapping) else None}
+        return {"status": "CLOSE_PENDING", "authoritative": False,
+                "order_id": _text(response.get("order_id")) or None, "client_order_id": cid}
 
     def monitor_once(self, coordinator: PortfolioCoordinator) -> Dict[str, Any]:
         """Reconcile first, then request idempotent reduce-only closes at Delta TP/SL."""

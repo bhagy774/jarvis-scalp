@@ -15,12 +15,15 @@ ASSET_POLICY = {
         "delta_symbol": "ETHUSDT",
         "delta_instrument_id": "22",
         "delta_market_type": "perpetual_futures",
+        "delta_quote_asset": "USDT",
+        "delta_settling_asset": "USDT",
+        "risk_currency": "USDT",
         "min_confidence": 70,
         "max_quote_age_seconds": 5,
         "max_spread_pct": 0.2,
         "max_chase_pct": 1.0,
         "max_slippage_pct": 0.2,
-        "max_trade_risk_usdt": 5.0,
+        "max_trade_risk_currency": 5.0,
     }
 }
 
@@ -66,8 +69,8 @@ class FakeDelta:
         self.close_calls = []
         self.product = {
             "id": 22, "symbol": "ETHUSDT", "state": "active",
-            "contract_type": "perpetual_futures", "base_asset": "ETH", "quote_asset": "USDT",
-            "contract_value_usdt": 1.0, "max_leverage": 10, "contract_size": 1,
+            "product_type": "perpetual_futures", "base_asset": "ETH", "quote_asset": "USDT",
+            "settling_asset": "USDT", "contract_value_usdt": 1.0, "max_leverage": 10, "contract_size": 1,
         }
 
     def get_product_metadata(self, symbol):
@@ -79,8 +82,8 @@ class FakeDelta:
         return {"source": "delta", "symbol": symbol, "product_id": product_id,
                 "bid": 100.0, "ask": 100.1, "observed_at": self.clock()}
 
-    def get_available_balance_usdt(self):
-        return 500.0
+    def get_available_balance(self, currency):
+        return 500.0 if currency == "USDT" else 0.0
 
     def place_protected_order(self, **kwargs):
         self.entry_calls.append(kwargs)
@@ -108,7 +111,7 @@ class FakeDelta:
                 identity = record.get("identity")
                 if identity:
                     positions.append({**identity, "notional": self.position["quantity"] * self.position["entry"],
-                                      "risk_notional": 0.1})
+                                      "risk_notional": 0.1, "risk_currency": "USDT"})
                     if self.close_order_id:
                         orders[candidate_id] = {"status": "CLOSED", "authoritative": True}
                     else:
@@ -118,15 +121,16 @@ class FakeDelta:
         else:
             for candidate_id in owned_orders:
                 orders[candidate_id] = {"status": "CLOSED", "authoritative": True}
-        return {"complete": True, "as_of": self.clock(), "positions": positions, "orders": orders}
+        return {"complete": True, "as_of": self.clock(), "positions": positions, "orders": orders,
+                "external_orders": [], "risk_currency": "USDT"}
 
-    def place_order(self, **kwargs):
+    def place_reduce_only_order(self, **kwargs):
         self.close_calls.append(kwargs)
-        if kwargs.get("reduce_only") is not True:
+        if kwargs.get("side") != "sell" or int(kwargs.get("size", 0)) <= 0:
             return {"success": False}
         self.close_order_id = kwargs.get("client_order_id")
         self.position = None
-        return {"success": True, "order_id": "delta-close-1"}
+        return {"success": True, "order_id": "delta-close-1", "client_order_id": self.close_order_id}
 
 
 def build(fake=None, result=None):
@@ -169,10 +173,10 @@ def test_mapping_quote_product_freshness_and_missing_data_all_fail_closed():
     with pytest.raises(CandidateRejected):
         build_delta_candidate(analysis(), delta=fake, policy_registry=ASSET_POLICY, now=NOW)
     fake.product["base_asset"] = "ETH"
-    fake.product["contract_type"] = "perpetual"
+    fake.product["product_type"] = "perpetual"
     with pytest.raises(CandidateRejected, match="metadata"):
         build_delta_candidate(analysis(), delta=fake, policy_registry=ASSET_POLICY, now=NOW)
-    fake.product["contract_type"] = "perpetual_futures"
+    fake.product["product_type"] = "perpetual_futures"
     fake.get_delta_executable_quote = lambda **kwargs: {"source": "binance", "symbol": "ETHUSDT", "product_id": "22", "bid": 100, "ask": 100.1, "observed_at": NOW}
     with pytest.raises(CandidateRejected):
         build_delta_candidate(analysis(), delta=fake, policy_registry=ASSET_POLICY, now=NOW)
@@ -181,7 +185,7 @@ def test_mapping_quote_product_freshness_and_missing_data_all_fail_closed():
 def test_non_atomic_broker_and_non_complete_account_capability_are_rejected():
     fake = FakeDelta()
     fake.place_protected_order = None
-    with pytest.raises(CandidateRejected, match="atomic"):
+    with pytest.raises(CandidateRejected, match="staged entry/bracket"):
         build_delta_candidate(analysis(), delta=fake, policy_registry=ASSET_POLICY, now=NOW)
 
     fake = FakeDelta()
@@ -190,8 +194,8 @@ def test_non_atomic_broker_and_non_complete_account_capability_are_rejected():
         build_delta_candidate(analysis(), delta=fake, policy_registry=ASSET_POLICY, now=NOW)
 
     fake = FakeDelta()
-    fake.get_available_balance_usdt = None
-    with pytest.raises(CandidateRejected, match="USDT-denominated"):
+    fake.get_available_balance = None
+    with pytest.raises(CandidateRejected, match="exact-currency"):
         build_delta_candidate(analysis(), delta=fake, policy_registry=ASSET_POLICY, now=NOW)
 
 
@@ -210,7 +214,9 @@ def test_analysis_plan_risk_execution_fill_monitor_close_and_restart(tmp_path):
     first = coordinator.submit(candidate, adapter)
     assert first["status"] == "FILLED"
     assert len(fake.entry_calls) == 1
-    assert fake.entry_calls[0]["client_order_id"].startswith("jarvis-mc-entry-")
+    assert fake.entry_calls[0]["client_order_id"].startswith("jme")
+    assert len(fake.entry_calls[0]["client_order_id"]) == 32
+    assert fake.entry_calls[0]["leverage"] == candidate.leverage
     assert fake.entry_calls[0]["stop_loss"] == 98 and fake.entry_calls[0]["take_profit"] == 105
     assert coordinator.submit(candidate, adapter)["duplicate"] is True
     assert len(fake.entry_calls) == 1
@@ -223,7 +229,8 @@ def test_analysis_plan_risk_execution_fill_monitor_close_and_restart(tmp_path):
     monitored = adapter.monitor_once(coordinator)
     assert monitored["status"] == "MONITORED" and monitored["close_requests"] == 1
     assert fake.close_calls and fake.close_calls[0]["side"] == "sell"
-    assert fake.close_calls[0]["reduce_only"] is True
+    assert fake.close_calls[0]["product_id"] == 22
+    assert len(fake.close_calls[0]["client_order_id"]) == 32
     assert coordinator.snapshot()["orders"][candidate.candidate_id]["status"] == "CLOSE_PENDING"
 
     # Restart recovery cannot declare close on the close acknowledgement; the

@@ -373,9 +373,9 @@ def test_actual_live_product_discovery_joins_scanner_liquidity_to_exact_delta_pr
     class Products:
         def get_available_products(self):
             return [
-                {"id": 42, "symbol": "BTCUSDT", "contract_type": "perpetual", "state": "live", "base_asset": "BTC", "quote_asset": "USDT"},
-                {"id": 84, "symbol": "ETHUSDT", "contract_type": "perpetual", "state": "active", "base_asset": "ETH", "quote_asset": "USDT"},
-                {"id": 86, "symbol": "SOLUSDT", "contract_type": "perpetual", "state": "active", "base_asset": "SOL", "quote_asset": "USDT"},
+                {"id": 42, "symbol": "BTCUSDT", "contract_type": "perpetual_futures", "state": "live", "underlying_asset": {"symbol": "BTC"}, "quoting_asset": {"symbol": "USDT"}, "settling_asset": {"symbol": "USDT"}, "contract_value": "0.001", "contract_unit_currency": "BTC", "tick_size": "0.1", "max_leverage": 20},
+                {"id": 84, "symbol": "ETHUSDT", "contract_type": "perpetual_futures", "state": "active", "underlying_asset": {"symbol": "ETH"}, "quoting_asset": {"symbol": "USDT"}, "settling_asset": {"symbol": "USDT"}, "contract_value": "0.01", "contract_unit_currency": "ETH", "tick_size": "0.01", "max_leverage": 20},
+                {"id": 86, "symbol": "SOLUSDT", "contract_type": "perpetual_futures", "state": "active", "underlying_asset": {"symbol": "SOL"}, "quoting_asset": {"symbol": "USDT"}, "settling_asset": {"symbol": "USDT"}, "contract_value": "0.1", "contract_unit_currency": "SOL", "tick_size": "0.01", "max_leverage": 20},
                 {"symbol": "ETHUSD", "contract_type": "perpetual", "state": "active"},
             ]
 
@@ -387,7 +387,7 @@ def test_actual_live_product_discovery_joins_scanner_liquidity_to_exact_delta_pr
     assert records[0]["market_type"] == "spot"
     assert all(item["venue"] == "binance" for item in records)
     assert records[0]["execution_identity"] == {
-        "venue": "delta", "market_type": "perpetual", "instrument_id": "42", "symbol": "BTCUSDT"
+        "venue": "delta", "market_type": "perpetual_futures", "instrument_id": "42", "symbol": "BTCUSDT"
     }
     assert records[0]["mapping_policy_id"]
     assert "liquidity_24h_usdt" in records[0]

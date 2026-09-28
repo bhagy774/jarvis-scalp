@@ -96,6 +96,8 @@ class ValidatedCandidate:
     policy_id: str
     risk_notional: float
     analysis_identity: Optional[FullIdentity] = None
+    risk_currency: str = "USDT"
+    leverage: int = 1
 
     @property
     def notional(self) -> float:
@@ -196,6 +198,16 @@ def candidate_from_analysis(
     if not provenance:
         raise CandidateRejected("sizing provenance required")
     risk_notional = _positive_number(plan.get("risk_notional"), "risk_notional")
+    risk_currency = str(plan.get("risk_currency") or "USDT").strip().upper()
+    if not risk_currency or len(risk_currency) > 12:
+        raise CandidateRejected("explicit risk currency is malformed")
+    raw_leverage = plan.get("leverage", 1)
+    try:
+        leverage = int(raw_leverage)
+    except (TypeError, ValueError, OverflowError):
+        raise CandidateRejected("integer leverage plan is required")
+    if leverage < 1 or leverage > 1000 or float(raw_leverage) != leverage:
+        raise CandidateRejected("leverage must be an integer within venue bounds")
     stop_risk = abs(entry - stop) * qty * contract_multiplier
     if risk_notional > stop_risk + max(1e-8, stop_risk * 1e-6):
         raise CandidateRejected("declared risk exceeds stop-distance exposure")
@@ -215,7 +227,8 @@ def candidate_from_analysis(
     return ValidatedCandidate(candidate_id, identity, tf, snapshot_version, fetched, completed,
                               decision_at, reference_at, reference_price, max_slippage_pct, max_chase_pct,
                               direction, entry, stop, target, qty, size_unit, contract_multiplier,
-                              provenance, policy_id, risk_notional, analysis_identity)
+                              provenance, policy_id, risk_notional, analysis_identity,
+                              risk_currency, leverage)
 
 
 class PaperExecutionAdapter(Protocol):
@@ -297,8 +310,12 @@ class PortfolioCoordinator:
                 for key, value in raw.get("external_positions", {}).items():
                     if not isinstance(value, dict):
                         raise ValueError("external position risk/notional required")
+                    currency = str(value.get("risk_currency") or "USDT").strip().upper()
+                    if not currency or len(currency) > 12:
+                        raise ValueError("external position currency required")
                     external[str(key)] = {"notional": _positive_number(value.get("notional"), "external notional"),
-                                          "risk_notional": _positive_number(value.get("risk_notional"), "external risk")}
+                                          "risk_notional": _positive_number(value.get("risk_notional"), "external risk"),
+                                          "risk_currency": currency}
                 self._orders, self._external_positions = orders, external
         except Exception:
             # Corrupt state means no orders, no opens, and no new admission.
@@ -325,6 +342,10 @@ class PortfolioCoordinator:
     def _capacity(self, candidate: ValidatedCandidate) -> bool:
         active = [x for x in self._orders.values() if x["status"] in _ACTIVE]
         external = self._external_positions
+        currencies = {str(x.get("candidate", {}).get("risk_currency") or "USDT").upper() for x in active}
+        currencies.update(str(x.get("risk_currency") or "USDT").upper() for x in external.values())
+        if currencies and currencies != {str(candidate.risk_currency).upper()}:
+            return False
         identity_key = self._identity_key(candidate.identity)
         if any(FullIdentity.parse(x["candidate"]["identity"]) == candidate.identity for x in active):
             return False
@@ -406,6 +427,10 @@ class PortfolioCoordinator:
                 row["protection_state"] = str(response.get("protection_state"))
             if isinstance(response.get("protective_exits"), Mapping):
                 row["protective_exits"] = dict(response["protective_exits"])
+            if str(response.get("close_order_id") or "").strip():
+                row["close_order_id"] = str(response.get("close_order_id")).strip()
+            if str(response.get("close_client_order_id") or "").strip():
+                row["close_client_order_id"] = str(response.get("close_client_order_id")).strip()
             if state == "REJECTED":
                 # Even a submit acknowledgement is not the authoritative account/order
                 # reconciliation required to release capacity.
@@ -439,7 +464,11 @@ class PortfolioCoordinator:
                 key = self._identity_key(identity)
                 if key in positions:
                     return False
-                positions[key] = {"notional": notional, "risk_notional": risk_notional}
+                currency = str(item.get("risk_currency") or "USDT").strip().upper()
+                if not currency or len(currency) > 12:
+                    return False
+                positions[key] = {"notional": notional, "risk_notional": risk_notional,
+                                  "risk_currency": currency}
             order_states = {}
             for cid, detail in orders_raw.items():
                 if not isinstance(detail, Mapping) or detail.get("authoritative") is not True:
@@ -452,6 +481,11 @@ class PortfolioCoordinator:
             return False
         with self._lock:
             new_orders = json.loads(json.dumps(self._orders))
+            currencies = {str(value.get("risk_currency") or "USDT").upper() for value in positions.values()}
+            currencies.update(str(row.get("candidate", {}).get("risk_currency") or "USDT").upper()
+                              for row in new_orders.values() if row.get("status") in _ACTIVE)
+            if len(currencies) > 1:
+                return False
             for cid, row in new_orders.items():
                 identity = FullIdentity.parse(row["candidate"]["identity"])
                 ikey = self._identity_key(identity)
@@ -537,6 +571,10 @@ class PortfolioCoordinator:
                     raise ValueError("malformed close response")
             except Exception:
                 response = {"status": "CLOSE_PENDING"}
+            if str(response.get("order_id") or "").strip():
+                row["close_order_id"] = str(response.get("order_id")).strip()
+            if str(response.get("client_order_id") or "").strip():
+                row["close_client_order_id"] = str(response.get("client_order_id")).strip()
             if str(response.get("status", "")).upper() == "REJECTED" and response.get("authoritative") is True:
                 row["status"] = "FILLED" if row.get("filled_quantity") else "PARTIAL"
                 row["close_requested"] = False
