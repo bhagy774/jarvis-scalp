@@ -21,9 +21,12 @@ import requests
 import logging
 import json
 import re
+import copy
 from urllib.parse import urlencode
 from typing import Dict, List, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+from options_chain import build_provider_chain, combine_provider_chains, payout_max_pain
 
 # FIX #9: Load API keys from environment variables (or .env file)
 try:
@@ -71,6 +74,7 @@ class DeltaExchangeData:
             "User-Agent": "JarvisTradingSystem/2.0"
         })
         self._cache = {}
+        self._options_chain_cache = {}
 
         # ── HYBRID: Use Binance for price+candles (more accurate, no API key needed) ──
         try:
@@ -80,6 +84,14 @@ class DeltaExchangeData:
         except ImportError:
             self._binance = None
             logger.warning("[HYBRID] ⚠️  binance_data.py not found, using Delta for everything")
+
+        # Public, read-only options adapter. It is constructed lazily without
+        # making a network request; unsupported eAPI schemas fail closed.
+        try:
+            from binance_options_client import BinanceOptionsClient
+            self._binance_options = BinanceOptionsClient()
+        except ImportError:
+            self._binance_options = None
 
     @staticmethod
     def _perpetual_fallback_allowed() -> bool:
@@ -321,6 +333,37 @@ class DeltaExchangeData:
             return {"candles": results, "source": "delta", "symbol": requested_symbol}
         return {"candles": [], "source": "delta", "symbol": requested_symbol}
 
+    def get_delta_native_candles_with_metadata(
+        self, *, symbol: str, resolution: str, limit: int
+    ) -> Dict[str, Any]:
+        """Fetch Delta candles only, with no Binance or Bybit substitution.
+
+        The multicoin analysis namespace uses this method so a Delta execution
+        product is never silently paired with another venue's similarly-named
+        ticker. This is a public read-only request and does not authorize orders.
+        """
+        multipliers = {
+            "1m": 60, "3m": 180, "5m": 300, "15m": 900,
+            "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400,
+        }
+        requested_symbol = str(symbol or "").strip().upper()
+        if not requested_symbol or resolution not in multipliers:
+            return {"candles": [], "source": "delta", "symbol": requested_symbol}
+        end_time = int(time.time())
+        start_time = end_time - (int(limit) * multipliers[resolution])
+        params = {"symbol": requested_symbol, "resolution": resolution,
+                  "start": start_time, "end": end_time}
+        response = self._request("GET", "/v2/history/candles", params)
+        if not response.get("success"):
+            return {"candles": [], "source": "delta", "symbol": requested_symbol}
+        rows = response.get("data", {}).get("result", [])
+        if not isinstance(rows, list):
+            return {"candles": [], "source": "delta", "symbol": requested_symbol}
+        for row in rows:
+            if isinstance(row, dict) and row.get("volume") is None:
+                row["volume"] = 0.0
+        return {"candles": rows, "source": "delta", "symbol": requested_symbol}
+
     def get_historical_candles(self, symbol: str = "BTCUSD", resolution: str = "5m", limit: int = 100) -> List[Dict]:
         """Legacy list-shaped wrapper around metadata-bearing candle fetch."""
         return self.get_historical_candles_with_metadata(symbol, resolution, limit).get("candles", [])
@@ -372,62 +415,110 @@ class DeltaExchangeData:
     # 3. OPTIONS CHAIN & GREEKS (Replaces Deribit)
     # ==========================================
 
+    @staticmethod
+    def _delta_ticker_page(response: Dict) -> tuple[list[dict], Any, bool, bool]:
+        """Return rows, next cursor, marker-seen and terminal-page evidence."""
+        if not isinstance(response, dict) or not response.get("success"):
+            return [], None, False, False
+        body = response.get("data")
+        if not isinstance(body, dict):
+            return [], None, False, False
+        rows = body.get("result")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return [], None, False, False
+        meta = body.get("meta") if isinstance(body.get("meta"), dict) else None
+        paging = body.get("pagination") if isinstance(body.get("pagination"), dict) else meta
+        if paging is None:
+            return rows, None, False, False
+        cursor_key = next((k for k in ("next_cursor", "nextCursor", "next", "after") if k in paging), None)
+        more_key = next((k for k in ("has_more", "hasMore", "has_next", "hasNextPage") if k in paging), None)
+        marker_seen = cursor_key is not None or more_key is not None
+        if not marker_seen:
+            return rows, None, False, False
+        cursor = paging.get(cursor_key) if cursor_key else None
+        more = bool(paging.get(more_key)) if more_key else bool(cursor)
+        return rows, cursor if more else None, True, not more
+
     def get_options_chain(self, underlying: str = "BTC") -> Dict:
-        """
-        Get options chain with Greeks.
-        Returns data in a unified format compatible with Jarvis Logic.
-        """
-        # Fetch calls and puts
-        res = self._request("GET", "/v2/tickers", {
-            "contract_types": "call_options,put_options",
-            "underlying_asset_symbols": underlying
-        })
-        
-        if not res["success"]:
-            return {}
+        """Fetch current all-page BTC/ETH option chains from supported providers.
 
-        options = res["data"].get("result", [])
-        
-        # Analyze Chain
-        chain_data = {
-            "calls": [], # List of option objects
-            "puts": [], # List of option objects
-            "pcr": 0.0, # Put/Call Ratio
-            "total_oi": 0,
-            "max_pain": 0 # To be calculated
+        A chain is filter-usable only when the provider schema, identity,
+        freshness, and terminal-pagination/manifest evidence all validate.
+        Missing fields stay null and are counted; Greeks are never modeled.
+        """
+        from datetime import datetime, timezone
+        from options_snapshot_store import append_snapshot
+
+        asset = str(underlying or "").upper().replace("USDT", "").replace("USD", "")
+        cached = getattr(self, "_options_chain_cache", {}).get(asset)
+        if cached and time.monotonic() - cached[0] <= 15:
+            return copy.deepcopy(cached[1])
+        retrieved = datetime.now(timezone.utc)
+        if not re.fullmatch(r"[A-Z0-9]{2,12}", asset):
+            return combine_provider_chains("", {})
+        pages: list[list[dict]] = []
+        cursor = None
+        marker_seen = False
+        terminated = False
+        provider_error = None
+        max_pages = 100
+        page_size = 500
+        for page_number in range(max_pages):
+            params = {
+                "contract_types": "call_options,put_options",
+                "underlying_asset_symbols": asset,
+                "page_size": page_size,
+            }
+            if cursor is not None:
+                params["after"] = cursor
+            response = self._request("GET", "/v2/tickers", params)
+            rows, next_cursor, has_marker, terminal = self._delta_ticker_page(response)
+            if not isinstance(response, dict) or not response.get("success"):
+                provider_error = (response.get("error") if isinstance(response, dict) else None) or "provider_request_failed"
+                break
+            if not isinstance(response.get("data"), dict) or not isinstance(response["data"].get("result"), list):
+                provider_error = "provider_schema_invalid"
+                break
+            pages.append(rows)
+            marker_seen = marker_seen or has_marker
+            if terminal:
+                terminated = True
+                break
+            if next_cursor is None:
+                # A page without an explicit continuation is not completeness evidence.
+                break
+            if next_cursor == cursor:
+                provider_error = "pagination_cursor_did_not_advance"
+                break
+            cursor = next_cursor
+        else:
+            provider_error = "pagination_page_limit_reached"
+        pagination = {
+            "complete": terminated,
+            "truncated": bool(provider_error == "pagination_page_limit_reached" or (marker_seen and not terminated)),
+            "marker_seen": marker_seen,
+            "pages_received": len(pages),
+            "page_size_requested": page_size,
+            "termination_evidence": "provider_terminal_pagination_marker" if terminated else None,
+            "cursor_used": cursor is not None,
         }
-        
-        total_call_oi = 0
-        total_put_oi = 0
-        strikes = set()
-        
-        for opt in options:
+        delta_chain = build_provider_chain(
+            asset, "Delta", pages, pagination, retrieved_at=retrieved,
+            provider_error=provider_error,
+        )
+        delta_chain["status"] = "ok" if delta_chain["validation"]["usable"] else ("provider_error" if provider_error else "incomplete_or_unverified")
+        providers = {"Delta": delta_chain}
+        if self._binance_options is not None:
             try:
-                contract_type = opt.get("contract_type")
-                strike = float(opt.get("strike_price", 0))
-                oi = float(opt.get("oi", 0))
-                
-                # Parse Greeks (Delta endpoint sometimes nests them, sometimes flat)
-                greeks = opt.get("greeks", {}) or {}
-                
-                # Parse Expiry from Symbol (e.g., BTC-280624-60000-C)
-                parts = opt["symbol"].split("-")
-                expiry = parts[1] if len(parts) >= 2 else "PERPETUAL"
-
-                item = {
-                    "symbol": opt["symbol"],
-                    "expiry": expiry, # Storing expiry
-                    "strike": strike,
-                    "price": float(opt.get("mark_price", 0)),
-                    "iv": float(opt.get("implied_volatility", 0)),
-                    "oi": oi,
-                    "volume": float(opt.get("volume", 0)),
-                    "delta": float(greeks.get("delta", 0)) if greeks else 0,
-                    "gamma": float(greeks.get("gamma", 0)) if greeks else 0,
-                    "theta": float(greeks.get("theta", 0)) if greeks else 0,
-                    "vega": float(greeks.get("vega", 0)) if greeks else 0,
-                    "rho": float(greeks.get("rho", 0)) if greeks else 0
+                binance_chain = self._binance_options.get_options_chain(asset)
+                if isinstance(binance_chain, dict):
+                    providers["Binance Options"] = binance_chain
+            except Exception as exc:
+                providers["Binance Options"] = {
+                    "venue": "Binance Options", "underlying": asset, "contracts": [], "status": "provider_error",
+                    "validation": {"usable": False, "complete": False, "reasons": ["provider_request_failed"], "error_type": type(exc).__name__},
                 }
+<<<<<<< HEAD
                 
                 strikes.add(strike)
                 chain_data["total_oi"] += oi
@@ -453,103 +544,95 @@ class DeltaExchangeData:
         chain_data["max_pain"] = self._calculate_max_pain(chain_data)
             
         return chain_data
+=======
+        chain = combine_provider_chains(asset, providers)
+        snapshot_path = os.environ.get("JARVIS_OPTIONS_SNAPSHOT_PATH", "")
+        if snapshot_path:
+            written = append_snapshot(snapshot_path, chain, captured_at=retrieved)
+            chain["snapshot_persistence"] = {"enabled": True, "written": bool(written), "schema": "jarvis.options.snapshot.v1"}
+        else:
+            chain["snapshot_persistence"] = {"enabled": False, "reason": "JARVIS_OPTIONS_SNAPSHOT_PATH_not_set"}
+        self._options_chain_cache[asset] = (time.monotonic(), copy.deepcopy(chain))
+        return chain
+>>>>>>> 896f0a39576c2dcc9c5699da66df75437f7ac0d4
 
     def get_institutional_bias(self, underlying: str = "BTC") -> Dict:
-        """
-        [MULTI-EXPIRY] Big Player Analysis.
-        Analyzes Near-term (Gamma) vs Far-term (Positioning).
-        """
+        """Apply the existing PCR heuristic only to one validated provider chain."""
         chain = self.get_options_chain(underlying)
-        all_opts = chain.get("calls", []) + chain.get("puts", [])
-        
-        if not all_opts:
-            return {"bias": "NEUTRAL", "score": 0, "reasons": ["No Data"]}
-            
-        # 1. Group by Expiry
-        expiries = {}
-        for opt in all_opts:
-            exp = opt.get("expiry", "UNKNOWN")
-            if exp not in expiries:
-                expiries[exp] = {"calls": 0, "puts": 0, "call_vol": 0, "put_vol": 0}
-            
-            if "call" in opt["symbol"].lower() or opt["symbol"].endswith("-C"):
-                expiries[exp]["calls"] += opt["oi"]
-                expiries[exp]["call_vol"] += opt["volume"]
-            else:
-                expiries[exp]["puts"] += opt["oi"]
-                expiries[exp]["put_vol"] += opt["volume"]
-                
-        # 2. Analyze Each Expiry
+        providers = chain.get("providers", {}) if isinstance(chain, dict) else {}
+        provider = next((providers.get(name) for name in ("Delta", "Binance Options")
+                         if isinstance(providers.get(name), dict)
+                         and providers[name].get("validation", {}).get("usable")), None)
+        if provider is None:
+            validation = chain.get("validation", {}) if isinstance(chain, dict) else {}
+            return {
+                "bias": "NEUTRAL", "score": 0, "reasons": ["No Data"],
+                "raw_data": {"options_validation": validation, "source_provider": None,
+                             "provider_status": {name: item.get("status") for name, item in providers.items() if isinstance(item, dict)}},
+            }
+        all_opts = provider.get("contracts", [])
+        metrics = provider.get("metrics", {})
+        if not all_opts or not metrics.get("open_interest_complete") or metrics.get("put_call_ratio") is None:
+            return {"bias": "NEUTRAL", "score": 0, "reasons": ["No Data"],
+                    "raw_data": {"options_validation": provider.get("validation"), "source_provider": provider.get("venue"),
+                                 "coverage": provider.get("coverage"), "provider_metrics": metrics}}
+
+        expiries: dict[str, dict[str, float]] = {}
+        for option in all_opts:
+            exp = option.get("expiry")
+            if not exp or option.get("open_interest") is None:
+                continue
+            row = expiries.setdefault(exp, {"calls": 0.0, "puts": 0.0, "call_volume": 0.0, "put_volume": 0.0})
+            side = "calls" if option.get("type") == "call" else "puts"
+            row[side] += option["open_interest"]
+            vol = option.get("volume")
+            if vol is not None:
+                row["call_volume" if side == "calls" else "put_volume"] += vol
         reasons = []
         total_score = 0
-        sorted_exps = sorted(expiries.keys()) # sort by date string (approx)
-        
-        # Analyze Top 3 Expiries (Near, Mid, Far)
-        for i, exp in enumerate(sorted_exps[:3]):
+        for exp in sorted(expiries):
             data = expiries[exp]
-            total_oi = data["calls"] + data["puts"]
-            if total_oi < 100: continue # Skip ghosts
-            
-            pcr = data["puts"] / data["calls"] if data["calls"] > 0 else 2.0
-            
-            # Weight: Near term has less weight on "Trend" but more on "Volatility"
-            # Far term has more weight on "Trend"
-            term = "NEAR" if i == 0 else "FAR"
-            
+            if data["calls"] + data["puts"] < 100:
+                continue
+            if data["calls"] <= 0:
+                continue
+            pcr = data["puts"] / data["calls"]
             if pcr > 1.3:
-                bias = "BEARISH"
-                score = -2
-                reasons.append(f"[{exp}] High PCR ({pcr:.2f}) -> Hedging/Bearish")
+                total_score -= 2
+                reasons.append(f"[{exp}] High PCR ({pcr:.2f}); unsigned OI is descriptive, not dealer direction")
             elif pcr < 0.65:
-                bias = "BULLISH"
-                score = 2
-                reasons.append(f"[{exp}] Low PCR ({pcr:.2f}) -> Call Buying/Bullish")
-            else:
-                bias = "NEUTRAL"
-                score = 0
-                
-            total_score += score
-            
-        # 3. Final Verdict
-        final_bias = "NEUTRAL"
-        if total_score >= 3: final_bias = "BULLISH"
-        elif total_score <= -3: final_bias = "BEARISH"
-            
+                total_score += 2
+                reasons.append(f"[{exp}] Low PCR ({pcr:.2f}); unsigned OI is descriptive, not dealer direction")
+        final_bias = "BULLISH" if total_score >= 3 else ("BEARISH" if total_score <= -3 else "NEUTRAL")
+        max_pain = metrics.get("max_pain", {})
+        max_pain_strike = max_pain.get("strike") if max_pain.get("available") else None
+        pcr = metrics.get("put_call_ratio")
         return {
-            "bias": final_bias,
-            "score": total_score,
-            "reasons": reasons,
-            "pcr": round(chain.get("pcr", 0), 3),  # FIX: expose pcr at top level
-            "max_pain": self._calculate_max_pain(chain),  # FIX: expose max_pain at top level
+            "bias": final_bias, "score": total_score, "reasons": reasons,
+            "pcr": pcr, "max_pain": max_pain_strike,
             "raw_data": {
-                "expiries": expiries,
-                "total_oi": chain["total_oi"],
-                "pcr": round(chain.get("pcr", 0), 3),  # FIX: also in raw_data for compatibility
-                "max_pain": chain.get("max_pain", 0),
-            }
+                "expiries": expiries, "total_oi": sum(c["open_interest"] for c in all_opts),
+                "pcr": pcr, "max_pain": max_pain,
+                "options_validation": provider.get("validation"),
+                "source_provider": provider.get("venue"),
+                "coverage": provider.get("coverage"),
+                "provider_metrics": metrics,
+            },
         }
 
-    def _calculate_max_pain(self, chain: Dict) -> float:
-        """
-        Calculate Max Pain: the strike where combined option sellers lose the least.
-        Simplified: find the strike with highest combined OI (Call + Put).
-        """
+    def _calculate_max_pain(self, chain: Dict) -> Optional[float]:
+        """Return payout-minimizing strike, never the highest-OI strike."""
         try:
-            all_opts = chain.get("calls", []) + chain.get("puts", [])
-            if not all_opts:
-                return 0.0
-            strike_oi = {}
-            for opt in all_opts:
-                strike = opt.get("strike", 0)
-                oi = opt.get("oi", 0)
-                if strike > 0:
-                    strike_oi[strike] = strike_oi.get(strike, 0) + oi
-            if not strike_oi:
-                return 0.0
-            max_pain_strike = max(strike_oi, key=strike_oi.get)
-            return float(max_pain_strike)
+            providers = chain.get("providers", {}) if isinstance(chain, dict) else {}
+            selected = chain.get("selected_provider") if isinstance(chain, dict) else None
+            provider = providers.get(selected) if selected else None
+            if isinstance(provider, dict):
+                pain = provider.get("metrics", {}).get("max_pain", {})
+                return pain.get("strike") if pain.get("available") else None
+            pain = payout_max_pain(chain.get("calls", []) + chain.get("puts", []))
+            return pain.get("strike") if pain.get("available") else None
         except Exception:
-            return 0.0
+            return None
 
 
     # ==========================================
@@ -641,34 +724,77 @@ class DeltaExchangeData:
         than sending an unsupported ``symbol`` query parameter or making a
         broad positions request.
         """
-        resolved_symbol = symbol
+        resolved_symbol = None
+        product_id = None
         if not symbol:
+            # Preserve the explicit unscoped query for callers that intentionally
+            # ask for all positions. Instrument-specific reconciliation below
+            # must always resolve and scope by a known Delta product ID.
             res = self._request("GET", "/v2/positions", None, authorized=True)
         else:
-            product_id = self.get_product_id(symbol)
-            if product_id is None:
-                logger.error("[DELTA API] Product ID not found for requested positions")
+            product = self._resolve_product(symbol)
+            if not isinstance(product, dict):
+                logger.error("[DELTA API] Product not found for requested positions")
                 return []
-            resolved_symbol = product.get("symbol", symbol)
+            raw_symbol = product.get("symbol")
+            if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+                logger.error("[DELTA API] Invalid product symbol for requested positions")
+                return []
+            resolved_symbol = raw_symbol.strip().upper()
+            requested = symbol.strip().upper() if isinstance(symbol, str) else ""
+            accepted_symbols = {requested}
+            if requested.endswith("USDT"):
+                accepted_symbols.add(requested[:-4] + "USD")
+            elif requested.endswith("USD"):
+                accepted_symbols.add(requested[:-3] + "USDT")
+            if resolved_symbol not in accepted_symbols:
+                logger.error("[DELTA API] Resolved product does not match requested positions symbol")
+                return []
             try:
-                pid = int(product_id)
-            except (TypeError, ValueError):
+                pid = int(product["id"])
+                if pid <= 0:
+                    raise ValueError("non-positive product ID")
+            except (KeyError, TypeError, ValueError):
                 logger.error("[DELTA API] Invalid product ID for requested positions")
                 return []
-            # Build signed URL with product_id as query param (Delta requirement)
-            endpoint_with_param = f"/v2/positions?product_id={pid}"
-            res = self._request("GET", endpoint_with_param, None, authorized=True)
-        if res["success"]:
-            try:
-                positions = res["data"].get("result", [])
-                if resolved_symbol:
-                    positions = [p for p in positions
-                                 if p.get("product", {}).get("symbol") == resolved_symbol
-                                 or p.get("symbol") == resolved_symbol]
-                return positions
-            except Exception:
-                return []
-        return []
+            product_id = pid
+            # Build signed URL with product_id as query param (Delta requirement).
+            res = self._request("GET", f"/v2/positions?product_id={pid}", None, authorized=True)
+        if not isinstance(res, dict) or not res.get("success"):
+            return []
+        data = res.get("data")
+        positions = data.get("result") if isinstance(data, dict) else None
+        if not isinstance(positions, list):
+            return []
+        if resolved_symbol is None:
+            return positions
+
+        matched = []
+        for position in positions:
+            if not isinstance(position, dict):
+                continue
+            raw_product = position.get("product")
+            if raw_product is not None and not isinstance(raw_product, dict):
+                continue
+            raw_product = raw_product if isinstance(raw_product, dict) else {}
+            raw_position_id = raw_product.get("id", position.get("product_id"))
+            if raw_position_id is not None:
+                try:
+                    if int(raw_position_id) != product_id:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            raw_position_symbol = (raw_product.get("symbol") or position.get("symbol")
+                                   or position.get("product_symbol"))
+            if raw_position_symbol is not None:
+                if not isinstance(raw_position_symbol, str) or raw_position_symbol.strip().upper() != resolved_symbol:
+                    continue
+            elif raw_position_id is None:
+                # The endpoint is scoped, but a record with no instrument identity
+                # cannot safely be assigned to this caller's product.
+                continue
+            matched.append(position)
+        return matched
 
     def close_all_positions(self, symbol: str = "BTCUSDT") -> List[Dict]:
         """
@@ -896,13 +1022,19 @@ class DeltaExchangeData:
             results.append(res)
         return {"results": results}
     
-    def get_available_symbols(self) -> List[str]:
-        """Get list of all available trading symbols"""
+    def get_available_products(self) -> List[Dict[str, Any]]:
+        """Return public product records for exact venue instrument discovery."""
         res = self._request("GET", "/v2/products", authorized=False)
-        if res["success"]:
-            products = res["data"].get("result", [])
-            return [p["symbol"] for p in products if "symbol" in p]
-        return []
+        if not isinstance(res, dict) or not res.get("success"):
+            return []
+        products = res.get("data", {}).get("result", [])
+        if not isinstance(products, list):
+            return []
+        return [dict(product) for product in products if isinstance(product, dict) and product.get("symbol")]
+
+    def get_available_symbols(self) -> List[str]:
+        """Get list of all available trading symbols."""
+        return [str(product["symbol"]) for product in self.get_available_products()]
     
     def place_limit_order(self, symbol: str, side: str, quantity: int, price: float) -> Dict:
         """Place a limit order (wrapper for place_order)"""
