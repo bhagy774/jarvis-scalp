@@ -1,0 +1,19 @@
+# Binance-analysis → Delta multicoin execution bridge
+
+## Scope and safety
+
+The multicoin Parts 1–12 pipeline is an isolated background analysis path. It discovers scanner-qualified assets only when exactly one active Delta perpetual product has explicit matching base/USDT quote metadata and the corresponding Binance `BASEUSDT` spot symbol is available. The candle cache/provider identity remains Binance spot; the exact Delta product ID, symbol, market type, and an explicit mapping-policy ID travel separately. A missing/mismatched mapping is excluded, not guessed. Each discovered identity runs independently across the existing native timeframes with **500 closed candles plus one forming candle per timeframe** and strict freshness/source checks.
+
+A completed analysis is not an order instruction. The execution bridge only accepts the deterministic Parts 11/12 direction/confidence, a non-blocking Part 7 new-entry gate, and explicit stop/target geometry. It then obtains Delta product metadata, a fresh Delta-native bid/ask and an explicitly USDT-denominated available balance; uses ask for buys or bid for sells; applies Delta contract-value sizing through `jarvis_risk.calculate_trade_size` and `jarvis_lot_limits.enforce_entry_lots`; and rechecks quote, chase, slippage, product identity, and stop/target geometry before submission. No model output can override the deterministic gate. Binance reference prices are not treated as executable Delta prices.
+
+The portfolio coordinator persists the reservation before a broker side effect, enforces global/asset/correlation and total notional/risk limits, serializes submissions, blocks duplicates, and holds unknown/partial states until a complete authoritative account reconciliation. Existing open positions must report active stop-loss and take-profit protection. Manual closes are identity-scoped and reduce-only; close acknowledgements alone do not release the reservation.
+
+## Activation status
+
+Both analysis and multicoin execution are disabled by default. `JARVIS_MULTICOIN_ANALYSIS=1` opts into the isolated analysis/scheduling path only. The separate execution initialization flag defaults to `JARVIS_MULTICOIN_DELTA_EXECUTION=0`; any actual live submit additionally requires all of `JARVIS_AUTO_TRADE`, `JARVIS_LIVE_EXECUTION`, `DELTA_USE_MAINNET`, and `DELTA_ORDER_EXECUTION_ENABLED`, a reviewed per-asset mapping/risk policy, and a clean startup reconciliation. The `C:\\jarvis\\STOP_JARVIS` kill file blocks submission.
+
+**The checked-in `DeltaExchangeData` wrapper currently does not provide the bridge-required atomic `place_protected_order`, Delta executable-quote reader, complete authoritative account-snapshot/reconciliation, or USDT-denominated available-balance interface.** These requirements are intentionally not emulated using the wrapper's market-order endpoint or its currency-ambiguous wallet-balance convenience method. Therefore engine initialization reports Delta multicoin execution as `UNAVAILABLE`; an environment flag cannot bypass that capability check. This PR authorizes code only: no live readiness, exchange schema, account, deployment, order, or PC timing is certified.
+
+## Offline validation limits
+
+The offline fake-broker suite exercises strict mapping, Delta quote/metadata/risk-size planning, policy checks, idempotency, concurrent same-instrument submissions, protected fill verification, account reconciliation, protective monitoring, reduce-only close, restart recovery, and missing/unknown-state fail-closed behavior. Fakes are test fixtures and are not evidence of actual Parts signal quality or live broker behavior. No full production Parts 1–12 run on real historical multi-asset data was measured because no suitable checked-in candle dataset is available; no network exchange requests were used.

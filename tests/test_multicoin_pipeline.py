@@ -373,9 +373,9 @@ def test_actual_live_product_discovery_joins_scanner_liquidity_to_exact_delta_pr
     class Products:
         def get_available_products(self):
             return [
-                {"id": 42, "symbol": "BTCUSDT", "contract_type": "perpetual", "state": "live"},
-                {"id": 84, "symbol": "ETHUSDT", "contract_type": "perpetual", "state": "active"},
-                {"id": 86, "symbol": "SOLUSDT", "contract_type": "perpetual", "state": "active"},
+                {"id": 42, "symbol": "BTCUSDT", "contract_type": "perpetual", "state": "live", "base_asset": "BTC", "quote_asset": "USDT"},
+                {"id": 84, "symbol": "ETHUSDT", "contract_type": "perpetual", "state": "active", "base_asset": "ETH", "quote_asset": "USDT"},
+                {"id": 86, "symbol": "SOLUSDT", "contract_type": "perpetual", "state": "active", "base_asset": "SOL", "quote_asset": "USDT"},
                 {"symbol": "ETHUSD", "contract_type": "perpetual", "state": "active"},
             ]
 
@@ -383,9 +383,13 @@ def test_actual_live_product_discovery_joins_scanner_liquidity_to_exact_delta_pr
     engine.market_router = SimpleNamespace(scanner=Scanner(), delta=Products())
     records = engine._multicoin_candidate_instruments()
     assert [item["symbol"] for item in records] == ["BTCUSDT", "ETHUSDT"]
-    assert records[0]["instrument_id"] == "42"
-    assert records[0]["market_type"] == "perpetual"
-    assert all(item["venue"] == "delta" for item in records)
+    assert records[0]["instrument_id"] == "BTCUSDT"
+    assert records[0]["market_type"] == "spot"
+    assert all(item["venue"] == "binance" for item in records)
+    assert records[0]["execution_identity"] == {
+        "venue": "delta", "market_type": "perpetual", "instrument_id": "42", "symbol": "BTCUSDT"
+    }
+    assert records[0]["mapping_policy_id"]
     assert "liquidity_24h_usdt" in records[0]
 
 
@@ -402,10 +406,11 @@ def test_actual_entrypoint_wiring_is_default_off_and_results_never_enter_orders(
     assert "self.multicoin_pipeline.poll" in loop
     assert "self.jarvis.analyze_trade_setup" in loop
     assert "self.multicoin_pipeline_status" in loop
+    pipeline_handoffs = []
     for node in ast.walk(methods["start_live_trading"]):
-        if isinstance(node, ast.Call):
-            paper_handoff = isinstance(node.func, ast.Attribute) and node.func.attr == "_consume_multicoin_paper_results"
-            if not paper_handoff:
-                assert all("multicoin_pipeline_status" not in ast.unparse(arg) for arg in node.args)
-                assert all("multicoin_pipeline_status" not in ast.unparse(keyword.value) for keyword in node.keywords)
+        if isinstance(node, ast.Call) and any("multicoin_pipeline_status" in ast.unparse(arg) for arg in node.args):
+            if isinstance(node.func, ast.Attribute):
+                pipeline_handoffs.append(node.func.attr)
+    assert sorted(pipeline_handoffs) == ["_consume_multicoin_delta_results", "_consume_multicoin_paper_results"]
     assert "self._consume_multicoin_paper_results(self.multicoin_pipeline_status)" in loop
+    assert "self._consume_multicoin_delta_results(self.multicoin_pipeline_status)" in loop

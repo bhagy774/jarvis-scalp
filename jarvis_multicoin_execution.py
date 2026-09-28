@@ -1,11 +1,11 @@
-"""Fail-closed multicoin candidate validation and paper execution lifecycle.
+"""Fail-closed multicoin candidate validation and portfolio lifecycle.
 
 No exchange implementation lives here. Candidate conversion requires an
 explicit plan, an external allow-listed asset policy, and a fresh COMPLETE
 Parts 1-12 result. The coordinator is thread-atomic and persists a conservative
-journal before submission; UNKNOWN/PARTIAL/FILLED exposure retains its entire
+journal before adapter submission; UNKNOWN/PARTIAL/FILLED exposure retains its
 reservation until a complete authoritative reconciliation proves a terminal
-state. Default disabled.
+state. Paper/live authorization is external and defaults disabled.
 """
 from __future__ import annotations
 
@@ -95,6 +95,7 @@ class ValidatedCandidate:
     sizing_provenance: str
     policy_id: str
     risk_notional: float
+    analysis_identity: Optional[FullIdentity] = None
 
     @property
     def notional(self) -> float:
@@ -103,17 +104,21 @@ class ValidatedCandidate:
     def to_dict(self) -> Dict[str, Any]:
         row = asdict(self)
         row["identity"] = self.identity.to_dict()
+        row["analysis_identity"] = self.analysis_identity.to_dict() if self.analysis_identity else self.identity.to_dict()
         return row
 
 
 def candidate_from_analysis(
-    result: Mapping[str, Any], *, policy_registry: Mapping[str, str], now: Optional[float] = None,
-    max_age_seconds: float = 180.0,
+    result: Mapping[str, Any], *, policy_registry: Mapping[str, str],
+    mapping_policy_registry: Optional[Mapping[str, str]] = None,
+    now: Optional[float] = None, max_age_seconds: float = 180.0,
 ) -> ValidatedCandidate:
-    """Validate one explicitly supplied `execution_plan`; never invent geometry/size.
+    """Validate an explicit, fully sized plan for a completed Parts 1-12 result.
 
-    `policy_registry` is trusted runtime configuration, not a field trusted from
-    the analyzer. Values are exact policy IDs allow-listed per base asset.
+    ``request_identity`` identifies the analysis provider. ``execution_identity``
+    is separate and mandatory when the analysis provider differs from the broker;
+    price-source tickers are never silently reinterpreted as Delta contracts.
+    ``policy_registry`` is trusted runtime configuration (asset -> policy id).
     """
     if not isinstance(result, Mapping) or result.get("status") != "COMPLETE":
         raise CandidateRejected("only COMPLETE analysis can produce a candidate")
@@ -122,9 +127,20 @@ def candidate_from_analysis(
         raise CandidateRejected("unexpected analysis scope/authority")
     if result.get("freshness_status") not in (None, "FRESH"):
         raise CandidateRejected("analysis result is stale")
-    identity = FullIdentity.parse(result.get("request_identity"))
-    if identity.venue not in {"delta", "binance"}:
-        raise CandidateRejected("unsupported candidate venue")
+    analysis_identity = FullIdentity.parse(result.get("request_identity"))
+    plan = result.get("execution_plan")
+    if not isinstance(plan, Mapping):
+        raise CandidateRejected("explicit execution plan missing; no inferred entry/size")
+    identity = FullIdentity.parse(plan.get("execution_identity") or result.get("execution_identity") or result.get("request_identity"))
+    if identity.venue not in {"delta", "binance"} or analysis_identity.venue not in {"delta", "binance"}:
+        raise CandidateRejected("unsupported analysis or execution venue")
+    if analysis_identity != identity:
+        if _base_asset(analysis_identity.symbol) != _base_asset(identity.symbol):
+            raise CandidateRejected("analysis/execution underlying mismatch")
+        if analysis_identity.venue != "binance" or identity.venue != "delta":
+            raise CandidateRejected("unsupported cross-venue mapping")
+        if not str(plan.get("mapping_policy_id") or "").strip():
+            raise CandidateRejected("explicit analysis-to-Delta mapping policy required")
     snapshot_version = str(result.get("snapshot_version") or "").strip()
     if not snapshot_version:
         raise CandidateRejected("snapshot version missing")
@@ -138,17 +154,17 @@ def candidate_from_analysis(
         raise CandidateRejected("analysis timestamps invalid")
     if current - fetched > max(1.0, float(max_age_seconds)):
         raise CandidateRejected("analysis result expired")
-    plan = result.get("execution_plan")
-    if not isinstance(plan, Mapping):
-        raise CandidateRejected("explicit execution plan missing; no inferred entry/size")
     tf = str(plan.get("timeframe") or "").strip()
     if tf not in {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"}:
         raise CandidateRejected("unsupported/missing decision timeframe")
     decision_at = _positive_number(plan.get("decision_timestamp"), "decision_timestamp")
     if decision_at < fetched or decision_at > completed + 2 or current - decision_at > max(1.0, float(max_age_seconds)):
         raise CandidateRejected("decision timestamp invalid or stale")
+    # A closed Binance candle normally timestamps its open, so its valid close
+    # can precede snapshot retrieval. Freshness and the completed-time upper
+    # bound are authoritative; requiring timestamp >= fetch would reject it.
     reference_at = _positive_number(plan.get("reference_price_timestamp"), "reference_price_timestamp")
-    if reference_at < fetched or reference_at > completed + 2 or current - reference_at > max(1.0, float(max_age_seconds)):
+    if reference_at > completed + 2 or current - reference_at > max(1.0, float(max_age_seconds)):
         raise CandidateRejected("reference price timestamp invalid or stale")
     reference_price = _positive_number(plan.get("reference_price"), "reference_price")
     max_slippage_pct = _nonnegative_number(plan.get("max_slippage_pct"), "max_slippage_pct")
@@ -168,12 +184,10 @@ def candidate_from_analysis(
         raise CandidateRejected("SELL stop/entry/target geometry invalid")
     chase_pct = abs(entry - reference_price) / reference_price * 100.0
     if chase_pct > max_chase_pct:
-        raise CandidateRejected("entry exceeds explicit max chase from reference price")
+        raise CandidateRejected("entry exceeds explicit max chase from Binance reference")
     size_unit = str(plan.get("size_unit") or "").strip().lower()
     provenance = str(plan.get("sizing_provenance") or "").strip()
     if size_unit == "base_asset_quantity":
-        # The stated unit is already the underlying asset, so one unit equals
-        # one unit of base exposure. This is dimensional identity, not a sizing fallback.
         contract_multiplier = 1.0
     elif size_unit == "contracts":
         contract_multiplier = _positive_number(plan.get("contract_multiplier"), "contract_multiplier")
@@ -189,15 +203,19 @@ def candidate_from_analysis(
     policy_id = str(policy_registry.get(asset) or "").strip()
     if not policy_id or str(plan.get("policy_id") or "").strip() != policy_id:
         raise CandidateRejected("no matching approved per-asset policy")
-    raw_id = "|".join((identity.venue, identity.market_type, identity.instrument_id, identity.symbol,
-                       tf, snapshot_version, direction, str(decision_at), str(reference_at), str(reference_price),
-                       str(max_slippage_pct), str(max_chase_pct), str(entry), str(stop), str(target),
-                       str(qty), size_unit, str(contract_multiplier), provenance, policy_id, str(risk_notional)))
+    if identity.venue == "delta" and identity != analysis_identity:
+        allowed_mapping_id = str((mapping_policy_registry or {}).get(asset) or "").strip()
+        if not allowed_mapping_id or str(plan.get("mapping_policy_id") or "").strip() != allowed_mapping_id:
+            raise CandidateRejected("analysis-to-Delta mapping policy is not allow-listed")
+    # Stable across quote refreshes: one decision/snapshot can submit at most once.
+    raw_id = "|".join((analysis_identity.venue, analysis_identity.market_type, analysis_identity.instrument_id,
+                       analysis_identity.symbol, identity.venue, identity.market_type, identity.instrument_id,
+                       identity.symbol, tf, snapshot_version, direction, str(decision_at), policy_id))
     candidate_id = hashlib.sha256(raw_id.encode()).hexdigest()
     return ValidatedCandidate(candidate_id, identity, tf, snapshot_version, fetched, completed,
                               decision_at, reference_at, reference_price, max_slippage_pct, max_chase_pct,
                               direction, entry, stop, target, qty, size_unit, contract_multiplier,
-                              provenance, policy_id, risk_notional)
+                              provenance, policy_id, risk_notional, analysis_identity)
 
 
 class PaperExecutionAdapter(Protocol):
@@ -223,17 +241,21 @@ _VALID_STATES = _ACTIVE | _TERMINAL
 
 
 class PortfolioCoordinator:
-    """Bounded, lock-serialized paper portfolio with restart-safe journal.
+    """Bounded, lock-serialized portfolio with restart-safe journal.
 
     Submission is deliberately separate from authorization: this coordinator
     accepts only ValidatedCandidate objects and is disabled by default. Orders
     are retained on timeout/unknown, and per-position close never sweeps peers.
+    Its adapter may be a no-network paper model or a separately authorized
+    broker adapter that meets the strict reconciliation/protection contract.
     """
     def __init__(self, *, journal_path: str, enabled: bool = False,
                  max_positions: int = 2, max_total_notional: float, max_total_risk: float,
                  per_asset_caps: Optional[Mapping[str, int]] = None,
                  correlation_groups: Optional[Mapping[str, str]] = None,
-                 max_per_correlation_group: int = 1, clock: Callable[[], float] = time.time):
+                 max_per_correlation_group: int = 1, clock: Callable[[], float] = time.time,
+                 require_reconciliation: bool = False,
+                 require_protective_reconciliation: bool = False):
         self.enabled = bool(enabled)
         self.journal_path = Path(journal_path)
         self.max_positions = max(1, int(max_positions))
@@ -243,6 +265,9 @@ class PortfolioCoordinator:
         self.correlation_groups = {str(k).upper(): str(v) for k, v in (correlation_groups or {}).items()}
         self.max_per_correlation_group = max(1, int(max_per_correlation_group))
         self.clock = clock
+        self.require_reconciliation = bool(require_reconciliation)
+        self.require_protective_reconciliation = bool(require_protective_reconciliation)
+        self._reconciled = not self.require_reconciliation
         self._lock = threading.RLock()
         self.healthy = True
         self._orders: Dict[str, Dict[str, Any]] = {}
@@ -328,9 +353,14 @@ class PortfolioCoordinator:
         with self._lock:
             if not self.enabled or not self.healthy:
                 return {"status": "BLOCKED", "reason": "coordinator disabled or journal unhealthy"}
+            # A journaled candidate is an idempotent no-op even while restart
+            # reconciliation is pending. This lookup never submits or releases
+            # its reservation; new identities remain blocked until reconciliation.
             old = self._orders.get(candidate.candidate_id)
             if old:
                 return {"status": old["status"], "candidate_id": candidate.candidate_id, "duplicate": True}
+            if self.require_reconciliation and not self._reconciled:
+                return {"status": "BLOCKED", "reason": "authoritative account reconciliation required before submission"}
             if not self._capacity(candidate):
                 return {"status": "BLOCKED", "reason": "portfolio/correlation capacity exceeded"}
             row = {"candidate_id": candidate.candidate_id, "candidate": candidate.to_dict(),
@@ -366,6 +396,16 @@ class PortfolioCoordinator:
             if state == "FILLED" and filled_quantity < candidate.quantity:
                 state = "PARTIAL" if filled_quantity > 0 else "SUBMISSION_UNKNOWN"
             row["filled_quantity"] = filled_quantity
+            try:
+                avg_fill = float(response.get("average_fill_price", 0.0) or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                avg_fill = 0.0
+            if math.isfinite(avg_fill) and avg_fill > 0:
+                row["average_fill_price"] = avg_fill
+            if response.get("protection_state") is not None:
+                row["protection_state"] = str(response.get("protection_state"))
+            if isinstance(response.get("protective_exits"), Mapping):
+                row["protective_exits"] = dict(response["protective_exits"])
             if state == "REJECTED":
                 # Even a submit acknowledgement is not the authoritative account/order
                 # reconciliation required to release capacity.
@@ -417,6 +457,16 @@ class PortfolioCoordinator:
                 ikey = self._identity_key(identity)
                 update = order_states.get(cid)
                 present = ikey in positions
+                if self.require_protective_reconciliation and present and row.get("status") in {"FILLED", "PARTIAL", "CLOSE_PENDING"}:
+                    if update is None:
+                        return False
+                    detail = update[1]
+                    exits = detail.get("protective_exits")
+                    if (str(detail.get("protection_state") or "").upper() != "ACTIVE"
+                            or not isinstance(exits, Mapping)
+                            or not str(exits.get("stop_loss_order_id") or "").strip()
+                            or not str(exits.get("take_profit_order_id") or "").strip()):
+                        return False
                 if update:
                     state, detail = update
                     if state in {"FILLED", "PARTIAL"} and not present:
@@ -456,6 +506,7 @@ class PortfolioCoordinator:
                 self._orders, self._external_positions = old_orders, old_external
                 self.healthy = False
                 return False
+            self._reconciled = True
             return True
 
     def close_position(self, candidate_id: str, identity: Mapping[str, Any], adapter: PaperExecutionAdapter) -> Dict[str, Any]:
@@ -499,5 +550,6 @@ class PortfolioCoordinator:
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             return {"enabled": self.enabled, "healthy": self.healthy,
+                    "ready": bool(self.enabled and self.healthy and self._reconciled),
                     "orders": json.loads(json.dumps(self._orders)),
                     "external_positions": dict(self._external_positions)}
