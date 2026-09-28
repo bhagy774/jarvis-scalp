@@ -10,7 +10,7 @@
 - Main at verification: `09f1d8aba01e6ac66a4e45e182ccb9d7eea934f4` (unchanged)
 - PR head before this implementation: `3293e248743054527a337f9044c523c079f31b26` (open, draft, unmerged)
 - Implementation/test commit pushed to the existing PR branch: `94aad7b4015c2e17c7836cbbf2f7126152473849` (`feat: add fail-closed multicoin paper execution lifecycle`).
-- A separate report/progress follow-up is being pushed to the same branch; there is no new PR or duplicate branch.
+- The comprehensive report and progress checklist were committed to the same branch in documentation follow-up `069105d835660566c6548a8304e9f5e9fddcb754`; there is no new PR or duplicate branch.
 
 The local working tree was a source snapshot, not a Git checkout. PR metadata, main tip, and PR-head pipeline/live source were checked via the approved GitHub connection before the source push; the PR head was unchanged immediately before that push. Only the six implementation/test files listed below were included in the source/test commit. PR #94 was not changed.
 
