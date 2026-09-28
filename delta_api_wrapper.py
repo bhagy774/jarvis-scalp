@@ -518,33 +518,6 @@ class DeltaExchangeData:
                     "venue": "Binance Options", "underlying": asset, "contracts": [], "status": "provider_error",
                     "validation": {"usable": False, "complete": False, "reasons": ["provider_request_failed"], "error_type": type(exc).__name__},
                 }
-<<<<<<< HEAD
-                
-                strikes.add(strike)
-                chain_data["total_oi"] += oi
-                
-                if contract_type == "call_options":
-                    chain_data["calls"].append(item)
-                    total_call_oi += oi
-                elif contract_type == "put_options":
-                    chain_data["puts"].append(item)
-                    total_put_oi += oi
-                    
-            except Exception:
-                continue
-                
-        # PCR Calculation
-        if total_call_oi > 0:
-            chain_data["pcr"] = total_put_oi / total_call_oi
-            
-        # Simplified Max Pain (Weighted Average)
-        # Note: Full Max Pain requires iterating all strikes. 
-        # For efficiency, we just store the raw lists.
-        # Smart Backtester/Live Analyst can calculate specifics.
-        chain_data["max_pain"] = self._calculate_max_pain(chain_data)
-            
-        return chain_data
-=======
         chain = combine_provider_chains(asset, providers)
         snapshot_path = os.environ.get("JARVIS_OPTIONS_SNAPSHOT_PATH", "")
         if snapshot_path:
@@ -554,7 +527,6 @@ class DeltaExchangeData:
             chain["snapshot_persistence"] = {"enabled": False, "reason": "JARVIS_OPTIONS_SNAPSHOT_PATH_not_set"}
         self._options_chain_cache[asset] = (time.monotonic(), copy.deepcopy(chain))
         return chain
->>>>>>> 896f0a39576c2dcc9c5699da66df75437f7ac0d4
 
     def get_institutional_bias(self, underlying: str = "BTC") -> Dict:
         """Apply the existing PCR heuristic only to one validated provider chain."""
