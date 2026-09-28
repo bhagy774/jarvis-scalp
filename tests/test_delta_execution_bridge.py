@@ -33,10 +33,15 @@ def analysis(**changes):
         "decision_authority": "none",
         "execution_eligible": False,
         "freshness_status": "FRESH",
+        "coverage": [f"Part{i}" for i in range(1, 13)],
+        "snapshot_version": "snap-eth-1m-abc",
+        "parts_by_timeframe": {
+            tf: {f"part{i}": {"signal": 0} for i in range(1, 11)}
+            for tf in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+        },
         "request_identity": {"venue": "binance", "market_type": "spot", "instrument_id": "ETHUSDT", "symbol": "ETHUSDT"},
         "execution_identity": {"venue": "delta", "market_type": "perpetual_futures", "instrument_id": "22", "symbol": "ETHUSDT"},
         "mapping_policy_id": ASSET_POLICY["ETH"]["mapping_policy_id"],
-        "snapshot_version": "snap-eth-1m-abc",
         "snapshot_fetched_at": NOW - 5,
         "analysis_completed_at": NOW - 2,
         "analysis_reference": {"source": "binance", "symbol": "ETHUSDT", "timeframe": "1m", "timestamp": NOW - 60, "price": 100.0},
@@ -152,6 +157,10 @@ def test_mapping_quote_product_freshness_and_missing_data_all_fail_closed():
         analysis(analysis_reference={"source": "binance", "symbol": "ETHUSDT", "timeframe": "1m", "timestamp": NOW - 900, "price": 100}),
         analysis(deterministic_decision={"origin": "jarvis_deterministic_parts11_12", "direction": "NO_TRADE", "confidence": 90}),
         analysis(part7_gate={"entry_blocked": True, "risk_veto": True}),
+        analysis(part7_gate={"entry_blocked": False}),
+        analysis(freshness_status=None),
+        analysis(coverage=["Part1"]),
+        analysis(parts_by_timeframe={"1m": {"part1": {}}}),
     ]
     for result in bad_results:
         with pytest.raises(CandidateRejected):

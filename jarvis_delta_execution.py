@@ -16,6 +16,7 @@ import os
 import time
 from typing import Any, Callable, Dict, Mapping, Optional
 
+from direct_candle_cache import LIVE_TIMEFRAMES
 from jarvis_multicoin_execution import (
     CandidateRejected, FullIdentity, PortfolioCoordinator, ValidatedCandidate,
     _base_asset, _nonnegative_number, _positive_number, candidate_from_analysis,
@@ -54,8 +55,20 @@ def _require_analysis(result: Mapping[str, Any], policy: Mapping[str, Any], now:
     if (result.get("scope") != "parts1-12-analysis-only" or result.get("analysis_only") is not True
             or result.get("decision_authority") != "none" or result.get("execution_eligible") is not False):
         raise CandidateRejected("analysis result has an unexpected authority/scope marker")
-    if result.get("freshness_status") not in (None, "FRESH"):
-        raise CandidateRejected("analysis result is stale")
+    if result.get("freshness_status") != "FRESH":
+        raise CandidateRejected("analysis result freshness is missing or stale")
+    expected_coverage = [f"Part{i}" for i in range(1, 13)]
+    if result.get("coverage") != expected_coverage:
+        raise CandidateRejected("analysis does not explicitly cover Parts 1-12")
+    if not _text(result.get("snapshot_version")):
+        raise CandidateRejected("analysis snapshot version is missing")
+    parts_by_timeframe = result.get("parts_by_timeframe")
+    required_parts = {f"part{i}" for i in range(1, 11)}
+    if (not isinstance(parts_by_timeframe, Mapping)
+            or set(parts_by_timeframe) != set(LIVE_TIMEFRAMES)
+            or any(not isinstance(parts_by_timeframe.get(tf), Mapping)
+                   or not required_parts.issubset(set(parts_by_timeframe[tf])) for tf in LIVE_TIMEFRAMES)):
+        raise CandidateRejected("complete Parts 1-10 timeframe coverage is missing")
     source_identity = FullIdentity.parse(result.get("request_identity"))
     if (source_identity.venue != "binance" or source_identity.market_type != "spot"
             or source_identity.instrument_id != source_identity.symbol):
@@ -137,7 +150,7 @@ def _require_analysis(result: Mapping[str, Any], policy: Mapping[str, Any], now:
     if p11_signal != expected_signal or not math.isfinite(p12_confidence) or p12_confidence < min_confidence:
         raise CandidateRejected("Part11/Part12 do not confirm the deterministic trade decision")
     gate = result.get("part7_gate")
-    if not isinstance(gate, Mapping) or gate.get("entry_blocked") is not False or gate.get("risk_veto") is True:
+    if not isinstance(gate, Mapping) or gate.get("entry_blocked") is not False or gate.get("risk_veto") is not False:
         raise CandidateRejected("Part7 new-entry gate is missing or blocks entry")
     try:
         entry_reference = _positive_number(decision.get("entry_price"), "decision reference entry")
