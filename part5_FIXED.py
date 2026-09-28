@@ -17,7 +17,8 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-
+import torch
+import torch.nn as nn
 # Safe stdout encoding wrapper for Windows terminals
 if hasattr(sys.stdout, 'reconfigure'):
     try:
@@ -104,19 +105,17 @@ except (ImportError, OSError):
         device = lambda x: 'cpu'
         float32 = 'float32'
         long = 'long'
-
+        
         class nn:
             Module = DummyModule
             Linear = DummyModule
             LSTM = DummyModule
             GRU = DummyModule
-            Dropout = DummyModule
-            CrossEntropyLoss = DummyModule
-
+            
         class optim:
             Adam = DummyModule
             SGD = DummyModule
-
+        
         class cuda:
             @staticmethod
             def is_available(): return False
@@ -130,12 +129,12 @@ except (ImportError, OSError):
             def set_per_process_memory_fraction(*args, **kwargs): pass
             @staticmethod
             def memory_allocated(): return 0
-
+        
         @staticmethod
         def tensor(data, **kwargs):
             if isinstance(data, DummyTensor): return data
             return DummyTensor(data)
-
+        
         @staticmethod
         def zeros(*args, **kwargs):
             shape = args[0] if args else (1,)
@@ -171,19 +170,6 @@ except (ImportError, OSError):
         def clamp(tensor, min_val, max_val):
             val = tensor.item() if isinstance(tensor, DummyTensor) else float(tensor)
             return DummyTensor(max(min_val, min(max_val, val)))
-
-    # The no-PyTorch fallback must expose the same module-level names as the
-    # successful import branch; otherwise importing this module fails before
-    # its CPU-safe adapters can be used.
-    nn = torch.nn
-    optim = torch.optim
-
-    class _FallbackFunctional:
-        @staticmethod
-        def relu(value): return value
-        @staticmethod
-        def softmax(value, dim=-1): return value
-    F = _FallbackFunctional()
 
 # Helpers for CUDA context management & device names
 @contextmanager
