@@ -31,7 +31,9 @@ def make_rows(now, tf, *, symbol="ETHUSDT", mutate=None):
     rows = []
     for i in range(FETCH_CANDLES):
         ts = start + i * seconds
-        price = 1000 + i
+        # Stable values for overlapping timestamp windows allow incremental
+        # cache refreshes to distinguish immutable closed bars from updates.
+        price = 1000 + (ts // seconds) % 1000
         rows.append({"time": ts, "open": price, "high": price + 2,
                      "low": price - 2, "close": price + 1, "volume": 1})
     return rows
