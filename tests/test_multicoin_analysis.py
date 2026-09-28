@@ -225,8 +225,11 @@ def test_feature_flag_defaults_off_and_runtime_wiring_is_shadow_only():
     assert "multicoin_pipeline_status" in loop_text
     for node in ast.walk(methods["start_live_trading"]):
         if isinstance(node, ast.Call):
-            assert all("multicoin_pipeline_status" not in ast.unparse(arg) for arg in node.args)
-            assert all("multicoin_pipeline_status" not in ast.unparse(keyword.value) for keyword in node.keywords)
+            paper_handoff = isinstance(node.func, ast.Attribute) and node.func.attr == "_consume_multicoin_paper_results"
+            if not paper_handoff:
+                assert all("multicoin_pipeline_status" not in ast.unparse(arg) for arg in node.args)
+                assert all("multicoin_pipeline_status" not in ast.unparse(keyword.value) for keyword in node.keywords)
+    assert "self._consume_multicoin_paper_results(self.multicoin_pipeline_status)" in loop_text
 
 
 def test_existing_router_position_lock_remains_immutable():

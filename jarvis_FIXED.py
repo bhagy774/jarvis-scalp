@@ -167,6 +167,16 @@ except Exception:
     MultiCoinPipeline = None
     MULTICOIN_PIPELINE_AVAILABLE = False
 try:
+    from jarvis_multicoin_execution import (
+        PortfolioCoordinator, DeterministicPaperAdapter, candidate_from_analysis,
+    )
+    MULTICOIN_EXECUTION_AVAILABLE = True
+except Exception:
+    PortfolioCoordinator = None
+    DeterministicPaperAdapter = None
+    candidate_from_analysis = None
+    MULTICOIN_EXECUTION_AVAILABLE = False
+try:
     from part7_signal import analyze_timeframe as _analyze_part7_timeframe, aggregate_results as _aggregate_part7_results
     PART7_SHARED_ANALYZER_AVAILABLE = True
 except Exception:
@@ -1203,9 +1213,10 @@ class LiveTradingEngine:
                 delta_client=getattr(self.jarvis, 'delta_data', None),
             )
 
-        # Optional, full Parts 1-12 background analysis is diagnostic-only and
-        # default-off. It has its own Delta-only cache, isolated Jarvis owner per
-        # job, product identity, and never feeds the route/decision/order path.
+        # Optional, full Parts 1-12 analysis is default-off. It has its own
+        # Delta-only cache, isolated owner, and product identity. A separate
+        # paper-only handoff below rejects results without an explicit plan;
+        # this does not change the selected-symbol or live-order path.
         self.multicoin_pipeline = None
         self.multicoin_pipeline_status = {
             'enabled': multicoin_analysis_enabled(),
@@ -1236,6 +1247,36 @@ class LiveTradingEngine:
             except Exception as _multi_error:
                 logger.warning('[MULTICOIN] Initialization unavailable: %s', type(_multi_error).__name__)
                 self.multicoin_pipeline_status = {'enabled': True, 'status': 'UNAVAILABLE', 'results': {}}
+
+        # Optional isolated paper-only execution of an explicitly supplied plan.
+        # The Parts 1-12 adapter currently emits no entry/stop/size plan, so the
+        # fail-closed validator ordinarily refuses candidates. This never routes
+        # to Delta/Binance orders or modifies the selected-symbol execution path.
+        self.multicoin_paper_coordinator = None
+        self.multicoin_paper_adapter = None
+        self.multicoin_paper_status = {'enabled': False, 'submitted': 0, 'blocked': 0}
+        if (os.getenv('JARVIS_MULTICOIN_PAPER_EXECUTION', '0').strip() == '1'
+                and MULTICOIN_EXECUTION_AVAILABLE and not getattr(self.jarvis, 'is_backtest_mode', False)):
+            try:
+                _policies = json.loads(os.getenv('JARVIS_MULTICOIN_PAPER_POLICY_REGISTRY', '{}'))
+                if not isinstance(_policies, dict):
+                    raise ValueError('policy registry must be an asset-to-policy object')
+                _budget = float(os.environ['JARVIS_MULTICOIN_PAPER_MAX_NOTIONAL'])
+                _risk_budget = float(os.environ['JARVIS_MULTICOIN_PAPER_MAX_RISK'])
+                self.multicoin_paper_coordinator = PortfolioCoordinator(
+                    journal_path=os.getenv('JARVIS_MULTICOIN_PAPER_JOURNAL', '.jarvis_state/multicoin_paper_execution.json'),
+                    enabled=True, max_positions=int(os.getenv('JARVIS_MULTICOIN_PAPER_MAX_POSITIONS', '2')),
+                    max_total_notional=_budget, max_total_risk=_risk_budget,
+                    per_asset_caps=json.loads(os.getenv('JARVIS_MULTICOIN_PAPER_ASSET_CAPS', '{}')),
+                    correlation_groups=json.loads(os.getenv('JARVIS_MULTICOIN_PAPER_CORRELATION_GROUPS', '{}')),
+                    max_per_correlation_group=int(os.getenv('JARVIS_MULTICOIN_PAPER_MAX_PER_GROUP', '1')),
+                )
+                self.multicoin_paper_adapter = DeterministicPaperAdapter()
+                self._multicoin_paper_policies = {str(k).upper(): str(v) for k, v in _policies.items()}
+                self.multicoin_paper_status = {'enabled': True, 'submitted': 0, 'blocked': 0, 'last_status': 'IDLE'}
+            except Exception as _paper_error:
+                logger.warning('[MULTICOIN-PAPER] Initialization fail-closed: %s', type(_paper_error).__name__)
+                self.multicoin_paper_status = {'enabled': False, 'status': 'UNAVAILABLE'}
 
         # ═══ PRE-TRADE SIMULATOR STATS (fail-open; JARVIS_PRESIM=0 disables) ═══
         self.presim_stats = {'checks': 0, 'vetoes': 0, 'adjustments': 0}
@@ -2120,6 +2161,9 @@ class LiveTradingEngine:
             return {
                 'parts_by_timeframe': analysis.get('parts_by_timeframe', {}),
                 'once_per_symbol_parts': analysis.get('once_per_symbol_parts', {}),
+                # An explicit plan is intentionally absent from current Part
+                # outputs; only a reviewed future adapter may supply this key.
+                'execution_plan': analysis.get('execution_plan'),
                 'adapter_engine_status': {
                     'part1_native': getattr(owner.parts.get('part1_breakout'), '_engine_factory', None) is not None,
                     'part2_native': getattr(owner.parts.get('part2_zone'), '_engine', None) is not None,
@@ -2128,6 +2172,33 @@ class LiveTradingEngine:
         except Exception as _analysis_error:
             logger.warning('[MULTICOIN] Isolated pipeline failed for %s: %s', getattr(key, 'symbol', '?'), type(_analysis_error).__name__)
             return {}
+
+    def _consume_multicoin_paper_results(self, pipeline_status):
+        """Consume only fresh, explicitly planned complete analysis in isolated paper mode."""
+        coordinator = getattr(self, 'multicoin_paper_coordinator', None)
+        adapter = getattr(self, 'multicoin_paper_adapter', None)
+        if coordinator is None or adapter is None or not isinstance(pipeline_status, dict):
+            return
+        for result in (pipeline_status.get('results') or {}).values():
+            if not isinstance(result, dict) or result.get('status') != 'COMPLETE':
+                continue
+            try:
+                candidate = candidate_from_analysis(
+                    result, policy_registry=getattr(self, '_multicoin_paper_policies', {}),
+                    now=time.time(), max_age_seconds=float(os.getenv('JARVIS_MULTICOIN_RESULT_MAX_AGE_SEC', '180')),
+                )
+                outcome = coordinator.submit(candidate, adapter)
+                self.multicoin_paper_status['last_status'] = outcome.get('status')
+                if outcome.get('duplicate'):
+                    continue
+                if outcome.get('status') in {'FILLED', 'PARTIAL', 'SUBMISSION_UNKNOWN'}:
+                    self.multicoin_paper_status['submitted'] = int(self.multicoin_paper_status.get('submitted', 0)) + 1
+                else:
+                    self.multicoin_paper_status['blocked'] = int(self.multicoin_paper_status.get('blocked', 0)) + 1
+            except Exception as _candidate_error:
+                self.multicoin_paper_status['last_status'] = 'BLOCKED_INVALID_CANDIDATE'
+                self.multicoin_paper_status['last_reason'] = str(_candidate_error)[:160]
+                self.multicoin_paper_status['blocked'] = int(self.multicoin_paper_status.get('blocked', 0)) + 1
 
     def stop_live_trading(self, timeout=None):
         """Request a bounded, orderly stop without touching open positions."""
@@ -2309,6 +2380,7 @@ class LiveTradingEngine:
                     # Status is diagnostics-only and never enters decision logic.
                     if self.multicoin_pipeline is not None:
                         self.multicoin_pipeline_status = self.multicoin_pipeline.poll()
+                        self._consume_multicoin_paper_results(self.multicoin_pipeline_status)
 
                     # 1. Select a verified crypto contract before collecting any
                     # data. A route is locked for the entire life of an open

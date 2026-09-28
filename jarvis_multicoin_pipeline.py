@@ -1,9 +1,9 @@
-"""Opt-in, analysis-only full Part1--Part12 candidate pipeline.
+"""Opt-in full Part1--Part12 analysis pipeline with fail-closed paper handoff.
 
-The live Delta route and this background analysis namespace are deliberately
-separate.  A caller must supply complete product identities from its venue
-adapter and an analyzer callback that creates an isolated Jarvis owner per job.
-No result from this module is executable or consumed by the order path.
+The live Delta route and background analysis namespace are separate. A caller
+must supply complete product identities and an isolated analysis owner. Analysis
+outputs are never live-order eligible; an isolated paper adapter may accept only
+an explicitly supplied plan after separate contract/policy validation.
 """
 from __future__ import annotations
 
@@ -328,6 +328,11 @@ class MultiCoinPipeline:
                 "part14": "not_in_scope",
                 "snapshot_version": version, "snapshot_fetched_at": float(snapshot.fetched_at),
                 "analysis_completed_at": completed,
+                # No entry/stop/target/size may be inferred from Parts 1-12. A
+                # downstream paper adapter may validate only an explicit plan
+                # returned by the analyzer; current Jarvis output has none.
+                "execution_plan": dict(raw["execution_plan"]) if isinstance(raw.get("execution_plan"), Mapping) else None,
+                "execution_candidate_status": "PLAN_PRESENT_REQUIRES_VALIDATION" if isinstance(raw.get("execution_plan"), Mapping) else "BLOCKED_MISSING_EXPLICIT_PLAN",
                 "analysis_only": True, "decision_authority": "none", "execution_eligible": False,
                 "reason": None if complete else "one or more Part adapters did not complete for all native frames",
             }

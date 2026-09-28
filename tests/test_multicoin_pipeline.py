@@ -342,6 +342,8 @@ def test_full_jarvis_parts_1_to_12_are_isolated_per_symbol_and_serial_parallel_e
     assert integrated_result["status"] == "COMPLETE"
     assert integrated_result["coverage"] == [f"Part{i}" for i in range(1, 13)]
     assert integrated_result["execution_eligible"] is False
+    assert integrated_result["execution_plan"] is None
+    assert integrated_result["execution_candidate_status"] == "BLOCKED_MISSING_EXPLICIT_PLAN"
     assert len(owners) == 7
     assert len({id(owner) for owner in owners}) == 7
     assert all(len(owner.parts["part1_breakout"]._engines) == len(LIVE_TIMEFRAMES) for owner in owners)
@@ -402,5 +404,8 @@ def test_actual_entrypoint_wiring_is_default_off_and_results_never_enter_orders(
     assert "self.multicoin_pipeline_status" in loop
     for node in ast.walk(methods["start_live_trading"]):
         if isinstance(node, ast.Call):
-            assert all("multicoin_pipeline_status" not in ast.unparse(arg) for arg in node.args)
-            assert all("multicoin_pipeline_status" not in ast.unparse(keyword.value) for keyword in node.keywords)
+            paper_handoff = isinstance(node.func, ast.Attribute) and node.func.attr == "_consume_multicoin_paper_results"
+            if not paper_handoff:
+                assert all("multicoin_pipeline_status" not in ast.unparse(arg) for arg in node.args)
+                assert all("multicoin_pipeline_status" not in ast.unparse(keyword.value) for keyword in node.keywords)
+    assert "self._consume_multicoin_paper_results(self.multicoin_pipeline_status)" in loop
