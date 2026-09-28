@@ -91,13 +91,14 @@ class ValidatedCandidate:
     take_profit: float
     quantity: float
     size_unit: str
+    contract_multiplier: float
     sizing_provenance: str
     policy_id: str
     risk_notional: float
 
     @property
     def notional(self) -> float:
-        return self.entry_price * self.quantity
+        return self.entry_price * self.quantity * self.contract_multiplier
 
     def to_dict(self) -> Dict[str, Any]:
         row = asdict(self)
@@ -122,6 +123,8 @@ def candidate_from_analysis(
     if result.get("freshness_status") not in (None, "FRESH"):
         raise CandidateRejected("analysis result is stale")
     identity = FullIdentity.parse(result.get("request_identity"))
+    if identity.venue not in {"delta", "binance"}:
+        raise CandidateRejected("unsupported candidate venue")
     snapshot_version = str(result.get("snapshot_version") or "").strip()
     if not snapshot_version:
         raise CandidateRejected("snapshot version missing")
@@ -168,10 +171,19 @@ def candidate_from_analysis(
         raise CandidateRejected("entry exceeds explicit max chase from reference price")
     size_unit = str(plan.get("size_unit") or "").strip().lower()
     provenance = str(plan.get("sizing_provenance") or "").strip()
-    if size_unit not in {"base_asset_quantity", "contracts"} or not provenance:
-        raise CandidateRejected("explicit size unit and sizing provenance required")
+    if size_unit == "base_asset_quantity":
+        # The stated unit is already the underlying asset, so one unit equals
+        # one unit of base exposure. This is dimensional identity, not a sizing fallback.
+        contract_multiplier = 1.0
+    elif size_unit == "contracts":
+        contract_multiplier = _positive_number(plan.get("contract_multiplier"), "contract_multiplier")
+    else:
+        raise CandidateRejected("explicit supported size unit required")
+    if not provenance:
+        raise CandidateRejected("sizing provenance required")
     risk_notional = _positive_number(plan.get("risk_notional"), "risk_notional")
-    if risk_notional > abs(entry - stop) * qty + max(1e-8, abs(entry - stop) * qty * 1e-6):
+    stop_risk = abs(entry - stop) * qty * contract_multiplier
+    if risk_notional > stop_risk + max(1e-8, stop_risk * 1e-6):
         raise CandidateRejected("declared risk exceeds stop-distance exposure")
     asset = _base_asset(identity.symbol)
     policy_id = str(policy_registry.get(asset) or "").strip()
@@ -180,11 +192,12 @@ def candidate_from_analysis(
     raw_id = "|".join((identity.venue, identity.market_type, identity.instrument_id, identity.symbol,
                        tf, snapshot_version, direction, str(decision_at), str(reference_at), str(reference_price),
                        str(max_slippage_pct), str(max_chase_pct), str(entry), str(stop), str(target),
-                       str(qty), size_unit, provenance, policy_id, str(risk_notional)))
+                       str(qty), size_unit, str(contract_multiplier), provenance, policy_id, str(risk_notional)))
     candidate_id = hashlib.sha256(raw_id.encode()).hexdigest()
     return ValidatedCandidate(candidate_id, identity, tf, snapshot_version, fetched, completed,
                               decision_at, reference_at, reference_price, max_slippage_pct, max_chase_pct,
-                              direction, entry, stop, target, qty, size_unit, provenance, policy_id, risk_notional)
+                              direction, entry, stop, target, qty, size_unit, contract_multiplier,
+                              provenance, policy_id, risk_notional)
 
 
 class PaperExecutionAdapter(Protocol):

@@ -69,6 +69,9 @@ def test_candidate_contract_requires_all_explicit_fields_and_asset_policy():
     good = candidate()
     assert good.direction == "BUY" and good.identity.instrument_id == "101"
     assert good.notional == 100.0 and good.risk_notional == 2.0
+    contract_plan = {**analysis()["execution_plan"], "size_unit": "contracts", "contract_multiplier": 10.0, "risk_notional": 20.0}
+    contract_candidate = candidate_from_analysis(analysis(plan=contract_plan), policy_registry=POLICIES, now=NOW)
+    assert contract_candidate.notional == 1000.0 and contract_candidate.risk_notional == 20.0
     for bad_result, policies in [
         (analysis(status="PARTIAL"), POLICIES),
         ({**analysis(), "snapshot_fetched_at": NOW-500}, POLICIES),
@@ -79,6 +82,7 @@ def test_candidate_contract_requires_all_explicit_fields_and_asset_policy():
         (analysis(plan={**analysis()["execution_plan"], "stop_loss": 101}), POLICIES),
         (analysis(plan={k: v for k, v in analysis()["execution_plan"].items() if k != "reference_price"}), POLICIES),
         (analysis(plan={**analysis()["execution_plan"], "entry_price": 101.0}), POLICIES),
+        (analysis(plan={**analysis()["execution_plan"], "size_unit": "contracts"}), POLICIES),
         (analysis(), {"BTC": "different-policy"}),
     ]:
         with pytest.raises(CandidateRejected):
