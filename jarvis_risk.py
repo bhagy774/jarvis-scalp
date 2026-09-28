@@ -171,6 +171,68 @@ def contract_quote_value_usdt(product: Dict[str, Any], price: float) -> Optional
     return None
 
 
+def contract_quote_value_in_currency(product: Dict[str, Any], price: float, currency: str) -> Optional[float]:
+    """Return one contract's notional only when Delta quote and collateral units match.
+
+    Delta's product schema explicitly distinguishes quoting_asset,
+    settling_asset, contract_value, and contract_unit_currency. The adapter
+    accepts no implicit USD/USDT/INR conversion: if the quote currency differs
+    from the actual settlement currency a separately validated FX adapter is
+    required and this helper returns None.
+    """
+    if not isinstance(product, dict):
+        return None
+    target = str(currency or "").strip().upper()
+    if not target:
+        return None
+    def symbol(value):
+        if isinstance(value, dict):
+            value = value.get("symbol") or value.get("asset_symbol") or value.get("name")
+        return str(value or "").strip().upper()
+    quote = symbol(product.get("quoting_asset") or product.get("quote_asset") or product.get("quote_currency"))
+    settle = symbol(product.get("settling_asset") or product.get("settlement_asset") or product.get("settlement_currency"))
+    if quote != target or settle != target:
+        return None
+    try:
+        mark = float(price)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(mark) or mark <= 0:
+        return None
+    for key in ("contract_type", "notional_type", "margin_currency_type", "settlement_type"):
+        marker = str(product.get(key, "")).strip().lower().replace("-", "_")
+        if "inverse" in marker or "coin_margined" in marker or marker in {"coin", "base"}:
+            return None
+    raw = None
+    value_key = None
+    for key in ("contract_value", "contract_size_value", "contract_value_quote", "contract_value_usdt",
+                "notional_per_contract", "contract_size", "multiplier"):
+        if product.get(key) is not None:
+            raw, value_key = product.get(key), key
+            break
+    if raw is None and isinstance(product.get("contract_unit"), dict):
+        unit_info = product["contract_unit"]
+        raw = unit_info.get("value", unit_info.get("size"))
+        unit = symbol(unit_info.get("currency") or unit_info.get("unit"))
+    else:
+        unit = symbol(product.get("contract_value_currency") or product.get("contract_unit_currency")
+                      or product.get("contract_unit"))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    if value_key in {"contract_value_usdt", "contract_value_quote", "notional_per_contract"} and not unit:
+        unit = target
+    base = symbol(product.get("underlying_asset_symbol") or product.get("underlying_asset") or product.get("base_asset"))
+    if unit == target:
+        return value
+    if base and unit == base:
+        return value * mark
+    return None
+
+
 def calculate_trade_size(
     available_balance: float,
     confidence: int,
@@ -183,6 +245,8 @@ def calculate_trade_size(
     min_margin_usdt: float = MIN_MARGIN_USDT,
     contract_value_usdt: Optional[float] = None,
     require_contract_value: bool = False,
+    max_trade_risk_currency: Optional[float] = None,
+    risk_currency: str = "USDT",
 ) -> Dict[str, Any]:
     """Return one consistent size/leverage decision for paper and live paths."""
     try:
@@ -200,7 +264,11 @@ def calculate_trade_size(
     margin = min(max_margin, max(min_margin_usdt, base_margin + compound))
     if margin <= 0:
         return {"ok": False, "reason": "margin policy leaves no collateral", "contracts": 0, "leverage": 0}
-    risk_budget = min(balance * max(0.0, float(MAX_RISK_PCT)) * mult, max_trade_risk_usdt if max_trade_risk_usdt is not None else float("inf"))
+    currency = str(risk_currency or "").strip().upper()
+    if not currency:
+        return {"ok": False, "reason": "risk currency is required", "contracts": 0, "leverage": 0}
+    configured_trade_cap = max_trade_risk_currency if max_trade_risk_currency is not None else max_trade_risk_usdt
+    risk_budget = min(balance * max(0.0, float(MAX_RISK_PCT)) * mult, configured_trade_cap if configured_trade_cap is not None else float("inf"))
     if risk_budget <= 0:
         return {"ok": False, "reason": "trade risk budget is zero", "contracts": 0, "leverage": 0}
     try:
@@ -221,16 +289,31 @@ def calculate_trade_size(
         return {**lev, "ok": False, "reason": "risk budget cannot fund one whole contract", "contracts": 0, "confidence": conf, "multiplier": mult, "contract_value_usdt": contract_value}
     actual_notional = float(contracts) * contract_value
     actual_margin = min(margin, actual_notional / lev["leverage"])
-    return {
-        **lev,
-        "ok": True,
-        "contracts": contracts,
+    result = {
+        **lev, "ok": True, "contracts": contracts,
         "contract_value_usdt": round(contract_value, 8),
         "notional_usdt": round(actual_notional, 8),
         "margin_usdt": round(actual_margin, 8),
-        "balance": round(balance, 8),
-        "confidence": conf,
-        "multiplier": mult,
-        "compound_used": round(compound, 8),
-        "sizing_note": f"balance=${balance:.4f}, margin=${actual_margin:.4f}, risk=${risk_budget:.4f}, exposure=${actual_notional:.4f}, contracts={contracts}, leverage={lev['leverage']}x",
+        "balance": round(balance, 8), "confidence": conf,
+        "multiplier": mult, "compound_used": round(compound, 8),
+        "sizing_note": f"balance={currency} {balance:.4f}, margin={currency} {actual_margin:.4f}, risk={currency} {risk_budget:.4f}, exposure={currency} {actual_notional:.4f}, contracts={contracts}, leverage={lev['leverage']}x",
+        "risk_currency": currency,
+        "available_balance_currency": currency,
+        "available_balance_amount": round(balance, 8),
+        "contract_value_currency": currency,
+        "contract_value_amount": round(contract_value, 8),
+        "notional_currency": currency,
+        "notional_amount": round(actual_notional, 8),
+        "margin_currency": currency,
+        "margin_amount": round(actual_margin, 8),
+        "risk_amount": round(min(actual_notional * stop, risk_budget), 8),
     }
+    if currency != "USDT":
+        # Legacy *_usdt keys are intentionally omitted for USD/INR/etc.; no
+        # conversion or denomination substitution is represented by these values.
+        for key in ("risk_notional_usdt", "max_notional_usdt", "margin_usdt",
+                    "risk_notional_usdt", "contract_value_usdt", "notional_usdt"):
+            result.pop(key, None)
+        result["max_notional_currency"] = round(float(lev["max_notional_usdt"]), 8)
+        result["trade_risk_currency_amount"] = round(risk_budget, 8)
+    return result

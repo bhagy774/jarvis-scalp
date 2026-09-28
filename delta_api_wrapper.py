@@ -17,6 +17,7 @@ import os
 import time
 import hmac
 import hashlib
+import math
 import requests
 import logging
 import json
@@ -215,8 +216,671 @@ class DeltaExchangeData:
     # ==========================================
 
     def get_balance(self) -> Dict:
-        """Fetch wallet balance"""
+        """Fetch the authenticated wallet response without selecting a currency."""
         return self._request("GET", "/v2/wallet/balances", authorized=True)
+
+    @staticmethod
+    def _delta_page(data: Dict[str, Any], page_size: int) -> tuple[list[dict], Optional[str], bool]:
+        """Validate one cursor-paginated Delta response (rows, cursor, terminal)."""
+        if not isinstance(data, dict) or not isinstance(data.get("result"), list):
+            raise ValueError("Delta response has no result list")
+        rows = data["result"]
+        if any(not isinstance(row, dict) for row in rows):
+            raise ValueError("Delta result contains a malformed row")
+        meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+        pagination = data.get("pagination") if isinstance(data.get("pagination"), dict) else meta
+        cursor_key = next((k for k in ("after", "next_cursor", "nextCursor", "next") if k in pagination), None)
+        more_key = next((k for k in ("has_more", "hasMore", "has_next", "hasNextPage") if k in pagination), None)
+        if more_key and pagination.get(more_key) is False:
+            return rows, None, True
+        cursor = pagination.get(cursor_key) if cursor_key else None
+        if cursor_key and cursor in (None, ""):
+            # Delta documents meta.after=null when no following page exists;
+            # that explicit terminal cursor remains authoritative even on a
+            # full-sized final page.
+            return rows, None, True
+        if cursor not in (None, ""):
+            return rows, str(cursor), False
+        # Without an explicit cursor or a short page, completeness is unknown.
+        if len(rows) < page_size:
+            return rows, None, True
+        return rows, None, False
+
+    def _get_all_pages(self, endpoint: str, *, authorized: bool, params: Optional[Dict[str, Any]] = None,
+                       page_size: int = 100, max_pages: int = 100) -> tuple[list[dict], bool]:
+        rows: list[dict] = []
+        cursor = None
+        seen_cursors = set()
+        for _ in range(max_pages):
+            query = dict(params or {})
+            query["page_size"] = page_size
+            if cursor:
+                query["after"] = cursor
+            response = self._request("GET", endpoint, query, authorized=authorized)
+            if not isinstance(response, dict) or response.get("success") is not True:
+                return [], False
+            try:
+                page, next_cursor, terminal = self._delta_page(response.get("data"), page_size)
+            except ValueError:
+                return [], False
+            rows.extend(page)
+            if terminal:
+                return rows, True
+            if not next_cursor or next_cursor in seen_cursors:
+                return [], False
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        return [], False
+
+    @staticmethod
+    def _product_asset_fields(product: Dict[str, Any]) -> tuple[str, str, str, str]:
+        """Read Delta's explicit product metadata; never infer assets from ticker suffixes."""
+        def asset_symbol(value):
+            if isinstance(value, dict):
+                value = value.get("symbol") or value.get("asset_symbol") or value.get("name")
+            return str(value or "").strip().upper()
+        base = asset_symbol(product.get("underlying_asset_symbol") or product.get("underlying_asset")
+                            or product.get("base_asset"))
+        quote = asset_symbol(product.get("quoting_asset") or product.get("quote_asset")
+                             or product.get("quote_currency"))
+        settle = asset_symbol(product.get("settling_asset") or product.get("settlement_asset")
+                              or product.get("settlement_currency"))
+        product_type = str(product.get("product_type") or product.get("market_type")
+                           or product.get("contract_type") or "").strip().lower()
+        return base, quote, settle, product_type
+
+    def get_available_products_snapshot(self) -> Dict[str, Any]:
+        """Fetch the complete, cursor-paginated Delta product catalogue."""
+        products, complete = self._get_all_pages("/v2/products", authorized=False, page_size=100, max_pages=100)
+        return {"complete": bool(complete), "as_of": time.time(), "products": products if complete else []}
+
+    def get_available_balance(self, currency: str) -> float:
+        """Return only the exact currency's available wallet balance; never convert or substitute."""
+        symbol = str(currency or "").strip().upper()
+        if not symbol or not re.fullmatch(r"[A-Z0-9]{2,12}", symbol):
+            return 0.0
+        response = self.get_balance()
+        body = response.get("data") if isinstance(response, dict) else None
+        rows = body.get("result") if isinstance(body, dict) else None
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return 0.0
+        matches = [row for row in rows if str(row.get("asset_symbol") or "").strip().upper() == symbol]
+        if len(matches) != 1:
+            return 0.0
+        try:
+            value = float(matches[0].get("available_balance"))
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return value if value > 0 and value < float("inf") else 0.0
+
+    def get_available_balance_usdt(self) -> float:
+        """Compatibility accessor for a real USDT row only (no USD/INR fallback)."""
+        return self.get_available_balance("USDT")
+
+    def get_delta_executable_quote(self, *, symbol: str, product_id: str) -> Optional[Dict[str, Any]]:
+        """Read the exact Delta L2 top of book and its exchange update timestamp."""
+        requested = str(symbol or "").strip().upper()
+        pid = str(product_id or "").strip()
+        if not requested or not pid:
+            return None
+        catalogue = self.get_available_products_snapshot()
+        if catalogue.get("complete") is not True:
+            return None
+        matches = [p for p in catalogue["products"]
+                   if str(p.get("symbol") or "").strip().upper() == requested
+                   and str(p.get("id", p.get("product_id"))) == pid]
+        if len(matches) != 1:
+            return None
+        book_response = self._request("GET", f"/v2/l2orderbook/{requested}", authorized=False)
+        body = book_response.get("data") if isinstance(book_response, dict) and book_response.get("success") else None
+        book = body.get("result") if isinstance(body, dict) else None
+        if not isinstance(book, dict) or str(book.get("symbol") or "").strip().upper() != requested:
+            return None
+        buys, sells = book.get("buy"), book.get("sell")
+        if not isinstance(buys, list) or not buys or not isinstance(sells, list) or not sells:
+            return None
+        try:
+            bid, ask = float(buys[0]["price"]), float(sells[0]["price"])
+            raw_ts = float(book.get("last_updated_at"))
+            # Delta L2 timestamps are documented as Unix microseconds.
+            observed = raw_ts / 1_000_000.0 if raw_ts > 10_000_000_000 else raw_ts
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+        max_age = max(0.1, min(60.0, float(os.environ.get("JARVIS_DELTA_QUOTE_MAX_AGE_SEC", "5"))))
+        now = time.time()
+        if (not all(map(lambda n: n > 0 and n < float("inf"), (bid, ask, observed)))
+                or ask < bid or observed > now + 2 or now - observed > max_age):
+            return None
+        return {"source": "delta", "symbol": requested, "product_id": pid,
+                "bid": bid, "ask": ask, "observed_at": observed}
+
+    def _get_positions_for_product_id(self, product_id: str) -> Optional[list[dict]]:
+        try:
+            pid = int(product_id)
+            if pid <= 0:
+                return None
+        except (TypeError, ValueError):
+            return None
+        response = self._request("GET", f"/v2/positions?product_id={pid}", authorized=True)
+        body = response.get("data") if isinstance(response, dict) and response.get("success") else None
+        result = body.get("result") if isinstance(body, dict) else None
+        # Delta documents GET /v2/positions?product_id=... as one position
+        # object (not a list). Accept the official object schema; list support
+        # is retained for compatible wrapper/test transports but ambiguous or
+        # malformed payloads remain unavailable.
+        if isinstance(result, dict):
+            # Treat only an actual position-shaped object as the documented
+            # object response; an arbitrary JSON object must not be converted
+            # into a synthetic zero/unknown position for reconciliation.
+            if "size" not in result:
+                return None
+            try:
+                size = float(result.get("size"))
+                raw_pid = result.get("product_id") or (result.get("product") or {}).get("id")
+                if not math.isfinite(size) or (raw_pid is not None and int(raw_pid) != int(product_id)):
+                    return None
+            except (TypeError, ValueError, OverflowError, AttributeError):
+                return None
+            row = dict(result)
+            row.setdefault("product_id", int(product_id))
+            return [row]
+        if not isinstance(result, list) or any(not isinstance(row, dict) for row in result):
+            return None
+        return result
+
+    @staticmethod
+    def _order_result(response: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        body = response.get("data") if isinstance(response, dict) else None
+        result = body.get("result") if isinstance(body, dict) else None
+        return result if isinstance(result, dict) else None
+
+    def _get_order_by_client_id(self, client_order_id: str) -> Optional[Dict[str, Any]]:
+        client_id = str(client_order_id or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", client_id):
+            return None
+        response = self._request("GET", f"/v2/orders/client_order_id/{client_id}", authorized=True)
+        return self._order_result(response) if isinstance(response, dict) and response.get("success") else None
+
+    def _set_and_confirm_product_leverage(self, product_id: int, leverage: int) -> bool:
+        """Set then read back Delta's per-product order leverage before entry."""
+        try:
+            pid, lev = int(product_id), int(leverage)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if pid <= 0 or lev < 1 or lev > 1000:
+            return False
+        endpoint = f"/v2/products/{pid}/orders/leverage"
+        changed = self._request("POST", endpoint, {"leverage": str(lev)}, authorized=True)
+        result = self._order_result(changed) if isinstance(changed, dict) and changed.get("success") else None
+        if not result:
+            return False
+        try:
+            if int(result.get("product_id")) != pid or int(float(result.get("leverage"))) != lev:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        confirmed = self._request("GET", endpoint, authorized=True)
+        result = self._order_result(confirmed) if isinstance(confirmed, dict) and confirmed.get("success") else None
+        try:
+            return bool(result and int(result.get("product_id")) == pid
+                        and int(float(result.get("leverage"))) == lev)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def place_protected_order(self, *, product_id: int, symbol: str, side: str, size: int,
+                              order_type: str, stop_loss: float, take_profit: float,
+                              leverage: int, client_order_id: str) -> Dict[str, Any]:
+        """Stage a Delta entry, then attach documented TP/SL bracket orders after confirmed fill.
+
+        Delta's documented bracket endpoint attaches exits to an existing position;
+        this is NOT atomic entry+protection. Any unclear fill/protection outcome
+        returns SUBMISSION_UNKNOWN and preserves the coordinator reservation.
+        """
+        truthy = {"1", "true", "yes", "on"}
+        required = ("JARVIS_MULTICOIN_DELTA_EXECUTION", "JARVIS_AUTO_TRADE", "JARVIS_LIVE_EXECUTION",
+                    "DELTA_USE_MAINNET", "DELTA_ORDER_EXECUTION_ENABLED")
+        if any(os.environ.get(name, "false").strip().lower() not in truthy for name in required):
+            return {"status": "REJECTED", "authoritative": True, "reason": "live execution flags are not all enabled"}
+        if not bool(getattr(self, "_USE_MAINNET", False)):
+            return {"status": "REJECTED", "authoritative": True, "reason": "Delta mainnet client is not selected"}
+        if os.environ.get("JARVIS_KILL_SWITCH", "1") != "0" and os.path.exists("C:\\jarvis\\STOP_JARVIS"):
+            return {"status": "REJECTED", "authoritative": True, "reason": "kill switch is active"}
+        try:
+            pid, qty, lev = int(product_id), int(size), int(leverage)
+            entry, stop, target = str(side).lower(), float(stop_loss), float(take_profit)
+            client_id = str(client_order_id).strip()
+            if (pid <= 0 or qty <= 0 or lev < 1 or lev > 1000 or entry not in {"buy", "sell"}
+                    or order_type != "market"
+                    or not all(map(lambda x: x > 0 and x < float("inf"), (stop, target)))
+                    or not client_id or len(client_id) > 32):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            return {"status": "REJECTED", "authoritative": True, "reason": "invalid protected-entry request"}
+        products = self.get_available_products_snapshot()
+        if products.get("complete") is not True:
+            return {"status": "REJECTED", "authoritative": True, "reason": "complete Delta product catalogue unavailable"}
+        matched = [p for p in products["products"] if str(p.get("id", p.get("product_id"))) == str(pid)
+                   and str(p.get("symbol") or "").strip().upper() == str(symbol).strip().upper()]
+        if len(matched) != 1:
+            return {"status": "REJECTED", "authoritative": True, "reason": "Delta product identity is ambiguous"}
+        product = matched[0]
+        base, quote, settle, product_type = self._product_asset_fields(product)
+        state = str(product.get("state") or product.get("status") or "").strip().lower()
+        specs = product.get("product_specs") if isinstance(product.get("product_specs"), dict) else {}
+        trading_status = str(product.get("trading_status") or "").strip().lower()
+        if (state not in {"active", "live", "trading", "listed"}
+                or product_type not in {"perpetual", "perpetual_futures", "perpetual_swap", "perpetual_swaps"}
+                or not base or not quote or not settle or quote != settle
+                or str(product.get("notional_type") or "").strip().lower() == "inverse"
+                or product.get("is_quanto") is True or specs.get("only_reduce_only_orders_allowed") is True
+                or trading_status not in {"", "operational"}):
+            return {"status": "REJECTED", "authoritative": True, "reason": "Delta product metadata is not eligible"}
+        # Delta documents product leverage as a separate per-product setting.
+        # Set and GET it back before sending any exposure-creating order.
+        executable = self.get_delta_executable_quote(symbol=str(symbol), product_id=str(pid))
+        if not isinstance(executable, dict):
+            return {"status": "REJECTED", "authoritative": True, "reason": "fresh Delta executable quote unavailable"}
+        current_entry = float(executable["ask"] if entry == "buy" else executable["bid"])
+        if (entry == "buy" and not stop < current_entry < target) or (entry == "sell" and not target < current_entry < stop):
+            return {"status": "REJECTED", "authoritative": True, "reason": "Delta quote invalidates protective price geometry"}
+        try:
+            from jarvis_risk import contract_quote_value_in_currency
+            if contract_quote_value_in_currency(product, current_entry, settle) is None:
+                return {"status": "REJECTED", "authoritative": True, "reason": "Delta contract value/settlement unit is unsupported"}
+        except Exception:
+            return {"status": "REJECTED", "authoritative": True, "reason": "Delta contract sizing metadata is unavailable"}
+        if not self._set_and_confirm_product_leverage(pid, lev):
+            return {"status": "REJECTED", "authoritative": True, "reason": "Delta product leverage could not be confirmed"}
+        # The venue's documented bracket API creates limit exits on the current
+        # position. Market entry is accepted only if it resolves to an exact fill.
+        payload = {"product_id": pid, "product_symbol": str(symbol).strip().upper(),
+                   "size": qty, "side": entry, "order_type": "market_order",
+                   "client_order_id": client_id}
+        response = self._request("POST", "/v2/orders", payload, authorized=True)
+        order = self._order_result(response) if isinstance(response, dict) and response.get("success") else None
+        if not order:
+            # A transport failure may happen after the exchange accepted the POST.
+            return {"status": "SUBMISSION_UNKNOWN", "authoritative": False,
+                    "client_order_id": client_id, "reason": "Delta entry response is unknown"}
+        order_id = order.get("id")
+        if order_id is None:
+            return {"status": "SUBMISSION_UNKNOWN", "authoritative": False,
+                    "client_order_id": client_id, "reason": "Delta entry order id missing"}
+        try:
+            total = int(order.get("size", qty))
+            unfilled = int(order.get("unfilled_size", max(0, total - int(order.get("filled_size", 0) or 0))))
+            filled = max(0, min(total, total - unfilled))
+            average = float(order.get("average_fill_price", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                    "client_order_id": client_id, "reason": "Delta entry fill schema is invalid"}
+        state = str(order.get("state") or "").strip().lower()
+        if state in {"open", "pending", "partially_filled"} and unfilled > 0:
+            cancel = self._request("DELETE", f"/v2/orders/{order_id}", authorized=True)
+            if not isinstance(cancel, dict) or cancel.get("success") is not True:
+                return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                        "client_order_id": client_id, "reason": "unfilled entry remainder could not be canceled"}
+            reread = self._request("GET", f"/v2/orders/{order_id}", authorized=True)
+            confirmed = self._order_result(reread) if isinstance(reread, dict) and reread.get("success") else None
+            if not confirmed:
+                return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                        "client_order_id": client_id, "reason": "entry cancellation state is unknown"}
+            try:
+                total = int(confirmed.get("size", qty))
+                unfilled = int(confirmed.get("unfilled_size", 0))
+                filled = max(0, min(total, total - unfilled))
+                average = float(confirmed.get("average_fill_price", average) or average)
+            except (TypeError, ValueError, OverflowError):
+                return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                        "client_order_id": client_id, "reason": "canceled entry fill schema is invalid"}
+            if str(confirmed.get("state") or "").lower() not in {"cancelled", "canceled", "filled", "closed"}:
+                return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                        "client_order_id": client_id, "reason": "entry remainder cancellation is not terminal"}
+        if filled <= 0:
+            if state in {"rejected", "cancelled", "canceled", "closed"}:
+                return {"status": "REJECTED", "authoritative": True, "order_id": str(order_id),
+                        "client_order_id": client_id, "filled_quantity": 0}
+            return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                    "client_order_id": client_id, "reason": "Delta did not confirm a positive fill"}
+        if average <= 0 or average == float("inf"):
+            return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                    "client_order_id": client_id, "filled_quantity": filled,
+                    "reason": "filled entry has no authoritative average fill price"}
+        # Confirm the current position size before attaching a whole-position bracket.
+        positions = self._get_positions_for_product_id(str(pid))
+        if positions is None:
+            return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                    "client_order_id": client_id, "filled_quantity": filled,
+                    "average_fill_price": average, "reason": "Delta position state unavailable before protection"}
+        signed_size = 0.0
+        for pos in positions:
+            try:
+                raw_pid = pos.get("product_id") or (pos.get("product") or {}).get("id")
+                if raw_pid is not None and int(raw_pid) != pid:
+                    continue
+                signed_size = float(pos.get("size", 0) or 0)
+            except (TypeError, ValueError, AttributeError):
+                return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                        "client_order_id": client_id, "filled_quantity": filled,
+                        "average_fill_price": average, "reason": "Delta position identity/size malformed"}
+            if signed_size:
+                break
+        if abs(signed_size) != float(filled) or (entry == "buy" and signed_size <= 0) or (entry == "sell" and signed_size >= 0):
+            return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                    "client_order_id": client_id, "filled_quantity": filled,
+                    "average_fill_price": average, "reason": "Delta position does not match confirmed entry fill"}
+        # Delta documents POST /orders/bracket as separate TP/SL orders that
+        # close the entire position. Stops use limit orders; a gap can leave a
+        # triggered stop-limit unfilled, so monitoring/reconciliation remains required.
+        tick = float(product.get("tick_size", 0) or 0)
+        if tick <= 0 or tick == float("inf"):
+            return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                    "client_order_id": client_id, "filled_quantity": filled,
+                    "average_fill_price": average, "reason": "Delta tick size unavailable for protective exits"}
+        closing_side = "sell" if signed_size > 0 else "buy"
+        emergency_client_id = "jmf" + hashlib.sha256(client_id.encode()).hexdigest()[:29]
+        def emergency_reduce_only_close():
+            return self._request("POST", "/v2/orders", {
+                "product_id": pid, "product_symbol": str(symbol).strip().upper(),
+                "size": int(abs(signed_size)), "side": closing_side,
+                "order_type": "market_order", "reduce_only": True,
+                "client_order_id": emergency_client_id,
+            }, authorized=True)
+        pad = max(tick, stop * 0.001)
+        stop_limit = stop - pad if closing_side == "sell" else stop + pad
+        bracket_payload = {
+            "product_id": pid, "product_symbol": str(symbol).strip().upper(),
+            "stop_loss_order": {"order_type": "limit_order", "stop_price": str(stop), "limit_price": str(stop_limit)},
+            "take_profit_order": {"order_type": "limit_order", "stop_price": str(target), "limit_price": str(target)},
+            "bracket_stop_trigger_method": "last_traded_price",
+        }
+        bracket = self._request("POST", "/v2/orders/bracket", bracket_payload, authorized=True)
+        if not isinstance(bracket, dict) or bracket.get("success") is not True:
+            # No atomic guarantee exists. Try a strictly reduce-only emergency
+            # close; regardless of its acknowledgement, hold as UNKNOWN until
+            # a complete account snapshot reconciles the position and bracket.
+            close = emergency_reduce_only_close()
+            close_order = self._order_result(close) if isinstance(close, dict) and close.get("success") else None
+            return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                    "client_order_id": client_id, "filled_quantity": filled,
+                    "average_fill_price": average, "protection_state": "FAILED_CLOSE_ATTEMPTED",
+                    "reason": "Delta protective bracket placement failed; reduce-only close outcome requires reconciliation",
+                    "close_order_id": str(close_order.get("id")) if close_order and close_order.get("id") is not None else None,
+                    "close_client_order_id": emergency_client_id,
+                    "close_order_response_received": close_order is not None}
+        # Verify both child exits are actually active before reporting protection.
+        active_orders, complete = self._get_all_pages("/v2/orders", authorized=True,
+                                                       params={"product_ids": str(pid), "states": "open,pending"},
+                                                       page_size=100, max_pages=20)
+        if not complete:
+            close = emergency_reduce_only_close()
+            close_order = self._order_result(close) if isinstance(close, dict) and close.get("success") else None
+            return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                    "client_order_id": client_id, "filled_quantity": filled,
+                    "average_fill_price": average, "protection_state": "UNVERIFIED_CLOSE_ATTEMPTED",
+                    "close_order_id": str(close_order.get("id")) if close_order and close_order.get("id") is not None else None,
+                    "close_client_order_id": emergency_client_id,
+                    "reason": "protective child-order verification incomplete; reduce-only close outcome requires reconciliation"}
+        def active_child(row, kind):
+            try:
+                return (int(row.get("product_id")) == pid
+                        and str(row.get("state") or "").lower() in {"open", "pending"}
+                        and str(row.get("stop_order_type") or "").lower() == kind
+                        and row.get("reduce_only") is True
+                        and str(row.get("side") or "").lower() == closing_side
+                        and row.get("id") is not None)
+            except (TypeError, ValueError, AttributeError):
+                return False
+        stop_orders = [o for o in active_orders if active_child(o, "stop_loss_order")]
+        target_orders = [o for o in active_orders if active_child(o, "take_profit_order")]
+        stop_ids = [str(o.get("id")) for o in stop_orders]
+        target_ids = [str(o.get("id")) for o in target_orders]
+        if len(stop_ids) != 1 or len(target_ids) != 1:
+            close = emergency_reduce_only_close()
+            close_order = self._order_result(close) if isinstance(close, dict) and close.get("success") else None
+            return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                    "client_order_id": client_id, "filled_quantity": filled,
+                    "average_fill_price": average, "protection_state": "UNVERIFIED_CLOSE_ATTEMPTED",
+                    "close_order_id": str(close_order.get("id")) if close_order and close_order.get("id") is not None else None,
+                    "close_client_order_id": emergency_client_id,
+                    "reason": "Delta bracket acknowledged but protective child orders were not independently visible; reduce-only close requires reconciliation"}
+        return {"status": "FILLED" if filled == qty else "PARTIAL", "authoritative": True,
+                "order_id": str(order_id), "client_order_id": client_id,
+                "filled_quantity": filled, "average_fill_price": average,
+                "protection_state": "ACTIVE",
+                "protective_exits": {"stop_loss_order_id": stop_ids[0], "take_profit_order_id": target_ids[0]},
+                "protection_atomic": False, "settlement_currency": settle}
+
+    def get_complete_account_snapshot(self, *, owned_orders: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a bounded Delta account snapshot using documented products, positions, orders and wallet endpoints.
+
+        Position risk is gross contract notional in each product's explicit
+        settlement currency. Since the current coordinator aggregates a single
+        numeric portfolio currency, mixed settlement currencies are incomplete
+        and are rejected rather than converted implicitly.
+        """
+        from jarvis_risk import contract_quote_value_in_currency
+        catalogue = self.get_available_products_snapshot()
+        if catalogue.get("complete") is not True:
+            return {"complete": False, "reason": "product catalogue incomplete"}
+        products = catalogue["products"]
+        perpetuals = []
+        product_by_id = {}
+        for product in products:
+            base, quote, settle, kind = self._product_asset_fields(product)
+            state = str(product.get("state") or product.get("status") or "").strip().lower()
+            if state in {"active", "live", "trading", "listed"} and kind in {
+                    "perpetual", "perpetual_futures", "perpetual_swap", "perpetual_swaps"}:
+                raw_id = product.get("id", product.get("product_id"))
+                if raw_id is None:
+                    return {"complete": False, "reason": "perpetual product id missing"}
+                product_by_id[str(raw_id)] = product
+                perpetuals.append(product)
+        max_products = max(1, min(250, int(os.environ.get("JARVIS_DELTA_MAX_RECONCILE_PERPETUALS", "100"))))
+        if len(perpetuals) > max_products:
+            return {"complete": False, "reason": "active perpetual universe exceeds bounded reconciliation limit"}
+        balances_response = self.get_balance()
+        balance_body = balances_response.get("data") if isinstance(balances_response, dict) and balances_response.get("success") else None
+        balance_rows = balance_body.get("result") if isinstance(balance_body, dict) else None
+        if not isinstance(balance_rows, list) or any(not isinstance(row, dict) for row in balance_rows):
+            return {"complete": False, "reason": "wallet balance schema incomplete"}
+        positions_margined = self._request("GET", "/v2/positions/margined", authorized=True)
+        margined_body = positions_margined.get("data") if isinstance(positions_margined, dict) and positions_margined.get("success") else None
+        margined_rows = margined_body.get("result") if isinstance(margined_body, dict) else None
+        if not isinstance(margined_rows, list) or any(not isinstance(row, dict) for row in margined_rows):
+            return {"complete": False, "reason": "margined position snapshot unavailable"}
+        all_orders, orders_complete = self._get_all_pages("/v2/orders", authorized=True, page_size=100, max_pages=20)
+        if not orders_complete:
+            return {"complete": False, "reason": "active order pagination incomplete"}
+
+        # Query every live perpetual product by its documented exact product id
+        # endpoint; /positions/margined may lag a change by up to 10 seconds.
+        positions = []
+        exact_by_pid: Dict[str, Dict[str, Any]] = {}
+        currencies = set()
+        for product in perpetuals:
+            pid = str(product.get("id", product.get("product_id")))
+            rows = self._get_positions_for_product_id(pid)
+            if rows is None:
+                return {"complete": False, "reason": "exact product position query failed"}
+            raw_position = None
+            for pos in rows:
+                raw_pid = pos.get("product_id") or (pos.get("product") or {}).get("id")
+                if raw_pid is not None and str(raw_pid) != pid:
+                    return {"complete": False, "reason": "position product identity mismatch"}
+                try:
+                    sz = float(pos.get("size", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    return {"complete": False, "reason": "position size malformed"}
+                if not math.isfinite(sz):
+                    return {"complete": False, "reason": "position size nonfinite"}
+                if sz:
+                    if raw_position is not None:
+                        return {"complete": False, "reason": "multiple nonzero position rows for one product"}
+                    raw_position = pos
+            exact_by_pid[pid] = raw_position or {"product_id": int(pid), "size": 0}
+            if raw_position is None:
+                continue
+            base, quote, settle, kind = self._product_asset_fields(product)
+            if not base or not quote or not settle or quote != settle:
+                return {"complete": False, "reason": "open position has unsupported quote/settlement currency"}
+            try:
+                size_abs = abs(float(raw_position.get("size")))
+                price = float(raw_position.get("mark_price") or raw_position.get("entry_price")
+                              or raw_position.get("average_entry_price") or 0)
+                if price <= 0:
+                    quote_data = self.get_delta_executable_quote(symbol=str(product.get("symbol")), product_id=pid)
+                    price = (float(quote_data["bid"]) + float(quote_data["ask"])) / 2 if quote_data else 0
+                contract_value = contract_quote_value_in_currency(product, price, settle)
+            except (TypeError, ValueError, OverflowError):
+                return {"complete": False, "reason": "position notional cannot be valued"}
+            if not contract_value or not math.isfinite(float(contract_value)) or size_abs <= 0:
+                return {"complete": False, "reason": "position notional unavailable"}
+            currencies.add(settle)
+            positions.append({"venue": "delta", "market_type": kind, "instrument_id": pid,
+                              "symbol": str(product.get("symbol") or "").strip().upper(),
+                              "notional": size_abs * float(contract_value),
+                              "risk_notional": size_abs * float(contract_value),
+                              "risk_currency": settle, "size": float(raw_position.get("size"))})
+        # Do not silently ignore an option/spot position from the broad margin
+        # endpoint; it is outside this coordinator's valuation model.
+        for pos in margined_rows:
+            try:
+                size = float(pos.get("size", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                return {"complete": False, "reason": "margined position size malformed"}
+            if size and str(pos.get("product_id") or (pos.get("product") or {}).get("id") or "") not in product_by_id:
+                return {"complete": False, "reason": "non-perpetual account position needs separate risk reconciliation"}
+
+        # Match owned order IDs/client IDs and explicitly confirm protection child IDs.
+        output_orders: Dict[str, Any] = {}
+        owned_exchange_ids = set()
+        owned_client_ids = set()
+        for candidate_id, owned in (owned_orders or {}).items():
+            if not isinstance(owned, dict):
+                return {"complete": False, "reason": "owned-order metadata malformed"}
+            identity = owned.get("identity") or {}
+            pid = str(identity.get("instrument_id") or "")
+            if pid not in product_by_id or pid not in exact_by_pid:
+                return {"complete": False, "reason": "owned Delta product is not in account catalogue"}
+            order_id = str(owned.get("order_id") or "")
+            client_id = str(owned.get("client_order_id") or "")
+            order = None
+            if order_id:
+                order_response = self._request("GET", f"/v2/orders/{order_id}", authorized=True)
+                order = self._order_result(order_response) if isinstance(order_response, dict) and order_response.get("success") else None
+            if order is None and client_id:
+                order = self._get_order_by_client_id(client_id)
+                if order:
+                    order_id = str(order.get("id") or "")
+            if not order or not order_id:
+                return {"complete": False, "reason": "owned entry order cannot be authoritatively resolved"}
+            try:
+                if int(order.get("product_id")) != int(pid):
+                    return {"complete": False, "reason": "owned order product mismatch"}
+                total = int(order.get("size", owned.get("quantity", 0)))
+                unfilled = int(order.get("unfilled_size", 0))
+                filled = max(0, total - unfilled)
+                average = float(order.get("average_fill_price", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                return {"complete": False, "reason": "owned order fill fields malformed"}
+            owned_exchange_ids.add(order_id)
+            owned_client_ids.update({client_id, str(order.get("client_order_id") or "")})
+            close_order_id = str(owned.get("close_order_id") or "")
+            close_client_id = str(owned.get("close_client_order_id") or "")
+            close_order = None
+            if close_order_id:
+                close_response = self._request("GET", f"/v2/orders/{close_order_id}", authorized=True)
+                close_order = self._order_result(close_response) if isinstance(close_response, dict) and close_response.get("success") else None
+            if close_order is None and close_client_id:
+                close_order = self._get_order_by_client_id(close_client_id)
+                if close_order:
+                    close_order_id = str(close_order.get("id") or "")
+            if (close_order_id or close_client_id) and not close_order:
+                return {"complete": False, "reason": "owned reduce-only close cannot be authoritatively resolved"}
+            if close_order:
+                try:
+                    if (int(close_order.get("product_id")) != int(pid)
+                            or close_order.get("reduce_only") is not True
+                            or str(close_order.get("client_order_id") or "") != close_client_id):
+                        return {"complete": False, "reason": "owned close order identity/reduce-only mismatch"}
+                except (TypeError, ValueError):
+                    return {"complete": False, "reason": "owned close order schema malformed"}
+                owned_exchange_ids.add(close_order_id)
+                owned_client_ids.add(close_client_id)
+            protective = owned.get("protective_exits") if isinstance(owned.get("protective_exits"), dict) else {}
+            stop_id = str(protective.get("stop_loss_order_id") or "")
+            target_id = str(protective.get("take_profit_order_id") or "")
+            if not stop_id or not target_id:
+                matching_protection = [row for row in all_orders if str(row.get("product_id")) == pid
+                                       and str(row.get("state") or "").lower() in {"open", "pending"}
+                                       and row.get("reduce_only") is True]
+                stop_rows = [row for row in matching_protection if str(row.get("stop_order_type") or "").lower() == "stop_loss_order"]
+                target_rows = [row for row in matching_protection if str(row.get("stop_order_type") or "").lower() == "take_profit_order"]
+                if len(stop_rows) == 1 and len(target_rows) == 1:
+                    stop_id, target_id = str(stop_rows[0].get("id") or ""), str(target_rows[0].get("id") or "")
+            position = exact_by_pid[pid]
+            try:
+                signed_size = float(position.get("size", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                return {"complete": False, "reason": "owned exact position malformed"}
+            if signed_size:
+                expected_sign = 1 if str(owned.get("direction") or "").upper() in {"BUY", "CALL"} else -1
+                if (expected_sign > 0 and signed_size < 0) or (expected_sign < 0 and signed_size > 0):
+                    return {"complete": False, "reason": "owned position direction mismatches candidate"}
+                if not stop_id or not target_id:
+                    return {"complete": False, "reason": "owned open position lacks visible bracket child orders"}
+                active_by_id = {str(row.get("id")): row for row in all_orders}
+                stop_row, target_row = active_by_id.get(stop_id), active_by_id.get(target_id)
+                if not stop_row or not target_row:
+                    return {"complete": False, "reason": "protective child order is not active"}
+                try:
+                    if (int(stop_row.get("product_id", -1)) != int(pid) or int(target_row.get("product_id", -1)) != int(pid)
+                            or stop_row.get("reduce_only") is not True or target_row.get("reduce_only") is not True
+                            or str(stop_row.get("stop_order_type") or "").lower() != "stop_loss_order"
+                            or str(target_row.get("stop_order_type") or "").lower() != "take_profit_order"):
+                        return {"complete": False, "reason": "protective child identity/type/reduce-only status invalid"}
+                except (TypeError, ValueError):
+                    return {"complete": False, "reason": "protective child schema malformed"}
+                detail = {"status": "FILLED" if filled >= total else "PARTIAL", "authoritative": True,
+                          "filled_quantity": filled, "average_fill_price": average,
+                          "protection_state": "ACTIVE",
+                          "protective_exits": {"stop_loss_order_id": stop_id, "take_profit_order_id": target_id}}
+                owned_exchange_ids.update({order_id, stop_id, target_id})
+            else:
+                state = str(order.get("state") or "").lower()
+                child_filled = False
+                for child_id in (stop_id, target_id):
+                    if child_id:
+                        child_response = self._request("GET", f"/v2/orders/{child_id}", authorized=True)
+                        child = self._order_result(child_response) if isinstance(child_response, dict) and child_response.get("success") else None
+                        if child and str(child.get("state") or "").lower() in {"closed", "filled"}:
+                            child_filled = True
+                close_filled = False
+                if close_order:
+                    close_state = str(close_order.get("state") or "").lower()
+                    try:
+                        close_total = int(close_order.get("size", 0))
+                        close_unfilled = int(close_order.get("unfilled_size", 0))
+                        close_filled = close_state in {"closed", "filled"} and close_total > close_unfilled
+                    except (TypeError, ValueError, OverflowError):
+                        return {"complete": False, "reason": "owned reduce-only close fill fields malformed"}
+                if (close_filled and filled > 0) or (child_filled and state in {"closed", "filled"}):
+                    detail = {"status": "CLOSED", "authoritative": True, "filled_quantity": filled}
+                    owned_exchange_ids.update({order_id, stop_id, target_id, close_order_id})
+                elif state in {"rejected", "cancelled", "canceled"} and filled == 0:
+                    detail = {"status": "REJECTED", "authoritative": True, "filled_quantity": 0}
+                    owned_exchange_ids.add(order_id)
+                else:
+                    return {"complete": False, "reason": "flat position does not prove order termination/close"}
+            output_orders[str(candidate_id)] = detail
+        external_orders = [order for order in all_orders if str(order.get("id") or "") not in owned_exchange_ids
+                           and str(order.get("client_order_id") or "") not in owned_client_ids]
+        if currencies and len(currencies) > 1:
+            return {"complete": False, "reason": "mixed settlement currencies cannot be aggregated safely"}
+        return {"complete": True, "as_of": time.time(), "positions": positions,
+                "orders": output_orders, "external_orders": external_orders,
+                "wallet_balances": balance_rows, "risk_currency": next(iter(currencies), "")}
 
     def get_live_price(self, symbol: str = "BTCUSDT") -> float:
         """Get real-time BTC price — uses Binance (most accurate), falls back to Delta."""
@@ -864,14 +1528,32 @@ class DeltaExchangeData:
             return None
 
     def get_product_metadata(self, symbol: str) -> Optional[Dict]:
-        """Return validated venue product metadata for risk/execution callers."""
-        product = self._resolve_product(symbol)
-        if not isinstance(product, dict):
+        """Return unique metadata from a complete public product snapshot.
+
+        The legacy `_resolve_product` convenience lookup reads a single raw
+        response page and can map USDT/USD aliases. That is unsuitable for
+        policy-bound live execution: it could miss duplicate symbols or a
+        product beyond the server's default page. The multicoin path requires
+        one exact symbol in a terminally complete catalogue instead.
+        """
+        requested = str(symbol or "").strip().upper()
+        if not requested:
             return None
+        snapshot = self.get_available_products_snapshot()
+        if not isinstance(snapshot, dict) or snapshot.get("complete") is not True:
+            return None
+        products = snapshot.get("products")
+        if not isinstance(products, list):
+            return None
+        matches = [product for product in products if isinstance(product, dict)
+                   and str(product.get("symbol") or "").strip().upper() == requested]
+        if len(matches) != 1:
+            return None
+        product = matches[0]
         try:
-            if int(product["id"]) <= 0 or not str(product.get("symbol", "")).strip():
+            if int(product.get("id", product.get("product_id"))) <= 0:
                 return None
-        except (KeyError, TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         return dict(product)
 
@@ -892,22 +1574,23 @@ class DeltaExchangeData:
             return False
         if leverage <= 0:
             return False
-        product_id = self.get_product_id(symbol)
-        if not product_id:
-            logger.error(f"[RISK] Output: Product ID not found for {symbol}")
+        if leverage <= 0 or leverage > 1000:
             return False
-
-        params = {
-            "product_id": int(product_id),
-            "leverage": str(leverage)
-        }
-        res = self._request("POST", "/v2/orders/leverage", params, authorized=True)
-        if res["success"]:
-            logger.info(f"[RISK] Leverage set to {leverage}x for {symbol}")
-            return True
-        else:
-            logger.error(f"[RISK] Failed to set leverage: {res.get('error')}")
+        product = self.get_product_metadata(symbol)
+        if not product:
+            logger.error(f"[RISK] Output: Exact product metadata not found for {symbol}")
             return False
+        try:
+            product_id = int(product.get("id", product.get("product_id")))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if product_id <= 0:
+            return False
+        if not self._set_and_confirm_product_leverage(product_id, leverage):
+            logger.error(f"[RISK] Failed to set and confirm leverage for {symbol}")
+            return False
+        logger.info(f"[RISK] Leverage set to {leverage}x for {symbol}")
+        return True
 
     def place_order(self, symbol: str, side: str, size: int, order_type: str = "market", limit_price: float = 0,
                     reduce_only: bool = False, client_order_id: str = None) -> Dict:
@@ -979,6 +1662,68 @@ class DeltaExchangeData:
             logger.error(f"[EXECUTION] Failed: {res.get('error')}")
             return {"success": False, "error": res.get("error")}
 
+    def place_reduce_only_order(self, *, product_id: int, symbol: str, side: str, size: int,
+                                client_order_id: str) -> Dict[str, Any]:
+        """Submit an identity-exact, reduce-only market close order.
+
+        Close orders are independently guarded just like exposure-creating
+        entry orders: direct callers must not bypass any of the opt-in flags,
+        mainnet selection, or the operator kill switch.
+        """
+        truthy = {"1", "true", "yes", "on"}
+        required = ("JARVIS_MULTICOIN_DELTA_EXECUTION", "JARVIS_AUTO_TRADE", "JARVIS_LIVE_EXECUTION",
+                    "DELTA_USE_MAINNET", "DELTA_ORDER_EXECUTION_ENABLED")
+        if any(os.environ.get(name, "false").strip().lower() not in truthy for name in required):
+            return {"success": False, "error": "All live execution flags are required for Delta close"}
+        if not bool(getattr(self, "_USE_MAINNET", False)):
+            return {"success": False, "error": "Delta mainnet client is not selected"}
+        if os.environ.get("JARVIS_KILL_SWITCH", "1") != "0" and os.path.exists("C:\\jarvis\\STOP_JARVIS"):
+            return {"success": False, "error": "Kill switch is active"}
+        try:
+            pid, qty = int(product_id), int(size)
+            sym, order_side, client_id = str(symbol).strip().upper(), str(side).strip().lower(), str(client_order_id).strip()
+            if pid <= 0 or qty <= 0 or order_side not in {"buy", "sell"} or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", client_id):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            return {"success": False, "error": "Invalid reduce-only close request"}
+        catalogue = self.get_available_products_snapshot()
+        if catalogue.get("complete") is not True:
+            return {"success": False, "error": "Complete Delta product catalogue unavailable"}
+        matches = [p for p in catalogue["products"] if str(p.get("id", p.get("product_id"))) == str(pid)
+                   and str(p.get("symbol") or "").strip().upper() == sym]
+        if len(matches) != 1:
+            return {"success": False, "error": "Exact Delta close identity not found"}
+        positions = self._get_positions_for_product_id(str(pid))
+        if positions is None:
+            return {"success": False, "error": "Exact Delta position unavailable for close"}
+        nonzero = []
+        for position in positions:
+            try:
+                value = float(position.get("size", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                return {"success": False, "error": "Malformed exact Delta position"}
+            if not math.isfinite(value):
+                return {"success": False, "error": "Malformed exact Delta position"}
+            if value:
+                nonzero.append(value)
+        if len(nonzero) != 1 or qty > abs(nonzero[0]) or order_side != ("sell" if nonzero[0] > 0 else "buy"):
+            return {"success": False, "error": "Reduce-only close does not match the current owned position"}
+        response = self._request("POST", "/v2/orders", {
+            "product_id": pid, "product_symbol": sym, "size": qty, "side": order_side,
+            "order_type": "market_order", "reduce_only": True, "client_order_id": client_id,
+        }, authorized=True)
+        order = self._order_result(response) if isinstance(response, dict) and response.get("success") else None
+        if not order or str(order.get("client_order_id") or "") != client_id:
+            # The request may have reached Delta despite an incomplete response.
+            return {"success": False, "unknown": True, "client_order_id": client_id}
+        try:
+            if int(order.get("product_id")) != pid or order.get("reduce_only") is not True:
+                return {"success": False, "unknown": True, "client_order_id": client_id}
+        except (TypeError, ValueError):
+            return {"success": False, "unknown": True, "client_order_id": client_id}
+        return {"success": True, "order_id": str(order.get("id") or ""),
+                "client_order_id": client_id, "details": order}
+
     def place_batch_orders(self, orders: List[Dict]) -> Dict:
         """
         Place Main Trade + Hedge Options simultaneously?
@@ -995,14 +1740,13 @@ class DeltaExchangeData:
         return {"results": results}
     
     def get_available_products(self) -> List[Dict[str, Any]]:
-        """Return public product records for exact venue instrument discovery."""
-        res = self._request("GET", "/v2/products", authorized=False)
-        if not isinstance(res, dict) or not res.get("success"):
+        """Return only a complete cursor-paginated public Delta product catalogue."""
+        snapshot = self.get_available_products_snapshot()
+        if snapshot.get("complete") is not True:
+            logger.warning("[DELTA API] Product catalogue pagination incomplete")
             return []
-        products = res.get("data", {}).get("result", [])
-        if not isinstance(products, list):
-            return []
-        return [dict(product) for product in products if isinstance(product, dict) and product.get("symbol")]
+        return [dict(product) for product in snapshot["products"]
+                if isinstance(product, dict) and product.get("symbol")]
 
     def get_available_symbols(self) -> List[str]:
         """Get list of all available trading symbols."""
