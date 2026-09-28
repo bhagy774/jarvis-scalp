@@ -18,7 +18,11 @@ module = ast.Module(body=methods, type_ignores=[])
 class Delta:
     def get_institutional_bias(self, asset):
         return {"bias":"BULLISH", "score":4, "pcr":0.75, "support_wall":95,
-                "resistance_wall":110, "max_pain":102, "reasons":["fixture chain"]}
+                "resistance_wall":110, "max_pain":102, "reasons":["fixture chain"],
+                "raw_data":{"source_provider":"Delta", "options_validation":{
+                    "underlying":"ETH", "usable":True, "complete":True,
+                    "identity_valid":True, "fresh":True},
+                    "coverage":{"contract_count":2}}}
 class Fake:
     asset="ETH"
     delta_client=Delta()
@@ -56,6 +60,18 @@ class OptionsMathIntegration(unittest.TestCase):
     def test_invalid_price_fails_closed(self):
         out=self._run(float('nan'))
         self.assertEqual(out["signal"],0)
+        self.assertFalse(out["telemetry"]["available"])
+        self.assertEqual(self.calls,[])
+
+    def test_real_no_data_shape_is_not_reported_as_valid_intelligence(self):
+        fake = Fake()
+        class NoData:
+            def get_institutional_bias(self, asset):
+                return {"bias":"NEUTRAL", "score":0, "reasons":["No Data"]}
+        fake.delta_client = NoData()
+        fake.analyze_options_with_ollama=lambda telemetry, current: self.analyze_whale(fake, telemetry, current)
+        out = self.analyze(fake, {"close":Series([100.0])}, {"selected_symbol":"ETHUSDT"})
+        self.assertEqual(out["signal"], 0)
         self.assertFalse(out["telemetry"]["available"])
         self.assertEqual(self.calls,[])
 
