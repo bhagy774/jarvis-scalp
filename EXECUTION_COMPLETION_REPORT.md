@@ -10,7 +10,8 @@
 - Main at verification: `09f1d8aba01e6ac66a4e45e182ccb9d7eea934f4` (unchanged)
 - PR head before this implementation: `3293e248743054527a337f9044c523c079f31b26` (open, draft, unmerged)
 - Implementation/test commit pushed to the existing PR branch: `94aad7b4015c2e17c7836cbbf2f7126152473849` (`feat: add fail-closed multicoin paper execution lifecycle`).
-- The comprehensive report and progress checklist were committed to the same branch in documentation follow-up `069105d835660566c6548a8304e9f5e9fddcb754`; there is no new PR or duplicate branch.
+- Risk-sizing hardening follow-up: `404254846ffee58875f3b431f0229f63d4222c70` (`fix: account for contract multiplier in multicoin risk`).
+- The report/checklist were committed in documentation follow-up `069105d835660566c6548a8304e9f5e9fddcb754`, with report-status refresh `1a14e318cfdd786e07819928e7de1310b297bbdf`; further docs below include this risk-hardening follow-up. No new PR or duplicate branch.
 
 The local working tree was a source snapshot, not a Git checkout. PR metadata, main tip, and PR-head pipeline/live source were checked via the approved GitHub connection before the source push; the PR head was unchanged immediately before that push. Only the six implementation/test files listed below were included in the source/test commit. PR #94 was not changed.
 
@@ -20,7 +21,7 @@ The local working tree was a source snapshot, not a Git checkout. PR metadata, m
 
 New `jarvis_multicoin_execution.py` provides `candidate_from_analysis()`. It accepts only a fresh `COMPLETE` `parts1-12-analysis-only` result with `analysis_only=True`, `decision_authority="none"`, `execution_eligible=False`, full `(venue, market_type, instrument_id, symbol)` identity, snapshot version/timestamps, and an explicit `execution_plan`.
 
-The plan must explicitly carry the decision timeframe, decision timestamp, reference-price timestamp and price, maximum slippage/chase percentages, normalized BUY/SELL direction, entry, stop, target, quantity, size unit, sizing provenance, risk notional, and an allow-listed policy ID. Invalid stop geometry, stale/missing data, unknown policy, missing size/price/identity, out-of-bound chase, and normalized NO-TRADE/HOLD direction fail closed. No default entry, stop, target, or size is fabricated. Candidate IDs are deterministic across the complete validated plan and snapshot version.
+The plan must explicitly carry the decision timeframe, decision timestamp, reference-price timestamp and price, maximum slippage/chase percentages, normalized BUY/SELL direction, entry, stop, target, quantity, size unit, sizing provenance, risk notional, and an allow-listed policy ID. Contract-sized quantities additionally require an explicit positive contract multiplier; risk and notional caps account for that multiplier rather than treating contracts as base units. Invalid stop geometry, stale/missing data, unknown policy, missing size/price/identity, out-of-bound chase, and normalized NO-TRADE/HOLD direction fail closed. No default entry, stop, target, or size is fabricated. Candidate IDs are deterministic across the complete validated plan and snapshot version.
 
 `jarvis_multicoin_pipeline.py` now forwards an analyzer-supplied plan only when it is explicitly a mapping. It marks the normal current output `BLOCKED_MISSING_EXPLICIT_PLAN` rather than deriving execution details from Parts 1–12.
 
@@ -47,7 +48,7 @@ The real Part1–12 adapter currently returns no `execution_plan`, because its e
 
 ## Files changed in implementation/test commit
 
-- `jarvis_multicoin_execution.py` — candidate contract, policy validation, persistent coordinator, deterministic paper adapter.
+- `jarvis_multicoin_execution.py` — candidate contract, policy validation, persistent coordinator, deterministic paper adapter; explicit contract multipliers added in risk hardening commit `404254846ffee58875f3b431f0229f63d4222c70`.
 - `jarvis_multicoin_pipeline.py` — explicit-plan pass-through and fail-closed status when absent.
 - `jarvis_FIXED.py` — default-off separate paper result-consumer in the background analysis loop; no integration into selected-symbol/live orders.
 - `tests/test_multicoin_execution.py` — candidate/rejection, races/caps, lifecycle, restart, and engine handoff fixtures.
@@ -68,7 +69,7 @@ PYTHONPATH=/tmp/multicoin-test-deps:$PWD PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_
   tests/test_execution_safety.py
 ```
 
-**Result: 63 passed.** This includes all 10 `tests/test_execution_safety.py` tests; none was deselected. The suite covers competing concurrent candidates, cap enforcement, timeout/unknown idempotency and restart, partial fill reconciliation, authoritative rejection release, snapshot mismatch preservation, independent position closes, stale/malformed/no-trade plans, policy/identity isolation, and the actual LiveTradingEngine paper handoff. The paper handoff accepted only a synthetic explicit plan; it refused the native-analysis result without a plan.
+**Result: 63 passed in 36.97 seconds on final code.** This includes all 10 `tests/test_execution_safety.py` tests; none was deselected. The suite covers competing concurrent candidates, cap enforcement, timeout/unknown idempotency and restart, partial fill reconciliation, authoritative rejection release, snapshot mismatch preservation, independent position closes, stale/malformed/no-trade plans, policy/identity isolation, and the actual LiveTradingEngine paper handoff. The paper handoff accepted only a synthetic explicit plan; it refused the native-analysis result without a plan.
 
 AST syntax parsing also passed for `jarvis_multicoin_execution.py`, `jarvis_multicoin_pipeline.py`, `jarvis_FIXED.py`, and the three modified multicoin test files.
 
@@ -83,4 +84,4 @@ AST syntax parsing also passed for `jarvis_multicoin_execution.py`, `jarvis_mult
 
 ## PR / deployment state
 
-The implementation and offline tests were pushed to existing draft PR #95 at commit `94aad7b4015c2e17c7836cbbf2f7126152473849`. A report/checklist refresh is a separate follow-up on that same PR branch. This work remains unmerged and undeployed. The next safe milestone is implement and review a fresh per-asset execution-plan/policy source, add simulation of actual quote/slippage/fee/fill behavior, then test authoritative live-position reconciliation and venue adapter contracts offline before requesting separately authorized paper/testnet validation.
+The implementation/offline tests and risk-sizing follow-up (`94aad7b4015c2e17c7836cbbf2f7126152473849`, `404254846ffee58875f3b431f0229f63d4222c70`) and documentation were pushed to existing draft PR #95 only. At this report refresh, the PR remains open, draft, and unmerged; it is undeployed. The next safe milestone is implement and review a fresh per-asset execution-plan/policy source, add simulation of actual quote/slippage/fee/fill behavior, then test authoritative live-position reconciliation and venue adapter contracts offline before requesting separately authorized paper/testnet validation.

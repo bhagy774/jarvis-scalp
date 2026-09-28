@@ -1,8 +1,8 @@
 # Multicoin execution progress checklist
 
-## Finished in PR #95 implementation commit `94aad7b4015c2e17c7836cbbf2f7126152473849`
+## Finished in PR #95 implementation commit `94aad7b4015c2e17c7836cbbf2f7126152473849` plus risk-hardening follow-up `404254846ffee58875f3b431f0229f63d4222c70`
 
-- [x] Strict full-identity analysis-to-candidate validator with explicit timeframe, data version/timestamps, reference price, slippage/chase limits, direction/NO-TRADE handling, entry/SL/TP, quantity/unit/provenance/risk and asset policy allow-list — `jarvis_multicoin_execution.py`, `candidate_from_analysis()`.
+- [x] Strict full-identity analysis-to-candidate validator with explicit timeframe, data version/timestamps, reference price, slippage/chase limits, direction/NO-TRADE handling, entry/SL/TP, quantity/unit/provenance/risk (with explicit contract multiplier for contracts) and asset policy allow-list — `jarvis_multicoin_execution.py`, `candidate_from_analysis()`.
 - [x] Fail-closed result bridge: Part1–12 plan is passed through only if analyzer explicitly returns a mapping; ordinary native output marked missing-plan — `jarvis_multicoin_pipeline.py`, `_run()`.
 - [x] Optional default-off local paper-only loop handoff, isolated from selected-symbol/live order path — `jarvis_FIXED.py`, `LiveTradingEngine._consume_multicoin_paper_results()` and loop poll.
 - [x] Thread-atomic notional/risk/position/correlation reservation; journal-before-submit; idempotency; distinct unknown/partial/filled/rejected/close-pending/closed lifecycle; full-identity reconciliation and close ownership — `jarvis_multicoin_execution.py`, `PortfolioCoordinator`.
