@@ -121,7 +121,33 @@ def build_final_decision(
         direction = "NO_TRADE"
         clean_reasons.append("Confidence unavailable")
     context = options_context if isinstance(options_context, dict) else {}
-    if require_options and direction in {"BUY", "SELL"} and (
+    candidate_direction = direction
+    # Conservative macro filter: for non-BTC/ETH charts, a unanimous, fresh,
+    # complete BTC+ETH options conflict blocks the candidate. It is never a
+    # weighted vote or a substitute for selected-asset evidence. Missing or
+    # contradictory macro data is not scored. The separate BTC-only Oracle
+    # execution guard remains in force for altcoins.
+    symbol_base = str(symbol or "").upper().replace("-", "").replace("_", "")
+    for quote in ("USDT", "USD"):
+        if symbol_base.endswith(quote):
+            symbol_base = symbol_base[:-len(quote)]
+            break
+    if direction in {"BUY", "SELL"} and symbol_base not in {"BTC", "ETH"}:
+        macros = context.get("macro_contexts", [])
+        qualified = {}
+        if isinstance(macros, list):
+            for macro in macros:
+                if not isinstance(macro, dict) or macro.get("role") != "macro_context" or macro.get("available") is not True:
+                    continue
+                asset = str(macro.get("source_asset", "")).upper()
+                validation = macro.get("validation") if isinstance(macro.get("validation"), dict) else {}
+                if asset in {"BTC", "ETH"} and validation.get("usable") is True and validation.get("complete") is True and validation.get("fresh") is True and validation.get("freshness_status") == "fresh" and validation.get("identity_valid") is True and validation.get("underlying") == asset:
+                    qualified[asset] = str(macro.get("bias", "NEUTRAL")).upper()
+        expected_conflict = "BEARISH" if direction == "BUY" else "BULLISH"
+        if qualified.get("BTC") == expected_conflict and qualified.get("ETH") == expected_conflict:
+            direction = "NO_TRADE"
+            clean_reasons.append("BTC and ETH options context unanimously conflicts with selected-asset direction")
+    if require_options and candidate_direction in {"BUY", "SELL"} and (
         not context.get("available", False) or context.get("role") != "asset_primary"
     ):
         direction = "NO_TRADE"

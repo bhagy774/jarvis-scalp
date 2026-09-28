@@ -3622,7 +3622,7 @@ Follow the tag with a 1-sentence options analyst insight.
     def analyze(self, data, context=None):
         """Unified selected-asset options analysis; BTC Deribit is never an alt substitute."""
         try:
-            requested = context.get('symbol') if isinstance(context, dict) else None
+            requested = (context.get('selected_symbol') or context.get('symbol')) if isinstance(context, dict) else None
             asset = str(requested or self.asset or '').upper().replace('USDT', '').replace('USD', '')
             if asset:
                 self.asset = asset
@@ -3647,6 +3647,25 @@ Follow the tag with a 1-sentence options analyst insight.
             except Exception as e:
                 logging.warning(f"Options client API fetch warning: {e}")
                 bias_data = {'bias': 'NEUTRAL', 'score': 0, 'reasons': [str(e)]}
+
+            # Do not turn Delta's ordinary {bias: NEUTRAL, reasons: [No Data]}
+            # payload, a provider error, or a partial/stale chain into a usable
+            # Part14 vote. Only the selected asset's validated chain is primary.
+            raw_data = bias_data.get('raw_data', {}) if isinstance(bias_data, dict) else {}
+            options_validation = raw_data.get('options_validation', {}) if isinstance(raw_data, dict) else {}
+            if not (isinstance(options_validation, dict)
+                    and options_validation.get('usable') is True
+                    and options_validation.get('complete') is True
+                    and options_validation.get('fresh') is True
+                    and options_validation.get('identity_valid') is True
+                    and options_validation.get('underlying') == self.asset):
+                return {
+                    "signal": 0,
+                    "thought": f"Selected-asset options unavailable or unvalidated ({self.asset})",
+                    "telemetry": {"signal": 0, "available": False, "asset": self.asset,
+                                  "validation": options_validation or None,
+                                  "greeks_model_derived": False},
+                }
             
             # Additional detailed analysis if available (Deribit specific)
             thoughts = []
@@ -3689,9 +3708,14 @@ Follow the tag with a 1-sentence options analyst insight.
             pcr_float = pcr_float if pcr_float is not None and math.isfinite(pcr_float) and pcr_float >= 0 else None
 
             telemetry = {
-                "exchange": "Delta" if source == delta_source else "Deribit",
+                "exchange": raw_data.get('source_provider') or ("Delta" if source == delta_source else "Deribit"),
                 "asset": self.asset,
                 "available": True,
+                "chain_validation": options_validation,
+                "chain_coverage": raw_data.get('coverage'),
+                "greeks_source": "exchange_observed_only",
+                "greeks_model_derived": False,
+                "dealer_gamma_direction": {"available": False, "reason": "unsigned open interest does not identify dealer positioning"},
                 "bias_score": float(bias_data.get('score', 0)),
                 "pcr": pcr_float,
                 "signal": math_signal,
@@ -5569,22 +5593,27 @@ class JarvisElite:
                     try:
                         # 🎓 TEACHER FIX #1: Data Pollution (Pass-by-reference mutation bug)
                         # Ensure each part receives a pristine, independent copy of the dataframe.
-                        # Part 7 also receives the selected symbol/timeframe identity so it
-                        # cannot silently analyze a BTC/default or mixed-symbol frame.
+                        # Part 7 and Part 14 receive the routed symbol explicitly; options must
+                        # never fall back to Part14's historical BTC constructor default.
                         part_context = self.market_context
-                        if name == 'part7_volatility':
+                        if name in ('part7_volatility', 'part14_options_chain'):
+                            selected_symbol = getattr(self, 'active_symbol', None) or getattr(data, 'attrs', {}).get('symbol')
                             part_context = dict(self.market_context)
                             part_context.update({
-                                'selected_symbol': getattr(self, 'active_symbol', None),
+                                'selected_symbol': selected_symbol,
+                                'symbol': selected_symbol,
                                 'timeframe': tf_name,
-                                'is_backtest_mode': self.is_backtest_mode,
-                                'shared_candle_source': 'historical_replay' if self.is_backtest_mode else 'shared_exchange',
                             })
-                            tf_data = tf_data.copy()
-                            tf_data.attrs = dict(getattr(tf_data, 'attrs', {}) or {})
-                            if getattr(self, 'active_symbol', None):
-                                tf_data.attrs['symbol'] = self.active_symbol
-                            tf_data.attrs['timeframe'] = tf_name
+                            if name == 'part7_volatility':
+                                part_context.update({
+                                    'is_backtest_mode': self.is_backtest_mode,
+                                    'shared_candle_source': 'historical_replay' if self.is_backtest_mode else 'shared_exchange',
+                                })
+                                tf_data = tf_data.copy()
+                                tf_data.attrs = dict(getattr(tf_data, 'attrs', {}) or {})
+                                if selected_symbol:
+                                    tf_data.attrs['symbol'] = selected_symbol
+                                tf_data.attrs['timeframe'] = tf_name
                         res = part.analyze(tf_data, context=part_context)
                         if isinstance(res, dict):
                             tf_results[name] = res
