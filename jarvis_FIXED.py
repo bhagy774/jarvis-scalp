@@ -3249,9 +3249,24 @@ class Part2Zone:
             if self._engine is not None and 'mtf_datasets' in context:
                 try:
                     mtf = context['mtf_datasets']
-                    df_1m = mtf.get('1m', data)
-                    df_5m = mtf.get('5m', data)
-                    df_15m = mtf.get('15m', data)
+                    # Part 2 is intrinsically a 1m/5m/15m consumer. Never
+                    # substitute the invocation's frame for a missing interval:
+                    # that silently makes wrong-TF data look like valid context.
+                    required = ('1m', '5m', '15m')
+                    if any(tf not in mtf or not isinstance(mtf[tf], pd.DataFrame)
+                           or len(mtf[tf]) < 500 for tf in required):
+                        raise ValueError('Part2 requires complete native 1m/5m/15m frames')
+                    df_1m, df_5m, df_15m = (mtf[tf].copy(deep=True) for tf in required)
+                    expected_symbol = str(context.get('selected_symbol') or context.get('symbol') or '').upper()
+                    expected_identity = context.get('analysis_identity')
+                    for tf, frame in zip(required, (df_1m, df_5m, df_15m)):
+                        attrs = dict(getattr(frame, 'attrs', {}) or {})
+                        if attrs.get('timeframe') != tf:
+                            raise ValueError(f'Part2 native timeframe provenance missing for {tf}')
+                        if expected_symbol and str(attrs.get('symbol', '')).upper() != expected_symbol:
+                            raise ValueError(f'Part2 symbol provenance mismatch for {tf}')
+                        if expected_identity and attrs.get('analysis_identity') != expected_identity:
+                            raise ValueError(f'Part2 snapshot identity mismatch for {tf}')
                     if len(df_1m) > 0:
                         current_candle = df_1m.iloc[-1].to_dict()
                         signals = self._engine.process_market_data(df_1m, df_5m, df_15m, current_candle)
@@ -6024,11 +6039,21 @@ class JarvisElite:
                     frame = native_mtf[tf_name]
                     if (not isinstance(frame, pd.DataFrame) or len(frame) != 500
                             or not isinstance(frame.index, pd.DatetimeIndex)
-                            or not frame.index.is_monotonic_increasing or frame.index.has_duplicates):
+                            or not frame.index.is_monotonic_increasing or frame.index.has_duplicates
+                            or not {'open', 'high', 'low', 'close', 'volume'}.issubset(frame.columns)
+                            or frame[list({'open', 'high', 'low', 'close', 'volume'})].isna().any().any()):
                         return self._get_no_trade_signal(f'WAIT/NO-DATA: invalid native frame {tf_name}')
                     frame_copy = frame.copy(deep=True)
                     frame_copy.attrs = dict(getattr(frame, 'attrs', {}) or {})
+                    source_symbol = str(frame_copy.attrs.get('symbol', '')).upper()
+                    source_tf = frame_copy.attrs.get('timeframe')
+                    if source_symbol and source_symbol != selected_symbol:
+                        return self._get_no_trade_signal(f'WAIT/NO-DATA: wrong-symbol native frame {tf_name}')
+                    if source_tf and source_tf != tf_name:
+                        return self._get_no_trade_signal(f'WAIT/NO-DATA: wrong-timeframe native frame {tf_name}')
                     frame_copy.attrs.update({'symbol': selected_symbol, 'timeframe': tf_name})
+                    if candle_snapshot is not None:
+                        frame_copy.attrs['analysis_identity'] = candle_snapshot.identity
                     mtf_data[tf_name] = frame_copy
                 data = mtf_data['1m'].copy(deep=True)
                 self._api_mtf_cache = mtf_data
@@ -6066,6 +6091,24 @@ class JarvisElite:
                 mtf_data = self._fetch_mtf_from_api(getattr(self, 'active_symbol', None))
                 if set(mtf_data) != set(LIVE_TIMEFRAMES):
                     return self._get_no_trade_signal('WAIT/NO-DATA: incomplete native timeframe snapshot')
+                # Fail closed before any Part runs. The direct cache is expected
+                # to return exactly the policy-mandated 500 closed rows per TF;
+                # do not let legacy/test fetch routes bypass that contract.
+                required_ohlcv = {'open', 'high', 'low', 'close', 'volume'}
+                for tf_name in LIVE_TIMEFRAMES:
+                    frame = mtf_data[tf_name]
+                    if (not isinstance(frame, pd.DataFrame) or len(frame) != 500
+                            or not isinstance(frame.index, pd.DatetimeIndex)
+                            or not frame.index.is_monotonic_increasing or frame.index.has_duplicates
+                            or not required_ohlcv.issubset(frame.columns)
+                            or frame[list(required_ohlcv)].isna().any().any()):
+                        return self._get_no_trade_signal(f'WAIT/NO-DATA: invalid native timeframe {tf_name}')
+                    frame = frame.copy(deep=True)
+                    frame.attrs = dict(getattr(mtf_data[tf_name], 'attrs', {}) or {})
+                    frame.attrs.update({'symbol': str(getattr(self, 'active_symbol', '') or '').upper(), 'timeframe': tf_name})
+                    if self._active_candle_snapshot is not None:
+                        frame.attrs['analysis_identity'] = self._active_candle_snapshot.identity
+                    mtf_data[tf_name] = frame
                 self._api_mtf_cache = mtf_data
                 self.market_context['mtf_datasets'] = mtf_data
                 if self._active_candle_snapshot is not None:
