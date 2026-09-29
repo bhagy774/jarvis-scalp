@@ -38,6 +38,7 @@ state: Dict[str, Any] = {
     "chat_history": [],
     "system_online": True,
     "coordinator_telemetry": {},
+    "dashboard": {},
 }
 
 MAX_TEXT = 500
@@ -97,10 +98,12 @@ def apply_coordinator_telemetry(payload: Any) -> Dict[str, Any]:
     if len(encoded.encode("utf-8")) > MAX_TELEMETRY_BYTES:
         raise ValueError("telemetry is too large")
 
-    allowed = ("market_data", "thoughts", "matrix", "regime", "signal", "ai_consensus")
+    allowed = ("market_data", "thoughts", "matrix", "regime", "signal", "ai_consensus", "dashboard")
     telemetry = {key: _json_safe(payload[key]) for key in allowed if key in payload}
     telemetry["received_at"] = datetime.now().isoformat()
     state["coordinator_telemetry"] = telemetry
+    if isinstance(telemetry.get("dashboard"), dict):
+        state["dashboard"] = telemetry["dashboard"]
     state["pipeline"]["coordinator_regime"] = _bounded_text(telemetry.get("regime", "NEUTRAL"), 80)
     state["pipeline"]["last_packet_ts"] = telemetry["received_at"]
 
