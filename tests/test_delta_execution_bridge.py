@@ -4,6 +4,7 @@ import pytest
 
 from jarvis_delta_execution import DeltaExecutionAdapter, build_delta_candidate
 from jarvis_multicoin_execution import CandidateRejected, PortfolioCoordinator
+from jarvis_strategy_approval import evaluate_central_strategy, make_entry_approval
 
 
 NOW = 1_800_000_000.0
@@ -28,13 +29,54 @@ ASSET_POLICY = {
 }
 
 
+def central_evidence():
+    return {
+        "part1_breakout": {"signal": 1, "thought": "bullish breakout"},
+        "part2_zone": {"signal": 1, "thought": "bullish demand zone"},
+        "part3_psychology": {"signal": 1, "thought": "bullish candle"},
+        "part4_volume": {"signal": 1, "thought": "volume confirmation"},
+        "part5_ml": {"signal": 1, "thought": "model confirms"},
+        "part6_trend": {"signal": 1, "thought": "trend bullish"},
+        "part7_volatility": {"signal": 1, "thought": "volatility expansion"},
+        "part8_structure": {"signal": 1, "thought": "structure bullish"},
+        "part9_orderflow": {"signal": 1, "thought": "orderflow bullish"},
+        "part10_candlestats": {"signal": 1, "thought": "candlestats bullish"},
+    }
+
+
+def valid_part7_gate(symbol):
+    return {
+        "symbol": symbol, "entry_blocked": False, "risk_veto": False,
+        "status": "ok", "data_status": "valid", "timeframe": "aggregate",
+        "blocked_timeframes": [], "veto_timeframes": [],
+        "timeframe_results": {
+            tf: {"symbol": symbol, "timeframe": tf, "status": "neutral",
+                 "data_status": "valid", "entry_blocked": False, "risk_veto": False}
+            for tf in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+        },
+    }
+
+
 def analysis(**changes):
+    snapshot_version = changes.get("snapshot_version", "snap-eth-1m-abc")
+    evidence = central_evidence()
+    gate = valid_part7_gate("ETHUSDT")
+    decision = evaluate_central_strategy(evidence, gate, confidence=90, expected_symbol="ETHUSDT")
+    approval = make_entry_approval(
+        decision, direction="BUY", symbol="ETHUSDT", exchange="delta", contract="ETHUSDT",
+        instrument_id="22", market_type="perpetual_futures", analysis_symbol="ETHUSDT",
+        analysis_exchange="binance", snapshot_version=snapshot_version,
+        analysis_timestamp=NOW - 3, confidence=90,
+    )
     result = {
         "status": "COMPLETE",
         "scope": "parts1-12-analysis-only",
         "analysis_only": True,
-        "decision_authority": "none",
+        "decision_authority": "jarvis_FIXED",
         "execution_eligible": False,
+        "central_strategy_decision": decision,
+        "central_strategy_evidence": evidence,
+        "central_strategy_approval": approval,
         "freshness_status": "FRESH",
         "coverage": [f"Part{i}" for i in range(1, 13)],
         "snapshot_version": "snap-eth-1m-abc",
@@ -49,9 +91,9 @@ def analysis(**changes):
         "analysis_completed_at": NOW - 2,
         "analysis_reference": {"source": "binance", "symbol": "ETHUSDT", "timeframe": "1m", "timestamp": NOW - 60, "price": 100.0},
         "once_per_symbol_parts": {"part11": {"signal": 1}, "part12": {"confidence": 90}},
-        "part7_gate": {"entry_blocked": False, "risk_veto": False},
+        "part7_gate": gate,
         "deterministic_decision": {
-            "origin": "jarvis_deterministic_parts11_12", "direction": "BUY", "confidence": 90,
+            "origin": "jarvis_FIXED_central_strategy", "direction": "BUY", "confidence": 90,
             "entry_price": 100.0, "stop_loss": 98.0, "take_profit": 105.0,
         },
     }
@@ -153,7 +195,11 @@ def test_valid_eth_bridge_sizes_from_delta_metadata_quote_and_risk_engine():
 
 def test_mapping_quote_product_freshness_and_missing_data_all_fail_closed():
     fake = FakeDelta()
+    zone_veto_evidence = central_evidence()
+    zone_veto_evidence["part2_zone"] = {"signal": -1, "thought": "resistance zone"}
     bad_results = [
+        analysis(central_strategy_evidence=zone_veto_evidence),
+        analysis(central_strategy_evidence=None),
         analysis(request_identity={"venue": "binance", "market_type": "spot", "instrument_id": "SOLUSDT", "symbol": "SOLUSDT"}),
         analysis(request_identity={"venue": "binance", "market_type": "spot", "instrument_id": "unrelated-id", "symbol": "ETHUSDT"}),
         analysis(execution_identity={"venue": "delta", "market_type": "perpetual_futures", "instrument_id": "33", "symbol": "SOLUSDT"}),
@@ -162,6 +208,7 @@ def test_mapping_quote_product_freshness_and_missing_data_all_fail_closed():
         analysis(deterministic_decision={"origin": "jarvis_deterministic_parts11_12", "direction": "NO_TRADE", "confidence": 90}),
         analysis(part7_gate={"entry_blocked": True, "risk_veto": True}),
         analysis(part7_gate={"entry_blocked": False}),
+        analysis(part7_gate={"symbol": "BTCUSDT", "entry_blocked": False, "risk_veto": False}),
         analysis(freshness_status=None),
         analysis(coverage=["Part1"]),
         analysis(parts_by_timeframe={"1m": {"part1": {}}}),

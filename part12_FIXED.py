@@ -502,11 +502,31 @@ Follow the tag with a 1-sentence risk justification.
     
     # ==================== INTELLIGENT ORDER EXECUTION ====================
     
-    async def execute_trade(self, signal_type: str, confidence: float, current_bid: float, current_ask: float) -> Dict:
-        """
-        Execute trade with GPU-accelerated risk management
-        """
+    async def execute_trade(self, signal_type: str, confidence: float, current_bid: float, current_ask: float, *,
+                            central_decision=None, central_approval=None, part_results=None,
+                            part7_gate=None, symbol=None, exchange=None, contract=None,
+                            instrument_id=None, market_type=None, snapshot_version=None) -> Dict:
+        """Execute only with current Jarvis central authority and scope."""
         try:
+            from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval
+            central_direction = {'CALL': 'BUY', 'BUY': 'BUY', 'PUT': 'SELL', 'SELL': 'SELL'}.get(str(signal_type).upper())
+            if not isinstance(central_decision, dict) or central_decision.get('approved') is not True:
+                return {'status': 'rejected', 'reason': 'Jarvis central strategy approval is required'}
+            if central_direction is None or str(central_decision.get('direction', '')).upper() != central_direction:
+                return {'status': 'rejected', 'reason': 'Jarvis central direction mismatch'}
+            recomputed = evaluate_central_strategy(
+                part_results, part7_gate, confidence=central_decision.get('confidence'),
+                expected_symbol=symbol,
+            )
+            if not recomputed.get('approved') or recomputed.get('direction') != central_direction:
+                return {'status': 'rejected', 'reason': 'Jarvis central evidence or Part7 gate rejected entry'}
+            valid, reason = validate_entry_approval(
+                central_approval, direction=central_direction, symbol=symbol, exchange=exchange,
+                contract=contract, instrument_id=instrument_id, market_type=market_type,
+                snapshot_version=snapshot_version, confidence=central_decision.get('confidence'),
+            )
+            if not valid:
+                return {'status': 'rejected', 'reason': reason}
             if confidence < self.risk_config['confidence_threshold']:
                 return {'status': 'rejected', 'reason': 'Low confidence'}
             
@@ -1196,7 +1216,37 @@ class AdvancedTradeExecutionSystem:
             
             signal_type = signal.get('signal')
             confidence = signal.get('confidence', 0.0)
-            
+            # Legacy Part12 is not a strategy authority. Require Jarvis evidence,
+            # Part7's explicit clear gate, and the complete instrument scope.
+            from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval
+            central_decision = signal.get('central_strategy_decision')
+            central_approval = signal.get('central_strategy_approval')
+            part_results = signal.get('part_results')
+            part7_gate = signal.get('part7_gate')
+            central_direction = {'CALL': 'BUY', 'BUY': 'BUY', 'PUT': 'SELL', 'SELL': 'SELL'}.get(str(signal_type).upper())
+            identity = market_data.get('execution_identity') or market_data.get('identity') or {}
+            scope = {
+                'symbol': market_data.get('symbol') or identity.get('symbol'),
+                'exchange': market_data.get('exchange') or identity.get('venue'),
+                'contract': market_data.get('contract') or identity.get('symbol'),
+                'instrument_id': market_data.get('instrument_id') or identity.get('instrument_id'),
+                'market_type': market_data.get('market_type') or identity.get('market_type'),
+                'snapshot_version': market_data.get('snapshot_version'),
+            }
+            if not isinstance(central_decision, dict) or central_decision.get('approved') is not True or central_direction is None or str(central_decision.get('direction', '')).upper() != central_direction:
+                return {'status': 'rejected', 'reason': 'Jarvis central strategy approval is required'}
+            recomputed = evaluate_central_strategy(
+                part_results, part7_gate, confidence=central_decision.get('confidence'),
+                expected_symbol=scope['symbol'],
+            )
+            if not recomputed.get('approved') or recomputed.get('direction') != central_direction:
+                return {'status': 'rejected', 'reason': 'Jarvis central evidence or Part7 gate rejected entry'}
+            valid, reason = validate_entry_approval(
+                central_approval, direction=central_direction, **scope,
+                confidence=central_decision.get('confidence'),
+            )
+            if not valid:
+                return {'status': 'rejected', 'reason': reason}
             if confidence < self.confidence_threshold:
                 return {'status': 'rejected', 'reason': f'Low confidence: {confidence:.2f}'}
             
@@ -1230,7 +1280,12 @@ class AdvancedTradeExecutionSystem:
                 signal_type,
                 confidence,
                 market_data['bid'],
-                market_data['ask']
+                market_data['ask'],
+                central_decision=central_decision,
+                central_approval=central_approval,
+                part_results=part_results,
+                part7_gate=part7_gate,
+                **scope,
             )
             
             # Log execution

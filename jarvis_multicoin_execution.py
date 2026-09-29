@@ -20,6 +20,8 @@ import threading
 import time
 from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Sequence, Tuple
 
+from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval
+
 
 class CandidateRejected(ValueError):
     pass
@@ -125,15 +127,16 @@ def candidate_from_analysis(
     if not isinstance(result, Mapping) or result.get("status") != "COMPLETE":
         raise CandidateRejected("only COMPLETE analysis can produce a candidate")
     if (result.get("scope") != "parts1-12-analysis-only" or result.get("analysis_only") is not True
-            or result.get("decision_authority") != "none" or result.get("execution_eligible") is not False):
-        raise CandidateRejected("unexpected analysis scope/authority")
+            or result.get("decision_authority") != "jarvis_FIXED" or result.get("execution_eligible") is not False):
+        raise CandidateRejected("analysis lacks Jarvis central strategy authority/scope marker")
     if result.get("freshness_status") not in (None, "FRESH"):
         raise CandidateRejected("analysis result is stale")
     analysis_identity = FullIdentity.parse(result.get("request_identity"))
     plan = result.get("execution_plan")
-    if not isinstance(plan, Mapping):
-        raise CandidateRejected("explicit execution plan missing; no inferred entry/size")
-    identity = FullIdentity.parse(plan.get("execution_identity") or result.get("execution_identity") or result.get("request_identity"))
+    identity = FullIdentity.parse(
+        (plan.get("execution_identity") if isinstance(plan, Mapping) else None)
+        or result.get("execution_identity") or result.get("request_identity")
+    )
     if identity.venue not in {"delta", "binance"} or analysis_identity.venue not in {"delta", "binance"}:
         raise CandidateRejected("unsupported analysis or execution venue")
     if analysis_identity != identity:
@@ -156,6 +159,55 @@ def candidate_from_analysis(
         raise CandidateRejected("analysis timestamps invalid")
     if current - fetched > max(1.0, float(max_age_seconds)):
         raise CandidateRejected("analysis result expired")
+    if fetched > completed or completed > current + 2:
+        raise CandidateRejected("analysis timestamps are invalid")
+    if current - fetched < -2:
+        raise CandidateRejected("analysis snapshot is from the future")
+    snapshot_version = str(result.get("snapshot_version") or "").strip()
+    central_decision = result.get("central_strategy_decision")
+    if not isinstance(central_decision, Mapping) or central_decision.get("approved") is not True:
+        raise CandidateRejected("Jarvis central strategy did not approve the entry")
+    gate = result.get("part7_gate")
+    if not isinstance(gate, Mapping) or gate.get("entry_blocked") is not False or gate.get("risk_veto") is not False:
+        raise CandidateRejected("Part7 new-entry gate is missing or blocks entry")
+    gate_symbol = str(gate.get("symbol") or "").upper().replace("/", "").replace("-", "").replace("_", "")
+    analysis_symbol = analysis_identity.symbol.upper().replace("/", "").replace("-", "").replace("_", "")
+    if not gate_symbol or gate_symbol != analysis_symbol:
+        raise CandidateRejected("Part7 gate symbol identity is missing or mismatched")
+    central_direction = str(central_decision.get("direction") or "").upper()
+    try:
+        central_confidence = int(round(float(central_decision.get("confidence"))))
+    except (TypeError, ValueError, OverflowError):
+        raise CandidateRejected("Jarvis central confidence is missing")
+    central_evidence = result.get("central_strategy_evidence")
+    recomputed = evaluate_central_strategy(
+        central_evidence, gate, confidence=central_confidence,
+        expected_symbol=analysis_identity.symbol,
+    )
+    if not recomputed.get("approved") or recomputed.get("direction") != central_direction:
+        raise CandidateRejected("central Part evidence or Part7 gate does not approve this direction")
+    approval = result.get("central_strategy_approval")
+    if not isinstance(approval, Mapping):
+        raise CandidateRejected("scope-bound Jarvis central strategy approval is missing")
+    if (str(approval.get("analysis_symbol") or "").upper() != analysis_identity.symbol
+            or str(approval.get("analysis_exchange") or "").lower() != analysis_identity.venue):
+        raise CandidateRejected("Jarvis approval analysis identity does not match the source instrument")
+    approval_ok, approval_reason = validate_entry_approval(
+        approval, direction=central_direction, symbol=identity.symbol, exchange=identity.venue,
+        contract=identity.symbol, instrument_id=identity.instrument_id,
+        market_type=identity.market_type, snapshot_version=snapshot_version,
+        confidence=central_confidence, now=current, max_age_seconds=max_age_seconds,
+    )
+    if not approval_ok:
+        raise CandidateRejected(approval_reason)
+    try:
+        approved_at = float(approval.get("analysis_timestamp"))
+    except (TypeError, ValueError, OverflowError):
+        raise CandidateRejected("Jarvis approval timestamp is malformed")
+    if approved_at < fetched or approved_at > completed + 2:
+        raise CandidateRejected("Jarvis approval timestamp is outside the analysis interval")
+    if not isinstance(plan, Mapping):
+        raise CandidateRejected("explicit execution plan missing; no inferred entry/size")
     tf = str(plan.get("timeframe") or "").strip()
     if tf not in {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"}:
         raise CandidateRejected("unsupported/missing decision timeframe")
@@ -176,6 +228,8 @@ def candidate_from_analysis(
         raise CandidateRejected("NO TRADE is not an executable candidate")
     if direction not in {"BUY", "SELL"}:
         raise CandidateRejected("direction must be BUY or SELL")
+    if direction != central_direction:
+        raise CandidateRejected("execution plan direction differs from Jarvis central approval")
     entry = _positive_number(plan.get("entry_price"), "entry_price")
     stop = _positive_number(plan.get("stop_loss"), "stop_loss")
     target = _positive_number(plan.get("take_profit"), "take_profit")

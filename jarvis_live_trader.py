@@ -41,6 +41,25 @@ if sys.platform == "win32":
 
 logger = logging.getLogger("JarvisAutoTrader")
 
+
+def _validate_central_entry(approval, part_results, part7_gate, direction, confidence, symbol, snapshot_version):
+    """Recompute Jarvis policy and validate provenance/scope before every entry route."""
+    try:
+        from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval
+        expected = "BUY" if str(direction).upper() in ("CALL", "BUY") else "SELL" if str(direction).upper() in ("PUT", "SELL") else "NO_TRADE"
+        decision = evaluate_central_strategy(
+            part_results, part7_gate, confidence=confidence, expected_symbol=symbol
+        )
+        if not decision.get("approved") or decision.get("direction") != expected:
+            return False, "Jarvis central strategy did not approve this direction"
+        return validate_entry_approval(
+            approval, direction=expected, symbol=symbol, exchange="delta",
+            contract=symbol, instrument_id=symbol, market_type="unverified",
+            snapshot_version=snapshot_version, confidence=confidence,
+        )
+    except Exception as exc:
+        return False, f"Jarvis central approval validation failed: {exc}"
+
 # ── ANSI colors (same as professional_display) ─────────────────────────────
 R  = '\033[91m'; G  = '\033[92m'; Y  = '\033[93m'
 C  = '\033[96m'; W  = '\033[97m'; DG = '\033[90m'
@@ -54,6 +73,7 @@ def _box(msg, col=C): print(f"{col}  ▶  {RST}{msg}")
 # ══════════════════════════════════════════════════════════════════
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP, contract_quote_value_usdt
 from jarvis_lot_limits import enforce_entry_lots
+from jarvis_decision import normalize_confidence
 try:
     from jarvis_position_ownership import claim_position, claim_close
 except ImportError:
@@ -167,7 +187,9 @@ class JarvisAutoTrader:
 
     def execute(self, direction: str, confidence: int,
                 current_price: float, part_results: Dict = None,
-                trade_type: str = "SCALP", symbol: str = "BTCUSDT") -> Dict:
+                trade_type: str = "SCALP", symbol: str = "BTCUSDT",
+                *, part7_gate: Dict = None, central_approval: Dict = None,
+                snapshot_version: str = None) -> Dict:
         """
         Main entry: receive signal → run all gates → place order.
         direction  : 'CALL' or 'PUT'
@@ -190,6 +212,12 @@ class JarvisAutoTrader:
         symbol = str(symbol or "").upper().replace("-", "").replace("_", "").strip()
         if not symbol or symbol in {"BTC", "USDT"}:
             return self._skip("Invalid execution symbol")
+        approval_ok, approval_reason = _validate_central_entry(
+            central_approval, part_results, part7_gate, direction, confidence,
+            symbol, snapshot_version,
+        )
+        if not approval_ok:
+            return self._skip(f"Central Jarvis entry approval: {approval_reason}")
 
         # Reset daily stats at midnight
         if date.today() != self.today_date:
@@ -220,7 +248,10 @@ class JarvisAutoTrader:
 
         # ─ Gate 3: Execute ───────────────────────────────────────
         return self._place_trade(
-            direction, confidence, current_price, trade_type, hedge_plan, symbol)
+            direction, confidence, current_price, trade_type, hedge_plan, symbol,
+            central_approval=central_approval, part_results=part_results,
+            part7_gate=part7_gate, snapshot_version=snapshot_version,
+        )
 
     def trigger_emergency_stop(self):
         """Close ALL positions immediately."""
@@ -338,11 +369,19 @@ class JarvisAutoTrader:
     # ──────────────────────────────────────────────────────────────
 
     def _place_trade(self, direction, confidence, price,
-                     trade_type, hedge_plan, symbol: str = "BTCUSDT") -> Dict:
-        """Execute both legs (futures + optional hedge)."""
+                     trade_type, hedge_plan, symbol: str = "BTCUSDT", *,
+                     central_approval=None, part_results=None, part7_gate=None,
+                     snapshot_version=None) -> Dict:
+        """Execute a new entry only with fresh Jarvis central approval."""
         symbol = str(symbol or "").upper().replace("-", "").replace("_", "").strip()
         if not symbol:
             return {"success": False, "reason": "Execution symbol is missing"}
+        approval_ok, approval_reason = _validate_central_entry(
+            central_approval, part_results, part7_gate, direction, confidence,
+            symbol, snapshot_version,
+        )
+        if not approval_ok:
+            return {"success": False, "reason": f"Central Jarvis entry approval: {approval_reason}"}
         # Defense in depth: even a direct legacy caller cannot inject a
         # model-selected option leg into execution. No hedge policy is validated.
         hedge_plan = {"do_hedge": False, "reason": "No validated deterministic hedge policy"}
@@ -442,6 +481,14 @@ class JarvisAutoTrader:
         logger.info("[EXECUTION] %s %s %s contracts at %sx AUTO; TP=%s SL=%s hold=%sm",
                     direction, symbol, contracts, leverage, tp_price, sl_price, hold_minutes)
 
+        # Recheck freshness immediately before the first venue mutation.
+        approval_ok, approval_reason = _validate_central_entry(
+            central_approval, part_results, part7_gate, direction, confidence,
+            symbol, snapshot_version,
+        )
+        if not approval_ok:
+            return {"success": False, "reason": f"Central Jarvis approval expired before execution: {approval_reason}"}
+
         # ─ LEG 0: Set leverage only for deliberately enabled live execution.
         # Paper execution must never alter an exchange account.
         if self.is_enabled:
@@ -454,6 +501,14 @@ class JarvisAutoTrader:
             logger.info('[EXECUTION] leverage %sx AUTO applied for %s', leverage, symbol)
         else:
             logger.info('[EXECUTION] paper mode: venue leverage unchanged')
+
+        # Final authorization freshness/scope check directly before entry order.
+        approval_ok, approval_reason = _validate_central_entry(
+            central_approval, part_results, part7_gate, direction, confidence,
+            symbol, snapshot_version,
+        )
+        if not approval_ok:
+            return {"success": False, "reason": f"Central Jarvis approval expired before order: {approval_reason}"}
 
         # ─ LEG 1: Futures scalp ──────────────────────────────────
         futures_result = {"success": False, "error": "not attempted"}
@@ -800,10 +855,27 @@ class JarvisAutoTrader:
                 logger.info("[REVERSAL] skipped: position is not in profit")
                 continue
 
-            # Execute reversal
-            self._execute_reversal(pos, new_dir, new_conf, position_price)
+            # A reversal exit may close the existing position independently, but
+            # the opposite-side entry receives only this fresh analysis approval.
+            central_approval = result.get("central_strategy_approval")
+            snapshot_version = (central_approval or {}).get("snapshot_version")
+            part_results = getattr(self._jarvis_ref, "latest_part_results", {})
+            part7_gate = getattr(self._jarvis_ref, "latest_part7", {})
+            approval_ok, approval_reason = _validate_central_entry(
+                central_approval, part_results, part7_gate, new_dir, new_conf,
+                selected_symbol, snapshot_version,
+            )
+            if not approval_ok:
+                logger.info("[REVERSAL] new entry blocked by central Jarvis: %s", approval_reason)
+            self._execute_reversal(
+                pos, new_dir, new_conf, position_price,
+                central_approval=central_approval, part_results=part_results,
+                part7_gate=part7_gate, snapshot_version=snapshot_version,
+            )
 
-    def _execute_reversal(self, pos: Dict, new_dir: str, confidence: int, price: float):
+    def _execute_reversal(self, pos: Dict, new_dir: str, confidence: int, price: float, *,
+                          central_approval=None, part_results=None, part7_gate=None,
+                          snapshot_version=None):
         """
         1. Close current position at market
         2. Open new position in opposite direction
@@ -866,7 +938,9 @@ class JarvisAutoTrader:
         trade_type = pos.get("trade_type", "SCALP")
         result = self._place_trade(
             new_dir, confidence, price, trade_type, hedge_plan,
-            symbol=pos.get("symbol", "")
+            symbol=pos.get("symbol", ""), central_approval=central_approval,
+            part_results=part_results, part7_gate=part7_gate,
+            snapshot_version=snapshot_version,
         )
 
         if result.get("success"):

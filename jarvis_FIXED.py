@@ -1,5 +1,6 @@
  # JARVIS_MAGIC_STRING_12345
 import math
+import hashlib
 # jarvis_trade_elite_integrated.py
 # JARVIS TRADE ELITE v7.0 - FULLY INTEGRATED WITH ALL 4 ENGINES
 # Complete system with AutoBacktest, AutoTraining, AutoOptimizer, LiveTrading
@@ -32,6 +33,7 @@ from professional_display import ProfessionalSignalDisplay
 from jarvis_dashboard import UnifiedDashboard
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
 from jarvis_decision import normalize_confidence, confidence_text, build_final_decision
+from jarvis_strategy_approval import evaluate_central_strategy, make_entry_approval
 from jarvis_runtime import detect_backend, torch_device
 # Legacy Ollama context removed; deterministic gates are authoritative.
 pro_display = ProfessionalSignalDisplay()
@@ -1571,8 +1573,29 @@ class LiveTradingEngine:
             logger.debug(f"[SCENARIO] gate error (fail-open → pass): {e}")
             return direction
 
-    def _open_paper_trade(self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl, current_price=None, symbol='BTCUSDT'):
-        """Open a new paper trade"""
+    def _open_paper_trade(self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl, current_price=None, symbol='BTCUSDT', *, central_approval=None, snapshot_version=None, part_results=None, part7_gate=None):
+        """Open a paper entry only with a fresh, scope-matched Jarvis approval."""
+        try:
+            from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval
+            expected = 'BUY' if str(direction).upper() in ('CALL', 'BUY') else 'SELL' if str(direction).upper() in ('PUT', 'SELL') else 'NO_TRADE'
+            central = evaluate_central_strategy(
+                part_results, part7_gate, confidence=confidence, expected_symbol=symbol
+            )
+            if (not central.get('approved') or central.get('direction') != expected):
+                self._dashboard_events.append('paper entry blocked: central Jarvis strategy rejected or direction mismatched')
+                return None
+            valid, reason = validate_entry_approval(
+                central_approval, direction=expected, symbol=symbol, exchange='delta',
+                contract=symbol, instrument_id=symbol, market_type='unverified',
+                snapshot_version=snapshot_version, confidence=confidence,
+            )
+            if not valid:
+                self._dashboard_events.append('paper entry blocked: ' + reason)
+                return None
+        except Exception as approval_error:
+            self._dashboard_events.append('paper entry blocked: central approval validation failed')
+            logger.warning('[PAPER] central approval validation failed: %s', approval_error)
+            return None
         if len(self.paper_open_trades) >= self.PAPER_CONFIG['max_open_trades']:
             return None
             
@@ -2241,6 +2264,14 @@ class LiveTradingEngine:
             if tuple(snapshot.identity) != key.as_tuple():
                 return {}
             native_frames = snapshot.analysis_frames()
+            version_frames = {tf: {
+                'source': snapshot.frames[tf].source,
+                'last_closed': str(snapshot.frames[tf].closed.index[-1]),
+                'forming_time': snapshot.frames[tf].current.get('time'),
+            } for tf in LIVE_TIMEFRAMES}
+            snapshot_version = hashlib.sha256(json.dumps(
+                {'identity': key.as_tuple(), 'frames': version_frames}, sort_keys=True
+            ).encode()).hexdigest()[:24]
             owner = JarvisElite(backtest_mode=True, analysis_only=True)
             owner.active_symbol = key.symbol
             owner.active_base_asset = key.symbol
@@ -2261,6 +2292,8 @@ class LiveTradingEngine:
             owner.analyze_trade_setup(
                 native_frames['1m'].copy(deep=True), candle_snapshot=snapshot,
                 native_mtf=native_frames,
+                analysis_execution_identity=key.mapped_execution_dict(),
+                analysis_snapshot_version=snapshot_version,
             )
             analysis = getattr(owner, 'latest_multicoin_analysis', None)
             if not isinstance(analysis, dict):
@@ -2280,6 +2313,12 @@ class LiveTradingEngine:
                 'parts_by_timeframe': analysis.get('parts_by_timeframe', {}),
                 'once_per_symbol_parts': analysis.get('once_per_symbol_parts', {}),
                 'part7_gate': analysis.get('part7_gate'),
+                'central_strategy_decision': analysis.get('central_strategy_decision'),
+                'central_strategy_evidence': analysis.get('central_strategy_evidence'),
+                'central_strategy_approval': analysis.get('central_strategy_approval'),
+                'snapshot_version': analysis.get('snapshot_version', snapshot_version),
+                'analysis_timestamp': analysis.get('analysis_timestamp'),
+                'execution_identity': key.mapped_execution_dict(),
                 'deterministic_decision': analysis.get('deterministic_decision'),
                 'analysis_reference': analysis_reference,
                 # Candidate creation is downstream of a fresh Delta quote,
@@ -2720,6 +2759,9 @@ class LiveTradingEngine:
                                     current_price=current_price or 0,
                                     symbol=symbol,
                                     part_results=getattr(self.jarvis, 'latest_part_results', {}),
+                                    part7_gate=getattr(self.jarvis, 'latest_part7', {}),
+                                    central_approval=result.get('central_strategy_approval'),
+                                    snapshot_version=(result.get('central_strategy_approval') or {}).get('snapshot_version'),
                                     trade_type=trade_type,
                                 )
                                 self._print_decision_audit(
@@ -2770,7 +2812,11 @@ class LiveTradingEngine:
                                 trade = self._open_paper_trade(
                                     direction, entry_price or current_price,
                                     confidence, expiry, tp1, tp2, sl, current_price=current_price,
-                                    symbol=symbol
+                                    symbol=symbol,
+                                    central_approval=result.get('central_strategy_approval'),
+                                    snapshot_version=(result.get('central_strategy_approval') or {}).get('snapshot_version'),
+                                    part_results=getattr(self.jarvis, 'latest_part_results', {}),
+                                    part7_gate=getattr(self.jarvis, 'latest_part7', {}),
                                 )
                                 if trade:
                                     self._dashboard_events.append(
@@ -5727,8 +5773,14 @@ class JarvisElite:
             logger.warning('[MTF-API] Direct native fetch rejected: %s', error)
             return {}
 
-    def analyze_trade_setup(self, data, mtf_context=None, candle_snapshot=None, native_mtf=None):
-        """Analyze verified closed native candles; current candle stays metadata-only."""
+    def analyze_trade_setup(self, data, mtf_context=None, candle_snapshot=None, native_mtf=None,
+                            analysis_execution_identity=None, analysis_snapshot_version=None):
+        """Analyze verified closed native candles; current candle stays metadata-only.
+
+        Parts 1-12 are evidence only. Jarvis centrally evaluates the findings
+        and emits a scoped strategy approval; broker risk/reconciliation remains
+        a separate mandatory downstream responsibility.
+        """
         if native_mtf is not None:
             self.latest_multicoin_analysis = None
         try:
@@ -5980,7 +6032,8 @@ class JarvisElite:
                 self.market_context['analysis_identity'] = (
                     candle_snapshot.identity if candle_snapshot is not None else None
                 )
-                self.market_context['snapshot_version'] = (
+                self.market_context['snapshot_version'] = str(
+                    analysis_snapshot_version or
                     f"{getattr(candle_snapshot, 'identity', None)}:{getattr(candle_snapshot, 'fetched_at', 0)}"
                 )
                 if candle_snapshot is not None:
@@ -6290,15 +6343,23 @@ class JarvisElite:
                     'snapshot_version': self.market_context.get('snapshot_version'),
                 }
             
-            math_signal = math_res.get('signal', 0)
+            math_signal = math_res.get('signal', 0)  # diagnostic Part11 opinion only
             math_confidence = math_conf_res.get('confidence', 10)
+            part7_gate = getattr(self, 'latest_part7', {}) or {}
+            central_evidence = evaluate_central_strategy(
+                part_results, part7_gate, expected_symbol=getattr(self, 'active_symbol', None)
+            )
+            self.latest_strategy_decision = dict(central_evidence)
+            # Part11's own signal (including its legacy veto return) is not a
+            # strategy authority. Jarvis recomputes the preserved weighted
+            # consensus/zone/anchor rules from Parts 1-10 centrally.
+            logic_signal = 1 if central_evidence.get('direction') == 'BUY' else -1 if central_evidence.get('direction') == 'SELL' else 0
+            confidence = math_confidence
             
             # --- HOLISTIC NEURAL GLOBAL SYNTHESIS (PHASE 15: THE COUNCIL) ---
-            # Judge is now ENABLED and validates high-confidence signals (score >= 10)
-            # System uses: Mathematical Analyst + Quantum V5 + DeepSeek Judge
+            # Model judges are advisory/retired; no unavailable neural result
+            # can grant or veto central strategy approval.
             neural_res = None
-            logic_signal = math_signal
-            confidence = math_confidence
             ai_thought = "Deterministic mathematical fusion (model judge retired)"
 
             # Map thoughts for final synthesis
@@ -6615,11 +6676,13 @@ class JarvisElite:
             # decision.  A disagreement is a hard block; never manufacture a
             # consensus merely because one model was selected as the winner.
             _decision_opinions = []
-            for _raw_opinion in (math_signal, logic_signal):
-                if _raw_opinion > 0:
-                    _decision_opinions.append('BUY')
-                elif _raw_opinion < 0:
-                    _decision_opinions.append('SELL')
+            # Only Jarvis' centrally recomputed strategy direction is an
+            # execution opinion. Part11's signal remains audit telemetry and
+            # cannot independently veto or reinstate the final direction.
+            if logic_signal > 0:
+                _decision_opinions.append('BUY')
+            elif logic_signal < 0:
+                _decision_opinions.append('SELL')
             if isinstance(neural_res, dict):
                 _neural_bias = str(neural_res.get('bias', '')).upper()
                 if _neural_bias in ('CALL', 'BUY', 'LONG'):
@@ -6645,6 +6708,127 @@ class JarvisElite:
                 final_decision['no_trade_reason'] = part7_gate.get(
                     'reason', 'Part7 entry gate blocked')
                 final_decision['part7_volatility'] = part7_gate
+
+            # Final entry authority is centralized here. Part11/Part12 remain
+            # evidence/confidence providers; neither can restore a directional
+            # signal or bypass a Part7/zone/dissent/score block.
+            try:
+                minimum_score = float(self.scoring_matrix.minimum_trade_score)
+            except (TypeError, ValueError, AttributeError):
+                minimum_score = float('inf')
+            central_decision = evaluate_central_strategy(
+                part_results, part7_gate, confidence=score,
+                minimum_confidence=minimum_score,
+                expected_symbol=getattr(self, 'active_symbol', None),
+            )
+            self.latest_strategy_decision = dict(central_decision)
+            final_decision['central_strategy_decision'] = dict(central_decision)
+            if not central_decision.get('approved'):
+                final_decision.setdefault('trade_signal', {}).update({
+                    'direction': 'NO_TRADE', 'confidence_score': '0/100',
+                })
+                reasons = central_decision.get('reasons') or ['Central strategy did not approve entry']
+                final_decision['no_trade_reason'] = '; '.join(str(x) for x in reasons)
+            else:
+                central_direction = {'BUY': 'CALL', 'SELL': 'PUT'}[central_decision['direction']]
+                final_decision.setdefault('trade_signal', {}).update({
+                    'direction': central_direction,
+                    'confidence_score': f"{int(round(float(score)))}/100",
+                })
+
+            analysis_timestamp = time.time()
+            analysis_version = str(self.market_context.get('snapshot_version') or analysis_snapshot_version or '')
+            source_identity = getattr(candle_snapshot, 'identity', None) if candle_snapshot is not None else None
+            source_symbol = str(getattr(candle_snapshot, 'symbol', None) or getattr(self, 'active_symbol', '') or '').upper()
+            source_exchange = 'delta'
+            source_market_type = 'unverified'
+            source_instrument_id = source_symbol
+            if isinstance(source_identity, Mapping):
+                source_exchange = str(source_identity.get('venue') or source_exchange).lower()
+                source_market_type = str(source_identity.get('market_type') or source_market_type).lower()
+                source_instrument_id = str(source_identity.get('instrument_id') or source_symbol)
+            elif isinstance(source_identity, (list, tuple)) and len(source_identity) >= 4:
+                source_exchange = str(source_identity[0] or source_exchange).lower()
+                source_market_type = str(source_identity[1] or source_market_type).lower()
+                source_instrument_id = str(source_identity[2] or source_symbol)
+                source_symbol = str(source_identity[3] or source_symbol).upper()
+            execution_identity = analysis_execution_identity if isinstance(analysis_execution_identity, Mapping) else {}
+            execution_exchange = str(execution_identity.get('venue') or source_exchange).lower()
+            execution_market_type = str(execution_identity.get('market_type') or source_market_type).lower()
+            execution_contract = str(execution_identity.get('symbol') or getattr(self, 'active_symbol', None) or source_symbol).upper()
+            execution_instrument_id = str(execution_identity.get('instrument_id') or execution_contract)
+            scope_symbol = execution_contract
+            self.latest_strategy_scope = {
+                'symbol': scope_symbol, 'exchange': execution_exchange,
+                'contract': execution_contract, 'instrument_id': execution_instrument_id,
+                'market_type': execution_market_type, 'snapshot_version': analysis_version,
+                'analysis_timestamp': analysis_timestamp,
+                'analysis_symbol': source_symbol, 'analysis_exchange': source_exchange,
+            }
+            strategy_approval = None
+            if (central_decision.get('approved') and analysis_version
+                    and scope_symbol and (not self.is_backtest_mode or self.analysis_only)):
+                try:
+                    scoped_decision = {**central_decision, 'symbol': scope_symbol}
+                    strategy_approval = make_entry_approval(
+                        scoped_decision, direction=central_decision['direction'],
+                        symbol=scope_symbol, exchange=execution_exchange,
+                        contract=execution_contract, instrument_id=execution_instrument_id,
+                        market_type=execution_market_type, analysis_symbol=source_symbol,
+                        analysis_exchange=source_exchange, snapshot_version=analysis_version,
+                        analysis_timestamp=analysis_timestamp, confidence=int(round(float(score))),
+                    )
+                    final_decision['central_strategy_approval'] = strategy_approval
+                except (TypeError, ValueError) as approval_error:
+                    central_decision = {**central_decision, 'approved': False, 'status': 'BLOCKED',
+                                        'direction': 'NO_TRADE',
+                                        'reasons': list(central_decision.get('reasons', [])) + [str(approval_error)]}
+                    self.latest_strategy_decision = dict(central_decision)
+                    final_decision['central_strategy_decision'] = dict(central_decision)
+                    final_decision.setdefault('trade_signal', {}).update({'direction': 'NO_TRADE', 'confidence_score': '0/100'})
+                    final_decision['no_trade_reason'] = '; '.join(central_decision['reasons'])
+
+            # The multicoin analysis envelope carries the exact Jarvis decision
+            # and its scoped approval. It still has no execution plan or size;
+            # downstream bridge/risk/reconciliation checks remain mandatory.
+            if native_mtf is not None and isinstance(getattr(self, 'latest_multicoin_analysis', None), dict):
+                final_dir = str(final_decision.get('trade_signal', {}).get('direction') or 'NO_TRADE').upper()
+                mapped_dir = {'CALL': 'BUY', 'PUT': 'SELL'}.get(final_dir, 'NO_TRADE')
+                if not central_decision.get('approved') or mapped_dir != central_decision.get('direction'):
+                    mapped_dir = 'NO_TRADE'
+                try:
+                    final_confidence = int(round(float(score))) if mapped_dir != 'NO_TRADE' else 0
+                except (TypeError, ValueError, OverflowError):
+                    final_confidence = 0
+                signal_data = final_decision.get('trade_signal', {}) or {}
+                self.latest_multicoin_analysis.update({
+                    'central_strategy_decision': dict(central_decision),
+                    'central_strategy_evidence': {
+                        name: dict(value) for name, value in part_results.items()
+                        if name in {
+                            'part1_breakout', 'part2_zone', 'part3_psychology',
+                            'part4_volume', 'part5_ml', 'part6_trend',
+                            'part7_volatility', 'part8_structure',
+                            'part9_orderflow', 'part10_candlestats',
+                        } and isinstance(value, Mapping)
+                    },
+                    'central_strategy_approval': strategy_approval,
+                    'analysis_timestamp': analysis_timestamp,
+                    'snapshot_version': analysis_version,
+                    'execution_identity': dict(execution_identity) if execution_identity else None,
+                    'deterministic_decision': {
+                        'origin': 'jarvis_FIXED_central_strategy',
+                        'direction': mapped_dir,
+                        'confidence': final_confidence,
+                        'entry_price': signal_data.get('entry_price'),
+                        'take_profit': signal_data.get('take_profit_1'),
+                        'stop_loss': signal_data.get('stop_loss'),
+                        'part11_signal': (self.latest_multicoin_analysis.get('once_per_symbol_parts', {})
+                                          .get('part11', {}).get('signal')),
+                        'part12_confidence': (self.latest_multicoin_analysis.get('once_per_symbol_parts', {})
+                                              .get('part12', {}).get('confidence')),
+                    },
+                })
 
             # Return valid signal (passed or filtered)
             # --- AI AUTONOMY (JARVIS UNLEASHED) ---
