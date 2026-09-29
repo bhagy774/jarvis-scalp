@@ -4,7 +4,9 @@ import pytest
 
 from jarvis_delta_execution import DeltaExecutionAdapter, build_delta_candidate
 from jarvis_multicoin_execution import CandidateRejected, PortfolioCoordinator
-from jarvis_strategy_approval import evaluate_central_strategy, make_entry_approval
+from jarvis_strategy_approval import (
+    build_execution_plan, evaluate_central_strategy, make_entry_approval,
+)
 
 
 NOW = 1_800_000_000.0
@@ -342,3 +344,131 @@ def test_live_authorization_accepts_configured_numeric_true_flags(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setenv("JARVIS_KILL_SWITCH", "0")
     assert DeltaExecutionAdapter._live_flags_authorized() is True
+
+
+def test_protected_broker_authorization_binds_plan_and_broker_levels(monkeypatch):
+    import importlib
+    import sys
+    import time
+    import types
+
+    shim = types.ModuleType("options_chain")
+    shim.build_provider_chain = lambda *args, **kwargs: {}
+    shim.combine_provider_chains = lambda *args, **kwargs: {}
+    shim.payout_max_pain = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "options_chain", shim)
+    wrapper = importlib.import_module("delta_api_wrapper")
+
+    evidence = central_evidence()
+    gate = valid_part7_gate("ETHUSDT")
+    decision = evaluate_central_strategy(evidence, gate, confidence=90, expected_symbol="ETHUSDT")
+    plan = build_execution_plan(
+        direction="BUY", recommended_expiry="SCALP", entry_price=100,
+        stop_loss=99, take_profit=102, symbol="ETHUSDT",
+        snapshot_version="snap-protected", confidence=90,
+    )
+    approval = make_entry_approval(
+        decision, direction="BUY", symbol="ETHUSDT", exchange="delta",
+        contract="ETHUSDT", instrument_id="22", market_type="perpetual_futures",
+        analysis_symbol="ETHUSDT", analysis_exchange="delta",
+        snapshot_version="snap-protected", analysis_timestamp=time.time(),
+        confidence=90, execution_plan=plan,
+    )
+    auth = {
+        "central_approval": approval, "part_results": evidence, "part7_gate": gate,
+        "strategy_plan": plan, "snapshot_version": "snap-protected",
+        "analysis_symbol": "ETHUSDT", "confidence": 90,
+        "broker_plan": {"symbol": "ETHUSDT", "instrument_id": "22", "direction": "BUY",
+            "quantity": 1, "leverage": 2, "entry_price": 100,
+            "stop_loss": 99, "take_profit": 102, "risk_budget_usdt": 5},
+    }
+    args = {"symbol": "ETHUSDT", "side": "buy", "product_id": 22,
+            "size": 1, "stop_loss": 99, "take_profit": 102, "leverage": 2}
+    assert wrapper._validate_jarvis_broker_entry_authorization(auth, **args)[0]
+    mutated = {**auth, "broker_plan": {**auth["broker_plan"], "stop_loss": 98}}
+    rejected, reason = wrapper._validate_jarvis_broker_entry_authorization(
+        mutated, **(args | {"stop_loss": 98}),
+    )
+    assert not rejected and "plan" in reason.lower()
+    moved_entry = {**auth, "broker_plan": {**auth["broker_plan"], "entry_price": 100.01}}
+    rejected_entry, entry_reason = wrapper._validate_jarvis_broker_entry_authorization(
+        moved_entry, **args,
+    )
+    assert not rejected_entry and "plan" in entry_reason.lower()
+    assert wrapper._same_decimal_price("100.00", 100.0)
+    assert not wrapper._same_decimal_price("100.01", 100.0)
+
+    for name in ("JARVIS_MULTICOIN_DELTA_EXECUTION", "JARVIS_AUTO_TRADE", "JARVIS_LIVE_EXECUTION",
+                 "DELTA_USE_MAINNET", "DELTA_ORDER_EXECUTION_ENABLED"):
+        monkeypatch.setenv(name, "true")
+    monkeypatch.setenv("JARVIS_KILL_SWITCH", "0")
+    delta = object.__new__(wrapper.DeltaExchangeData)
+    delta._USE_MAINNET = True
+    delta.get_available_products_snapshot = lambda: {"complete": True, "products": [{
+        "id": 22, "symbol": "ETHUSDT", "state": "active", "product_type": "perpetual_futures",
+        "base_asset": "ETH", "quote_asset": "USDT", "settling_asset": "USDT",
+        "product_specs": {}, "tick_size": 0.01,
+    }]}
+    delta.get_delta_executable_quote = lambda **kwargs: {
+        "source": "delta", "symbol": "ETHUSDT", "product_id": "22", "bid": 100.0,
+        "ask": 100.01, "observed_at": time.time(),
+    }
+    delta._request = lambda *args, **kwargs: pytest.fail("quote mismatch must block before venue mutation")
+    mismatch = delta.place_protected_order(
+        product_id=22, symbol="ETHUSDT", side="buy", size=1, order_type="market",
+        stop_loss=99, take_profit=102, leverage=2, client_order_id="quote-mismatch-test",
+        entry_authorization=auth,
+    )
+    assert mismatch["status"] == "REJECTED"
+    assert "exact Jarvis plan entry" in mismatch["reason"]
+
+
+def test_protective_child_reconciliation_binds_prices_quantity_and_reduce_only(monkeypatch):
+    import importlib
+    import sys
+    import types
+
+    shim = types.ModuleType("options_chain")
+    shim.build_provider_chain = lambda *args, **kwargs: {}
+    shim.combine_provider_chains = lambda *args, **kwargs: {}
+    shim.payout_max_pain = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "options_chain", shim)
+    wrapper = importlib.import_module("delta_api_wrapper")
+    row = {"id": "stop-1", "product_id": 22, "state": "open", "reduce_only": True,
+           "side": "sell", "stop_order_type": "stop_loss_order", "size": 2,
+           "stop_price": "99", "limit_price": "98.9"}
+    expected = {"product_id": 22, "side": "sell", "kind": "stop_loss_order",
+                "quantity": 2, "trigger": 99, "limit": 98.9}
+    assert wrapper._valid_protective_child(row, **expected)
+    mutations = [
+        ("stop_price", "98.9"), ("limit_price", "99"), ("size", 1),
+        ("reduce_only", False), ("side", "buy"), ("state", "filled"),
+        ("product_id", 33),
+    ]
+    for field, value in mutations:
+        assert not wrapper._valid_protective_child(row | {field: value}, **expected)
+
+
+def test_raw_delta_entries_are_rejected_but_reduce_only_close_route_remains(monkeypatch):
+    import importlib
+    import sys
+    import types
+
+    shim = types.ModuleType("options_chain")
+    shim.build_provider_chain = lambda *args, **kwargs: {}
+    shim.combine_provider_chains = lambda *args, **kwargs: {}
+    shim.payout_max_pain = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "options_chain", shim)
+    wrapper = importlib.import_module("delta_api_wrapper")
+    delta = object.__new__(wrapper.DeltaExchangeData)
+    calls = []
+    delta.get_product_id = lambda symbol: 22
+    delta._request = lambda *args, **kwargs: (calls.append((args, kwargs)) or {
+        "success": True, "data": {"result": {"id": "close-1"}},
+    })
+    monkeypatch.setenv("DELTA_ORDER_EXECUTION_ENABLED", "true")
+    denied = delta.place_order("ETHUSDT", "buy", 1)
+    assert not denied["success"] and not calls
+    closed = delta.place_order("ETHUSDT", "sell", 1, reduce_only=True)
+    assert closed["success"] and len(calls) == 1
+    assert calls[0][0][2]["reduce_only"] is True

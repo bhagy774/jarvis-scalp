@@ -199,11 +199,18 @@ def _require_analysis(result: Mapping[str, Any], policy: Mapping[str, Any], now:
     if (str(approval.get("analysis_symbol") or "").upper() != source_identity.symbol
             or str(approval.get("analysis_exchange") or "").lower() != source_identity.venue):
         raise CandidateRejected("Jarvis approval analysis identity does not match the source instrument")
+    strategy_plan = (result.get("central_execution_plan") or result.get("jarvis_execution_plan")
+                     or (result.get("execution_plan") if isinstance(result.get("execution_plan"), Mapping)
+                         and result.get("execution_plan", {}).get("schema_version") == "jarvis-execution-plan-v1" else None))
+    bound_plan = bool(str(approval.get("execution_plan_id") or ""))
+    if bound_plan and not isinstance(strategy_plan, Mapping):
+        raise CandidateRejected("Jarvis-bound central execution plan is missing")
     approval_ok, approval_reason = validate_entry_approval(
         approval, direction=direction, symbol=execution_identity.symbol, exchange=execution_identity.venue,
         contract=execution_identity.symbol, instrument_id=execution_identity.instrument_id,
         market_type=execution_identity.market_type, snapshot_version=result.get("snapshot_version"),
-        confidence=confidence, now=now, max_age_seconds=max_age,
+        confidence=confidence, execution_plan=strategy_plan if bound_plan else None,
+        now=now, max_age_seconds=max_age,
     )
     if not approval_ok:
         raise CandidateRejected(approval_reason)
@@ -424,6 +431,8 @@ class DeltaExecutionAdapter:
                           "identity": candidate.get("identity"),
                           "direction": candidate.get("direction"),
                           "quantity": candidate.get("quantity"),
+                          "stop_loss": candidate.get("stop_loss"),
+                          "take_profit": candidate.get("take_profit"),
                           "protective_exits": row.get("protective_exits"),
                           "client_order_id": client_id,
                           "close_order_id": row.get("close_order_id"),
@@ -490,6 +499,7 @@ class DeltaExecutionAdapter:
                 side="buy" if candidate.direction == "BUY" else "sell", size=int(candidate.quantity),
                 order_type="market", stop_loss=candidate.stop_loss, take_profit=candidate.take_profit,
                 leverage=int(candidate.leverage), client_order_id=client_id,
+                entry_authorization=dict(candidate.entry_authorization or {}),
             )
         except Exception:
             return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "reason": "Delta submit response lost"}

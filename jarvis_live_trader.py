@@ -23,7 +23,10 @@ import sys
 import time
 import json
 import logging
+import math
 import threading
+import uuid
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, date
 from typing import Dict, Optional, List
 
@@ -42,20 +45,37 @@ if sys.platform == "win32":
 logger = logging.getLogger("JarvisAutoTrader")
 
 
-def _validate_central_entry(approval, part_results, part7_gate, direction, confidence, symbol, snapshot_version):
-    """Recompute Jarvis policy and validate provenance/scope before every entry route."""
+def _same_exact_price(left, right):
+    """Require exact plan-price equality until a slippage policy is configured."""
     try:
-        from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval
+        a, b = Decimal(str(left)), Decimal(str(right))
+        return a.is_finite() and b.is_finite() and a == b
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
+def _validate_central_entry(approval, part_results, part7_gate, direction, confidence, symbol, snapshot_version, execution_plan=None, trade_mode=None):
+    """Recompute Jarvis policy and validate its scoped plan before every entry route."""
+    try:
+        from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval, validate_execution_plan
         expected = "BUY" if str(direction).upper() in ("CALL", "BUY") else "SELL" if str(direction).upper() in ("PUT", "SELL") else "NO_TRADE"
         decision = evaluate_central_strategy(
             part_results, part7_gate, confidence=confidence, expected_symbol=symbol
         )
         if not decision.get("approved") or decision.get("direction") != expected:
             return False, "Jarvis central strategy did not approve this direction"
+        plan_ok, plan_reason = validate_execution_plan(
+            execution_plan, direction=expected, symbol=symbol,
+            snapshot_version=snapshot_version, confidence=confidence,
+            trade_mode=trade_mode,
+        )
+        if not plan_ok:
+            return False, plan_reason
         return validate_entry_approval(
             approval, direction=expected, symbol=symbol, exchange="delta",
             contract=symbol, instrument_id=symbol, market_type="unverified",
             snapshot_version=snapshot_version, confidence=confidence,
+            execution_plan=execution_plan,
         )
     except Exception as exc:
         return False, f"Jarvis central approval validation failed: {exc}"
@@ -75,12 +95,14 @@ from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP, contract_quote_v
 from jarvis_lot_limits import enforce_entry_lots
 from jarvis_decision import normalize_confidence
 try:
-    from jarvis_position_ownership import claim_position, claim_close
+    from jarvis_position_ownership import claim_position, claim_close, position_owner
 except ImportError:
     def claim_position(position_id, owner):
         return True  # fail-open fallback if module missing
     def claim_close(position_id, owner):
         return True, None  # fail-open fallback
+    def position_owner(position_id):
+        return None
 LEVERAGE_CAP        = MAX_LEVERAGE_CAP  # policy cap; not a user-selected leverage
 MAX_RISK_USDT       = float(os.environ.get("JARVIS_MAX_RISK_USDT", "10"))
 MAX_DAILY_LOSS_USDT = float(os.environ.get("JARVIS_MAX_DAILY_LOSS","30"))
@@ -151,6 +173,8 @@ class JarvisAutoTrader:
         self.hedge_advisor  = hedge_advisor
         self.is_enabled     = LIVE_EXECUTION_ENABLED
         self.emergency_stop = False
+        self._entry_reconciliation_required = False
+        self._pending_entry_reconciliation = None
 
         # ── State ────────────────────────────────────────────────
         self.open_positions: List[Dict] = []
@@ -189,7 +213,7 @@ class JarvisAutoTrader:
                 current_price: float, part_results: Dict = None,
                 trade_type: str = "SCALP", symbol: str = "BTCUSDT",
                 *, part7_gate: Dict = None, central_approval: Dict = None,
-                snapshot_version: str = None) -> Dict:
+                snapshot_version: str = None, execution_plan: Dict = None) -> Dict:
         """
         Main entry: receive signal → run all gates → place order.
         direction  : 'CALL' or 'PUT'
@@ -197,6 +221,8 @@ class JarvisAutoTrader:
         """
         if self.emergency_stop:
             return self._skip("🛑 EMERGENCY STOP ACTIVE")
+        if getattr(self, "_entry_reconciliation_required", False):
+            return self._skip("Unresolved Delta entry submission; authoritative reconciliation required")
         if not isinstance(direction, str) or direction.upper() not in ("CALL", "PUT", "BUY", "SELL"):
             return self._skip("Invalid trade direction")
         direction = direction.upper()
@@ -214,7 +240,7 @@ class JarvisAutoTrader:
             return self._skip("Invalid execution symbol")
         approval_ok, approval_reason = _validate_central_entry(
             central_approval, part_results, part7_gate, direction, confidence,
-            symbol, snapshot_version,
+            symbol, snapshot_version, execution_plan=execution_plan, trade_mode=trade_type,
         )
         if not approval_ok:
             return self._skip(f"Central Jarvis entry approval: {approval_reason}")
@@ -251,6 +277,7 @@ class JarvisAutoTrader:
             direction, confidence, current_price, trade_type, hedge_plan, symbol,
             central_approval=central_approval, part_results=part_results,
             part7_gate=part7_gate, snapshot_version=snapshot_version,
+            execution_plan=execution_plan,
         )
 
     def trigger_emergency_stop(self):
@@ -295,9 +322,161 @@ class JarvisAutoTrader:
             print(f"  ⚠️  Cancel orders failed: {e}")
 
     def resume(self):
-        """Resume after emergency stop."""
+        """Resume only after emergency stop; unresolved entries need reconciliation."""
+        if getattr(self, "_entry_reconciliation_required", False):
+            logger.error("[EXECUTION] Resume blocked: reconcile unresolved Delta entry first")
+            return False
         self.emergency_stop = False
         print(_p("▶  Auto-trader RESUMED", BD+G))
+        return True
+
+    def _remember_entry_reconciliation(self, *, product, symbol, direction, confidence,
+                                       quantity, leverage, balance, execution_plan,
+                                       client_order_id, response=None, adoption_allowed=True):
+        """Latch uncertain live submissions until a complete Delta snapshot resolves them."""
+        response = response if isinstance(response, dict) else {}
+        product_id = str((product or {}).get("id", (product or {}).get("product_id") or ""))
+        candidate_id = "auto:" + str(client_order_id)
+        protective = response.get("protective_exits") if isinstance(response.get("protective_exits"), dict) else {}
+        owned = {
+            "identity": {"venue": "delta", "market_type": "perpetual_futures",
+                         "instrument_id": product_id, "symbol": symbol},
+            "direction": "BUY" if direction in ("CALL", "BUY") else "SELL",
+            "quantity": quantity,
+            "order_id": response.get("order_id"),
+            "client_order_id": str(client_order_id),
+            "close_order_id": response.get("close_order_id"),
+            "close_client_order_id": response.get("close_client_order_id"),
+            "protective_exits": dict(protective),
+            "stop_loss": execution_plan.get("stop_loss") if isinstance(execution_plan, dict) else None,
+            "take_profit": execution_plan.get("take_profit") if isinstance(execution_plan, dict) else None,
+        }
+        self._pending_entry_reconciliation = {
+            "candidate_id": candidate_id, "owned": owned,
+            "product": dict(product or {}), "symbol": symbol,
+            "direction": "BUY" if direction in ("CALL", "BUY") else "SELL",
+            "quantity": int(quantity), "leverage": int(leverage),
+            "balance": float(balance), "execution_plan": dict(execution_plan or {}),
+            "confidence": int(confidence),
+            "trade_mode": str((execution_plan or {}).get("trade_mode") or "SCALP"),
+            "adoption_allowed": bool(adoption_allowed),
+        }
+        self._entry_reconciliation_required = True
+        self.emergency_stop = True
+
+    def reconcile_pending_entry(self):
+        """Resolve a latched entry only from a fresh complete authoritative Delta snapshot.
+
+        A confirmed protected open position is adopted into this trader's lifecycle;
+        a terminal rejected/closed order with no position clears the entry latch.
+        Anything incomplete, stale, mismatched, unprotected or ambiguous remains halted.
+        This function never submits or retries an order.
+        """
+        pending = getattr(self, "_pending_entry_reconciliation", None)
+        if not getattr(self, "_entry_reconciliation_required", False) or not isinstance(pending, dict):
+            return False
+        getter = getattr(self.delta, "get_complete_account_snapshot", None)
+        if not callable(getter):
+            return False
+        try:
+            snapshot = getter(owned_orders={pending["candidate_id"]: pending["owned"]})
+        except Exception as exc:
+            logger.warning("[RECONCILIATION] Delta account snapshot failed: %s", type(exc).__name__)
+            return False
+        if not isinstance(snapshot, dict) or snapshot.get("complete") is not True:
+            return False
+        try:
+            as_of = float(snapshot.get("as_of"))
+            max_age = max(1.0, min(120.0, float(os.environ.get("JARVIS_ENTRY_RECONCILE_MAX_AGE_SEC", "30"))))
+            if not math.isfinite(as_of) or as_of > time.time() + 2 or time.time() - as_of > max_age:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if snapshot.get("external_orders"):
+            return False
+        orders = snapshot.get("orders")
+        positions = snapshot.get("positions")
+        if not isinstance(orders, dict) or not isinstance(positions, list):
+            return False
+        detail = orders.get(pending["candidate_id"])
+        if not isinstance(detail, dict) or detail.get("authoritative") is not True:
+            return False
+        related = []
+        product_id = str(pending["owned"]["identity"]["instrument_id"])
+        for row in positions:
+            if not isinstance(row, dict):
+                return False
+            if (str(row.get("venue") or "").lower() == "delta"
+                    and str(row.get("instrument_id") or "") == product_id):
+                related.append(row)
+        if len(related) > 1:
+            return False
+        status = str(detail.get("status") or "").upper()
+        if status in {"REJECTED", "CLOSED"}:
+            if related:
+                return False
+            self._entry_reconciliation_required = False
+            self._pending_entry_reconciliation = None
+            return True
+        if (not pending.get("adoption_allowed") or status not in {"FILLED", "PARTIAL"}
+                or detail.get("protection_state") != "ACTIVE"
+                or not related):
+            return False
+        try:
+            filled = int(detail["filled_quantity"])
+            average = float(detail["average_fill_price"])
+            actual_signed = float(related[0]["size"])
+            plan = pending["execution_plan"]
+            stop, target = float(plan["stop_loss"]), float(plan["take_profit"])
+            planned_entry = float(plan["entry_price"])
+            contracts_value = contract_quote_value_usdt(pending["product"], average)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        expected_sign = 1 if pending["direction"] == "BUY" else -1
+        if (filled <= 0 or actual_signed != expected_sign * filled
+                or not _same_exact_price(average, planned_entry)
+                or not all(math.isfinite(v) and v > 0 for v in (average, stop, target))
+                or (pending["direction"] == "BUY" and not stop < average < target)
+                or (pending["direction"] == "SELL" and not target < average < stop)
+                or contracts_value is None or not math.isfinite(float(contracts_value))
+                or float(contracts_value) <= 0):
+            return False
+        notional = filled * float(contracts_value)
+        actual_risk = notional * abs(average - stop) / average
+        if not math.isfinite(actual_risk) or actual_risk > MAX_RISK_USDT + 1e-8:
+            return False
+        protective = detail.get("protective_exits")
+        if (not isinstance(protective, dict) or not protective.get("stop_loss_order_id")
+                or not protective.get("take_profit_order_id")):
+            return False
+        position_id = str(pending["owned"].get("order_id") or pending["owned"].get("client_order_id"))
+        if any(str(row.get("id")) == position_id for row in self.open_positions):
+            self._entry_reconciliation_required = False
+            self._pending_entry_reconciliation = None
+            return True
+        if not claim_position(position_id, self._ownership_token):
+            return False
+        minutes = 5 if pending["trade_mode"] == "SCALP" else 60
+        pos = {
+            "id": position_id, "direction": pending["direction"],
+            "entry_price": average, "tp_price": target, "sl_price": stop,
+            "contracts": filled, "contract_value_usdt": float(contracts_value),
+            "notional_usdt": notional,
+            "margin_usdt": min(pending["balance"], notional / max(1, pending["leverage"])),
+            "trade_risk_usdt": actual_risk, "symbol": pending["symbol"],
+            "trade_type": pending["trade_mode"], "confidence": pending["confidence"],
+            "leverage": pending["leverage"], "open_time": datetime.now().isoformat(),
+            "expiry_time": (datetime.now() + timedelta(minutes=minutes)).isoformat(),
+            "hedge_id": None, "paper": False, "status": "OPEN",
+            "_last_reversal_check": datetime.now(),
+            "protective_exits": dict(protective),
+        }
+        self.open_positions.append(pos)
+        self.last_trade_time = datetime.now()
+        self.daily_trades += 1
+        self._entry_reconciliation_required = False
+        self._pending_entry_reconciliation = None
+        return True
 
     def status_line(self) -> str:
         """One-line status for terminal display."""
@@ -371,14 +550,14 @@ class JarvisAutoTrader:
     def _place_trade(self, direction, confidence, price,
                      trade_type, hedge_plan, symbol: str = "BTCUSDT", *,
                      central_approval=None, part_results=None, part7_gate=None,
-                     snapshot_version=None) -> Dict:
+                     snapshot_version=None, execution_plan=None) -> Dict:
         """Execute a new entry only with fresh Jarvis central approval."""
         symbol = str(symbol or "").upper().replace("-", "").replace("_", "").strip()
         if not symbol:
             return {"success": False, "reason": "Execution symbol is missing"}
         approval_ok, approval_reason = _validate_central_entry(
             central_approval, part_results, part7_gate, direction, confidence,
-            symbol, snapshot_version,
+            symbol, snapshot_version, execution_plan=execution_plan, trade_mode=trade_type,
         )
         if not approval_ok:
             return {"success": False, "reason": f"Central Jarvis entry approval: {approval_reason}"}
@@ -392,11 +571,17 @@ class JarvisAutoTrader:
         # The caller owns routing.  Do not read the scanner again here: a
         # second scan could turn an ETH analysis into a SOL order.
 
-        # ── Derive size and leverage from collateral + stop risk ───────
-        tp_pct    = SWING_TP_PCT if trade_type == "SWING" else SCALP_TP_PCT
-        sl_pct    = SWING_SL_PCT if trade_type == "SWING" else SCALP_SL_PCT
-        tp_price  = round(price * (1 + tp_pct) if is_call else price * (1 - tp_pct), 2)
-        sl_price  = round(price * (1 - sl_pct) if is_call else price * (1 + sl_pct), 2)
+        # Central Jarvis plan is the only source of entry mode and protective levels.
+        # Do not recompute or accept an Oracle/model override at the executor.
+        try:
+            price = float(execution_plan["entry_price"])
+            tp_price = float(execution_plan["take_profit"])
+            sl_price = float(execution_plan["stop_loss"])
+            trade_type = str(execution_plan["trade_mode"]).upper()
+            sl_pct = float(execution_plan["risk_fraction"])
+            tp_pct = abs(tp_price - price) / price
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return {"success": False, "reason": "Jarvis execution plan has no usable levels"}
         product = None
         product_max_leverage = None
         contract_value_usdt = None
@@ -465,70 +650,102 @@ class JarvisAutoTrader:
         if contracts <= 0:
             return {"success": False, "reason": "Entry lot policy blocked"}
 
-        # ── Dynamic Oracle TP/SL Enhancement ────────────────────
-        oracle_gate = self._oracle_gate or _get_oracle_gate()
-        oracle_plan = None
         hold_minutes = 5 if trade_type == "SCALP" else 60
-        if oracle_gate:
-            oracle_plan = oracle_gate.get_oracle_tp_sl(price, direction, symbol=symbol)
-            if oracle_plan and oracle_plan.get("use_oracle"):
-                tp_price = oracle_plan["tp_price"]
-                sl_price = oracle_plan["sl_price"]
-                hold_minutes = oracle_plan.get("hold_minutes", hold_minutes)
 
         # The caller's unified dashboard owns terminal presentation.  Keep
         # execution detail in logs so one cycle does not emit scattered blocks.
         logger.info("[EXECUTION] %s %s %s contracts at %sx AUTO; TP=%s SL=%s hold=%sm",
                     direction, symbol, contracts, leverage, tp_price, sl_price, hold_minutes)
 
-        # Recheck freshness immediately before the first venue mutation.
+        # Final freshness/scope/plan check directly before an entry route.
         approval_ok, approval_reason = _validate_central_entry(
             central_approval, part_results, part7_gate, direction, confidence,
-            symbol, snapshot_version,
-        )
-        if not approval_ok:
-            return {"success": False, "reason": f"Central Jarvis approval expired before execution: {approval_reason}"}
-
-        # ─ LEG 0: Set leverage only for deliberately enabled live execution.
-        # Paper execution must never alter an exchange account.
-        if self.is_enabled:
-            try:
-                lev_ok = bool(self.delta.set_leverage(symbol, leverage))
-            except Exception as e:
-                return {"success": False, "reason": "Leverage setup failed", "error": str(e)}
-            if not lev_ok:
-                return {"success": False, "reason": "Leverage setup failed"}
-            logger.info('[EXECUTION] leverage %sx AUTO applied for %s', leverage, symbol)
-        else:
-            logger.info('[EXECUTION] paper mode: venue leverage unchanged')
-
-        # Final authorization freshness/scope check directly before entry order.
-        approval_ok, approval_reason = _validate_central_entry(
-            central_approval, part_results, part7_gate, direction, confidence,
-            symbol, snapshot_version,
+            symbol, snapshot_version, execution_plan=execution_plan, trade_mode=trade_type,
         )
         if not approval_ok:
             return {"success": False, "reason": f"Central Jarvis approval expired before order: {approval_reason}"}
 
-        # ─ LEG 1: Futures scalp ──────────────────────────────────
         futures_result = {"success": False, "error": "not attempted"}
         if self.is_enabled:
+            submitter = getattr(self.delta, "place_protected_order", None)
+            if not callable(submitter):
+                return {"success": False, "reason": "Protected Delta entry API unavailable; raw entries are disabled"}
+            product_id = product.get("id", product.get("product_id"))
+            client_order_id = "jv" + uuid.uuid4().hex[:28]
             try:
-                futures_result = self.delta.place_order(
-                    symbol=symbol,
-                    side=futures_side,
-                    size=contracts,
-                    order_type="market"
+                authorization = {
+                    "central_approval": central_approval,
+                    "part_results": part_results,
+                    "part7_gate": part7_gate,
+                    "strategy_plan": execution_plan,
+                    "snapshot_version": snapshot_version,
+                    "analysis_symbol": (central_approval or {}).get("analysis_symbol", symbol),
+                    "confidence": confidence,
+                    "broker_plan": {
+                        "symbol": symbol, "instrument_id": str(product_id),
+                        "direction": "BUY" if is_call else "SELL",
+                        "quantity": contracts, "leverage": leverage,
+                        "entry_price": price, "stop_loss": sl_price, "take_profit": tp_price,
+                        "risk_budget_usdt": MAX_RISK_USDT,
+                    },
+                }
+                protected = submitter(
+                    product_id=int(product_id), symbol=symbol, side=futures_side,
+                    size=contracts, order_type="market", stop_loss=sl_price,
+                    take_profit=tp_price, leverage=leverage,
+                    client_order_id=client_order_id,
+                    entry_authorization=authorization,
                 )
-            except Exception as e:
-                futures_result = {"success": False, "error": str(e)}
-        else:
-            # Paper mode
+            except Exception as exc:
+                protected = {"status": "SUBMISSION_UNKNOWN", "authoritative": False,
+                             "reason": f"protected Delta submission raised {type(exc).__name__}"}
+            status = str((protected or {}).get("status") or "").upper()
+            if (not isinstance(protected, dict) or protected.get("authoritative") is not True
+                    or status not in {"FILLED", "PARTIAL"}
+                    or protected.get("protection_state") != "ACTIVE"):
+                if status != "REJECTED" or not isinstance(protected, dict) or protected.get("authoritative") is not True:
+                    self._remember_entry_reconciliation(
+                        product=product, symbol=symbol, direction=direction, confidence=confidence,
+                        quantity=contracts, leverage=leverage, balance=balance,
+                        execution_plan=execution_plan, client_order_id=client_order_id,
+                        response=protected,
+                    )
+                protected_reason = protected.get("reason") if isinstance(protected, dict) else None
+                return {"success": False, "reason": protected_reason or "Delta entry fill/protection was not authoritatively confirmed",
+                    "status": status or "UNKNOWN", "reconciliation_required": self._entry_reconciliation_required}
+            try:
+                filled_quantity = int(protected.get("filled_quantity"))
+                fill_price = float(protected.get("average_fill_price"))
+            except (TypeError, ValueError, OverflowError):
+                self._remember_entry_reconciliation(
+                    product=product, symbol=symbol, direction=direction, confidence=confidence,
+                    quantity=contracts, leverage=leverage, balance=balance,
+                    execution_plan=execution_plan, client_order_id=client_order_id,
+                    response=protected,
+                )
+                return {"success": False, "reason": "Protected Delta fill details are malformed",
+                        "reconciliation_required": True}
+            if filled_quantity <= 0 or not math.isfinite(fill_price) or fill_price <= 0:
+                self._remember_entry_reconciliation(
+                    product=product, symbol=symbol, direction=direction, confidence=confidence,
+                    quantity=contracts, leverage=leverage, balance=balance,
+                    execution_plan=execution_plan, client_order_id=client_order_id,
+                    response=protected,
+                )
+                return {"success": False, "reason": "Protected Delta fill details are incomplete",
+                        "reconciliation_required": True}
             futures_result = {
-                "success": True,
-                "paper": True,
+                "success": True, "order_id": protected.get("order_id"),
+                "details": protected, "filled_quantity": filled_quantity,
+                "average_fill_price": fill_price,
+            }
+        else:
+            # Paper mode has no venue side effects and uses the same central plan.
+            futures_result = {
+                "success": True, "paper": True,
                 "order_id": f"PAPER_{int(time.time())}",
-                "details": {"side": futures_side, "size": contracts}
+                "details": {"side": futures_side, "size": contracts},
+                "filled_quantity": contracts, "average_fill_price": price,
             }
 
         if futures_result.get("success"):
@@ -538,6 +755,77 @@ class JarvisAutoTrader:
             logger.error('[EXECUTION] futures order failed: %s', futures_result.get('error', 'unknown'))
             return {"success": False, "reason": "Futures order failed",
                     "error": futures_result.get("error")}
+
+        try:
+            contracts = int(futures_result.get("filled_quantity", contracts))
+            price = float(futures_result.get("average_fill_price", price))
+        except (TypeError, ValueError, OverflowError):
+            if self.is_enabled:
+                self._remember_entry_reconciliation(
+                    product=product, symbol=symbol, direction=direction, confidence=confidence,
+                    quantity=contracts, leverage=leverage, balance=balance,
+                    execution_plan=execution_plan, client_order_id=client_order_id,
+                    response=futures_result.get("details"),
+                )
+            return {"success": False, "reason": "Entry fill quantity/price is malformed",
+                    "reconciliation_required": self._entry_reconciliation_required}
+        if contracts <= 0 or not math.isfinite(price) or price <= 0:
+            if self.is_enabled:
+                self._remember_entry_reconciliation(
+                    product=product, symbol=symbol, direction=direction, confidence=confidence,
+                    quantity=contracts, leverage=leverage, balance=balance,
+                    execution_plan=execution_plan, client_order_id=client_order_id,
+                    response=futures_result.get("details"),
+                )
+            return {"success": False, "reason": "Entry fill quantity/price is invalid",
+                    "reconciliation_required": self._entry_reconciliation_required}
+        if self.is_enabled and not _same_exact_price(price, execution_plan.get("entry_price")):
+            self._remember_entry_reconciliation(
+                product=product, symbol=symbol, direction=direction, confidence=confidence,
+                quantity=contracts, leverage=leverage, balance=balance,
+                execution_plan=execution_plan, client_order_id=client_order_id,
+                response=futures_result.get("details"),
+            )
+            return {"success": False, "reason": "Delta fill price differs from exact Jarvis plan entry; reconciliation required",
+                    "reconciliation_required": True}
+        if ((is_call and not sl_price < price < tp_price)
+                or (not is_call and not tp_price < price < sl_price)):
+            if self.is_enabled:
+                self._remember_entry_reconciliation(
+                    product=product, symbol=symbol, direction=direction, confidence=confidence,
+                    quantity=contracts, leverage=leverage, balance=balance,
+                    execution_plan=execution_plan, client_order_id=client_order_id,
+                    response=futures_result.get("details"),
+                )
+            return {"success": False, "reason": "Entry fill is outside the Jarvis protective plan geometry",
+                    "reconciliation_required": self._entry_reconciliation_required}
+        actual_contract_value = contract_quote_value_usdt(product, price) if self.is_enabled else float(
+            size_info.get("contract_value_usdt", contract_value_usdt or 1.0))
+        if actual_contract_value is None or not math.isfinite(float(actual_contract_value)) or float(actual_contract_value) <= 0:
+            if self.is_enabled:
+                self._remember_entry_reconciliation(
+                    product=product, symbol=symbol, direction=direction, confidence=confidence,
+                    quantity=contracts, leverage=leverage, balance=balance,
+                    execution_plan=execution_plan, client_order_id=client_order_id,
+                    response=futures_result.get("details"),
+                )
+            return {"success": False, "reason": "Filled Delta contract value cannot be verified",
+                    "reconciliation_required": self._entry_reconciliation_required}
+        actual_contract_value = float(actual_contract_value)
+        actual_notional = contracts * actual_contract_value
+        actual_margin = min(balance, actual_notional / max(leverage, 1))
+        actual_risk = actual_notional * abs(price - sl_price) / price
+        if self.is_enabled and actual_risk > MAX_RISK_USDT + 1e-8:
+            self._remember_entry_reconciliation(
+                product=product, symbol=symbol, direction=direction, confidence=confidence,
+                quantity=contracts, leverage=leverage, balance=balance,
+                execution_plan=execution_plan, client_order_id=client_order_id,
+                response=futures_result.get("details"),
+            )
+            logger.critical("[EXECUTION] confirmed fill risk %.6f exceeds budget %.6f; entry halt enabled",
+                            actual_risk, MAX_RISK_USDT)
+            return {"success": False, "reason": "Confirmed fill exceeds Jarvis risk budget; reconciliation required",
+                    "reconciliation_required": True}
 
         # ─ LEG 2: Options hedge (if requested) ──────────────────
         hedge_result = None
@@ -582,10 +870,10 @@ class JarvisAutoTrader:
             "tp_price":    tp_price,
             "sl_price":    sl_price,
             "contracts":   contracts,
-            "contract_value_usdt": float(size_info.get("contract_value_usdt", contract_value_usdt or 1.0)),
-            "notional_usdt": float(size_info.get("notional_usdt", contracts * (contract_value_usdt or 1.0))),
-            "margin_usdt": margin,
-            "trade_risk_usdt": float(size_info.get("trade_risk_usdt", 0.0)),
+            "contract_value_usdt": actual_contract_value,
+            "notional_usdt": actual_notional,
+            "margin_usdt": actual_margin,
+            "trade_risk_usdt": actual_risk,
             "symbol":      symbol,
             "trade_type":  trade_type,
             "confidence":  confidence,
@@ -600,10 +888,16 @@ class JarvisAutoTrader:
         position_id = pos["id"]
         if not claim_position(position_id, self._ownership_token):
             # The venue order succeeded but its identifier is already owned by
-            # another lifecycle manager.  Do not publish a second local
-            # position or allow two monitors to close it independently.
+            # another lifecycle manager. Never adopt it or let two monitors close it.
             logger.error("[OWNERSHIP] Position %s already owned by %s; refusing duplicate registration", position_id, position_owner(position_id))
             pos["status"] = "OWNERSHIP_UNKNOWN"
+            if self.is_enabled:
+                self._remember_entry_reconciliation(
+                    product=product, symbol=symbol, direction=direction, confidence=confidence,
+                    quantity=contracts, leverage=leverage, balance=balance,
+                    execution_plan=execution_plan, client_order_id=client_order_id,
+                    response=futures_result.get("details"), adoption_allowed=False,
+                )
             return {"success": False, "reason": "Position ownership conflict; reconciliation required", "position": pos}
         self.open_positions.append(pos)
         self.last_trade_time = datetime.now()
@@ -615,7 +909,7 @@ class JarvisAutoTrader:
         # ─ Estimated P&L (dashboard presents these fields) ─────────────
         notional    = float(pos.get("notional_usdt", contracts * (contract_value_usdt or 1.0)))
         risk_usdt   = float(pos.get("trade_risk_usdt", notional * sl_pct))
-        reward_usdt = notional * tp_pct
+        reward_usdt = notional * abs(tp_price - price) / price
         logger.info('[EXECUTION] risk=$%.4f reward=$%.4f leverage=%sx position=%s',
                     risk_usdt, reward_usdt, leverage, pos['id'])
         return {"success": True, "position": pos, "hedge": hedge_result}
@@ -861,21 +1155,26 @@ class JarvisAutoTrader:
             snapshot_version = (central_approval or {}).get("snapshot_version")
             part_results = getattr(self._jarvis_ref, "latest_part_results", {})
             part7_gate = getattr(self._jarvis_ref, "latest_part7", {})
+            execution_plan = result.get("execution_plan")
+            trade_mode = str((execution_plan or {}).get("trade_mode") or "")
             approval_ok, approval_reason = _validate_central_entry(
                 central_approval, part_results, part7_gate, new_dir, new_conf,
-                selected_symbol, snapshot_version,
+                selected_symbol, snapshot_version, execution_plan=execution_plan,
+                trade_mode=trade_mode,
             )
             if not approval_ok:
                 logger.info("[REVERSAL] new entry blocked by central Jarvis: %s", approval_reason)
+                continue
             self._execute_reversal(
                 pos, new_dir, new_conf, position_price,
                 central_approval=central_approval, part_results=part_results,
                 part7_gate=part7_gate, snapshot_version=snapshot_version,
+                execution_plan=execution_plan,
             )
 
     def _execute_reversal(self, pos: Dict, new_dir: str, confidence: int, price: float, *,
                           central_approval=None, part_results=None, part7_gate=None,
-                          snapshot_version=None):
+                          snapshot_version=None, execution_plan=None):
         """
         1. Close current position at market
         2. Open new position in opposite direction
@@ -935,12 +1234,12 @@ class JarvisAutoTrader:
         time.sleep(1)
 
         hedge_plan = {"do_hedge": False, "reason": "Reversal trade — no hedge"}
-        trade_type = pos.get("trade_type", "SCALP")
+        trade_type = str((execution_plan or {}).get("trade_mode") or "")
         result = self._place_trade(
             new_dir, confidence, price, trade_type, hedge_plan,
             symbol=pos.get("symbol", ""), central_approval=central_approval,
             part_results=part_results, part7_gate=part7_gate,
-            snapshot_version=snapshot_version,
+            snapshot_version=snapshot_version, execution_plan=execution_plan,
         )
 
         if result.get("success"):
@@ -1009,7 +1308,7 @@ class JarvisAutoTrader:
                     size=pos["contracts"],
                     order_type="market",
                     reduce_only=True,
-                    idempotency_key=f"jarvis-close-{position_id}",
+                    client_order_id=("jvc" + uuid.uuid5(uuid.NAMESPACE_URL, str(position_id)).hex[:28]),
                 )
                 if not isinstance(result, dict) or not result.get("success"):
                     return {"success": False, "ambiguous": True,

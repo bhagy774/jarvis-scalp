@@ -33,7 +33,10 @@ from professional_display import ProfessionalSignalDisplay
 from jarvis_dashboard import UnifiedDashboard
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
 from jarvis_decision import normalize_confidence, confidence_text, build_final_decision
-from jarvis_strategy_approval import evaluate_central_strategy, make_entry_approval
+from jarvis_strategy_approval import (
+    evaluate_central_strategy, make_entry_approval, build_execution_plan,
+    select_trade_mode,
+)
 from jarvis_runtime import detect_backend, torch_device
 # Legacy Ollama context removed; deterministic gates are authoritative.
 pro_display = ProfessionalSignalDisplay()
@@ -1573,10 +1576,10 @@ class LiveTradingEngine:
             logger.debug(f"[SCENARIO] gate error (fail-open → pass): {e}")
             return direction
 
-    def _open_paper_trade(self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl, current_price=None, symbol='BTCUSDT', *, central_approval=None, snapshot_version=None, part_results=None, part7_gate=None):
-        """Open a paper entry only with a fresh, scope-matched Jarvis approval."""
+    def _open_paper_trade(self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl, current_price=None, symbol='BTCUSDT', *, central_approval=None, snapshot_version=None, part_results=None, part7_gate=None, execution_plan=None):
+        """Open a paper entry only with a fresh, plan-bound Jarvis approval."""
         try:
-            from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval
+            from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval, validate_execution_plan, select_trade_mode
             expected = 'BUY' if str(direction).upper() in ('CALL', 'BUY') else 'SELL' if str(direction).upper() in ('PUT', 'SELL') else 'NO_TRADE'
             central = evaluate_central_strategy(
                 part_results, part7_gate, confidence=confidence, expected_symbol=symbol
@@ -1584,14 +1587,29 @@ class LiveTradingEngine:
             if (not central.get('approved') or central.get('direction') != expected):
                 self._dashboard_events.append('paper entry blocked: central Jarvis strategy rejected or direction mismatched')
                 return None
+            mode = select_trade_mode(expiry_name)
+            plan_ok, plan_reason = validate_execution_plan(
+                execution_plan, direction=expected, symbol=symbol,
+                snapshot_version=snapshot_version, confidence=confidence,
+                trade_mode=mode,
+            )
+            if not plan_ok:
+                self._dashboard_events.append('paper entry blocked: ' + plan_reason)
+                return None
             valid, reason = validate_entry_approval(
                 central_approval, direction=expected, symbol=symbol, exchange='delta',
                 contract=symbol, instrument_id=symbol, market_type='unverified',
                 snapshot_version=snapshot_version, confidence=confidence,
+                execution_plan=execution_plan,
             )
             if not valid:
                 self._dashboard_events.append('paper entry blocked: ' + reason)
                 return None
+            direction = 'CALL' if execution_plan['direction'] == 'BUY' else 'PUT'
+            entry_price = float(execution_plan['entry_price'])
+            sl = float(execution_plan['stop_loss'])
+            tp1 = float(execution_plan['take_profit'])
+            tp2 = tp1  # paper lifecycle currently uses TP1 only; no second target is authorized
         except Exception as approval_error:
             self._dashboard_events.append('paper entry blocked: central approval validation failed')
             logger.warning('[PAPER] central approval validation failed: %s', approval_error)
@@ -2749,10 +2767,11 @@ class LiveTradingEngine:
                         # 6. AUTO-TRADE: Execute on Delta Exchange if enabled
                         if self.auto_trader and direction in ('CALL', 'PUT'):
                             try:
-                                trade_type = 'SCALP'  # default
-                                # Use SWING if expiry suggests longer hold
-                                if expiry and str(expiry).upper() in ('DAY_TRADE', 'SWING', '15M', '30M'):
-                                    trade_type = 'SWING'
+                                execution_plan = result.get('execution_plan')
+                                trade_type = str((execution_plan or {}).get('trade_mode') or '')
+                                if trade_type not in ('SCALP', 'SWING'):
+                                    self._dashboard_events.append('Auto-trade blocked: central execution plan unavailable')
+                                    raise ValueError('central execution plan unavailable')
                                 at_result = self.auto_trader.execute(
                                     direction=direction,
                                     confidence=confidence,
@@ -2763,6 +2782,7 @@ class LiveTradingEngine:
                                     central_approval=result.get('central_strategy_approval'),
                                     snapshot_version=(result.get('central_strategy_approval') or {}).get('snapshot_version'),
                                     trade_type=trade_type,
+                                    execution_plan=execution_plan,
                                 )
                                 self._print_decision_audit(
                                     _final_snapshot, symbol, stage="ORDER_SUBMISSION",
@@ -2771,10 +2791,10 @@ class LiveTradingEngine:
                                 if at_result.get('success'):
                                     pos = at_result.get('position', {})
                                     self._dashboard_account = {
-                                        'trade_risk': pos.get('contracts', 0) * (0.008 if trade_type == 'SWING' else 0.002),
-                                        'margin': pos.get('contracts', 0) / max(pos.get('leverage', 1), 1),
+                                        'trade_risk': pos.get('trade_risk_usdt', 0.0),
+                                        'margin': pos.get('margin_usdt', 0.0),
                                         'contracts': pos.get('contracts', 0),
-                                        'notional': pos.get('contracts', 0),
+                                        'notional': pos.get('notional_usdt', 0.0),
                                         'leverage': pos.get('leverage', 'AUTO'),
                                     }
                                     self._dashboard_events.append(f"Auto-trade placed #{pos.get('id','?')} ({direction})")
@@ -2785,30 +2805,10 @@ class LiveTradingEngine:
                         elif direction in ('CALL', 'PUT') and self.can_trade():
                             # PreSim was already applied in the authoritative gate above.
                             if direction in ('CALL', 'PUT') and confidence >= self.PAPER_CONFIG['min_confidence']:
-                                # Compute ATR for hedge advisor
-                                try:
-                                    atr = float((df['high'] - df['low']).rolling(14).mean().iloc[-1])
-                                except Exception:
-                                    atr = current_price * 0.005  # Fallback ATR (0.5%)
-
-                                if hasattr(self, 'hedged_engine') and self.hedged_engine:
-                                    # Use AI Options Hedged Scalp Engine
-                                    try:
-                                        options_chain = self.jarvis.delta_data.get_options_chain(base_asset) \
-                                            if hasattr(self.jarvis.delta_data, 'get_options_chain') else {}
-                                    except Exception:
-                                        options_chain = {}
-                                    hedged_result = self.hedged_engine.execute_hedged_scalp(
-                                        signal={'direction': direction, 'confidence': confidence},
-                                        current_price=current_price,
-                                        atr=atr,
-                                        options_chain=options_chain,
-                                        jarvis_result=result
-                                    )
-                                    self.last_hedged_result = hedged_result
-                                    self._dashboard_events.append(f"Hedge: {hedged_result.get('status')} / applied={hedged_result.get('hedge_applied')}")
-                                
-                                # Always open paper trade to track P&L
+                                # The legacy options-hedge engine is not a Jarvis
+                                # deterministic plan and may place separate orders.
+                                # Keep it disabled until a scoped hedge policy exists.
+                                # Always open a plan-bound paper trade to track P&L.
                                 trade = self._open_paper_trade(
                                     direction, entry_price or current_price,
                                     confidence, expiry, tp1, tp2, sl, current_price=current_price,
@@ -2817,6 +2817,7 @@ class LiveTradingEngine:
                                     snapshot_version=(result.get('central_strategy_approval') or {}).get('snapshot_version'),
                                     part_results=getattr(self.jarvis, 'latest_part_results', {}),
                                     part7_gate=getattr(self.jarvis, 'latest_part7', {}),
+                                    execution_plan=result.get('execution_plan'),
                                 )
                                 if trade:
                                     self._dashboard_events.append(
@@ -6723,6 +6724,36 @@ class JarvisElite:
             )
             self.latest_strategy_decision = dict(central_decision)
             final_decision['central_strategy_decision'] = dict(central_decision)
+            execution_plan = None
+            if central_decision.get('approved'):
+                trade_signal = final_decision.get('trade_signal') or {}
+                try:
+                    execution_plan = build_execution_plan(
+                        direction=central_decision.get('direction'),
+                        recommended_expiry=trade_signal.get('recommended_expiry'),
+                        entry_price=trade_signal.get('entry_price'),
+                        stop_loss=trade_signal.get('stop_loss'),
+                        take_profit=trade_signal.get('take_profit_1'),
+                        symbol=getattr(self, 'active_symbol', None),
+                        snapshot_version=str(self.market_context.get('snapshot_version') or analysis_snapshot_version or ''),
+                        confidence=int(round(float(score))),
+                    )
+                    trade_signal.update({
+                        'direction': {'BUY': 'CALL', 'SELL': 'PUT'}[execution_plan['direction']],
+                        'trade_mode': execution_plan['trade_mode'],
+                        'entry_price': execution_plan['entry_price'],
+                        'stop_loss': execution_plan['stop_loss'],
+                        'take_profit_1': execution_plan['take_profit'],
+                    })
+                    final_decision['execution_plan'] = dict(execution_plan)
+                except (TypeError, ValueError, KeyError) as plan_error:
+                    central_decision = {**central_decision, 'approved': False, 'status': 'BLOCKED',
+                                        'direction': 'NO_TRADE',
+                                        'reasons': list(central_decision.get('reasons', [])) + [str(plan_error)]}
+                    execution_plan = None
+                    final_decision['central_strategy_decision'] = dict(central_decision)
+                    final_decision['no_trade_reason'] = '; '.join(central_decision['reasons'])
+                    trade_signal.update({'direction': 'NO_TRADE', 'confidence_score': '0/100'})
             if not central_decision.get('approved'):
                 final_decision.setdefault('trade_signal', {}).update({
                     'direction': 'NO_TRADE', 'confidence_score': '0/100',
@@ -6766,8 +6797,9 @@ class JarvisElite:
                 'analysis_symbol': source_symbol, 'analysis_exchange': source_exchange,
             }
             strategy_approval = None
-            if (central_decision.get('approved') and analysis_version
-                    and scope_symbol and (not self.is_backtest_mode or self.analysis_only)):
+            if (central_decision.get('approved') and execution_plan is not None
+                    and analysis_version and scope_symbol
+                    and (not self.is_backtest_mode or self.analysis_only)):
                 try:
                     scoped_decision = {**central_decision, 'symbol': scope_symbol}
                     strategy_approval = make_entry_approval(
@@ -6777,6 +6809,7 @@ class JarvisElite:
                         market_type=execution_market_type, analysis_symbol=source_symbol,
                         analysis_exchange=source_exchange, snapshot_version=analysis_version,
                         analysis_timestamp=analysis_timestamp, confidence=int(round(float(score))),
+                        execution_plan=execution_plan,
                     )
                     final_decision['central_strategy_approval'] = strategy_approval
                 except (TypeError, ValueError) as approval_error:
@@ -6787,10 +6820,20 @@ class JarvisElite:
                     final_decision['central_strategy_decision'] = dict(central_decision)
                     final_decision.setdefault('trade_signal', {}).update({'direction': 'NO_TRADE', 'confidence_score': '0/100'})
                     final_decision['no_trade_reason'] = '; '.join(central_decision['reasons'])
+            if central_decision.get('approved') and strategy_approval is None and not self.is_backtest_mode:
+                central_decision = {**central_decision, 'approved': False, 'status': 'BLOCKED',
+                                    'direction': 'NO_TRADE',
+                                    'reasons': list(central_decision.get('reasons', [])) +
+                                               ['Fresh scoped execution approval could not be created']}
+                self.latest_strategy_decision = dict(central_decision)
+                final_decision['central_strategy_decision'] = dict(central_decision)
+                final_decision['no_trade_reason'] = '; '.join(central_decision['reasons'])
+                final_decision.setdefault('trade_signal', {}).update({'direction': 'NO_TRADE', 'confidence_score': '0/100'})
+                final_decision.pop('execution_plan', None)
 
-            # The multicoin analysis envelope carries the exact Jarvis decision
-            # and its scoped approval. It still has no execution plan or size;
-            # downstream bridge/risk/reconciliation checks remain mandatory.
+            # This selected-symbol envelope includes a Jarvis plan for that
+            # symbol only. The independent multicoin Part7 shadow route still
+            # lacks full Parts 1-12 evidence and a mapped execution plan/size.
             if native_mtf is not None and isinstance(getattr(self, 'latest_multicoin_analysis', None), dict):
                 final_dir = str(final_decision.get('trade_signal', {}).get('direction') or 'NO_TRADE').upper()
                 mapped_dir = {'CALL': 'BUY', 'PUT': 'SELL'}.get(final_dir, 'NO_TRADE')
@@ -6813,6 +6856,7 @@ class JarvisElite:
                         } and isinstance(value, Mapping)
                     },
                     'central_strategy_approval': strategy_approval,
+                    'central_execution_plan': dict(execution_plan) if execution_plan else None,
                     'analysis_timestamp': analysis_timestamp,
                     'snapshot_version': analysis_version,
                     'execution_identity': dict(execution_identity) if execution_identity else None,

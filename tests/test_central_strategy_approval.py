@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping
 import importlib
 import sys
+import time
 import types
 
 import pytest
@@ -13,7 +14,8 @@ import pandas as pd
 
 from part7_signal import analyze_timeframe
 from jarvis_strategy_approval import (
-    evaluate_central_strategy, make_entry_approval, validate_entry_approval,
+    build_execution_plan, evaluate_central_strategy, make_entry_approval,
+    validate_entry_approval, validate_execution_plan,
 )
 
 
@@ -172,6 +174,8 @@ def test_live_auto_trader_direct_entry_requires_approval_but_exit_is_ungated(mon
     trader.delta = types.SimpleNamespace(place_order=lambda **kwargs: (orders.append(kwargs) or {"success": True}))
     close = trader._close_position_market({"id": "p1", "symbol": "BTCUSDT", "direction": "CALL", "contracts": 1})
     assert close["success"] and orders[0]["reduce_only"] is True
+    assert orders[0]["client_order_id"].startswith("jvc")
+    assert "idempotency_key" not in orders[0]
 
 
 def test_paper_entry_helper_direct_bypass_attempt_is_rejected():
@@ -212,3 +216,238 @@ def test_legacy_part10_and_part12_direct_entry_apis_require_central_approval():
     result = asyncio.run(engine.execute_trade("CALL", 9.0, 100.0, 100.1))
     assert result["status"] == "rejected"
     assert "central" in result["reason"].lower()
+
+
+def test_execution_plan_is_deterministic_and_scope_bound_for_scalp_and_swing():
+    scalp = build_execution_plan(
+        direction="BUY", recommended_expiry="SCALP", entry_price=100,
+        stop_loss=99, take_profit=102, symbol="BTCUSDT",
+        snapshot_version="snap-plan-1", confidence=80,
+    )
+    swing = build_execution_plan(
+        direction="SELL", recommended_expiry="DAY_TRADE", entry_price=100,
+        stop_loss=101, take_profit=98, symbol="BTCUSDT",
+        snapshot_version="snap-plan-1", confidence=80,
+    )
+    assert scalp["trade_mode"] == "SCALP" and scalp["stop_loss"] == 99 and scalp["take_profit"] == 102
+    assert swing["trade_mode"] == "SWING" and swing["stop_loss"] == 100.8 and swing["take_profit"] == 98.0
+    assert validate_execution_plan(scalp, direction="BUY", symbol="BTCUSDT",
+                                   snapshot_version="snap-plan-1", confidence=80,
+                                   trade_mode="SCALP")[0]
+    for kwargs in (
+        {"symbol": "ETHUSDT"}, {"snapshot_version": "stale"},
+        {"direction": "SELL"}, {"confidence": 81}, {"trade_mode": "SWING"},
+    ):
+        params = dict(direction="BUY", symbol="BTCUSDT", snapshot_version="snap-plan-1",
+                      confidence=80, trade_mode="SCALP")
+        params.update(kwargs)
+        assert not validate_execution_plan(scalp, **params)[0]
+    assert not validate_execution_plan(None, direction="BUY", symbol="BTCUSDT",
+                                       snapshot_version="snap-plan-1")[0]
+
+
+def test_live_central_validation_requires_plan_bound_approval(monkeypatch):
+    module = _live_trader_module(monkeypatch)
+    symbol = "BTCUSDT"
+    evidence = bullish_parts(symbol)
+    gate = clear_gate(symbol)
+    decision = evaluate_central_strategy(evidence, gate, confidence=80, expected_symbol=symbol)
+    now = time.time()
+    plan = build_execution_plan(
+        direction="BUY", recommended_expiry="SCALP", entry_price=100,
+        stop_loss=99, take_profit=102, symbol=symbol,
+        snapshot_version="snap-live", confidence=80,
+    )
+    approval = make_entry_approval(
+        {**decision, "symbol": symbol}, direction="BUY", symbol=symbol,
+        exchange="delta", contract=symbol, instrument_id=symbol,
+        market_type="unverified", snapshot_version="snap-live",
+        analysis_timestamp=now, confidence=80, execution_plan=plan,
+    )
+    assert module._validate_central_entry(approval, evidence, gate, "CALL", 80,
+           symbol, "snap-live", execution_plan=plan, trade_mode="SCALP")[0]
+    assert not module._validate_central_entry(approval, evidence, gate, "CALL", 80,
+           symbol, "snap-live", execution_plan=None, trade_mode="SCALP")[0]
+    assert not module._validate_central_entry(approval, evidence, gate, "CALL", 80,
+           symbol, "snap-live", execution_plan=plan, trade_mode="SWING")[0]
+
+
+def test_paper_trade_uses_bound_plan_levels_and_never_an_injected_tp2():
+    source = Path(__file__).resolve().parents[1] / "jarvis_FIXED.py"
+    parsed = ast.parse(source.read_text())
+    owner = next(node for node in parsed.body if isinstance(node, ast.ClassDef) and node.name == "LiveTradingEngine")
+    method = next(node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == "_open_paper_trade")
+    harness = ast.ClassDef(name="PaperEntryHarness", bases=[], keywords=[], body=[method], decorator_list=[])
+    module_ast = ast.fix_missing_locations(ast.Module(body=[harness], type_ignores=[]))
+    namespace = {"datetime": datetime, "timedelta": timedelta}
+    exec(compile(module_ast, str(source), "exec"), namespace)
+    engine = namespace["PaperEntryHarness"]()
+    engine._dashboard_events = []
+    engine.paper_open_trades = []
+    engine.PAPER_CONFIG = {"max_open_trades": 2, "expiry_map": {"SCALP": 5}}
+    engine._paper_size = lambda confidence, entry, stop, direction: {
+        "ok": True, "contracts": 1, "margin_usdt": 2, "notional_usdt": 100,
+        "leverage": 2, "trade_risk_usdt": 1,
+    }
+    symbol = "BTCUSDT"
+    evidence = bullish_parts(symbol)
+    gate = clear_gate(symbol)
+    decision = evaluate_central_strategy(evidence, gate, confidence=80, expected_symbol=symbol)
+    plan = build_execution_plan(
+        direction="BUY", recommended_expiry="SCALP", entry_price=100,
+        stop_loss=99, take_profit=102, symbol=symbol,
+        snapshot_version="snap-paper", confidence=80,
+    )
+    approval = make_entry_approval(
+        {**decision, "symbol": symbol}, direction="BUY", symbol=symbol,
+        exchange="delta", contract=symbol, instrument_id=symbol,
+        market_type="unverified", snapshot_version="snap-paper",
+        analysis_timestamp=time.time(), confidence=80, execution_plan=plan,
+    )
+    trade = engine._open_paper_trade(
+        "CALL", 500.0, 80, "SCALP", 501.0, 900.0, 499.0,
+        current_price=100, symbol=symbol, central_approval=approval,
+        snapshot_version="snap-paper", part_results=evidence, part7_gate=gate,
+        execution_plan=plan,
+    )
+    assert trade is not None
+    assert trade["entry_price"] == 100
+    assert trade["sl"] == 99 and trade["tp1"] == 102 and trade["tp2"] == 102
+
+
+@pytest.mark.parametrize("fill_price", [100.0, 100.01])
+def test_live_auto_trader_uses_plan_levels_and_protected_delta_adapter(monkeypatch, fill_price):
+    module = _live_trader_module(monkeypatch)
+    symbol = "BTCUSDT"
+    evidence = bullish_parts(symbol)
+    gate = clear_gate(symbol)
+    decision = evaluate_central_strategy(evidence, gate, confidence=80, expected_symbol=symbol)
+    plan = build_execution_plan(
+        direction="BUY", recommended_expiry="SCALP", entry_price=100,
+        stop_loss=99, take_profit=102, symbol=symbol,
+        snapshot_version="snap-live-order", confidence=80,
+    )
+    approval = make_entry_approval(
+        {**decision, "symbol": symbol}, direction="BUY", symbol=symbol,
+        exchange="delta", contract=symbol, instrument_id=symbol,
+        market_type="unverified", snapshot_version="snap-live-order",
+        analysis_timestamp=time.time(), confidence=80, execution_plan=plan,
+    )
+    submitted = []
+    delta = types.SimpleNamespace(
+        get_product_metadata=lambda requested: {"id": 22, "symbol": requested, "max_leverage": 10},
+        get_wallet_balance=lambda: 100.0,
+        place_protected_order=lambda **kwargs: (submitted.append(kwargs) or {
+            "status": "FILLED", "authoritative": True, "order_id": "entry-1",
+            "filled_quantity": kwargs["size"], "average_fill_price": fill_price,
+            "protection_state": "ACTIVE",
+        }),
+        place_order=lambda **kwargs: pytest.fail("new entry used raw place_order"),
+    )
+    trader = object.__new__(module.JarvisAutoTrader)
+    trader.emergency_stop = False
+    trader._entry_reconciliation_required = False
+    trader.is_enabled = True
+    trader.delta = delta
+    trader._ownership_token = "test-owner"
+    trader.open_positions = []
+    trader.daily_trades = 0
+    trader.last_trade_time = None
+    trader._oracle_gate = None
+    monkeypatch.setattr(module, "contract_quote_value_usdt", lambda product, price: 100.0)
+    monkeypatch.setattr(module, "calculate_trade_size", lambda *args, **kwargs: {
+        "ok": True, "contracts": 1, "leverage": 2, "margin_usdt": 5.0,
+        "notional_usdt": 100.0, "contract_value_usdt": 100.0,
+        "risk_amount": 1.0,
+    })
+    monkeypatch.setattr(module, "enforce_entry_lots", lambda quantity, **kwargs: quantity)
+    monkeypatch.setattr(module, "_get_sizer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "claim_position", lambda *args, **kwargs: True)
+    result = trader._place_trade(
+        "CALL", 80, 100.0, "SCALP", {}, symbol=symbol,
+        central_approval=approval, part_results=evidence, part7_gate=gate,
+        snapshot_version="snap-live-order", execution_plan=plan,
+    )
+    assert submitted[0]["stop_loss"] == 99 and submitted[0]["take_profit"] == 102
+    assert submitted[0]["entry_authorization"]["strategy_plan"] == plan
+    assert submitted[0]["entry_authorization"]["broker_plan"]["entry_price"] == 100
+    if fill_price == 100.0:
+        assert result["success"]
+        assert trader.open_positions[0]["entry_price"] == 100.0
+    else:
+        assert not result["success"]
+        assert result["reconciliation_required"] is True
+        assert trader._pending_entry_reconciliation["execution_plan"] == plan
+        assert trader.open_positions == []
+
+
+def _pending_test_entry(trader, module, *, direction="BUY"):
+    symbol = "BTCUSDT"
+    plan = build_execution_plan(
+        direction=direction, recommended_expiry="SCALP", entry_price=100,
+        stop_loss=99 if direction == "BUY" else 101,
+        take_profit=102 if direction == "BUY" else 98,
+        symbol=symbol, snapshot_version="snap-reconcile", confidence=80,
+    )
+    trader._remember_entry_reconciliation(
+        product={"id": 22, "symbol": symbol, "contract_value_usdt": 100.0},
+        symbol=symbol, direction=direction, confidence=80, quantity=1,
+        leverage=2, balance=100.0, execution_plan=plan,
+        client_order_id="jvtestreconcile1",
+        response={"order_id": "entry-reconcile-1", "protective_exits": {
+            "stop_loss_order_id": "stop-1", "take_profit_order_id": "target-1"}},
+    )
+    trader.open_positions = []
+    trader._ownership_token = "reconcile-test"
+    trader.daily_trades = 0
+    trader.last_trade_time = None
+    return plan
+
+
+def test_uncertain_entry_latch_clears_only_on_complete_terminal_broker_truth(monkeypatch):
+    module = _live_trader_module(monkeypatch)
+    trader = object.__new__(module.JarvisAutoTrader)
+    trader.delta = types.SimpleNamespace(get_complete_account_snapshot=lambda **kwargs: {
+        "complete": False, "reason": "incomplete account snapshot"})
+    _pending_test_entry(trader, module)
+    assert not trader.reconcile_pending_entry()
+    assert trader._entry_reconciliation_required
+    trader.delta.get_complete_account_snapshot = lambda **kwargs: {
+        "complete": True, "as_of": time.time(), "positions": [], "external_orders": [],
+        "orders": {next(iter(kwargs["owned_orders"])): {"status": "REJECTED", "authoritative": True}},
+    }
+    assert trader.reconcile_pending_entry()
+    assert not trader._entry_reconciliation_required
+    assert trader._pending_entry_reconciliation is None
+    trader.emergency_stop = True
+    assert trader.resume()
+
+
+def test_uncertain_protected_position_is_adopted_only_after_exact_reconciliation(monkeypatch):
+    module = _live_trader_module(monkeypatch)
+    monkeypatch.setattr(module, "contract_quote_value_usdt", lambda product, price: 100.0)
+    monkeypatch.setattr(module, "claim_position", lambda *args: True)
+    trader = object.__new__(module.JarvisAutoTrader)
+    plan = _pending_test_entry(trader, module)
+    def complete_snapshot(**kwargs):
+        candidate_id = next(iter(kwargs["owned_orders"]))
+        return {
+            "complete": True, "as_of": time.time(), "external_orders": [],
+            "orders": {candidate_id: {"status": "FILLED", "authoritative": True,
+                "filled_quantity": 1, "average_fill_price": 100.0,
+                "protection_state": "ACTIVE",
+                "protective_exits": {"stop_loss_order_id": "stop-1", "take_profit_order_id": "target-1"}}},
+            "positions": [{"venue": "delta", "market_type": "perpetual_futures",
+                "instrument_id": "22", "symbol": "BTCUSDT", "size": 1.0}],
+        }
+    trader.delta = types.SimpleNamespace(get_complete_account_snapshot=complete_snapshot)
+    trader.emergency_stop = True
+    assert trader.reconcile_pending_entry()
+    assert not trader._entry_reconciliation_required
+    assert trader._pending_entry_reconciliation is None
+    assert len(trader.open_positions) == 1
+    position = trader.open_positions[0]
+    assert position["entry_price"] == 100.0
+    assert position["sl_price"] == plan["stop_loss"] and position["tp_price"] == plan["take_profit"]
+    assert position["protective_exits"] == {"stop_loss_order_id": "stop-1", "take_profit_order_id": "target-1"}
+    assert trader.emergency_stop  # reconciliation never auto-resumes execution

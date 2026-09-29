@@ -17,6 +17,11 @@ from typing import Any, Mapping, Optional
 POLICY_VERSION = "jarvis-central-entry-v1"
 APPROVAL_SCHEMA = "jarvis-entry-approval-v1"
 DEFAULT_APPROVAL_TTL_SECONDS = 180.0
+EXECUTION_PLAN_SCHEMA = "jarvis-execution-plan-v1"
+# Existing JarvisAutoTrader swing policy. Scalp levels continue to come from
+# ScalpingEngine.calculate_targets in jarvis_FIXED.py.
+SWING_STOP_LOSS_PCT = 0.008
+SWING_TAKE_PROFIT_PCT = 0.020
 
 PART_WEIGHTS = {
     "part1_breakout": 1.1,
@@ -45,6 +50,131 @@ def _direction(value: Any) -> str:
 
 def _clean_symbol(value: Any) -> str:
     return str(value or "").strip().upper().replace("/", "").replace("-", "").replace("_", "")
+
+
+def select_trade_mode(recommended_expiry: Any) -> Optional[str]:
+    """Map Jarvis' existing deterministic expiry recommendation to executor modes.
+
+    The live executor supports SCALP and SWING. Its previous call-site mapped
+    DAY_TRADE/SWING/15M/30M to SWING and everything else to SCALP; this stricter
+    version accepts only the three values emitted by TradeOptimizer.
+    """
+    value = str(recommended_expiry or "").strip().upper().replace("-", "_").replace(" ", "_")
+    if value == "SCALP":
+        return "SCALP"
+    if value in {"DAY_TRADE", "SWING"}:
+        return "SWING"
+    return None
+
+
+def _plan_digest(plan: Mapping[str, Any]) -> str:
+    core = {key: plan.get(key) for key in (
+        "schema_version", "authority", "trade_mode", "direction", "symbol",
+        "snapshot_version", "confidence", "entry_price", "stop_loss",
+        "take_profit", "risk_per_unit", "risk_fraction", "reward_risk",
+        "sizing_policy",
+    )}
+    return hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()[:24]
+
+
+def build_execution_plan(
+    *, direction: Any, recommended_expiry: Any, entry_price: Any,
+    stop_loss: Any, take_profit: Any, symbol: Any, snapshot_version: Any,
+    confidence: Any,
+) -> dict[str, Any]:
+    """Build Jarvis' only deterministic single-symbol entry plan.
+
+    The SWING policy preserves the existing live trader's 0.8% SL / 2% TP.
+    SCALP uses the existing Part 1-12 pipeline's deterministic ScalpingEngine
+    SL and TP1; missing/invalid levels are not estimated or backfilled.
+    """
+    mode = select_trade_mode(recommended_expiry)
+    side = _direction(direction)
+    clean_symbol = _clean_symbol(symbol)
+    version = str(snapshot_version or "").strip()
+    try:
+        entry = float(entry_price)
+        conf = int(float(confidence))
+        supplied_stop = float(stop_loss)
+        supplied_target = float(take_profit)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("execution plan inputs are malformed")
+    if mode is None or side not in {"BUY", "SELL"}:
+        raise ValueError("unsupported trade mode or direction")
+    if not clean_symbol or not version or not all(math.isfinite(v) and v > 0 for v in (entry, supplied_stop, supplied_target)):
+        raise ValueError("execution plan scope or prices are missing/invalid")
+    if not 0 <= conf <= 100:
+        raise ValueError("execution plan confidence is outside 0..100")
+    if mode == "SWING":
+        stop = round(entry * (1 - SWING_STOP_LOSS_PCT) if side == "BUY" else entry * (1 + SWING_STOP_LOSS_PCT), 2)
+        target = round(entry * (1 + SWING_TAKE_PROFIT_PCT) if side == "BUY" else entry * (1 - SWING_TAKE_PROFIT_PCT), 2)
+        sizing_policy = "jarvis_risk.calculate_trade_size+legacy_swing_levels"
+    else:
+        stop, target = supplied_stop, supplied_target
+        sizing_policy = "jarvis_risk.calculate_trade_size+ScalpingEngine.calculate_targets"
+    if (side == "BUY" and not stop < entry < target) or (side == "SELL" and not target < entry < stop):
+        raise ValueError("entry/stop/target geometry is invalid")
+    risk = abs(entry - stop)
+    plan = {
+        "schema_version": EXECUTION_PLAN_SCHEMA,
+        "authority": "jarvis_FIXED",
+        "trade_mode": mode,
+        "direction": side,
+        "symbol": clean_symbol,
+        "snapshot_version": version,
+        "confidence": conf,
+        "entry_price": entry,
+        "stop_loss": stop,
+        "take_profit": target,
+        "risk_per_unit": risk,
+        "risk_fraction": risk / entry,
+        "reward_risk": abs(target - entry) / risk,
+        "sizing_policy": sizing_policy,
+    }
+    plan["plan_id"] = _plan_digest(plan)
+    return plan
+
+
+def validate_execution_plan(
+    plan: Any, *, direction: Any, symbol: Any, snapshot_version: Any,
+    confidence: Any = None, trade_mode: Any = None,
+) -> tuple[bool, str]:
+    """Reject altered, stale-scope, direction-mismatched or malformed plans."""
+    if not isinstance(plan, Mapping):
+        return False, "Jarvis execution plan is required"
+    if plan.get("schema_version") != EXECUTION_PLAN_SCHEMA or plan.get("authority") != "jarvis_FIXED":
+        return False, "Jarvis execution plan schema/authority is invalid"
+    expected_direction = _direction(direction)
+    if _direction(plan.get("direction")) != expected_direction or expected_direction not in {"BUY", "SELL"}:
+        return False, "Jarvis execution plan direction mismatch"
+    if _clean_symbol(plan.get("symbol")) != _clean_symbol(symbol):
+        return False, "Jarvis execution plan symbol mismatch"
+    if not str(snapshot_version or "").strip() or str(plan.get("snapshot_version") or "").strip() != str(snapshot_version).strip():
+        return False, "Jarvis execution plan snapshot mismatch"
+    mode = str(plan.get("trade_mode") or "").strip().upper()
+    if mode not in {"SCALP", "SWING"} or (trade_mode is not None and str(trade_mode).strip().upper() != mode):
+        return False, "Jarvis execution plan trade mode mismatch"
+    try:
+        entry, stop, target = (float(plan[key]) for key in ("entry_price", "stop_loss", "take_profit"))
+        conf = int(float(plan["confidence"]))
+        risk = float(plan["risk_per_unit"])
+        risk_fraction = float(plan["risk_fraction"])
+        reward_risk = float(plan["reward_risk"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False, "Jarvis execution plan numeric fields are malformed"
+    if not all(math.isfinite(x) for x in (entry, stop, target, risk, risk_fraction, reward_risk)) or min(entry, stop, target, risk, risk_fraction, reward_risk) <= 0:
+        return False, "Jarvis execution plan contains non-finite/non-positive values"
+    if ((expected_direction == "BUY" and not stop < entry < target)
+            or (expected_direction == "SELL" and not target < entry < stop)
+            or not math.isclose(risk, abs(entry - stop), rel_tol=1e-10, abs_tol=1e-10)
+            or not math.isclose(risk_fraction, risk / entry, rel_tol=1e-10, abs_tol=1e-10)
+            or not math.isclose(reward_risk, abs(target - entry) / risk, rel_tol=1e-10, abs_tol=1e-10)):
+        return False, "Jarvis execution plan geometry is invalid"
+    if not 0 <= conf <= 100 or (confidence is not None and conf != int(float(confidence))):
+        return False, "Jarvis execution plan confidence mismatch"
+    if not str(plan.get("sizing_policy") or "").strip() or plan.get("plan_id") != _plan_digest(plan):
+        return False, "Jarvis execution plan integrity check failed"
+    return True, "Jarvis execution plan validated"
 
 
 def evaluate_central_strategy(
@@ -243,6 +373,7 @@ class EntryApproval:
     expires_at: float
     confidence: int
     approval_id: str
+    execution_plan_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -252,7 +383,8 @@ def make_entry_approval(
     central_decision: Mapping[str, Any], *, direction: Any, symbol: Any,
     exchange: Any, contract: Any, instrument_id: Any = "", market_type: Any = "",
     analysis_symbol: Any = "", analysis_exchange: Any = "", snapshot_version: Any,
-    analysis_timestamp: Any, confidence: Any, ttl_seconds: float = DEFAULT_APPROVAL_TTL_SECONDS,
+    analysis_timestamp: Any, confidence: Any, execution_plan: Any = None,
+    ttl_seconds: float = DEFAULT_APPROVAL_TTL_SECONDS,
 ) -> dict[str, Any]:
     """Create a scope-bound approval only from an APPROVED Jarvis decision."""
     if not isinstance(central_decision, Mapping) or central_decision.get("approved") is not True:
@@ -277,6 +409,15 @@ def make_entry_approval(
         raise ValueError("approval scope is incomplete")
     if _clean_symbol(central_decision.get("symbol", clean_symbol)) != clean_symbol:
         raise ValueError("approval symbol differs from central decision scope")
+    plan_id = ""
+    if execution_plan is not None:
+        valid_plan, plan_reason = validate_execution_plan(
+            execution_plan, direction=normalized_direction, symbol=clean_symbol,
+            snapshot_version=version, confidence=conf,
+        )
+        if not valid_plan:
+            raise ValueError(plan_reason)
+        plan_id = str(execution_plan.get("plan_id") or "")
     expires = issued + min(ttl, DEFAULT_APPROVAL_TTL_SECONDS)
     core = {
         "schema_version": APPROVAL_SCHEMA,
@@ -295,6 +436,7 @@ def make_entry_approval(
         "analysis_timestamp": issued,
         "expires_at": expires,
         "confidence": conf,
+        "execution_plan_id": plan_id,
     }
     # The identifier is diagnostic and helps catch accidental field drift; it
     # is deliberately not treated as a secret or as cryptographic authorization.
@@ -305,7 +447,7 @@ def make_entry_approval(
 def validate_entry_approval(
     approval: Any, *, direction: Any, symbol: Any, exchange: Any, contract: Any,
     instrument_id: Any = None, market_type: Any = None, snapshot_version: Any,
-    confidence: Any = None, now: Optional[float] = None,
+    confidence: Any = None, execution_plan: Any = None, now: Optional[float] = None,
     max_age_seconds: float = DEFAULT_APPROVAL_TTL_SECONDS,
 ) -> tuple[bool, str]:
     """Validate an explicit central approval against the actual entry request."""
@@ -350,12 +492,28 @@ def validate_entry_approval(
             return False, "Requested confidence is malformed"
         if requested_confidence != approved_confidence:
             return False, "Central Jarvis approval confidence mismatch"
+    bound_plan_id = str(approval.get("execution_plan_id") or "")
+    if bound_plan_id:
+        valid_plan, plan_reason = validate_execution_plan(
+            execution_plan, direction=direction, symbol=symbol,
+            snapshot_version=snapshot_version, confidence=approved_confidence,
+        )
+        if not valid_plan or str(execution_plan.get("plan_id") or "") != bound_plan_id:
+            return False, plan_reason if not valid_plan else "Central Jarvis approval execution-plan mismatch"
+    elif execution_plan is not None:
+        valid_plan, plan_reason = validate_execution_plan(
+            execution_plan, direction=direction, symbol=symbol,
+            snapshot_version=snapshot_version, confidence=approved_confidence,
+        )
+        if not valid_plan:
+            return False, plan_reason
     # Check the diagnostic digest to reject accidental mutation. This is not
     # an authentication mechanism; callers must enforce provenance/scope.
     core = {k: approval.get(k) for k in (
         "schema_version", "authority", "status", "policy_version", "direction", "symbol",
         "exchange", "contract", "instrument_id", "market_type", "analysis_symbol",
         "analysis_exchange", "snapshot_version", "analysis_timestamp", "expires_at", "confidence",
+        "execution_plan_id",
     )}
     digest = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
     if approval.get("approval_id") != digest:

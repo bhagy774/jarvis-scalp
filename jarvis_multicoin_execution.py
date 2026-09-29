@@ -9,7 +9,7 @@ state. Paper/live authorization is external and defaults disabled.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import math
@@ -100,6 +100,7 @@ class ValidatedCandidate:
     analysis_identity: Optional[FullIdentity] = None
     risk_currency: str = "USDT"
     leverage: int = 1
+    entry_authorization: Optional[Mapping[str, Any]] = field(default=None, repr=False, compare=False)
 
     @property
     def notional(self) -> float:
@@ -107,6 +108,7 @@ class ValidatedCandidate:
 
     def to_dict(self) -> Dict[str, Any]:
         row = asdict(self)
+        row.pop("entry_authorization", None)
         row["identity"] = self.identity.to_dict()
         row["analysis_identity"] = self.analysis_identity.to_dict() if self.analysis_identity else self.identity.to_dict()
         return row
@@ -192,11 +194,18 @@ def candidate_from_analysis(
     if (str(approval.get("analysis_symbol") or "").upper() != analysis_identity.symbol
             or str(approval.get("analysis_exchange") or "").lower() != analysis_identity.venue):
         raise CandidateRejected("Jarvis approval analysis identity does not match the source instrument")
+    source_plan = (result.get("central_execution_plan") or result.get("jarvis_execution_plan")
+                   or (result.get("execution_plan") if isinstance(result.get("execution_plan"), Mapping)
+                       and result.get("execution_plan", {}).get("schema_version") == "jarvis-execution-plan-v1" else None))
+    bound_plan = bool(str(approval.get("execution_plan_id") or ""))
+    if bound_plan and not isinstance(source_plan, Mapping):
+        raise CandidateRejected("Jarvis-bound central execution plan is missing")
     approval_ok, approval_reason = validate_entry_approval(
         approval, direction=central_direction, symbol=identity.symbol, exchange=identity.venue,
         contract=identity.symbol, instrument_id=identity.instrument_id,
         market_type=identity.market_type, snapshot_version=snapshot_version,
-        confidence=central_confidence, now=current, max_age_seconds=max_age_seconds,
+        confidence=central_confidence, execution_plan=source_plan if bound_plan else None,
+        now=current, max_age_seconds=max_age_seconds,
     )
     if not approval_ok:
         raise CandidateRejected(approval_reason)
@@ -278,11 +287,28 @@ def candidate_from_analysis(
                        analysis_identity.symbol, identity.venue, identity.market_type, identity.instrument_id,
                        identity.symbol, tf, snapshot_version, direction, str(decision_at), policy_id))
     candidate_id = hashlib.sha256(raw_id.encode()).hexdigest()
+    entry_authorization = {
+        "central_approval": dict(approval),
+        "part_results": dict(central_evidence) if isinstance(central_evidence, Mapping) else None,
+        "part7_gate": dict(gate),
+        "snapshot_version": snapshot_version,
+        "analysis_symbol": analysis_identity.symbol,
+        "confidence": central_confidence,
+        "strategy_plan": dict(source_plan) if isinstance(source_plan, Mapping) else None,
+        "broker_plan": {
+            "direction": direction, "symbol": identity.symbol,
+            "instrument_id": identity.instrument_id, "quantity": qty,
+            "leverage": leverage, "entry_price": entry,
+            "stop_loss": stop, "take_profit": target,
+            "risk_budget_usdt": risk_notional if risk_currency == "USDT" else 0,
+            "trade_mode": str((source_plan or {}).get("trade_mode") or ""),
+        },
+    }
     return ValidatedCandidate(candidate_id, identity, tf, snapshot_version, fetched, completed,
                               decision_at, reference_at, reference_price, max_slippage_pct, max_chase_pct,
                               direction, entry, stop, target, qty, size_unit, contract_multiplier,
                               provenance, policy_id, risk_notional, analysis_identity,
-                              risk_currency, leverage)
+                              risk_currency, leverage, entry_authorization)
 
 
 class PaperExecutionAdapter(Protocol):
