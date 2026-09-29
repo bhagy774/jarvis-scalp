@@ -204,6 +204,22 @@ def _load_artifact(path: Path, part_id: str, identity: Mapping[str, str]) -> Dic
         w = tuple(_finite_vector(row, in_dim, "weights") for row in weights)
         b = _finite_vector(layer.get("bias"), out_dim, "bias")
         parsed_layers.append((w, b, act))
+
+    use_gpu = os.environ.get("JARVIS_NEURAL_GPU", "0") == "1"
+    gpu_layers = None
+    if use_gpu:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+                gpu_layers = []
+                for w, b, act in parsed_layers:
+                    t_w = torch.tensor(w, dtype=torch.float32, device=device)
+                    t_b = torch.tensor(b, dtype=torch.float32, device=device)
+                    gpu_layers.append((t_w, t_b, act))
+        except Exception:
+            gpu_layers = None
+
     training = obj.get("training")
     if not isinstance(training, dict) or training.get("status") != "validated" or training.get("split") != "chronological_purged" or training.get("approved_for_advisory") is not True:
         raise ValueError("artifact_not_validation_gated")
@@ -240,6 +256,8 @@ def _load_artifact(path: Path, part_id: str, identity: Mapping[str, str]) -> Dic
             or training["test_accuracy"] < training["test_majority_accuracy"] + 0.02):
         raise ValueError("artifact_out_of_sample_gate_failed")
     model = {"mean": mean, "std": std, "layers": tuple(parsed_layers), "training": training}
+    if gpu_layers is not None:
+        model["gpu_layers"] = tuple(gpu_layers)
     with _LOCK:
         _ARTIFACT_CACHE[key] = model
         _ARTIFACT_CACHE.move_to_end(key)
@@ -320,12 +338,11 @@ def _softmax(logits: Sequence[float]) -> Tuple[float, ...]:
     return tuple(x / den for x in exps)
 
 
-import os
-
 def _infer(model: Mapping[str, Any], vector: Sequence[float], part_id: str) -> Tuple[float, ...]:
     use_gpu = os.environ.get("JARVIS_NEURAL_GPU", "0") == "1"
+    run_on_cpu = True
 
-    if use_gpu:
+    if use_gpu and "gpu_layers" in model:
         try:
             import torch
             if torch.cuda.is_available():
@@ -336,11 +353,8 @@ def _infer(model: Mapping[str, Any], vector: Sequence[float], part_id: str) -> T
                 x = [max(-8.0, min(8.0, v)) for v in x]
                 t_x = torch.tensor(x, dtype=torch.float32, device=device)
 
-                # Forward pass on GPU
-                for weights, bias, activation in model["layers"]:
-                    t_w = torch.tensor(weights, dtype=torch.float32, device=device)
-                    t_b = torch.tensor(bias, dtype=torch.float32, device=device)
-
+                # Forward pass on GPU using cached tensors
+                for t_w, t_b, activation in model["gpu_layers"]:
                     t_x = torch.matmul(t_x, t_w.t()) + t_b
 
                     if activation == "relu":
@@ -354,12 +368,13 @@ def _infer(model: Mapping[str, Any], vector: Sequence[float], part_id: str) -> T
 
                 if not all(math.isfinite(v) for v in x):
                     raise ValueError("non_finite_inference")
-            else:
-                use_gpu = False
-        except ImportError:
-            use_gpu = False
 
-    if not use_gpu:
+                run_on_cpu = False
+        except Exception:
+            # Fall back to CPU on ANY PyTorch/CUDA runtime error or ImportError
+            run_on_cpu = True
+
+    if run_on_cpu:
         x = [max(-8.0, min(8.0, (v - m) / s)) for v, m, s in zip(vector, model["mean"], model["std"])]
         for weights, bias, activation in model["layers"]:
             x = [sum(wi * xi for wi, xi in zip(row, x)) + b for row, b in zip(weights, bias)]
