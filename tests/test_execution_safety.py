@@ -23,7 +23,8 @@ def isolate_process_local_position_ownership():
 def jarvis_paper_entry_authorization():
     """Use Jarvis' own deterministic evaluators to issue the paper-test approval."""
     from jarvis_strategy_approval import (
-        build_execution_plan, evaluate_central_strategy, make_entry_approval,
+        REQUIRED_TIMEFRAMES, build_execution_plan, evaluate_mtf_central_strategy,
+        make_entry_approval,
     )
     symbol, snapshot, confidence = "BTCUSDT", "paper-test-snapshot", 90
     evidence = {
@@ -44,8 +45,25 @@ def jarvis_paper_entry_authorization():
             for tf in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
         },
     }
-    decision = evaluate_central_strategy(
-        evidence, gate, confidence=confidence, expected_symbol=symbol,
+    timeframe_evidence = {}
+    for timeframe in REQUIRED_TIMEFRAMES:
+        bullish = timeframe in {"1m", "3m", "5m", "15m"}
+        row = {}
+        for name, item in evidence.items():
+            value = {**item, "symbol": symbol, "timeframe": timeframe}
+            if name == "part7_volatility":
+                value.update({"signal": 0, "thought": "neutral volatility", "status": "neutral",
+                              "data_status": "valid", "entry_blocked": False, "risk_veto": False})
+            elif name == "part2_zone":
+                value["native_timeframe"] = timeframe
+                if not bullish:
+                    value.update({"signal": 0, "thought": "no native zone"})
+            elif not bullish:
+                value.update({"signal": 0, "thought": "neutral native-frame evidence"})
+            row[name] = value
+        timeframe_evidence[timeframe] = row
+    decision = evaluate_mtf_central_strategy(
+        timeframe_evidence, gate, confidence=confidence, expected_symbol=symbol,
     )
     plan = build_execution_plan(
         direction="BUY", recommended_expiry="SCALP", entry_price=100.0,
@@ -58,8 +76,8 @@ def jarvis_paper_entry_authorization():
         analysis_exchange="delta", snapshot_version=snapshot,
         analysis_timestamp=time.time(), confidence=confidence, execution_plan=plan,
     )
-    return {"approval": approval, "evidence": evidence, "gate": gate,
-            "plan": plan, "snapshot": snapshot}
+    return {"approval": approval, "evidence": evidence, "timeframe_evidence": timeframe_evidence,
+            "gate": gate, "plan": plan, "snapshot": snapshot}
 
 
 class DeltaStub:
@@ -146,17 +164,22 @@ class ExecutionSafetyTests(unittest.TestCase):
             self.assertIn(pos, manager.open_positions)
 
     def test_live_paper_mode_never_sets_leverage_or_submits_order(self):
+        import importlib
         import jarvis_live_trader
+        # Earlier tests may temporarily import this module against fake sizing
+        # dependencies; reload after their monkeypatch fixtures have restored.
+        jarvis_live_trader = importlib.reload(jarvis_live_trader)
         trader = jarvis_live_trader.JarvisAutoTrader(DeltaStub(100))
         trader.is_enabled = False
         authorization = jarvis_paper_entry_authorization()
         response = trader._place_trade(
             "CALL", 90, 100.0, "SCALP", {"do_hedge": False},
             central_approval=authorization["approval"],
-            part_results=authorization["evidence"], part7_gate=authorization["gate"],
+            part_results=authorization["evidence"],
+            timeframe_parts=authorization["timeframe_evidence"], part7_gate=authorization["gate"],
             snapshot_version=authorization["snapshot"], execution_plan=authorization["plan"],
         )
-        self.assertTrue(response["success"])
+        self.assertTrue(response["success"], response)
         self.assertEqual(trader.delta.leverage_calls, [])
         self.assertEqual(trader.delta.order_calls, [])
 

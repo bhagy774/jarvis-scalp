@@ -368,7 +368,11 @@ class MultiCoinPipeline:
                     if isinstance(raw.get("execution_plan"), Mapping) else None,
                 "execution_candidate_status": "PLAN_PRESENT_REQUIRES_DELTA_VALIDATION" if isinstance(raw.get("execution_plan"), Mapping) else "BLOCKED_MISSING_EXPLICIT_PLAN",
                 "analysis_only": True,
-                "decision_authority": raw.get("decision_authority", "none"),
+                # Pipeline snapshots are always analysis-only.  The nested
+                # Jarvis decision/approval remain auditable evidence and are
+                # independently recomputed by each consumer; they do not turn
+                # this raw Parts result into execution-authorized output.
+                "decision_authority": "none",
                 "execution_eligible": False,
                 "reason": None if complete else "one or more Part adapters did not complete for all native frames",
             }

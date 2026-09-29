@@ -84,7 +84,7 @@ def _validate_jarvis_broker_entry_authorization(
     if not isinstance(authorization, dict):
         return False, "Jarvis central entry authorization is required"
     approval = authorization.get("central_approval")
-    evidence = authorization.get("part_results")
+    timeframe_evidence = authorization.get("parts_by_timeframe")
     gate = authorization.get("part7_gate")
     strategy_plan = authorization.get("strategy_plan")
     broker_plan = authorization.get("broker_plan")
@@ -92,8 +92,8 @@ def _validate_jarvis_broker_entry_authorization(
     analysis_symbol = authorization.get("analysis_symbol")
     try:
         from jarvis_strategy_approval import (
-            evaluate_central_strategy, validate_entry_approval,
-            validate_execution_plan,
+            PART_WEIGHTS, REQUIRED_TIMEFRAMES, evaluate_mtf_central_strategy,
+            validate_entry_approval, validate_execution_plan,
         )
         direction = "BUY" if str(side).strip().lower() == "buy" else "SELL" if str(side).strip().lower() == "sell" else "NO_TRADE"
         try:
@@ -102,11 +102,30 @@ def _validate_jarvis_broker_entry_authorization(
             return False, "Jarvis central entry confidence is malformed"
         if direction == "NO_TRADE" or not analysis_symbol:
             return False, "Jarvis central entry scope is incomplete"
-        central = evaluate_central_strategy(
-            evidence, gate, confidence=confidence, expected_symbol=analysis_symbol,
+        if (not isinstance(timeframe_evidence, dict)
+                or set(timeframe_evidence) != set(REQUIRED_TIMEFRAMES)):
+            return False, "Complete native 8-timeframe Jarvis evidence is required"
+        from jarvis_strategy_approval import _clean_symbol
+        expected_clean = _clean_symbol(analysis_symbol)
+        for timeframe in REQUIRED_TIMEFRAMES:
+            frame = timeframe_evidence.get(timeframe)
+            if not isinstance(frame, dict) or set(frame) != set(PART_WEIGHTS):
+                return False, f"{timeframe} Jarvis part evidence is incomplete"
+            for part_name in PART_WEIGHTS:
+                item = frame.get(part_name)
+                item_symbol = item.get("symbol", item.get("selected_symbol")) if isinstance(item, dict) else None
+                item_timeframe = (item.get("timeframe", item.get("native_timeframe"))
+                                  if isinstance(item, dict) else None)
+                if (_clean_symbol(item_symbol) != expected_clean
+                        or str(item_timeframe or "") != timeframe):
+                    return False, f"{timeframe} {part_name} symbol/timeframe identity mismatch"
+        central = evaluate_mtf_central_strategy(
+            timeframe_evidence, gate, confidence=confidence, expected_symbol=analysis_symbol,
         )
-        if not central.get("approved") or central.get("direction") != direction:
-            return False, "Jarvis central strategy does not approve this broker entry"
+        if (not central.get("approved") or central.get("direction") != direction
+                or str(central.get("trade_mode") or "").upper()
+                != str((strategy_plan or {}).get("trade_mode") or "").upper()):
+            return False, "Jarvis central MTF strategy does not approve this broker entry/mode"
         if not isinstance(approval, dict):
             return False, "Jarvis central approval is missing"
         # The approved execution symbol must be exact; instrument_id can be the
@@ -133,6 +152,7 @@ def _validate_jarvis_broker_entry_authorization(
         strategy_ok, plan_reason = validate_execution_plan(
             strategy_plan, direction=direction, symbol=approval.get("symbol"),
             snapshot_version=snapshot_version, confidence=confidence,
+            trade_mode=central.get("trade_mode"),
         )
         if not strategy_ok:
             return False, plan_reason
@@ -153,6 +173,7 @@ def _validate_jarvis_broker_entry_authorization(
         if (_clean_symbol(broker_plan.get("symbol")) != _clean_symbol(symbol)
                 or str(broker_plan.get("instrument_id") or "").strip() != str(product_id).strip()
                 or str(broker_plan.get("direction") or "").upper() != direction
+                or str(broker_plan.get("trade_mode") or "").upper() != str(central.get("trade_mode") or "").upper()
                 or requested_size != planned_size or requested_lev != planned_lev
                 or not math.isclose(stop, planned_stop, rel_tol=1e-10, abs_tol=1e-10)
                 or not math.isclose(target, planned_target, rel_tol=1e-10, abs_tol=1e-10)

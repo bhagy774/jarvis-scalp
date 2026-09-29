@@ -10,7 +10,10 @@ from direct_candle_cache import DirectCandleCache, FETCH_CANDLES, LIVE_TIMEFRAME
 from jarvis_delta_execution import DeltaExecutionAdapter, build_delta_candidate
 from jarvis_multicoin_execution import CandidateRejected
 from jarvis_multicoin_pipeline import InstrumentKey, MultiCoinPipeline
-from jarvis_strategy_approval import build_execution_plan, evaluate_central_strategy, make_entry_approval
+from jarvis_strategy_approval import (
+    PART_WEIGHTS, REQUIRED_TIMEFRAMES, build_execution_plan,
+    evaluate_mtf_central_strategy, make_entry_approval,
+)
 
 NOW = 1_800_000_000.0
 STEPS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900,
@@ -124,26 +127,45 @@ def _raw_analysis(key, snapshot):
     closed_at = float(snapshot.frames["1m"].closed.index[-1].timestamp()) + 60.0
     gate = _valid_gate(key.symbol)
     evidence = _central_evidence()
-    decision = evaluate_central_strategy(evidence, gate, confidence=90, expected_symbol=key.symbol)
+    by_timeframe = {}
+    normalized = {}
+    for timeframe in LIVE_TIMEFRAMES:
+        row = {}
+        canonical_row = {}
+        bullish = timeframe in {"1m", "3m", "5m", "15m"}
+        for index, (name, item) in enumerate(evidence.items(), 1):
+            scoped = {**item, "symbol": key.symbol, "timeframe": timeframe}
+            if name == "part7_volatility":
+                scoped.update({"signal": 0, "thought": "neutral volatility", "status": "neutral",
+                               "data_status": "valid", "entry_blocked": False, "risk_veto": False})
+            elif not bullish:
+                scoped.update({"signal": 0, "thought": "neutral native-frame evidence"})
+            if name == "part2_zone":
+                scoped["native_timeframe"] = timeframe
+            row[f"part{index}"] = scoped
+            canonical_row[name] = scoped
+        by_timeframe[timeframe] = row
+        normalized[timeframe] = canonical_row
+    decision = evaluate_mtf_central_strategy(normalized, gate, confidence=90, expected_symbol=key.symbol)
     strategy_plan = build_execution_plan(
-        direction="BUY", recommended_expiry="SCALP", entry_price=price,
+        direction=decision["direction"], recommended_expiry=decision["trade_mode"], entry_price=price,
         stop_loss=price * 0.98, take_profit=price * 1.05,
         symbol=key.mapped_execution_dict()["symbol"], snapshot_version=version, confidence=90,
     )
     approval = make_entry_approval(
-        decision, direction="BUY", symbol="ETHUSDT", exchange="delta", contract="ETHUSDT",
-        instrument_id="22", market_type="perpetual_futures", analysis_symbol=key.symbol,
-        analysis_exchange="binance", snapshot_version=version,
+        {**decision, "symbol": "ETHUSDT"}, direction=decision["direction"], symbol="ETHUSDT",
+        exchange="delta", contract="ETHUSDT", instrument_id="22", market_type="perpetual_futures",
+        analysis_symbol=key.symbol, analysis_exchange="binance", snapshot_version=version,
         analysis_timestamp=float(snapshot.fetched_at), confidence=90, execution_plan=strategy_plan,
     )
     return {
-        "parts_by_timeframe": {tf: {f"part{i}": {"signal": 1} for i in range(1, 11)} for tf in LIVE_TIMEFRAMES},
+        "parts_by_timeframe": by_timeframe,
         "once_per_symbol_parts": {"part11": {"signal": 1}, "part12": {"confidence": 90}},
         "part7_gate": gate, "central_strategy_decision": decision,
         "central_strategy_evidence": evidence, "central_strategy_approval": approval,
         "central_execution_plan": strategy_plan, "execution_plan": strategy_plan,
         "decision_authority": "jarvis_FIXED",
-        "deterministic_decision": {"origin": "jarvis_FIXED_central_strategy", "direction": "BUY",
+        "deterministic_decision": {"origin": "jarvis_FIXED_central_strategy", "direction": decision["direction"],
                                    "confidence": 90, "entry_price": price,
                                    "stop_loss": strategy_plan["stop_loss"],
                                    "take_profit": strategy_plan["take_profit"]},
@@ -174,7 +196,7 @@ def test_full_binance_analysis_pipeline_produces_scoped_plan_then_fake_delta_ent
     key, result = _pipeline_case(lambda key, snapshot: _raw_analysis(key, snapshot))
     assert result["status"] == "COMPLETE"
     assert result["scope"] == "parts1-12-analysis-only"
-    assert result["decision_authority"] == "jarvis_FIXED"
+    assert result["decision_authority"] == "none"
     assert result["execution_eligible"] is False
     assert result["central_execution_plan"]["symbol"] == "ETHUSDT"
     assert result["central_strategy_approval"]["execution_plan_id"] == result["central_execution_plan"]["plan_id"]
@@ -190,7 +212,11 @@ def test_full_binance_analysis_pipeline_produces_scoped_plan_then_fake_delta_ent
     response = adapter.submit(candidate, "synthetic-e2e-entry")
     assert response["status"] == "FILLED"
     assert len(broker.entry_calls) == 1
-    assert broker.entry_calls[0]["entry_authorization"]["strategy_plan"]["plan_id"] == result["central_execution_plan"]["plan_id"]
+    # The broker request carries only the validated contract-level plan; the
+    # separate Jarvis approval and strategy plan were recomputed and bound on
+    # the candidate before sizing, not leaked as venue API parameters.
+    assert broker.entry_calls[0]["stop_loss"] == candidate.stop_loss
+    assert broker.entry_calls[0]["take_profit"] == candidate.take_profit
 
 
 def test_pipeline_analysis_stays_non_executable_and_part7_veto_fails_before_broker_quote():

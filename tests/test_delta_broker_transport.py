@@ -14,7 +14,8 @@ from delta_api_wrapper import DeltaExchangeData
 from jarvis_delta_execution import DeltaExecutionAdapter
 from jarvis_multicoin_execution import PortfolioCoordinator
 from jarvis_strategy_approval import (
-    build_execution_plan, evaluate_central_strategy, make_entry_approval,
+    REQUIRED_TIMEFRAMES, build_execution_plan, evaluate_mtf_central_strategy,
+    make_entry_approval,
 )
 
 
@@ -55,8 +56,25 @@ def jarvis_broker_authorization(*, entry=100.1, stop=98.0, target=105.0,
             for tf in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
         },
     }
-    decision = evaluate_central_strategy(
-        evidence, gate, confidence=confidence, expected_symbol=symbol,
+    timeframe_parts = {}
+    for timeframe in REQUIRED_TIMEFRAMES:
+        bullish = timeframe in {"1m", "3m", "5m", "15m"}
+        row = {}
+        for name, item in evidence.items():
+            scoped = {**item, "symbol": symbol, "timeframe": timeframe}
+            if name == "part7_volatility":
+                scoped.update({"signal": 0, "thought": "neutral volatility", "status": "neutral",
+                              "data_status": "valid", "entry_blocked": False, "risk_veto": False})
+            elif name == "part2_zone":
+                scoped["native_timeframe"] = timeframe
+                if not bullish:
+                    scoped.update({"signal": 0, "thought": "no native zone"})
+            elif not bullish:
+                scoped.update({"signal": 0, "thought": "neutral native-frame evidence"})
+            row[name] = scoped
+        timeframe_parts[timeframe] = row
+    decision = evaluate_mtf_central_strategy(
+        timeframe_parts, gate, confidence=confidence, expected_symbol=symbol,
     )
     plan = build_execution_plan(
         direction="BUY", recommended_expiry="SCALP", entry_price=entry,
@@ -71,13 +89,16 @@ def jarvis_broker_authorization(*, entry=100.1, stop=98.0, target=105.0,
         confidence=confidence, execution_plan=plan,
     )
     return {
-        "central_approval": approval, "part_results": evidence, "part7_gate": gate,
+        "central_approval": approval, "part_results": evidence,
+        "timeframe_parts": timeframe_parts, "parts_by_timeframe": timeframe_parts,
+        "part7_gate": gate,
         "strategy_plan": plan, "snapshot_version": snapshot,
         "analysis_symbol": symbol, "confidence": confidence,
         "broker_plan": {
             "symbol": symbol, "instrument_id": str(product_id), "direction": "BUY",
             "quantity": 2, "leverage": 2, "entry_price": entry,
             "stop_loss": stop, "take_profit": target, "risk_budget_usdt": 5.0,
+            "trade_mode": "SCALP",
         },
     }
 
@@ -491,21 +512,22 @@ def test_explicit_jarvis_authorized_non_btc_delta_fixture_runs_adapter_lifecycle
     test_authorization = jarvis_broker_authorization(
         entry=100.1, stop=98.0, target=105.0, snapshot="eth-snapshot-01", now=now - 0.5,
     )
-    central_decision = evaluate_central_strategy(
-        test_authorization["part_results"], test_authorization["part7_gate"],
+    central_decision = evaluate_mtf_central_strategy(
+        test_authorization["timeframe_parts"], test_authorization["part7_gate"],
         confidence=90, expected_symbol="ETHUSDT",
     )
     result = {
         "status": "COMPLETE", "scope": "parts1-12-analysis-only", "analysis_only": True,
-        "decision_authority": "jarvis_FIXED", "execution_eligible": False, "freshness_status": "FRESH",
+        "decision_authority": "none", "execution_eligible": False, "freshness_status": "FRESH",
         "central_strategy_decision": central_decision,
         "central_strategy_evidence": test_authorization["part_results"],
         "central_strategy_approval": test_authorization["central_approval"],
         "central_execution_plan": test_authorization["strategy_plan"],
         "coverage": [f"Part{i}" for i in range(1, 13)], "snapshot_version": "eth-snapshot-01",
         "parts_by_timeframe": {
-            tf: {f"part{i}": {"signal": 0} for i in range(1, 11)}
-            for tf in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+            tf: {f"part{i}": dict(test_authorization["timeframe_parts"][tf][name])
+                 for i, name in enumerate(test_authorization["part_results"], 1)}
+            for tf in REQUIRED_TIMEFRAMES
         },
         "request_identity": {"venue": "binance", "market_type": "spot", "instrument_id": "ETHUSDT", "symbol": "ETHUSDT"},
         "execution_identity": {"venue": "delta", "market_type": "perpetual_futures", "instrument_id": "22", "symbol": "ETHUSDT"},

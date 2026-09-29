@@ -46,6 +46,29 @@ def bullish_parts(symbol="BTCUSDT"):
     }
 
 
+def timeframe_parts(symbol="BTCUSDT", *, low_only=True):
+    """Complete exact-frame evidence for an approved, deterministic SCALP."""
+    rows = {}
+    for timeframe in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"):
+        bullish = not low_only or timeframe in {"1m", "3m", "5m", "15m"}
+        row = {}
+        for name, item in bullish_parts(symbol).items():
+            value = dict(item)
+            value.update({"symbol": symbol, "timeframe": timeframe})
+            if name == "part7_volatility":
+                value.update({"signal": 0, "thought": "neutral volatility", "status": "neutral",
+                              "data_status": "valid", "entry_blocked": False, "risk_veto": False})
+            elif not bullish:
+                value.update({"signal": 0, "thought": "neutral native-frame evidence"})
+            if name == "part2_zone":
+                value["native_timeframe"] = timeframe
+                if not bullish:
+                    value.update({"signal": 0, "thought": "no native zone"})
+            row[name] = value
+        rows[timeframe] = row
+    return rows
+
+
 def clear_gate(symbol=None):
     return {
         "entry_blocked": False, "risk_veto": False, "status": "ok",
@@ -263,8 +286,10 @@ def test_live_central_validation_requires_plan_bound_approval(monkeypatch):
     module = _live_trader_module(monkeypatch)
     symbol = "BTCUSDT"
     evidence = bullish_parts(symbol)
+    timeframe_evidence = timeframe_parts(symbol)
     gate = clear_gate(symbol)
-    decision = evaluate_central_strategy(evidence, gate, confidence=80, expected_symbol=symbol)
+    from jarvis_strategy_approval import evaluate_mtf_central_strategy
+    decision = evaluate_mtf_central_strategy(timeframe_evidence, gate, confidence=80, expected_symbol=symbol)
     now = time.time()
     plan = build_execution_plan(
         direction="BUY", recommended_expiry="SCALP", entry_price=100,
@@ -278,11 +303,14 @@ def test_live_central_validation_requires_plan_bound_approval(monkeypatch):
         analysis_timestamp=now, confidence=80, execution_plan=plan,
     )
     assert module._validate_central_entry(approval, evidence, gate, "CALL", 80,
-           symbol, "snap-live", execution_plan=plan, trade_mode="SCALP")[0]
+           symbol, "snap-live", execution_plan=plan, trade_mode="SCALP",
+           timeframe_parts=timeframe_evidence)[0]
     assert not module._validate_central_entry(approval, evidence, gate, "CALL", 80,
-           symbol, "snap-live", execution_plan=None, trade_mode="SCALP")[0]
+           symbol, "snap-live", execution_plan=None, trade_mode="SCALP",
+           timeframe_parts=timeframe_evidence)[0]
     assert not module._validate_central_entry(approval, evidence, gate, "CALL", 80,
-           symbol, "snap-live", execution_plan=plan, trade_mode="SWING")[0]
+           symbol, "snap-live", execution_plan=plan, trade_mode="SWING",
+           timeframe_parts=timeframe_evidence)[0]
 
 
 def test_paper_trade_uses_bound_plan_levels_and_never_an_injected_tp2():
@@ -304,8 +332,10 @@ def test_paper_trade_uses_bound_plan_levels_and_never_an_injected_tp2():
     }
     symbol = "BTCUSDT"
     evidence = bullish_parts(symbol)
+    timeframe_evidence = timeframe_parts(symbol)
     gate = clear_gate(symbol)
-    decision = evaluate_central_strategy(evidence, gate, confidence=80, expected_symbol=symbol)
+    from jarvis_strategy_approval import evaluate_mtf_central_strategy
+    decision = evaluate_mtf_central_strategy(timeframe_evidence, gate, confidence=80, expected_symbol=symbol)
     plan = build_execution_plan(
         direction="BUY", recommended_expiry="SCALP", entry_price=100,
         stop_loss=99, take_profit=102, symbol=symbol,
@@ -320,8 +350,8 @@ def test_paper_trade_uses_bound_plan_levels_and_never_an_injected_tp2():
     trade = engine._open_paper_trade(
         "CALL", 500.0, 80, "SCALP", 501.0, 900.0, 499.0,
         current_price=100, symbol=symbol, central_approval=approval,
-        snapshot_version="snap-paper", part_results=evidence, part7_gate=gate,
-        execution_plan=plan,
+        snapshot_version="snap-paper", part_results=evidence, timeframe_parts=timeframe_evidence,
+        part7_gate=gate, execution_plan=plan,
     )
     assert trade is not None
     assert trade["entry_price"] == 100
@@ -333,8 +363,10 @@ def test_live_auto_trader_uses_plan_levels_and_protected_delta_adapter(monkeypat
     module = _live_trader_module(monkeypatch)
     symbol = "BTCUSDT"
     evidence = bullish_parts(symbol)
+    timeframe_evidence = timeframe_parts(symbol)
     gate = clear_gate(symbol)
-    decision = evaluate_central_strategy(evidence, gate, confidence=80, expected_symbol=symbol)
+    from jarvis_strategy_approval import evaluate_mtf_central_strategy
+    decision = evaluate_mtf_central_strategy(timeframe_evidence, gate, confidence=80, expected_symbol=symbol)
     plan = build_execution_plan(
         direction="BUY", recommended_expiry="SCALP", entry_price=100,
         stop_loss=99, take_profit=102, symbol=symbol,
@@ -378,8 +410,8 @@ def test_live_auto_trader_uses_plan_levels_and_protected_delta_adapter(monkeypat
     monkeypatch.setattr(module, "claim_position", lambda *args, **kwargs: True)
     result = trader._place_trade(
         "CALL", 80, 100.0, "SCALP", {}, symbol=symbol,
-        central_approval=approval, part_results=evidence, part7_gate=gate,
-        snapshot_version="snap-live-order", execution_plan=plan,
+        central_approval=approval, part_results=evidence, timeframe_parts=timeframe_evidence,
+        part7_gate=gate, snapshot_version="snap-live-order", execution_plan=plan,
     )
     assert submitted[0]["stop_loss"] == 99 and submitted[0]["take_profit"] == 102
     assert submitted[0]["entry_authorization"]["strategy_plan"] == plan

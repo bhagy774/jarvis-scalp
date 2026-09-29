@@ -1072,13 +1072,13 @@ class SignalFusionEngineGPU:
             if any(k in thought for k in ["error", "offline", "fallback", "missing"]):
                 continue
 
-            # MTF Penalty: If signal is 1m noise (MTF: 1/4), treat it as Neutral (chop)
+            # MTF annotation accepts the live 8-frame denominator and older /4 telemetry.
             import re
-            mtf_match = re.search(r'mtf: (\d)/4', thought)
+            mtf_match = re.search(r'mtf: (\d+)/(\d+)', thought)
             if mtf_match and sig != 0:
-                mtf_agree = int(mtf_match.group(1))
-                if mtf_agree < 2:
-                    sig = 0  # Force to Neutral because higher timeframes don't support it
+                mtf_agree, mtf_total = int(mtf_match.group(1)), int(mtf_match.group(2))
+                if mtf_total > 0 and mtf_agree / mtf_total < 0.5:
+                    sig = 0  # Low cross-frame support remains neutral.
 
             w = self.weights.get(name, 1.0)
             total_weight_den += w  # FULL weight goes to denominator regardless of signal strength
@@ -1173,6 +1173,50 @@ class SignalFusionEngineGPU:
             "consensus_ratio": max(buy_ratio, sell_ratio),
             "active_count": total_active_engines
         }
+
+    def analyze_multi_timeframe(self, results_by_timeframe: Dict[str, Any]) -> Dict[str, Any]:
+        """Fuse each native frame independently, then summarize all eight frames.
+
+        This remains Parts 1–10 evidence, not execution authority. Every row is
+        passed through the existing Part 11 engine with its canonical part names.
+        """
+        timeframes = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+        tf_weights = {"1m": 1.0, "3m": 1.5, "5m": 2.0, "15m": 3.0,
+                      "30m": 4.0, "1h": 5.0, "2h": 6.0, "4h": 7.0}
+        if not isinstance(results_by_timeframe, dict) or set(results_by_timeframe) != set(timeframes):
+            return {"signal": 0, "thought": "Part11 MTF evidence incomplete",
+                    "data_status": "error", "timeframe_coverage": []}
+        required_parts = set(self.weights)
+        per_timeframe = {}
+        buy_weight = sell_weight = 0.0
+        total_weight = sum(tf_weights.values())
+        for timeframe in timeframes:
+            parts = results_by_timeframe.get(timeframe)
+            if not isinstance(parts, dict) or not required_parts.issubset(parts):
+                return {"signal": 0, "thought": f"Part11 {timeframe} evidence incomplete",
+                        "data_status": "error", "timeframe_coverage": list(per_timeframe)}
+            result = self.analyze(parts)
+            try:
+                signal = float(result.get("signal", 0))
+            except (TypeError, ValueError, OverflowError):
+                return {"signal": 0, "thought": f"Part11 {timeframe} signal malformed",
+                        "data_status": "error", "timeframe_coverage": list(per_timeframe)}
+            if not np.isfinite(signal):
+                return {"signal": 0, "thought": f"Part11 {timeframe} signal non-finite",
+                        "data_status": "error", "timeframe_coverage": list(per_timeframe)}
+            per_timeframe[timeframe] = result
+            if signal > 0:
+                buy_weight += tf_weights[timeframe] * min(1.0, signal)
+            elif signal < 0:
+                sell_weight += tf_weights[timeframe] * min(1.0, abs(signal))
+        buy_ratio, sell_ratio = buy_weight / total_weight, sell_weight / total_weight
+        signal = 1 if buy_ratio >= 0.65 else -1 if sell_ratio >= 0.65 else 0
+        direction = "bullish" if signal > 0 else "bearish" if signal < 0 else "neutral"
+        agreed = sum(1 for result in per_timeframe.values() if int(result.get("signal", 0) or 0) == signal) if signal else 0
+        return {"signal": signal, "thought": f"Part11 native MTF {direction}: {agreed}/8 frames; diagnostic only",
+                "data_status": "valid", "timeframe": "aggregate",
+                "timeframe_coverage": list(timeframes), "timeframe_results": per_timeframe,
+                "weighted_buy_ratio": round(buy_ratio, 6), "weighted_sell_ratio": round(sell_ratio, 6)}
 
 
 # ==================== LINUX OPTIMIZATION ====================

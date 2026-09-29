@@ -37,6 +37,17 @@ PART_WEIGHTS = {
 }
 ANCHORS = {"part6_trend", "part8_structure", "part9_orderflow"}
 INACTIVE_MARKERS = ("error", "offline", "fallback", "missing")
+REQUIRED_TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+# Existing jarvis_FIXED.py native-timeframe weights. 1m remains a trigger-only
+# interval; it does not contribute to the SWING directional vote.
+TIMEFRAME_WEIGHTS = {
+    "1m": 1.0, "3m": 1.5, "5m": 2.0, "15m": 3.0,
+    "30m": 4.0, "1h": 5.0, "2h": 6.0, "4h": 7.0,
+}
+SCALP_DIRECTION_TIMEFRAMES = ("1m", "3m", "5m", "15m")
+SWING_DIRECTION_TIMEFRAMES = ("3m", "5m", "15m", "30m", "1h", "2h", "4h")
+SCALP_HIGHER_TIMEFRAME_GUARD = ("30m", "1h", "2h", "4h")
+CENTRAL_CONSENSUS_THRESHOLD = 0.65  # Existing Parts 1–11 consensus policy.
 
 
 def _direction(value: Any) -> str:
@@ -263,9 +274,11 @@ def evaluate_central_strategy(
         # result format is present. The live MTF adapter emits MTF x/8; those
         # values were already gated by Jarvis' per-part MTF integrity logic.
         import re
-        mtf_match = re.search(r"mtf: (\d)/4", thought)
-        if mtf_match and signal != 0 and int(mtf_match.group(1)) < 2:
-            signal = 0.0
+        mtf_match = re.search(r"mtf: (\d+)/(\d+)", thought)
+        if mtf_match and signal != 0:
+            mtf_agree, mtf_total = int(mtf_match.group(1)), int(mtf_match.group(2))
+            if mtf_total > 0 and mtf_agree / mtf_total < 0.5:
+                signal = 0.0
 
         denominator += weight
         if signal > 0:
@@ -339,6 +352,171 @@ def evaluate_central_strategy(
                            [f"Central confidence {normalized_confidence:.0f} below minimum {float(minimum_confidence):.0f}"], diagnostic)
 
     return _result("APPROVED", recommendation, normalized_confidence, [], diagnostic)
+
+
+def evaluate_mtf_central_strategy(
+    timeframe_parts: Any,
+    part7_gate: Any,
+    *,
+    confidence: Any = None,
+    minimum_confidence: Optional[float] = None,
+    expected_symbol: Any = None,
+) -> dict[str, Any]:
+    """Select a deterministic SCALP/SWING candidate from complete native evidence.
+
+    Every native frame is independently evaluated with the existing Parts 1–11
+    quorum, 65% weighted consensus, Part 2 zone veto and anchor-dissent policy.
+    SWING direction is decided from 3m–4h evidence; 1m only times entry. SCALP
+    direction uses 1m–15m evidence and the existing 30m–4h group can veto a
+    strongly counter-trend entry. A neutral 1m is always pending, never approval.
+    """
+    expected_clean = _clean_symbol(expected_symbol)
+    if not expected_clean:
+        return _result("BLOCKED", "NO_TRADE", None, ["Selected symbol is required for MTF approval"], {})
+    if not isinstance(timeframe_parts, Mapping) or set(timeframe_parts) != set(REQUIRED_TIMEFRAMES):
+        return _result("BLOCKED", "NO_TRADE", None, ["Complete native 8-timeframe Part evidence is required"], {})
+    if not isinstance(part7_gate, Mapping):
+        return _result("BLOCKED", "NO_TRADE", None, ["Part7 aggregate gate is missing"], {})
+    aggregate_frames = part7_gate.get("timeframe_results")
+    if not isinstance(aggregate_frames, Mapping):
+        return _result("BLOCKED", "NO_TRADE", None, ["Part7 timeframe evidence is missing"], {})
+    if (part7_gate.get("entry_blocked") is not False
+            or part7_gate.get("risk_veto") is not False
+            or part7_gate.get("status") != "ok"
+            or part7_gate.get("data_status") != "valid"
+            or part7_gate.get("timeframe") != "aggregate"
+            or _clean_symbol(part7_gate.get("symbol")) != expected_clean
+            or set(aggregate_frames) != set(REQUIRED_TIMEFRAMES)
+            or part7_gate.get("blocked_timeframes") != []
+            or part7_gate.get("veto_timeframes") != []):
+        return _result("BLOCKED", "NO_TRADE", None, ["Part7 aggregate is incomplete, blocked, stale, or symbol-mismatched"], {})
+
+    frame_gate = part7_gate["timeframe_results"]
+    decisions: dict[str, dict[str, Any]] = {}
+    for timeframe in REQUIRED_TIMEFRAMES:
+        parts = timeframe_parts.get(timeframe)
+        if not isinstance(parts, Mapping):
+            return _result("BLOCKED", "NO_TRADE", None, [f"{timeframe} Part evidence is missing"], {})
+        missing = [name for name in PART_WEIGHTS if name not in parts]
+        if missing:
+            return _result("BLOCKED", "NO_TRADE", None,
+                           [f"{timeframe} Part evidence is incomplete: " + ", ".join(missing)], {})
+        for part_name in PART_WEIGHTS:
+            item = parts.get(part_name)
+            if not isinstance(item, Mapping):
+                return _result("BLOCKED", "NO_TRADE", None,
+                               [f"{timeframe} {part_name} evidence is malformed"], {})
+            item_symbol = item.get("symbol", item.get("selected_symbol"))
+            if item_symbol is not None and _clean_symbol(item_symbol) != expected_clean:
+                return _result("BLOCKED", "NO_TRADE", None,
+                               [f"{timeframe} {part_name} symbol identity mismatch"], {})
+            for identity_key in ("timeframe", "native_timeframe"):
+                item_timeframe = item.get(identity_key)
+                if item_timeframe is not None and str(item_timeframe) != timeframe:
+                    return _result("BLOCKED", "NO_TRADE", None,
+                                   [f"{timeframe} {part_name} timeframe identity mismatch"], {})
+        part7_item = parts.get("part7_volatility")
+        if (part7_item.get("timeframe") != timeframe
+                or _clean_symbol(part7_item.get("symbol")) != expected_clean
+                or part7_item.get("data_status") != "valid"
+                or part7_item.get("entry_blocked") is not False
+                or part7_item.get("risk_veto") is not False
+                or part7_item.get("status") not in {"ok", "neutral"}):
+            return _result("BLOCKED", "NO_TRADE", None,
+                           [f"{timeframe} Part7 evidence identity/status mismatch"], {})
+        gate = frame_gate.get(timeframe)
+        if (not isinstance(gate, Mapping) or gate.get("timeframe") != timeframe
+                or _clean_symbol(gate.get("symbol")) != expected_clean
+                or gate.get("data_status") != "valid"
+                or gate.get("entry_blocked") is not False
+                or gate.get("risk_veto") is not False
+                or gate.get("status") not in {"ok", "neutral"}):
+            return _result("BLOCKED", "NO_TRADE", None,
+                           [f"Part7 {timeframe} evidence is missing, stale, blocked, or symbol-mismatched"], {})
+        decisions[timeframe] = evaluate_central_strategy(parts, gate)
+
+    def group_vote(timeframes: tuple[str, ...]) -> dict[str, Any]:
+        total = sum(TIMEFRAME_WEIGHTS[tf] for tf in timeframes)
+        buy = sum(TIMEFRAME_WEIGHTS[tf] for tf in timeframes
+                  if decisions[tf].get("status") == "APPROVED" and decisions[tf].get("direction") == "BUY")
+        sell = sum(TIMEFRAME_WEIGHTS[tf] for tf in timeframes
+                   if decisions[tf].get("status") == "APPROVED" and decisions[tf].get("direction") == "SELL")
+        direction = "BUY" if buy / total >= CENTRAL_CONSENSUS_THRESHOLD else (
+            "SELL" if sell / total >= CENTRAL_CONSENSUS_THRESHOLD else "NO_TRADE")
+        return {"timeframes": list(timeframes), "buy_weight": round(buy, 4),
+                "sell_weight": round(sell, 4), "total_weight": round(total, 4),
+                "buy_ratio": round(buy / total, 6), "sell_ratio": round(sell / total, 6),
+                "direction": direction}
+
+    swing = group_vote(SWING_DIRECTION_TIMEFRAMES)
+    scalp = group_vote(SCALP_DIRECTION_TIMEFRAMES)
+    guard = group_vote(SCALP_HIGHER_TIMEFRAME_GUARD)
+    frame_summary = {
+        tf: {"status": decisions[tf].get("status"), "direction": decisions[tf].get("direction"),
+             "reasons": list(decisions[tf].get("reasons") or [])}
+        for tf in REQUIRED_TIMEFRAMES
+    }
+    diagnostic = {"swing": swing, "scalp": scalp, "scalp_higher_timeframe_guard": guard,
+                  "timeframe_decisions": frame_summary}
+
+    mode = "SWING" if swing["direction"] in {"BUY", "SELL"} else (
+        "SCALP" if scalp["direction"] in {"BUY", "SELL"} else None)
+    candidate = swing["direction"] if mode == "SWING" else (scalp["direction"] if mode == "SCALP" else "NO_TRADE")
+    if mode is None:
+        return _result("NEUTRAL", "NO_TRADE", None,
+                       ["Neither the conservative SWING nor SCALP timeframe group reaches existing 65% confluence"], diagnostic)
+
+    # A zone or anchor veto in the selected directional group remains a veto;
+    # it is not diluted by otherwise-aligned frames.
+    selected_group = SWING_DIRECTION_TIMEFRAMES if mode == "SWING" else SCALP_DIRECTION_TIMEFRAMES
+    critical_reasons = [reason for tf in selected_group for reason in decisions[tf].get("reasons", [])
+                        if "zone veto" in str(reason).lower() or "anchor-dissent veto" in str(reason).lower()]
+    if critical_reasons:
+        result = _result("BLOCKED", "NO_TRADE", None, critical_reasons, diagnostic)
+        result.update({"trade_mode": mode, "setup_direction": candidate, "entry_trigger": "BLOCKED"})
+        return result
+    if mode == "SCALP" and guard["direction"] in {"BUY", "SELL"} and guard["direction"] != candidate:
+        result = _result("BLOCKED", "NO_TRADE", None,
+                         [f"SCALP {candidate} vetoed by 30m–4h {guard['direction']} confluence"], diagnostic)
+        result.update({"trade_mode": mode, "setup_direction": candidate, "entry_trigger": "HTF_VETO"})
+        return result
+
+    normalized_confidence = None
+    if confidence is not None:
+        try:
+            normalized_confidence = float(confidence)
+        except (TypeError, ValueError, OverflowError):
+            return _result("BLOCKED", "NO_TRADE", None, ["Central confidence is malformed"], diagnostic)
+        if not math.isfinite(normalized_confidence) or not 0 <= normalized_confidence <= 100:
+            return _result("BLOCKED", "NO_TRADE", None, ["Central confidence is outside 0..100"], diagnostic)
+        if minimum_confidence is not None:
+            try:
+                minimum = float(minimum_confidence)
+            except (TypeError, ValueError, OverflowError):
+                return _result("BLOCKED", "NO_TRADE", None, ["Minimum confidence is malformed"], diagnostic)
+            if not math.isfinite(minimum) or normalized_confidence < minimum:
+                return _result("BLOCKED", "NO_TRADE", candidate,
+                               [f"Central confidence {normalized_confidence:.0f} below minimum {minimum:.0f}"], diagnostic)
+
+    trigger = decisions["1m"]
+    if trigger.get("status") != "APPROVED":
+        trigger_reason = "1m entry trigger is neutral; valid setup remains pending without entry" if trigger.get("status") == "NEUTRAL" else "1m entry-trigger evidence is blocked or incomplete"
+        status = "PENDING" if trigger.get("status") == "NEUTRAL" else "BLOCKED"
+        result = _result(status, "NO_TRADE", normalized_confidence, [trigger_reason], diagnostic)
+        result.update({"trade_mode": mode, "setup_direction": candidate,
+                       "entry_trigger": "NEUTRAL" if status == "PENDING" else "BLOCKED"})
+        return result
+    if trigger.get("direction") != candidate:
+        result = _result("BLOCKED", "NO_TRADE", normalized_confidence,
+                         [f"1m entry trigger {trigger.get('direction')} opposes {mode} {candidate} setup"], diagnostic)
+        result.update({"trade_mode": mode, "setup_direction": candidate, "entry_trigger": "OPPOSITE"})
+        return result
+
+    if normalized_confidence is None and minimum_confidence is not None:
+        return _result("BLOCKED", "NO_TRADE", None, ["Central confidence is required for entry approval"], diagnostic)
+    result = _result("APPROVED", candidate, normalized_confidence, [], diagnostic)
+    result.update({"trade_mode": mode, "setup_direction": candidate, "entry_trigger": "ALIGNED"})
+    return result
 
 
 def _result(status: str, direction: str, confidence: Any, reasons: list[str], diagnostic: dict[str, Any]) -> dict[str, Any]:

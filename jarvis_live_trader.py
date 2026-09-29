@@ -54,14 +54,16 @@ def _same_exact_price(left, right):
         return False
 
 
-def _validate_central_entry(approval, part_results, part7_gate, direction, confidence, symbol, snapshot_version, execution_plan=None, trade_mode=None):
-    """Recompute Jarvis policy and validate its scoped plan before every entry route."""
+def _validate_central_entry(approval, part_results, part7_gate, direction, confidence, symbol, snapshot_version, execution_plan=None, trade_mode=None, timeframe_parts=None):
+    """Recompute Jarvis 8-frame mode/entry policy and validate the scoped plan."""
     try:
-        from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval, validate_execution_plan
+        from jarvis_strategy_approval import evaluate_mtf_central_strategy, validate_entry_approval, validate_execution_plan
         expected = "BUY" if str(direction).upper() in ("CALL", "BUY") else "SELL" if str(direction).upper() in ("PUT", "SELL") else "NO_TRADE"
-        decision = evaluate_central_strategy(
-            part_results, part7_gate, confidence=confidence, expected_symbol=symbol
+        decision = evaluate_mtf_central_strategy(
+            timeframe_parts, part7_gate, confidence=confidence, expected_symbol=symbol
         )
+        if decision.get("trade_mode") != trade_mode:
+            return False, "Central Jarvis timeframe mode mismatch"
         if not decision.get("approved") or decision.get("direction") != expected:
             return False, "Jarvis central strategy did not approve this direction"
         plan_ok, plan_reason = validate_execution_plan(
@@ -139,7 +141,7 @@ except ImportError:
 try:
     from jarvis_sizer import get_sizer as _get_sizer
 except ImportError:
-    _get_sizer = lambda: None
+    _get_sizer = lambda delta_client=None: None
 
 # ── Position Manager (lazy import) ───────────────────────────
 try:
@@ -213,7 +215,8 @@ class JarvisAutoTrader:
                 current_price: float, part_results: Dict = None,
                 trade_type: str = "SCALP", symbol: str = "BTCUSDT",
                 *, part7_gate: Dict = None, central_approval: Dict = None,
-                snapshot_version: str = None, execution_plan: Dict = None) -> Dict:
+                snapshot_version: str = None, execution_plan: Dict = None,
+                timeframe_parts: Dict = None) -> Dict:
         """
         Main entry: receive signal → run all gates → place order.
         direction  : 'CALL' or 'PUT'
@@ -241,6 +244,7 @@ class JarvisAutoTrader:
         approval_ok, approval_reason = _validate_central_entry(
             central_approval, part_results, part7_gate, direction, confidence,
             symbol, snapshot_version, execution_plan=execution_plan, trade_mode=trade_type,
+            timeframe_parts=timeframe_parts,
         )
         if not approval_ok:
             return self._skip(f"Central Jarvis entry approval: {approval_reason}")
@@ -277,7 +281,7 @@ class JarvisAutoTrader:
             direction, confidence, current_price, trade_type, hedge_plan, symbol,
             central_approval=central_approval, part_results=part_results,
             part7_gate=part7_gate, snapshot_version=snapshot_version,
-            execution_plan=execution_plan,
+            execution_plan=execution_plan, timeframe_parts=timeframe_parts,
         )
 
     def trigger_emergency_stop(self):
@@ -550,7 +554,7 @@ class JarvisAutoTrader:
     def _place_trade(self, direction, confidence, price,
                      trade_type, hedge_plan, symbol: str = "BTCUSDT", *,
                      central_approval=None, part_results=None, part7_gate=None,
-                     snapshot_version=None, execution_plan=None) -> Dict:
+                     snapshot_version=None, execution_plan=None, timeframe_parts=None) -> Dict:
         """Execute a new entry only with fresh Jarvis central approval."""
         symbol = str(symbol or "").upper().replace("-", "").replace("_", "").strip()
         if not symbol:
@@ -558,6 +562,7 @@ class JarvisAutoTrader:
         approval_ok, approval_reason = _validate_central_entry(
             central_approval, part_results, part7_gate, direction, confidence,
             symbol, snapshot_version, execution_plan=execution_plan, trade_mode=trade_type,
+            timeframe_parts=timeframe_parts,
         )
         if not approval_ok:
             return {"success": False, "reason": f"Central Jarvis entry approval: {approval_reason}"}
@@ -661,6 +666,7 @@ class JarvisAutoTrader:
         approval_ok, approval_reason = _validate_central_entry(
             central_approval, part_results, part7_gate, direction, confidence,
             symbol, snapshot_version, execution_plan=execution_plan, trade_mode=trade_type,
+            timeframe_parts=timeframe_parts,
         )
         if not approval_ok:
             return {"success": False, "reason": f"Central Jarvis approval expired before order: {approval_reason}"}
@@ -1154,13 +1160,14 @@ class JarvisAutoTrader:
             central_approval = result.get("central_strategy_approval")
             snapshot_version = (central_approval or {}).get("snapshot_version")
             part_results = getattr(self._jarvis_ref, "latest_part_results", {})
+            timeframe_parts = getattr(self._jarvis_ref, "latest_part_results_by_timeframe", {})
             part7_gate = getattr(self._jarvis_ref, "latest_part7", {})
             execution_plan = result.get("execution_plan")
             trade_mode = str((execution_plan or {}).get("trade_mode") or "")
             approval_ok, approval_reason = _validate_central_entry(
                 central_approval, part_results, part7_gate, new_dir, new_conf,
                 selected_symbol, snapshot_version, execution_plan=execution_plan,
-                trade_mode=trade_mode,
+                trade_mode=trade_mode, timeframe_parts=timeframe_parts,
             )
             if not approval_ok:
                 logger.info("[REVERSAL] new entry blocked by central Jarvis: %s", approval_reason)
@@ -1168,13 +1175,13 @@ class JarvisAutoTrader:
             self._execute_reversal(
                 pos, new_dir, new_conf, position_price,
                 central_approval=central_approval, part_results=part_results,
-                part7_gate=part7_gate, snapshot_version=snapshot_version,
-                execution_plan=execution_plan,
+                timeframe_parts=timeframe_parts, part7_gate=part7_gate,
+                snapshot_version=snapshot_version, execution_plan=execution_plan,
             )
 
     def _execute_reversal(self, pos: Dict, new_dir: str, confidence: int, price: float, *,
-                          central_approval=None, part_results=None, part7_gate=None,
-                          snapshot_version=None, execution_plan=None):
+                          central_approval=None, part_results=None, timeframe_parts=None,
+                          part7_gate=None, snapshot_version=None, execution_plan=None):
         """
         1. Close current position at market
         2. Open new position in opposite direction
@@ -1238,8 +1245,9 @@ class JarvisAutoTrader:
         result = self._place_trade(
             new_dir, confidence, price, trade_type, hedge_plan,
             symbol=pos.get("symbol", ""), central_approval=central_approval,
-            part_results=part_results, part7_gate=part7_gate,
-            snapshot_version=snapshot_version, execution_plan=execution_plan,
+            part_results=part_results, timeframe_parts=timeframe_parts,
+            part7_gate=part7_gate, snapshot_version=snapshot_version,
+            execution_plan=execution_plan,
         )
 
         if result.get("success"):

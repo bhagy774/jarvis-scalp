@@ -8,7 +8,7 @@ from jarvis_multicoin_execution import (
     CandidateRejected, DeterministicPaperAdapter, PortfolioCoordinator,
     candidate_from_analysis,
 )
-from jarvis_strategy_approval import evaluate_central_strategy, make_entry_approval
+from jarvis_strategy_approval import REQUIRED_TIMEFRAMES, evaluate_mtf_central_strategy, make_entry_approval
 
 
 NOW = 1_800_000_000.0
@@ -43,6 +43,22 @@ def part7_gate(symbol):
     }
 
 
+def timeframe_evidence(symbol):
+    result = {}
+    for timeframe in REQUIRED_TIMEFRAMES:
+        row = {}
+        for name, item in bullish_evidence().items():
+            scoped = {**item, "symbol": symbol, "timeframe": timeframe}
+            if name == "part7_volatility":
+                scoped.update({"signal": 0, "thought": "neutral volatility", "status": "neutral",
+                               "data_status": "valid", "entry_blocked": False, "risk_veto": False})
+            if name == "part2_zone":
+                scoped["native_timeframe"] = timeframe
+            row[name] = scoped
+        result[timeframe] = row
+    return result
+
+
 def analysis(symbol="BTCUSDT", product_id="101", *, plan=None, status="COMPLETE", fetched=NOW-10, completed=NOW-2):
     asset = symbol
     for quote in ("USDT", "USD"):
@@ -51,8 +67,9 @@ def analysis(symbol="BTCUSDT", product_id="101", *, plan=None, status="COMPLETE"
             break
     identity = {"venue": "delta", "market_type": "perpetual", "instrument_id": product_id, "symbol": symbol}
     evidence = bullish_evidence()
+    native_evidence = timeframe_evidence(symbol)
     gate = part7_gate(symbol)
-    decision = evaluate_central_strategy(evidence, gate, confidence=80, expected_symbol=symbol)
+    decision = evaluate_mtf_central_strategy(native_evidence, gate, confidence=80, expected_symbol=symbol)
     approval = make_entry_approval(
         decision, direction="BUY", symbol=symbol, exchange="delta", contract=symbol,
         instrument_id=product_id, market_type="perpetual", analysis_symbol=symbol,
@@ -61,8 +78,9 @@ def analysis(symbol="BTCUSDT", product_id="101", *, plan=None, status="COMPLETE"
     )
     return {
         "status": status, "scope": "parts1-12-analysis-only", "analysis_only": True,
-        "decision_authority": "jarvis_FIXED", "execution_eligible": False,
+        "decision_authority": "none", "execution_eligible": False,
         "request_identity": identity, "execution_identity": identity,
+        "parts_by_timeframe": native_evidence,
         "snapshot_version": "snap-abc", "snapshot_fetched_at": fetched,
         "analysis_completed_at": completed, "freshness_status": "FRESH",
         "central_strategy_decision": decision, "central_strategy_evidence": evidence,
@@ -113,12 +131,18 @@ def test_candidate_contract_requires_all_explicit_fields_and_asset_policy():
     contract_plan = {**analysis()["execution_plan"], "size_unit": "contracts", "contract_multiplier": 10.0, "risk_notional": 20.0}
     contract_candidate = candidate_from_analysis(analysis(plan=contract_plan), policy_registry=POLICIES, now=NOW)
     assert contract_candidate.notional == 1000.0 and contract_candidate.risk_notional == 20.0
-    zone_veto_evidence = bullish_evidence()
-    zone_veto_evidence["part2_zone"] = {"signal": -1, "thought": "resistance zone"}
+    zone_veto = analysis()
+    zone_veto["parts_by_timeframe"]["3m"]["part2_zone"].update({
+        "signal": -1, "thought": "resistance zone", "symbol": "BTCUSDT",
+        "timeframe": "3m", "native_timeframe": "3m",
+    })
+    wrong_frame = analysis()
+    wrong_frame["parts_by_timeframe"]["4h"]["part6_trend"]["symbol"] = "ETHUSDT"
     for bad_result, policies in [
         (analysis(status="PARTIAL"), POLICIES),
-        ({**analysis(), "central_strategy_evidence": zone_veto_evidence}, POLICIES),
-        ({**analysis(), "central_strategy_evidence": None}, POLICIES),
+        (zone_veto, POLICIES),
+        ({**analysis(), "parts_by_timeframe": {}}, POLICIES),
+        (wrong_frame, POLICIES),
         ({**analysis(), "snapshot_fetched_at": NOW-500}, POLICIES),
         ({**analysis(), "execution_plan": None}, POLICIES),
         ({**analysis(), "request_identity": {"venue": "delta", "symbol": "BTCUSDT"}}, POLICIES),

@@ -20,7 +20,13 @@ import threading
 import time
 from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Sequence, Tuple
 
-from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval
+from jarvis_strategy_approval import (
+    PART_WEIGHTS, REQUIRED_TIMEFRAMES, evaluate_mtf_central_strategy,
+    validate_entry_approval,
+)
+
+_CANONICAL_PARTS = tuple(PART_WEIGHTS)
+_PART_ALIASES = {f"part{index}": name for index, name in enumerate(_CANONICAL_PARTS, 1)}
 
 
 class CandidateRejected(ValueError):
@@ -129,8 +135,8 @@ def candidate_from_analysis(
     if not isinstance(result, Mapping) or result.get("status") != "COMPLETE":
         raise CandidateRejected("only COMPLETE analysis can produce a candidate")
     if (result.get("scope") != "parts1-12-analysis-only" or result.get("analysis_only") is not True
-            or result.get("decision_authority") != "jarvis_FIXED" or result.get("execution_eligible") is not False):
-        raise CandidateRejected("analysis lacks Jarvis central strategy authority/scope marker")
+            or result.get("decision_authority") != "none" or result.get("execution_eligible") is not False):
+        raise CandidateRejected("analysis-only Parts result has an unexpected authority/scope marker")
     if result.get("freshness_status") not in (None, "FRESH"):
         raise CandidateRejected("analysis result is stale")
     analysis_identity = FullIdentity.parse(result.get("request_identity"))
@@ -167,6 +173,7 @@ def candidate_from_analysis(
         raise CandidateRejected("analysis snapshot is from the future")
     snapshot_version = str(result.get("snapshot_version") or "").strip()
     central_decision = result.get("central_strategy_decision")
+    central_evidence = result.get("central_strategy_evidence")
     if not isinstance(central_decision, Mapping) or central_decision.get("approved") is not True:
         raise CandidateRejected("Jarvis central strategy did not approve the entry")
     gate = result.get("part7_gate")
@@ -181,13 +188,34 @@ def candidate_from_analysis(
         central_confidence = int(round(float(central_decision.get("confidence"))))
     except (TypeError, ValueError, OverflowError):
         raise CandidateRejected("Jarvis central confidence is missing")
-    central_evidence = result.get("central_strategy_evidence")
-    recomputed = evaluate_central_strategy(
-        central_evidence, gate, confidence=central_confidence,
+    raw_parts_by_timeframe = result.get("parts_by_timeframe")
+    if (not isinstance(raw_parts_by_timeframe, Mapping)
+            or set(raw_parts_by_timeframe) != set(REQUIRED_TIMEFRAMES)):
+        raise CandidateRejected("complete native 8-timeframe Part evidence is missing")
+    expected_symbol = analysis_identity.symbol.upper().replace("/", "").replace("-", "").replace("_", "")
+    normalized_parts: Dict[str, Dict[str, Any]] = {}
+    for timeframe in REQUIRED_TIMEFRAMES:
+        raw_frame = raw_parts_by_timeframe.get(timeframe)
+        if not isinstance(raw_frame, Mapping):
+            raise CandidateRejected(f"{timeframe} Part evidence is malformed")
+        frame: Dict[str, Any] = {}
+        for alias, canonical in _PART_ALIASES.items():
+            item = raw_frame.get(canonical, raw_frame.get(alias))
+            if not isinstance(item, Mapping):
+                raise CandidateRejected(f"{timeframe} {canonical} evidence is missing")
+            item_symbol = str(item.get("symbol") or item.get("selected_symbol") or "").upper().replace("/", "").replace("-", "").replace("_", "")
+            item_timeframe = str(item.get("timeframe") or item.get("native_timeframe") or "")
+            if item_symbol != expected_symbol or item_timeframe != timeframe:
+                raise CandidateRejected(f"{timeframe} {canonical} symbol/timeframe identity mismatch")
+            frame[canonical] = dict(item)
+        normalized_parts[timeframe] = frame
+    recomputed = evaluate_mtf_central_strategy(
+        normalized_parts, gate, confidence=central_confidence,
         expected_symbol=analysis_identity.symbol,
     )
-    if not recomputed.get("approved") or recomputed.get("direction") != central_direction:
-        raise CandidateRejected("central Part evidence or Part7 gate does not approve this direction")
+    if (not recomputed.get("approved") or recomputed.get("direction") != central_direction
+            or recomputed.get("trade_mode") != central_decision.get("trade_mode")):
+        raise CandidateRejected("central native-timeframe evidence or Part7 gate does not approve this mode/direction")
     approval = result.get("central_strategy_approval")
     if not isinstance(approval, Mapping):
         raise CandidateRejected("scope-bound Jarvis central strategy approval is missing")
@@ -290,6 +318,7 @@ def candidate_from_analysis(
     entry_authorization = {
         "central_approval": dict(approval),
         "part_results": dict(central_evidence) if isinstance(central_evidence, Mapping) else None,
+        "parts_by_timeframe": normalized_parts,
         "part7_gate": dict(gate),
         "snapshot_version": snapshot_version,
         "analysis_symbol": analysis_identity.symbol,

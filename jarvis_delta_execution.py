@@ -21,7 +21,6 @@ from jarvis_multicoin_execution import (
     CandidateRejected, FullIdentity, PortfolioCoordinator, ValidatedCandidate,
     _base_asset, _nonnegative_number, _positive_number, candidate_from_analysis,
 )
-from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval
 
 
 _ALLOWED_DELTA_TYPES = {"perpetual", "perpetual_futures", "perpetual_swap", "perpetual_swaps"}
@@ -81,8 +80,8 @@ def _require_analysis(result: Mapping[str, Any], policy: Mapping[str, Any], now:
     if not isinstance(result, Mapping) or result.get("status") != "COMPLETE":
         raise CandidateRejected("only a fresh COMPLETE Parts 1-12 analysis may be planned")
     if (result.get("scope") != "parts1-12-analysis-only" or result.get("analysis_only") is not True
-            or result.get("decision_authority") != "jarvis_FIXED" or result.get("execution_eligible") is not False):
-        raise CandidateRejected("analysis result lacks Jarvis central strategy authority/scope marker")
+            or result.get("decision_authority") != "none" or result.get("execution_eligible") is not False):
+        raise CandidateRejected("analysis result has an unexpected authority/scope marker")
     if result.get("freshness_status") != "FRESH":
         raise CandidateRejected("analysis result freshness is missing or stale")
     expected_coverage = [f"Part{i}" for i in range(1, 13)]
@@ -149,10 +148,7 @@ def _require_analysis(result: Mapping[str, Any], policy: Mapping[str, Any], now:
 
     decision = result.get("deterministic_decision")
     if not isinstance(decision, Mapping) or decision.get("origin") != "jarvis_FIXED_central_strategy":
-        raise CandidateRejected("Jarvis central strategy decision is missing")
-    central_decision = result.get("central_strategy_decision")
-    if not isinstance(central_decision, Mapping) or central_decision.get("approved") is not True:
-        raise CandidateRejected("Jarvis central strategy did not approve the entry")
+        raise CandidateRejected("deterministic Parts 1-12 decision is missing")
     direction = _text(decision.get("direction")).upper()
     if direction in {"NO_TRADE", "NONE", "HOLD", "NEUTRAL", ""}:
         raise CandidateRejected("NO TRADE decision")
@@ -167,59 +163,22 @@ def _require_analysis(result: Mapping[str, Any], policy: Mapping[str, Any], now:
     if min_confidence <= 0 or confidence < min_confidence or confidence > 100:
         raise CandidateRejected("confidence does not meet the asset policy")
 
-    if (_direction := str(central_decision.get("direction") or "").upper()) != direction:
-        raise CandidateRejected("approved direction differs from the Jarvis central strategy decision")
-    try:
-        central_confidence = int(round(float(central_decision.get("confidence"))))
-    except (TypeError, ValueError, OverflowError):
-        raise CandidateRejected("Jarvis central confidence is missing")
-    if central_confidence != confidence or confidence < min_confidence:
-        raise CandidateRejected("Jarvis central confidence does not meet the asset policy")
     parts = result.get("once_per_symbol_parts")
     p11 = parts.get("part11") if isinstance(parts, Mapping) else None
     p12 = parts.get("part12") if isinstance(parts, Mapping) else None
     if not isinstance(p11, Mapping) or not isinstance(p12, Mapping):
-        raise CandidateRejected("Parts 11/12 diagnostic analysis is incomplete")
+        raise CandidateRejected("Part11/Part12 deterministic consensus is incomplete")
+    try:
+        p11_signal = int(p11.get("signal"))
+        p12_confidence = float(p12.get("confidence"))
+    except (TypeError, ValueError, OverflowError):
+        raise CandidateRejected("Part11/Part12 consensus values are malformed")
+    expected_signal = 1 if direction == "BUY" else -1
+    if p11_signal != expected_signal or not math.isfinite(p12_confidence) or p12_confidence < min_confidence:
+        raise CandidateRejected("Part11/Part12 do not confirm the deterministic trade decision")
     gate = result.get("part7_gate")
     if not isinstance(gate, Mapping) or gate.get("entry_blocked") is not False or gate.get("risk_veto") is not False:
         raise CandidateRejected("Part7 new-entry gate is missing or blocks entry")
-    gate_symbol = _text(gate.get("symbol")).upper().replace("/", "").replace("-", "").replace("_", "")
-    if not gate_symbol or gate_symbol != source_identity.symbol.upper().replace("/", "").replace("-", "").replace("_", ""):
-        raise CandidateRejected("Part7 gate symbol identity is missing or mismatched")
-    central_evidence = result.get("central_strategy_evidence")
-    recomputed = evaluate_central_strategy(
-        central_evidence, gate, confidence=central_confidence,
-        expected_symbol=source_identity.symbol,
-    )
-    if not recomputed.get("approved") or recomputed.get("direction") != direction:
-        raise CandidateRejected("central Part evidence or Part7 gate does not approve this direction")
-    approval = result.get("central_strategy_approval")
-    if not isinstance(approval, Mapping):
-        raise CandidateRejected("scope-bound Jarvis central strategy approval is missing")
-    if (str(approval.get("analysis_symbol") or "").upper() != source_identity.symbol
-            or str(approval.get("analysis_exchange") or "").lower() != source_identity.venue):
-        raise CandidateRejected("Jarvis approval analysis identity does not match the source instrument")
-    strategy_plan = (result.get("central_execution_plan") or result.get("jarvis_execution_plan")
-                     or (result.get("execution_plan") if isinstance(result.get("execution_plan"), Mapping)
-                         and result.get("execution_plan", {}).get("schema_version") == "jarvis-execution-plan-v1" else None))
-    bound_plan = bool(str(approval.get("execution_plan_id") or ""))
-    if bound_plan and not isinstance(strategy_plan, Mapping):
-        raise CandidateRejected("Jarvis-bound central execution plan is missing")
-    approval_ok, approval_reason = validate_entry_approval(
-        approval, direction=direction, symbol=execution_identity.symbol, exchange=execution_identity.venue,
-        contract=execution_identity.symbol, instrument_id=execution_identity.instrument_id,
-        market_type=execution_identity.market_type, snapshot_version=result.get("snapshot_version"),
-        confidence=confidence, execution_plan=strategy_plan if bound_plan else None,
-        now=now, max_age_seconds=max_age,
-    )
-    if not approval_ok:
-        raise CandidateRejected(approval_reason)
-    try:
-        approved_at = float(approval.get("analysis_timestamp"))
-    except (TypeError, ValueError, OverflowError):
-        raise CandidateRejected("Jarvis approval timestamp is malformed")
-    if approved_at < fetched or approved_at > completed + 2:
-        raise CandidateRejected("Jarvis approval timestamp is outside the analysis interval")
     try:
         entry_reference = _positive_number(decision.get("entry_price"), "decision reference entry")
         stop = _positive_number(decision.get("stop_loss"), "deterministic stop loss")
@@ -499,7 +458,7 @@ class DeltaExecutionAdapter:
                 side="buy" if candidate.direction == "BUY" else "sell", size=int(candidate.quantity),
                 order_type="market", stop_loss=candidate.stop_loss, take_profit=candidate.take_profit,
                 leverage=int(candidate.leverage), client_order_id=client_id,
-                entry_authorization=dict(candidate.entry_authorization or {}),
+                entry_authorization=candidate.entry_authorization,
             )
         except Exception:
             return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "reason": "Delta submit response lost"}
