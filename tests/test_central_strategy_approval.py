@@ -22,6 +22,15 @@ from jarvis_strategy_approval import (
 NOW = 1_800_000_000.0
 
 
+@pytest.fixture(autouse=True)
+def isolate_process_local_position_ownership():
+    """Always release test-only lifecycle claims around each independent test."""
+    from jarvis_position_ownership import clear_registry
+    clear_registry()
+    yield
+    clear_registry()
+
+
 def bullish_parts(symbol="BTCUSDT"):
     return {
         "part1_breakout": {"signal": 1, "thought": "bullish breakout"},
@@ -155,8 +164,12 @@ def _live_trader_module(monkeypatch):
     lots.enforce_entry_lots = lambda *a, **k: 0
     monkeypatch.setitem(sys.modules, "jarvis_risk", risk)
     monkeypatch.setitem(sys.modules, "jarvis_lot_limits", lots)
-    sys.modules.pop("jarvis_live_trader", None)
-    return importlib.import_module("jarvis_live_trader")
+    monkeypatch.delitem(sys.modules, "jarvis_live_trader", raising=False)
+    module = importlib.import_module("jarvis_live_trader")
+    # Restore the prior cached module after this test instead of leaking a
+    # trader whose sizing dependencies were intentionally stubbed above.
+    monkeypatch.setitem(sys.modules, "jarvis_live_trader", module)
+    return module
 
 
 def test_live_auto_trader_direct_entry_requires_approval_but_exit_is_ungated(monkeypatch):

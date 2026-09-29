@@ -13,6 +13,9 @@ import pytest
 from delta_api_wrapper import DeltaExchangeData
 from jarvis_delta_execution import DeltaExecutionAdapter
 from jarvis_multicoin_execution import PortfolioCoordinator
+from jarvis_strategy_approval import (
+    build_execution_plan, evaluate_central_strategy, make_entry_approval,
+)
 
 
 NOW = time.time()
@@ -27,6 +30,56 @@ PRODUCT = {
 
 def response(result, **fields):
     return {"success": True, "data": {"result": result, **fields}}
+
+
+def jarvis_broker_authorization(*, entry=100.1, stop=98.0, target=105.0,
+                               symbol="ETHUSDT", product_id="22", snapshot="transport-snapshot",
+                               confidence=90, now=None):
+    """Issue a genuine scoped test approval through Jarvis' deterministic policy helpers."""
+    issued = time.time() if now is None else float(now)
+    evidence = {
+        name: {"signal": 1, "thought": "valid bullish test evidence"}
+        for name in (
+            "part1_breakout", "part2_zone", "part3_psychology", "part4_volume",
+            "part5_ml", "part6_trend", "part7_volatility", "part8_structure",
+            "part9_orderflow", "part10_candlestats",
+        )
+    }
+    gate = {
+        "symbol": symbol, "entry_blocked": False, "risk_veto": False,
+        "status": "ok", "data_status": "valid", "timeframe": "aggregate",
+        "blocked_timeframes": [], "veto_timeframes": [],
+        "timeframe_results": {
+            tf: {"symbol": symbol, "timeframe": tf, "status": "neutral",
+                 "data_status": "valid", "entry_blocked": False, "risk_veto": False}
+            for tf in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+        },
+    }
+    decision = evaluate_central_strategy(
+        evidence, gate, confidence=confidence, expected_symbol=symbol,
+    )
+    plan = build_execution_plan(
+        direction="BUY", recommended_expiry="SCALP", entry_price=entry,
+        stop_loss=stop, take_profit=target, symbol=symbol,
+        snapshot_version=snapshot, confidence=confidence,
+    )
+    approval = make_entry_approval(
+        decision, direction="BUY", symbol=symbol, exchange="delta", contract=symbol,
+        instrument_id=product_id, market_type="perpetual_futures",
+        analysis_symbol=symbol, analysis_exchange="binance",
+        snapshot_version=snapshot, analysis_timestamp=issued,
+        confidence=confidence, execution_plan=plan,
+    )
+    return {
+        "central_approval": approval, "part_results": evidence, "part7_gate": gate,
+        "strategy_plan": plan, "snapshot_version": snapshot,
+        "analysis_symbol": symbol, "confidence": confidence,
+        "broker_plan": {
+            "symbol": symbol, "instrument_id": str(product_id), "direction": "BUY",
+            "quantity": 2, "leverage": 2, "entry_price": entry,
+            "stop_loss": stop, "take_profit": target, "risk_budget_usdt": 5.0,
+        },
+    }
 
 
 class TransportDelta(DeltaExchangeData):
@@ -80,11 +133,16 @@ class TransportDelta(DeltaExchangeData):
         if endpoint == "/v2/orders/bracket" and method.upper() == "POST":
             if self.bracket_ok and not self.suppress_bracket_children:
                 closing_side = "sell" if self.position.get("size", 0) > 0 else "buy"
+                stop = payload["stop_loss_order"]
+                target = payload["take_profit_order"]
+                quantity = abs(int(self.position.get("size", 0)))
                 self.children = [
                     {"id": 701, "product_id": 22, "state": "open", "stop_order_type": "stop_loss_order",
-                     "reduce_only": True, "side": closing_side},
+                     "reduce_only": True, "side": closing_side, "size": quantity,
+                     "stop_price": stop["stop_price"], "limit_price": stop["limit_price"]},
                     {"id": 702, "product_id": 22, "state": "open", "stop_order_type": "take_profit_order",
-                     "reduce_only": True, "side": closing_side},
+                     "reduce_only": True, "side": closing_side, "size": quantity,
+                     "stop_price": target["stop_price"], "limit_price": target["limit_price"]},
                 ]
             return {"success": self.bracket_ok, "data": {"result": {}} if self.bracket_ok else None}
         if endpoint == "/v2/orders" and method.upper() == "POST":
@@ -229,12 +287,26 @@ def test_legacy_set_leverage_uses_exact_product_endpoint_and_readback(monkeypatc
     assert not any(call[1] == "/v2/orders/leverage" for call in client.calls)
 
 
+def test_protected_entry_without_jarvis_authorization_is_denied_before_venue_calls(monkeypatch):
+    set_live_flags(monkeypatch)
+    client = TransportDelta()
+    result = client.place_protected_order(
+        product_id=22, symbol="ETHUSDT", side="buy", size=2,
+        order_type="market", stop_loss=98, take_profit=105,
+        leverage=2, client_order_id="missing-approval",
+    )
+    assert result["status"] == "REJECTED"
+    assert "authorization is required" in result["reason"].lower()
+    assert client.calls == []
+
+
 def test_staged_real_transport_entry_confirms_leverage_fill_and_child_protection(monkeypatch):
     set_live_flags(monkeypatch)
     client = TransportDelta()
     result = client.place_protected_order(product_id=22, symbol="ETHUSDT", side="buy", size=2,
                                           order_type="market", stop_loss=98, take_profit=105,
-                                          leverage=2, client_order_id="jme123")
+                                          leverage=2, client_order_id="jme123",
+                                          entry_authorization=jarvis_broker_authorization())
     assert result["status"] == "FILLED" and result["protection_atomic"] is False
     assert result["protection_state"] == "ACTIVE"
     assert result["protective_exits"] == {"stop_loss_order_id": "701", "take_profit_order_id": "702"}
@@ -253,7 +325,8 @@ def test_live_entry_requires_currency_contract_and_confirmed_leverage(monkeypatc
     client.products[0]["settling_asset"] = {"symbol": "USD"}
     result = client.place_protected_order(product_id=22, symbol="ETHUSDT", side="buy", size=2,
                                           order_type="market", stop_loss=98, take_profit=105,
-                                          leverage=2, client_order_id="jme123")
+                                          leverage=2, client_order_id="jme123",
+                                          entry_authorization=jarvis_broker_authorization())
     assert result["status"] == "REJECTED"
     assert not any(c[0] == "POST" and c[1] == "/v2/orders" for c in client.calls)
 
@@ -262,7 +335,8 @@ def test_live_entry_requires_currency_contract_and_confirmed_leverage(monkeypatc
     client.products[0]["contract_value"] = 1
     result = client.place_protected_order(product_id=22, symbol="ETHUSDT", side="buy", size=2,
                                           order_type="market", stop_loss=98, take_profit=105,
-                                          leverage=2, client_order_id="jme123")
+                                          leverage=2, client_order_id="jme123",
+                                          entry_authorization=jarvis_broker_authorization())
     assert result["status"] == "REJECTED"
     assert not any(c[0] == "POST" and c[1] == "/v2/orders" for c in client.calls)
 
@@ -270,7 +344,8 @@ def test_live_entry_requires_currency_contract_and_confirmed_leverage(monkeypatc
     client.leverage_confirm = False
     result = client.place_protected_order(product_id=22, symbol="ETHUSDT", side="buy", size=2,
                                           order_type="market", stop_loss=98, take_profit=105,
-                                          leverage=2, client_order_id="jme123")
+                                          leverage=2, client_order_id="jme123",
+                                          entry_authorization=jarvis_broker_authorization())
     assert result["status"] == "REJECTED"
     assert not any(c[0] == "POST" and c[1] == "/v2/orders" for c in client.calls)
 
@@ -281,7 +356,8 @@ def test_entry_unknown_partial_cancel_and_protection_failure_attempt_reduce_only
     client.entry_response = {"success": False, "error": "Delta request failed"}
     result = client.place_protected_order(product_id=22, symbol="ETHUSDT", side="buy", size=2,
                                           order_type="market", stop_loss=98, take_profit=105,
-                                          leverage=2, client_order_id="jme123")
+                                          leverage=2, client_order_id="jme123",
+                                          entry_authorization=jarvis_broker_authorization())
     assert result["status"] == "SUBMISSION_UNKNOWN" and result["authoritative"] is False
 
     client = TransportDelta()
@@ -291,14 +367,16 @@ def test_entry_unknown_partial_cancel_and_protection_failure_attempt_reduce_only
     # DELETE and subsequent GET re-read are both accepted by this fixture.
     result = client.place_protected_order(product_id=22, symbol="ETHUSDT", side="buy", size=2,
                                           order_type="market", stop_loss=98, take_profit=105,
-                                          leverage=2, client_order_id="jme123")
+                                          leverage=2, client_order_id="jme123",
+                                          entry_authorization=jarvis_broker_authorization())
     assert result["status"] == "PARTIAL" and result["filled_quantity"] == 1
 
     client = TransportDelta()
     client.bracket_ok = False
     result = client.place_protected_order(product_id=22, symbol="ETHUSDT", side="buy", size=2,
                                           order_type="market", stop_loss=98, take_profit=105,
-                                          leverage=2, client_order_id="jme123")
+                                          leverage=2, client_order_id="jme123",
+                                          entry_authorization=jarvis_broker_authorization())
     assert result["status"] == "SUBMISSION_UNKNOWN"
     assert result["protection_state"] == "FAILED_CLOSE_ATTEMPTED"
     emergency = [c for c in client.calls if c[0] == "POST" and c[1] == "/v2/orders" and c[2].get("reduce_only")]
@@ -311,7 +389,8 @@ def test_missing_bracket_children_attempts_emergency_close(monkeypatch):
     client.suppress_bracket_children = True
     result = client.place_protected_order(product_id=22, symbol="ETHUSDT", side="buy", size=2,
                                           order_type="market", stop_loss=98, take_profit=105,
-                                          leverage=2, client_order_id="jme123")
+                                          leverage=2, client_order_id="jme123",
+                                          entry_authorization=jarvis_broker_authorization())
     assert result["status"] == "SUBMISSION_UNKNOWN"
     assert result["protection_state"] == "UNVERIFIED_CLOSE_ATTEMPTED"
     assert any(c[0] == "POST" and c[1] == "/v2/orders" and c[2].get("reduce_only") for c in client.calls)
@@ -336,14 +415,17 @@ def test_complete_snapshot_uses_exact_product_positions_and_reports_external_ord
     client.position = {"product_id": 22, "size": 2, "mark_price": "100.1"}
     client.children = [
         {"id": 701, "product_id": 22, "state": "open", "stop_order_type": "stop_loss_order",
-         "reduce_only": True, "side": "sell"},
+         "reduce_only": True, "side": "sell", "size": 2,
+         "stop_price": "98", "limit_price": "97.9"},
         {"id": 702, "product_id": 22, "state": "open", "stop_order_type": "take_profit_order",
-         "reduce_only": True, "side": "sell"},
+         "reduce_only": True, "side": "sell", "size": 2,
+         "stop_price": "105", "limit_price": "105"},
     ]
     client.external_orders = [{"id": 888, "product_id": 22, "client_order_id": "manual", "state": "open"}]
     snapshot = client.get_complete_account_snapshot(owned_orders={
         "candidate": {"identity": {"instrument_id": "22"}, "order_id": "501",
                       "client_order_id": "jme123", "direction": "BUY", "quantity": 2,
+                      "stop_loss": 98, "take_profit": 105,
                       "protective_exits": {"stop_loss_order_id": "701", "take_profit_order_id": "702"}}
     })
     assert snapshot["complete"] is True
@@ -380,7 +462,7 @@ def test_complete_snapshot_uses_exact_product_positions_and_reports_external_ord
     assert snapshot["complete"] is False and "mixed settlement" in snapshot["reason"]
 
 
-def test_non_btc_eth_full_adapter_submission_monitor_close_and_restart(tmp_path, monkeypatch):
+def test_explicit_jarvis_authorized_non_btc_delta_fixture_runs_adapter_lifecycle(tmp_path, monkeypatch):
     set_live_flags(monkeypatch)
     client = TransportDelta()
     asset_policy = {
@@ -403,9 +485,23 @@ def test_non_btc_eth_full_adapter_submission_monitor_close_and_restart(tmp_path,
     assert adapter.reconcile(coordinator)
 
     now = time.time()
+    # This is a complete, test-only Jarvis-produced authorization envelope for
+    # exercising the Delta consumer. The production multicoin analysis producer
+    # still does not emit a plan and remains non-submitting.
+    test_authorization = jarvis_broker_authorization(
+        entry=100.1, stop=98.0, target=105.0, snapshot="eth-snapshot-01", now=now - 0.5,
+    )
+    central_decision = evaluate_central_strategy(
+        test_authorization["part_results"], test_authorization["part7_gate"],
+        confidence=90, expected_symbol="ETHUSDT",
+    )
     result = {
         "status": "COMPLETE", "scope": "parts1-12-analysis-only", "analysis_only": True,
-        "decision_authority": "none", "execution_eligible": False, "freshness_status": "FRESH",
+        "decision_authority": "jarvis_FIXED", "execution_eligible": False, "freshness_status": "FRESH",
+        "central_strategy_decision": central_decision,
+        "central_strategy_evidence": test_authorization["part_results"],
+        "central_strategy_approval": test_authorization["central_approval"],
+        "central_execution_plan": test_authorization["strategy_plan"],
         "coverage": [f"Part{i}" for i in range(1, 13)], "snapshot_version": "eth-snapshot-01",
         "parts_by_timeframe": {
             tf: {f"part{i}": {"signal": 0} for i in range(1, 11)}
@@ -418,8 +514,8 @@ def test_non_btc_eth_full_adapter_submission_monitor_close_and_restart(tmp_path,
         "analysis_reference": {"source": "binance", "symbol": "ETHUSDT", "timeframe": "1m",
                                "timestamp": now - 30, "price": 100.0},
         "once_per_symbol_parts": {"part11": {"signal": 1}, "part12": {"confidence": 90}},
-        "part7_gate": {"entry_blocked": False, "risk_veto": False},
-        "deterministic_decision": {"origin": "jarvis_deterministic_parts11_12", "direction": "BUY",
+        "part7_gate": test_authorization["part7_gate"],
+        "deterministic_decision": {"origin": "jarvis_FIXED_central_strategy", "direction": "BUY",
             "confidence": 90, "entry_price": 100.0, "stop_loss": 98.0, "take_profit": 105.0},
     }
     candidate = adapter.prepare_candidate(result, now=now)
