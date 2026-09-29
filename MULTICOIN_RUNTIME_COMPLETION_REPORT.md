@@ -2,7 +2,7 @@
 
 **Repository:** `bhagy774/jarvis-scalp`  
 **PR:** [#97 — Centralize Parts 1–12 strategy entry authority](https://github.com/bhagy774/jarvis-scalp/pull/97)  
-**Verified base before work:** `main` at `89ace9b7600abb2c1bb153b2d86245fe57e752c6`; this was confirmed as the live `main` tip using GitHub commit listing. PR #97 was open at `32cc2a3e0e09e56c209a24800e3d37515b99c543`, base `main`, no reviews. PR #81 is also open, based on older `a5d6e7810995580c53dfb7c440b312eeabdde363`, and overlaps `jarvis_FIXED.py` / `jarvis_live_trader.py`; review overlap before either PR is merged.
+**Verified base before work:** `main` at `89ace9b7600abb2c1bb153b2d86245fe57e752c6`; this was confirmed as the live `main` tip using GitHub commit listing. PR #97 was open at `32cc2a3e0e09e56c209a24800e3d37515b99c543`, base `main`, no reviews. The implementation/test/docs push is commit `edd9f73ba9ad14ecb36d0f6f71764e208263d507`; PR #97 remains open on the same `main` base, with no submitted reviews. GitHub reports zero check runs for the pushed implementation commit (not a passing CI result). PR #81 is also open, based on older `a5d6e7810995580c53dfb7c440b312eeabdde363`, and overlaps `jarvis_FIXED.py` / `jarvis_live_trader.py`; review overlap before either PR is merged.
 
 ## Changes made
 
@@ -27,7 +27,7 @@ No invented strategy, signal, threshold, confidence, per-coin target, FX convers
 | **PASS** | Numerical test runtime already had Python 3.12.14, NumPy 2.5.3 and pandas 3.0.6 available; the full suite exercised the Parts and candle paths. No extra dependency install was needed. The supplied source snapshot has no `requirements.txt` at its root. |
 | **PASS** | Existing offline tests additionally cover identity isolation, Binance fallback rejection, all eight intervals / 500 closed-candle readiness, freshness, Part 7 vetoes, duplicates, concurrent reservations, partial/unknown fills, authoritative reconciliation, protection checks and reduce-only closes (see `tests/test_multicoin_pipeline.py`, `tests/test_multicoin_execution.py`, `tests/test_delta_execution_bridge.py`, `tests/test_execution_safety.py`). |
 | **UNVERIFIED** | Actual Binance/Delta product metadata, account currency semantics, live executable quote/fill behavior, venue order/bracket outcomes, account reconciliation, Windows/target-PC/GPU readiness, production resource limits and any profitable strategy behavior. Synthetic fixtures cannot establish those facts. |
-| **UNVERIFIED** | GitHub CI/check status for the new head; must be queried after pushing. The previous report had zero check runs on the old PR head. |
+| **UNVERIFIED / NONE REPORTED** | GitHub check-run query for implementation commit `edd9f73ba9ad14ecb36d0f6f71764e208263d507` returned **0 check runs**; no external CI pass is established. PR remains open and unreviewed. |
 | **NOT DONE** | No credential was inspected, no exchange/API request, bot startup, testnet/mainnet order, deployment, merge or live flag activation occurred. |
 
 The full actual Jarvis parts test uses synthetic closed candles and separately instantiated analysis-only owners; it verifies Parts coverage and symbol isolation, not a live directional signal. The positive order lifecycle proof deliberately uses a synthetic analyzer output plus a fake Delta transport. Only future user-supervised testing can establish PC/API behavior.
