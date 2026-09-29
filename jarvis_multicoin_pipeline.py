@@ -351,17 +351,25 @@ class MultiCoinPipeline:
                 "parts_by_timeframe": parts_by_tf if isinstance(parts_by_tf, Mapping) else {},
                 "once_per_symbol_parts": raw.get("once_per_symbol_parts", {}),
                 "part7_gate": raw.get("part7_gate"),
+                "central_strategy_decision": raw.get("central_strategy_decision"),
+                "central_strategy_evidence": raw.get("central_strategy_evidence"),
+                "central_strategy_approval": raw.get("central_strategy_approval"),
+                "central_execution_plan": dict(raw["central_execution_plan"])
+                    if isinstance(raw.get("central_execution_plan"), Mapping) else None,
                 "deterministic_decision": raw.get("deterministic_decision"),
                 "analysis_reference": raw.get("analysis_reference"),
                 "part14": "not_in_scope",
                 "snapshot_version": version, "snapshot_fetched_at": float(snapshot.fetched_at),
                 "analysis_completed_at": completed,
-                # No entry/stop/target/size may be inferred from Parts 1-12.
-                # Downstream adapters may consume only an explicit, independently
-                # validated execution plan; current Jarvis analysis supplies none.
-                "execution_plan": dict(raw["execution_plan"]) if isinstance(raw.get("execution_plan"), Mapping) else None,
-                "execution_candidate_status": "PLAN_PRESENT_REQUIRES_VALIDATION" if isinstance(raw.get("execution_plan"), Mapping) else "BLOCKED_MISSING_EXPLICIT_PLAN",
-                "analysis_only": True, "decision_authority": "none", "execution_eligible": False,
+                # The only plan passed here is the Jarvis price-level plan.
+                # The Delta bridge replaces it with a broker plan only after
+                # fresh exact product/quote/balance and risk checks.
+                "execution_plan": dict(raw["execution_plan"])
+                    if isinstance(raw.get("execution_plan"), Mapping) else None,
+                "execution_candidate_status": "PLAN_PRESENT_REQUIRES_DELTA_VALIDATION" if isinstance(raw.get("execution_plan"), Mapping) else "BLOCKED_MISSING_EXPLICIT_PLAN",
+                "analysis_only": True,
+                "decision_authority": raw.get("decision_authority", "none"),
+                "execution_eligible": False,
                 "reason": None if complete else "one or more Part adapters did not complete for all native frames",
             }
         except Exception as exc:

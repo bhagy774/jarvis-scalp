@@ -2334,14 +2334,17 @@ class LiveTradingEngine:
                 'central_strategy_decision': analysis.get('central_strategy_decision'),
                 'central_strategy_evidence': analysis.get('central_strategy_evidence'),
                 'central_strategy_approval': analysis.get('central_strategy_approval'),
+                'central_execution_plan': analysis.get('central_execution_plan'),
+                'decision_authority': analysis.get('decision_authority', 'none'),
                 'snapshot_version': analysis.get('snapshot_version', snapshot_version),
                 'analysis_timestamp': analysis.get('analysis_timestamp'),
                 'execution_identity': key.mapped_execution_dict(),
                 'deterministic_decision': analysis.get('deterministic_decision'),
                 'analysis_reference': analysis_reference,
-                # Candidate creation is downstream of a fresh Delta quote,
-                # exact contract metadata, balance-based risk sizing, and policy.
-                'execution_plan': None,
+                # This is Jarvis' price-level strategy plan only. Delta contract
+                # quantity/risk is intentionally produced later from fresh
+                # broker metadata, quote, balance and the explicit asset policy.
+                'execution_plan': analysis.get('central_execution_plan'),
                 'adapter_engine_status': {
                     'part1_native': getattr(owner.parts.get('part1_breakout'), '_engine_factory', None) is not None,
                     'part2_native': getattr(owner.parts.get('part2_zone'), '_engine', None) is not None,
@@ -6727,6 +6730,15 @@ class JarvisElite:
             execution_plan = None
             if central_decision.get('approved'):
                 trade_signal = final_decision.get('trade_signal') or {}
+                # A multicoin analysis reads Binance spot candles but approves a
+                # distinct, exact Delta execution identity. Bind the deterministic
+                # strategy plan to that Delta contract; the bridge later builds
+                # its contract-sized broker plan from fresh Delta quote/metadata.
+                execution_plan_symbol = getattr(self, 'active_symbol', None)
+                if native_mtf is not None and isinstance(analysis_execution_identity, Mapping):
+                    execution_plan_symbol = (analysis_execution_identity.get('symbol')
+                                             or analysis_execution_identity.get('contract')
+                                             or execution_plan_symbol)
                 try:
                     execution_plan = build_execution_plan(
                         direction=central_decision.get('direction'),
@@ -6734,7 +6746,7 @@ class JarvisElite:
                         entry_price=trade_signal.get('entry_price'),
                         stop_loss=trade_signal.get('stop_loss'),
                         take_profit=trade_signal.get('take_profit_1'),
-                        symbol=getattr(self, 'active_symbol', None),
+                        symbol=execution_plan_symbol,
                         snapshot_version=str(self.market_context.get('snapshot_version') or analysis_snapshot_version or ''),
                         confidence=int(round(float(score))),
                     )
@@ -6879,35 +6891,51 @@ class JarvisElite:
             # User Request: Trust AI logic over hard thresholds
             ai_signal = final_decision.get('trade_signal', {}).get('direction', 'NEUTRAL')
 
-            # Publish only the genuine deterministic Parts11/12-selected
-            # direction and target values from this isolated run. The bridge
-            # may later replace the Binance reference entry with a fresh Delta
-            # executable quote; it never derives missing targets or sizes.
+            # Publish the final Jarvis-owned plan and its exact levels. The
+            # downstream Delta bridge may scale those levels only by its
+            # authoritative same-underlying quote ratio, then recomputes
+            # contract risk and whole-contract quantity from venue metadata.
             if native_mtf is not None and isinstance(getattr(self, 'latest_multicoin_analysis', None), dict):
-                _raw_signal = final_decision.get('trade_signal', {}) or {}
-                _dir = str(_raw_signal.get('direction') or 'NO_TRADE').upper()
-                if score < self.scoring_matrix.minimum_trade_score or _dir not in {'CALL', 'PUT'}:
-                    _dir = 'NO_TRADE'
-                _raw_conf = _raw_signal.get('confidence_score', score)
+                plan = execution_plan if isinstance(execution_plan, Mapping) else None
+                approved = bool(central_decision.get('approved') and plan)
+                _dir = str(central_decision.get('direction') or 'NO_TRADE').upper() if approved else 'NO_TRADE'
                 try:
-                    _conf = int(float(str(_raw_conf).split('/', 1)[0]))
+                    _conf = int(round(float(central_decision.get('confidence')))) if approved else 0
                 except (TypeError, ValueError, OverflowError):
-                    _conf = int(score)
-                self.latest_multicoin_analysis['deterministic_decision'] = {
-                    'origin': 'jarvis_deterministic_parts11_12',
-                    'direction': {'CALL': 'BUY', 'PUT': 'SELL'}.get(_dir, 'NO_TRADE'),
-                    'confidence': max(0, min(100, _conf)),
-                    'entry_price': _raw_signal.get('entry_price'),
-                    # TP1 is the explicit nearer target produced by Jarvis'
-                    # existing deterministic scalping target function.
-                    'take_profit': _raw_signal.get('take_profit_1'),
-                    'stop_loss': _raw_signal.get('stop_loss'),
-                    'part11_signal': (self.latest_multicoin_analysis.get('once_per_symbol_parts', {})
-                                      .get('part11', {}).get('signal')),
-                    'part12_confidence': (self.latest_multicoin_analysis.get('once_per_symbol_parts', {})
-                                          .get('part12', {}).get('confidence')),
-                }
-                self.latest_multicoin_analysis['part7_gate'] = dict(part7_gate)
+                    _conf = 0
+                _raw_signal = final_decision.get('trade_signal', {}) or {}
+                self.latest_multicoin_analysis.update({
+                    'decision_authority': 'jarvis_FIXED',
+                    'deterministic_decision': {
+                        'origin': 'jarvis_FIXED_central_strategy',
+                        'direction': _dir,
+                        'confidence': max(0, min(100, _conf)),
+                        'entry_price': plan.get('entry_price') if plan else _raw_signal.get('entry_price'),
+                        'take_profit': plan.get('take_profit') if plan else _raw_signal.get('take_profit_1'),
+                        'stop_loss': plan.get('stop_loss') if plan else _raw_signal.get('stop_loss'),
+                        'part11_signal': (self.latest_multicoin_analysis.get('once_per_symbol_parts', {})
+                                          .get('part11', {}).get('signal')),
+                        'part12_confidence': (self.latest_multicoin_analysis.get('once_per_symbol_parts', {})
+                                              .get('part12', {}).get('confidence')),
+                    },
+                    'part7_gate': dict(part7_gate),
+                    'central_strategy_decision': dict(central_decision),
+                    'central_strategy_evidence': {
+                        name: dict(value) for name, value in part_results.items()
+                        if name in {
+                            'part1_breakout', 'part2_zone', 'part3_psychology',
+                            'part4_volume', 'part5_ml', 'part6_trend',
+                            'part7_volatility', 'part8_structure',
+                            'part9_orderflow', 'part10_candlestats',
+                        } and isinstance(value, Mapping)
+                    },
+                    'central_strategy_approval': strategy_approval,
+                    'central_execution_plan': dict(plan) if plan else None,
+                    'execution_plan': dict(plan) if plan else None,
+                    'analysis_timestamp': analysis_timestamp,
+                    'snapshot_version': analysis_version,
+                    'execution_identity': dict(execution_identity) if execution_identity else None,
+                })
 
             if score >= self.scoring_matrix.minimum_trade_score:
                 if self.hud_enabled:
