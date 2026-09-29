@@ -9,6 +9,7 @@ def prepare_features(evidence):
  quorum=sum(abs(v)>=.10 for v in flat)/80; direction=1 if overall>0 else -1 if overall<0 else 0; anchors=(by_part[5],by_part[7],by_part[8]); alignment=sum((1 if v>0 else -1 if v<0 else 0)*bool(direction) for v in anchors)/3
  dissent=sum(direction and v*direction<-.05 for v in flat)/80; counts=(sum(v<-.05 for v in flat),sum(abs(v)<=.05 for v in flat),sum(v>.05 for v in flat)); probs=[v/80 for v in counts]; entropy=-sum(p*math.log(max(p,1e-12)) for p in probs)/math.log(3)
  return tuple(clip(v) for v in by_part+by_tf+[overall,dispersion,quorum,alignment,dissent,entropy])
+def interpret_scores(scores,prediction): return {"fusion_direction":{"sell":"SELL","neutral":"NEUTRAL","buy":"BUY"}.get(prediction,"NEUTRAL"),"evidence_matrix_bucket":prediction}
 def label_target(rows,i,horizon,neutral_bps,x):
  ret=rows[i+horizon]["close"]/rows[i]["close"]-1; threshold=neutral_bps/10000
  return 2 if ret>threshold else 0 if ret< -threshold else 1

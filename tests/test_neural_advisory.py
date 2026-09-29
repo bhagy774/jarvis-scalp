@@ -97,6 +97,7 @@ class NeuralAdvisoryTests(unittest.TestCase):
                 self.assertEqual(result["status"],"available")
                 self.assertEqual(result["task"],na.MODEL_SPECS[part]["task"])
                 self.assertEqual(result["role"],"advisory_only_no_execution_authority")
+                self.assertTrue(result["task_output"])
                 self.assertAlmostEqual(sum(result["scores_uncalibrated"].values()),1.0)
                 if part=="part11_fusion": self.assertIn(result["direction"],["SELL","NEUTRAL","BUY"])
                 if part=="part12_confidence": self.assertIn("consensus_correctness_score_uncalibrated",result)

@@ -8,6 +8,7 @@ def prepare_features(data):
 def slope(xs):
  n=len(xs); xm=(n-1)/2; ym=sum(xs)/n
  return sum((i-xm)*(x-ym) for i,x in enumerate(xs))/(n*(n*n-1)/12) if n>1 else 0.0
+def interpret_scores(scores,prediction): return {"flow_followthrough":prediction,"followthrough_score_uncalibrated":scores[1]}
 def label_target(rows,i,horizon,neutral_bps,x):
  flow=x[0]+x[1]
  if abs(flow)<.02:return None

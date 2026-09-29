@@ -5,6 +5,7 @@ MODEL_SPEC={"task":"trend_persistence","dims":(12,12,4,1),"acts":("tanh","relu",
 def prepare_features(data):
  s=candle_math(data); vals=(s["ema821"],s["ema2150"],s["slope16"],s["slope32"],s["up_move14"],s["down_move14"],s["directional_imbalance"],s["ret4"],s["ret16"],s["range_pos32"],s["vol_ratio"],s["atr_pct"])
  return tuple(clip(x) for x in vals)
+def interpret_scores(scores,prediction): return {"trend_persistence":prediction,"trend_persistence_score_uncalibrated":scores[1]}
 def label_target(rows,i,horizon,neutral_bps,x):
  directional=x[0]+x[1]+x[2]
  if abs(directional)<1e-7:return 0

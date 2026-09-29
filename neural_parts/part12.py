@@ -9,6 +9,7 @@ def prepare_features(evidence):
  anchors=(by_part[5],by_part[7],by_part[8]); alignment=sum((1 if v>0 else -1 if v<0 else 0)*bool(direction) for v in anchors)/3; high_tf=sum(by_tf[i]*weights[i] for i in range(4,8))/sum(weights[4:8])
  frames=evidence.get("frames",evidence); veto=sum(bool(frames[tf].get("part7_volatility",{}).get("entry_blocked")) for tf in TIMEFRAMES)/8
  return tuple(clip(v) for v in [*[abs(x) for x in by_part],overall,std(by_part),agreement,active,neutral,alignment,high_tf,veto])
+def interpret_scores(scores,prediction): return {"consensus_correctness_score_uncalibrated":scores[1],"consensus_correctness_label":prediction}
 def label_target(rows,i,horizon,neutral_bps,x):
  ret=rows[i+horizon]["close"]/rows[i]["close"]-1; vote=x[10]
  if abs(ret)<neutral_bps/10000 or abs(vote)<.02:return None

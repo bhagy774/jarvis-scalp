@@ -7,6 +7,7 @@ def prepare_features(data):
  gap=div(r["open"]-s["prior_close"],s["atr14"]); engulf=(1.0 if body>0 else -1.0) if abs(body)>abs(prev) and body*prev<0 else 0.0
  vals=(s["body_ratio"],s["upper"][-1],s["lower"][-1],s["close_location"],s["range_atr"],gap,prev,engulf,1-s["body_ratio"],s["ret1"],s["ret4"],s["volz"])
  return tuple(clip(x) for x in vals)
+def interpret_scores(scores,prediction): return {"candle_reversal":prediction,"reversal_score_uncalibrated":scores[1]}
 def label_target(rows,i,horizon,neutral_bps,x):
  ret=rows[i+horizon]["close"]/rows[i]["close"]-1; body=rows[i]["close"]-rows[i]["open"]
  return int(bool(body and abs(ret)>=neutral_bps/10000 and ret*body<0))

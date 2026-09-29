@@ -5,6 +5,7 @@ MODEL_SPEC={"task":"candle_transition","dims":(12,12,6,3),"acts":("relu","tanh",
 def prepare_features(data):
  s=candle_math(data); vals=(s["body_ratio"],s["body"][-1]-s["body"][-2],s["streak"],s["transition"],s["green_fraction"],s["range_atr"],s["ret1"],s["ret4"],s["ret16"],s["drawdown16"],s["volz"],s["vol_ratio"])
  return tuple(clip(x) for x in vals)
+def interpret_scores(scores,prediction): return {"candle_transition":prediction,"reversal_score_uncalibrated":scores[0],"continuation_score_uncalibrated":scores[2]}
 def label_target(rows,i,horizon,neutral_bps,x):
  body=rows[i]["close"]-rows[i]["open"]; ret=rows[i+horizon]["close"]/rows[i]["close"]-1
  if not body or abs(ret)<neutral_bps/10000:return 1

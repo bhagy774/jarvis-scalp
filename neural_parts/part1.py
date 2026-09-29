@@ -6,6 +6,7 @@ def prepare_features(data):
  s=candle_math(data); r=s["rows"][-1]; ran=s["range"][-1]
  vals=(s["ret1"],s["ret4"],s["ret16"],s["break_hi20"],s["break_lo20"],s["range_pos20"],s["volz"],(r["close"]-r["open"])/ran,s["slope16"],s["atr_pct"],s["vol_ratio"],s["wick_imbalance"])
  return tuple(clip(x) for x in vals)
+def interpret_scores(scores,prediction): return {"breakout_event":prediction,"bull_break_score_uncalibrated":scores[2],"bear_break_score_uncalibrated":scores[0]}
 def label_target(rows,i,horizon,neutral_bps,x):
  future=rows[i+1:i+horizon+1]; recent=rows[max(0,i-13):i+1]
  atr=sum(max(r["high"]-r["low"],1e-12) for r in recent)/len(recent); up=rows[i]["close"]+.6*atr; down=rows[i]["close"]-.6*atr

@@ -5,6 +5,7 @@ MODEL_SPEC={"task":"volume_confirmed_move","dims":(12,18,8,3),"acts":("relu","re
 def prepare_features(data):
  s=candle_math(data); vals=(s["volz"],s["volume_ratio"],s["flow12"],s["flow4"],s["flow_ret_div"],s["voltrend"],s["ret1"],s["ret4"],s["range_atr"],s["close_location"],s["profile_concentration"],s["atr_pct"])
  return tuple(clip(x) for x in vals)
+def interpret_scores(scores,prediction): return {"volume_confirmation":prediction,"sell_confirmed_score_uncalibrated":scores[0],"buy_confirmed_score_uncalibrated":scores[2]}
 def label_target(rows,i,horizon,neutral_bps,x):
  future=rows[i+1:i+horizon+1]; ret=rows[i+horizon]["close"]/rows[i]["close"]-1; base=sum(r["volume"] for r in rows[max(0,i-31):i+1])/len(rows[max(0,i-31):i+1]); fvol=sum(r["volume"] for r in future)/len(future)
  if fvol<base*1.05 or abs(ret)<neutral_bps/10000:return 1

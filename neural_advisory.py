@@ -430,7 +430,8 @@ def predict_advisory(data: Any, part_id: str, context: Optional[Mapping[str, Any
                       "scores_uncalibrated": {label: scores[i] for i, label in enumerate(labels)},
                       "head_kind": spec["kind"],
                       "role": "advisory_only_no_execution_authority",
-                      "model_version": str(model["training"].get("model_version", "2"))}
+                      "model_version": str(model["training"].get("model_version", "3")),
+                      "task_output": TASKS[part_id].interpret_scores(scores, prediction)}
             if part_id == "part11_fusion":
                 result["direction"] = {"sell": "SELL", "neutral": "NEUTRAL", "buy": "BUY"}.get(prediction, "NEUTRAL")
             if part_id == "part12_confidence":
