@@ -1,8 +1,9 @@
-"""Strict, bounded, advisory-only inference for Jarvis Parts 1-10.
+"""Shared bounded runtime validation/CPU-kernel for twelve task-specific models.
 
-Runtime has no PyTorch/CUDA import, no network access, and no model creation.
-Only a validated local JSON artifact trained offline can produce an advisory.
-Results are diagnostic metadata and MUST NOT drive entry, risk or execution.
+Part-specific features, architecture contracts, heads and targets are versioned
+separately per task. Runtime has no PyTorch/CUDA/network/model-construction path.
+Only validated local JSON weights can produce diagnostic, never-authoritative
+advisories; central Jarvis policy retains all strategy and execution authority.
 """
 from __future__ import annotations
 
@@ -18,24 +19,11 @@ import threading
 import time
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
-FORMAT = "jarvis-advisory-mlp"
-FORMAT_VERSION = 1
-FEATURE_SCHEMA = "jarvis-ohlcv-part-features-v1"
-PARTS = tuple(f"part{i}_" + name for i, name in enumerate((
-    "breakout", "zone", "psychology", "volume", "ml", "trend",
-    "volatility", "structure", "orderflow", "candlestats"), 1))
-FEATURE_NAMES = {
-    "part1_breakout": ("ret1", "ret4", "ret16", "break_high20", "break_low20", "range_pos20", "volume_z", "body_signed", "slope16", "atr14_pct", "vol_ratio", "wick_imbalance"),
-    "part2_zone": ("range_pos32", "dist_weighted_mean", "dist_high32", "dist_low32", "volume_node_pos", "volume_z", "ret4", "ret16", "atr14_pct", "range_pos8", "trend_slope", "range_expansion"),
-    "part3_psychology": ("body_ratio", "upper_wick_ratio", "lower_wick_ratio", "close_location", "range_atr", "gap_atr", "prev_body_signed", "engulf_proxy", "doji_proxy", "ret1", "ret4", "volume_z"),
-    "part4_volume": ("volume_z", "volume_ratio", "signed_flow12", "signed_flow4", "flow_return_divergence", "volume_trend", "ret1", "ret4", "range_atr", "close_location", "volume_concentration", "atr14_pct"),
-    "part5_ml": ("drift_z16", "slope_t_proxy", "ret1", "ret4", "ret16", "ema8_21", "ema21_50", "rsi_centered", "volume_z", "vol_ratio", "atr14_pct", "drawdown16"),
-    "part6_trend": ("ema8_21", "ema21_50", "slope16", "slope32", "up_move14", "down_move14", "directional_imbalance", "ret4", "ret16", "range_pos32", "vol_ratio", "atr14_pct"),
-    "part7_volatility": ("std8", "std32", "vol_ratio", "atr14_pct", "atr14_50_ratio", "range_atr", "range_expansion", "ret1", "abs_ret4", "abs_ret16", "body_ratio", "volume_z"),
-    "part8_structure": ("break_high20", "break_low20", "break_high50", "break_low50", "swing_high_gap", "swing_low_gap", "range_pos20", "range_pos50", "slope16", "ret4", "atr14_pct", "volume_z"),
-    "part9_orderflow": ("signed_flow4", "signed_flow12", "flow_return_divergence", "cvd_slope12", "ret4", "ret16", "volume_z", "volume_ratio", "range_atr", "body_signed", "flow_price_divergence", "atr14_pct"),
-    "part10_candlestats": ("body_ratio", "body_acceleration", "streak8", "transition_rate16", "green_fraction16", "range_atr", "ret1", "ret4", "ret16", "drawdown16", "volume_z", "vol_ratio"),
-}
+FORMAT = "jarvis-advisory-task-model"
+FORMAT_VERSION = 3
+FEATURE_SCHEMA = "jarvis-task-specific-features-v3"
+from neural_parts import PARTS, FEATURE_NAMES, MODEL_SPECS, TASKS, prepare_features
+from neural_parts.common import TIMEFRAMES, mtf_signal_matrix as _mtf_signal_matrix
 _TIMEFRAME_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400}
 _MAX_ARTIFACT_BYTES = 128 * 1024
 _MAX_ARTIFACTS = 16
@@ -49,183 +37,14 @@ _ARTIFACT_CACHE: "OrderedDict[Tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
 _PREDICTION_CACHE: "OrderedDict[Tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
 
 
-def _clip(x: float, limit: float = 10.0) -> float:
-    if not math.isfinite(x):
-        raise ValueError("non_finite_feature")
-    return max(-limit, min(limit, x))
-
-
-def _safe_div(a: float, b: float, eps: float = 1e-12) -> float:
-    return a / (abs(b) + eps)
-
-
-def _rows(data: Any) -> Sequence[Mapping[str, Any]]:
-    """Read OHLCV from pandas-like frames or row mappings without importing pandas."""
-    if data is None:
-        return ()
-    if isinstance(data, (list, tuple)):
-        return data
-    if hasattr(data, "columns") and hasattr(data, "iloc"):
-        cols = set(data.columns)
-        required = ("open", "high", "low", "close", "volume")
-        if not set(required).issubset(cols):
-            raise ValueError("missing_ohlcv_columns")
-        frame = data.tail(64)
-        values = {k: frame[k].tolist() for k in required}
-        return tuple({k: values[k][i] for k in required} for i in range(len(frame)))
-    return ()
-
-
-def _numeric_rows(data: Any) -> Tuple[Tuple[float, float, float, float, float], ...]:
-    rows = _rows(data)
-    out = []
-    for row in rows[-64:]:
-        if not isinstance(row, Mapping):
-            raise ValueError("invalid_ohlcv_row")
-        vals = tuple(float(row[k]) for k in ("open", "high", "low", "close", "volume"))
-        if not all(math.isfinite(v) for v in vals):
-            raise ValueError("non_finite_ohlcv")
-        o, h, l, c, v = vals
-        if min(o, h, l, c) <= 0 or v < 0 or h < max(o, c, l) or l > min(o, c, h):
-            raise ValueError("invalid_ohlcv")
-        out.append(vals)
-    if len(out) < 64:
-        raise ValueError("insufficient_closed_candles")
-    return tuple(out)
-
-
-def _ema(xs: Sequence[float], period: int) -> float:
-    a = 2.0 / (period + 1.0)
-    value = xs[0]
-    for x in xs[1:]:
-        value = a * x + (1.0 - a) * value
-    return value
-
-
-def _slope(xs: Sequence[float]) -> float:
-    n = len(xs)
-    if n < 2:
-        return 0.0
-    mean_x = (n - 1) / 2.0
-    mean_y = sum(xs) / n
-    denom = sum((i - mean_x) ** 2 for i in range(n)) or 1.0
-    return sum((i - mean_x) * (v - mean_y) for i, v in enumerate(xs)) / denom
-
-
-def _std(xs: Sequence[float]) -> float:
-    if not xs:
-        return 0.0
-    m = sum(xs) / len(xs)
-    return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
-
-
-def _rsi(xs: Sequence[float], period: int = 14) -> float:
-    ds = [xs[i] - xs[i - 1] for i in range(max(1, len(xs) - period), len(xs))]
-    gain = sum(max(d, 0.0) for d in ds) / max(1, len(ds))
-    loss = sum(max(-d, 0.0) for d in ds) / max(1, len(ds))
-    if loss == 0:
-        return 1.0 if gain else 0.0
-    return 1.0 - 1.0 / (1.0 + gain / loss)
-
-
 def feature_vector(part_id: str, data: Any) -> Tuple[float, ...]:
-    """Create one deterministic, part-specific 12-feature OHLCV vector."""
+    """Dispatch to the named Part-owned feature projection."""
     if part_id not in FEATURE_NAMES:
         raise ValueError("unknown_part_id")
-    rows = _numeric_rows(data)
-    oo, hh, ll, cc, vv = ([r[i] for r in rows] for i in range(5))
-    n, price = len(cc), cc[-1]
-    rets = [cc[i] / cc[i - 1] - 1.0 for i in range(1, n)]
-    ranges = [max(hh[i] - ll[i], 1e-12) for i in range(n)]
-    bodies = [(cc[i] - oo[i]) / ranges[i] for i in range(n)]
-    upper = [(hh[i] - max(oo[i], cc[i])) / ranges[i] for i in range(n)]
-    lower = [(min(oo[i], cc[i]) - ll[i]) / ranges[i] for i in range(n)]
-    logc = [math.log(x) for x in cc]
-    ret = lambda k: cc[-1] / cc[max(0, n - 1 - k)] - 1.0
-    atr14 = sum(ranges[-14:]) / 14.0
-    atr50 = sum(ranges[-50:]) / 50.0
-    ret8std, ret32std = _std(rets[-8:]), _std(rets[-32:])
-    volmean32 = sum(vv[-32:]) / 32.0
-    volstd32 = _std(vv[-32:])
-    volume_z = _safe_div(vv[-1] - volmean32, volstd32)
-    volume_ratio = _safe_div(vv[-1], volmean32)
-    pos = lambda window: _safe_div(price - min(ll[-window:]), max(hh[-window:]) - min(ll[-window:]))
-    highgap = lambda window: _safe_div(price - max(hh[-window:]), price)
-    lowgap = lambda window: _safe_div(price - min(ll[-window:]), price)
-    ema8, ema21, ema50 = _ema(cc[-50:], 8), _ema(cc[-50:], 21), _ema(cc[-50:], 50)
-    ema821 = _safe_div(ema8 - ema21, price)
-    ema2150 = _safe_div(ema21 - ema50, price)
-    slope16 = _slope(logc[-16:])
-    slope32 = _slope(logc[-32:])
-    atr_pct = _safe_div(atr14, price)
-    range_atr = _safe_div(ranges[-1], atr14)
-    vol_ratio = _safe_div(ret8std, ret32std)
-    range_expansion = _safe_div(sum(ranges[-5:]) / 5.0, sum(ranges[-20:]) / 20.0)
-    close_location = 2.0 * _safe_div(cc[-1] - ll[-1], ranges[-1]) - 1.0
-    body_ratio = abs(bodies[-1])
-    wick_imbalance = upper[-1] - lower[-1]
-    flow = [bodies[i] * vv[i] for i in range(n)]
-    signed_flow = lambda w: _safe_div(sum(flow[-w:]), sum(vv[-w:]))
-    ret4, ret16 = ret(4), ret(16)
-    flow12, flow4 = signed_flow(12), signed_flow(4)
-    prior_close = cc[-2]
-    break_hi20 = _safe_div(cc[-1] - max(hh[-21:-1]), price)
-    break_lo20 = _safe_div(cc[-1] - min(ll[-21:-1]), price)
-    break_hi50 = _safe_div(cc[-1] - max(hh[-51:-1]), price)
-    break_lo50 = _safe_div(cc[-1] - min(ll[-51:-1]), price)
-    recent_vol = vv[-32:]
-    weighted_center = _safe_div(sum(c * v for c, v in zip(cc[-32:], recent_vol)), sum(recent_vol))
-    weighted_dev = _safe_div(price - weighted_center, price)
-    voltrend = _slope([math.log1p(v) for v in vv[-16:]])
-    flow_return_divergence = flow12 - max(-1.0, min(1.0, ret16 * 100.0))
-    transition = sum(1 for i in range(-16, -1) if bodies[i] * bodies[i + 1] < 0) / 15.0
-    same_streak = 1
-    for i in range(n - 2, max(-1, n - 9), -1):
-        if bodies[i] == 0 or bodies[i] * bodies[-1] <= 0:
-            break
-        same_streak += 1
-    green_fraction = sum(1 for x in bodies[-16:] if x > 0) / 16.0
-    prev_body = bodies[-2]
-    drawdown16 = _safe_div(price - max(hh[-16:]), price)
-    range_pos32, range_pos20, range_pos50 = pos(32), pos(20), pos(50)
-    profile_low, profile_high = min(ll[-32:]), max(hh[-32:])
-    profile_width = max(profile_high - profile_low, 1e-12)
-    profile_bins = [0.0] * 20
-    for i in range(n - 32, n):
-        typical = (hh[i] + ll[i] + cc[i]) / 3.0
-        bin_index = min(19, max(0, int((typical - profile_low) / profile_width * 20)))
-        profile_bins[bin_index] += vv[i]
-    volume_node_pos = ((max(range(20), key=lambda index: profile_bins[index]) + 0.5) / 20.0
-                       if sum(profile_bins) > 0 else range_pos32)
-    if part_id == "part1_breakout":
-        vals = [ret(1), ret4, ret16, break_hi20, break_lo20, range_pos20, volume_z, bodies[-1], slope16, atr_pct, vol_ratio, wick_imbalance]
-    elif part_id == "part2_zone":
-        vals = [range_pos32, weighted_dev, highgap(32), lowgap(32), volume_node_pos, volume_z, ret4, ret16, atr_pct, pos(8), slope32, range_expansion]
-    elif part_id == "part3_psychology":
-        gap = _safe_div(oo[-1] - prior_close, atr14)
-        engulf = math.copysign(1.0, bodies[-1]) if abs(bodies[-1]) > abs(prev_body) and bodies[-1] * prev_body < 0 else 0.0
-        vals = [body_ratio, upper[-1], lower[-1], close_location, range_atr, gap, prev_body, engulf, 1.0 - body_ratio, ret(1), ret4, volume_z]
-    elif part_id == "part4_volume":
-        vals = [volume_z, volume_ratio, flow12, flow4, flow_return_divergence, voltrend, ret(1), ret4, range_atr, close_location, _safe_div(sum(vv[-4:]), sum(vv[-32:])), atr_pct]
-    elif part_id == "part5_ml":
-        drift = _safe_div(sum(rets[-16:]) / 16.0, _std(rets[-16:]))
-        vals = [drift, _safe_div(slope16, _std(rets[-16:])), ret(1), ret4, ret16, ema821, ema2150, _rsi(cc) - 0.5, volume_z, vol_ratio, atr_pct, drawdown16]
-    elif part_id == "part6_trend":
-        ups = sum(max(hh[i] - hh[i - 1], 0.0) for i in range(n - 14, n))
-        downs = sum(max(ll[i - 1] - ll[i], 0.0) for i in range(n - 14, n))
-        imbalance = _safe_div(ups - downs, ups + downs)
-        vals = [ema821, ema2150, slope16, slope32, _safe_div(ups, price), _safe_div(downs, price), imbalance, ret4, ret16, range_pos32, vol_ratio, atr_pct]
-    elif part_id == "part7_volatility":
-        vals = [ret8std, ret32std, vol_ratio, atr_pct, _safe_div(atr14, atr50), range_atr, range_expansion, ret(1), abs(ret4), abs(ret16), body_ratio, volume_z]
-    elif part_id == "part8_structure":
-        vals = [break_hi20, break_lo20, break_hi50, break_lo50, highgap(50), lowgap(50), range_pos20, range_pos50, slope16, ret4, atr_pct, volume_z]
-    elif part_id == "part9_orderflow":
-        vals = [flow4, flow12, flow_return_divergence, _slope(flow[-12:]), ret4, ret16, volume_z, volume_ratio, range_atr, bodies[-1], flow12 - ret16 * 100.0, atr_pct]
-    else:  # Part 10 candle statistics
-        vals = [body_ratio, bodies[-1] - prev_body, (same_streak - 1) / 7.0, transition, green_fraction, range_atr, ret(1), ret4, ret16, drawdown16, volume_z, vol_ratio]
-    if len(vals) != len(FEATURE_NAMES[part_id]):
+    values = prepare_features(part_id, data)
+    if len(values) != len(FEATURE_NAMES[part_id]) or not all(math.isfinite(float(v)) for v in values):
         raise ValueError("feature_schema_internal_error")
-    return tuple(_clip(float(v)) for v in vals)
+    return tuple(float(v) for v in values)
 
 
 def _identity(context: Mapping[str, Any]) -> Optional[Dict[str, str]]:
@@ -247,6 +66,66 @@ def _identity(context: Mapping[str, Any]) -> Optional[Dict[str, str]]:
         return None
     return {"venue": venue.lower(), "market_type": market_type.lower(),
             "instrument_id": instrument_id, "symbol": symbol.upper(), "timeframe": tf}
+
+
+def validate_mtf_evidence(evidence: Any, identity: Mapping[str, str],
+                         analysis_timestamp: float, *, now: Optional[float] = None,
+                         is_backtest: bool = False) -> None:
+    """Fail closed on incomplete, cross-symbol or stale 8×10 Part matrices."""
+    if not isinstance(evidence, Mapping) or not isinstance(evidence.get("frames"), Mapping):
+        raise ValueError("mtf_evidence_envelope_required")
+    expected_identity = {k: identity[k] for k in ("venue", "market_type", "instrument_id", "symbol")}
+    provided = evidence.get("identity")
+    if not isinstance(provided, Mapping) or dict(provided) != expected_identity:
+        raise ValueError("mtf_evidence_identity_mismatch")
+    if str(evidence.get("symbol", "")).upper() != identity["symbol"].upper():
+        raise ValueError("mtf_evidence_symbol_mismatch")
+    timestamps = evidence.get("closed_timestamps")
+    frames = evidence["frames"]
+    if not isinstance(timestamps, Mapping) or set(timestamps) != set(TIMEFRAMES):
+        raise ValueError("mtf_evidence_timestamp_coverage_invalid")
+    if set(frames) != set(TIMEFRAMES):
+        raise ValueError("incomplete_eight_frame_evidence")
+    evaluation_time = now if now is not None else time.time()
+    for tf in TIMEFRAMES:
+        stamp = _timestamp_epoch(timestamps[tf])
+        interval = _TIMEFRAME_SECONDS[tf]
+        if stamp > analysis_timestamp + interval + 2.0:
+            raise ValueError("mtf_frame_timestamp_after_analysis")
+        if not is_backtest and (stamp > evaluation_time + 30.0 or evaluation_time - stamp > 3 * interval + 120.0):
+            raise ValueError("mtf_frame_stale_or_future")
+        frame = frames[tf]
+        if not isinstance(frame, Mapping):
+            raise ValueError("invalid_frame_evidence")
+        for part in PARTS[:10]:
+            result = frame.get(part)
+            if not isinstance(result, Mapping):
+                raise ValueError("missing_part_evidence")
+            if result.get("symbol") and str(result["symbol"]).upper() != identity["symbol"].upper():
+                raise ValueError("evidence_symbol_mismatch")
+            if result.get("timeframe") and str(result["timeframe"]) != tf:
+                raise ValueError("evidence_timeframe_mismatch")
+    _mtf_signal_matrix(evidence)
+
+
+def build_mtf_advisory_evidence(part_results: Any, candle_frames: Any,
+                                context: Mapping[str, Any]) -> Dict[str, Any]:
+    """Create an isolated envelope without mutating deterministic Part results."""
+    identity = _identity(context)
+    if identity is None or not isinstance(part_results, Mapping) or not isinstance(candle_frames, Mapping):
+        raise ValueError("mtf_evidence_context_invalid")
+    if set(part_results) != set(TIMEFRAMES) or set(candle_frames) != set(TIMEFRAMES):
+        raise ValueError("incomplete_eight_frame_evidence")
+    stamps = {}
+    for tf in TIMEFRAMES:
+        frame = candle_frames[tf]
+        if not hasattr(frame, "index") or not len(frame.index):
+            raise ValueError("mtf_closed_frame_timestamp_missing")
+        stamps[tf] = _timestamp_epoch(frame.index[-1])
+    payload = {"identity": {k: identity[k] for k in ("venue", "market_type", "instrument_id", "symbol")},
+               "symbol": identity["symbol"], "closed_timestamps": stamps,
+               "frames": {tf: dict(part_results[tf]) for tf in TIMEFRAMES}}
+    return payload
 
 
 def _slug(value: str) -> str:
@@ -298,19 +177,25 @@ def _load_artifact(path: Path, part_id: str, identity: Mapping[str, str]) -> Dic
         raise ValueError("artifact_identity_mismatch")
     if obj.get("feature_names") != list(FEATURE_NAMES[part_id]):
         raise ValueError("artifact_feature_names_mismatch")
+    spec = MODEL_SPECS[part_id]
+    contract = {"task": spec["task"], "dims": list(spec["dims"]),
+                "activations": list(spec["acts"]), "labels": list(spec["labels"]), "kind": spec["kind"]}
+    if obj.get("model_contract") != contract:
+        raise ValueError("artifact_model_contract_mismatch")
     norm = obj.get("normalization")
     if not isinstance(norm, dict):
         raise ValueError("artifact_normalization_missing")
-    mean = _finite_vector(norm.get("mean"), 12, "normalization_mean")
-    std = _finite_vector(norm.get("std"), 12, "normalization_std")
+    input_dim = len(FEATURE_NAMES[part_id])
+    mean = _finite_vector(norm.get("mean"), input_dim, "normalization_mean")
+    std = _finite_vector(norm.get("std"), input_dim, "normalization_std")
     if any(x <= 0 for x in std):
         raise ValueError("artifact_normalization_std_invalid")
     layers = obj.get("layers")
-    if not isinstance(layers, list) or len(layers) != 2:
+    dims, acts = spec["dims"], spec["acts"]
+    if not isinstance(layers, list) or len(layers) != len(dims) - 1:
         raise ValueError("artifact_architecture_invalid")
-    expected = ((16, 12), (3, 16))
     parsed_layers = []
-    for layer, (out_dim, in_dim), act in zip(layers, expected, ("relu", "linear")):
+    for layer, in_dim, out_dim, act in zip(layers, dims[:-1], dims[1:], acts):
         if not isinstance(layer, dict) or layer.get("activation") != act:
             raise ValueError("artifact_activation_invalid")
         weights = layer.get("weights")
@@ -426,16 +311,16 @@ def _validate_closed_series(data: Any, interval: int) -> None:
         raise ValueError("forming_candle_rejected")
 
 
-def _softmax(logits: Sequence[float]) -> Tuple[float, float, float]:
-    if len(logits) != 3 or not all(math.isfinite(x) for x in logits):
+def _softmax(logits: Sequence[float]) -> Tuple[float, ...]:
+    if len(logits) < 2 or not all(math.isfinite(x) for x in logits):
         raise ValueError("non_finite_inference")
     m = max(logits)
     exps = [math.exp(max(-80.0, min(80.0, x - m))) for x in logits]
     den = sum(exps)
-    return tuple(x / den for x in exps)  # sell, neutral, buy
+    return tuple(x / den for x in exps)
 
 
-def _infer(model: Mapping[str, Any], vector: Sequence[float]) -> Tuple[float, float, float]:
+def _infer(model: Mapping[str, Any], vector: Sequence[float], part_id: str) -> Tuple[float, ...]:
     x = [max(-8.0, min(8.0, (v - m) / s)) for v, m, s in zip(vector, model["mean"], model["std"])]
     for weights, bias, activation in model["layers"]:
         x = [sum(wi * xi for wi, xi in zip(row, x)) + b for row, b in zip(weights, bias)]
@@ -443,7 +328,21 @@ def _infer(model: Mapping[str, Any], vector: Sequence[float]) -> Tuple[float, fl
             raise ValueError("non_finite_inference")
         if activation == "relu":
             x = [max(0.0, v) for v in x]
-    return _softmax(x)
+        elif activation == "tanh":
+            x = [math.tanh(v) for v in x]
+        elif activation != "linear":
+            raise ValueError("unsupported_artifact_activation")
+    spec = MODEL_SPECS[part_id]
+    if spec["kind"] == "sigmoid":
+        if len(x) != 1:
+            raise ValueError("binary_head_shape_invalid")
+        z = max(-80.0, min(80.0, x[0]))
+        probability_like_score = 1.0 / (1.0 + math.exp(-z))
+        return (1.0 - probability_like_score, probability_like_score)
+    scores = _softmax(x)
+    if len(scores) != len(spec["labels"]):
+        raise ValueError("classification_head_shape_invalid")
+    return scores
 
 
 def predict_advisory(data: Any, part_id: str, context: Optional[Mapping[str, Any]] = None,
@@ -463,7 +362,11 @@ def predict_advisory(data: Any, part_id: str, context: Optional[Mapping[str, Any
             return {"status": "unavailable", "reason": "snapshot_freshness_missing"}
         if not math.isfinite(fetched) or abs((now if now is not None else time.time()) - fetched) > 180.0:
             return {"status": "unavailable", "reason": "stale_snapshot"}
-    ts = _index_time(data)
+    is_mtf_model = part_id in ("part11_fusion", "part12_confidence")
+    try:
+        ts = _timestamp_epoch(c.get("closed_candle_timestamp")) if c.get("closed_candle_timestamp") is not None else _index_time(data)
+    except Exception:
+        ts = None
     if ts is None:
         return {"status": "unavailable", "reason": "closed_candle_timestamp_missing"}
     is_backtest = bool(c.get("is_backtest_mode"))
@@ -472,7 +375,12 @@ def predict_advisory(data: Any, part_id: str, context: Optional[Mapping[str, Any
         if (now if now is not None else time.time()) - ts > 3 * interval + 120 or ts > (now if now is not None else time.time()) + 30:
             return {"status": "unavailable", "reason": "closed_candles_stale_or_future"}
     try:
-        _validate_closed_series(data, _TIMEFRAME_SECONDS[identity["timeframe"]])
+        if not is_mtf_model:
+            _validate_closed_series(data, _TIMEFRAME_SECONDS[identity["timeframe"]])
+        else:
+            # Each separate MTF head requires provenance, all eight closed
+            # frames, ten named Part outputs per frame, and current timestamps.
+            validate_mtf_evidence(data, identity, ts, now=now, is_backtest=is_backtest)
         attrs = getattr(data, "attrs", {}) or {}
         if attrs.get("symbol") and str(attrs["symbol"]).upper() != identity["symbol"]:
             return {"status": "unavailable", "reason": "frame_symbol_mismatch"}
@@ -511,15 +419,22 @@ def predict_advisory(data: Any, part_id: str, context: Optional[Mapping[str, Any
                 if cached is not None:
                     _PREDICTION_CACHE.move_to_end(cache_key)
                     return dict(cached)
-            scores = _infer(model, vector)
+            scores = _infer(model, vector, part_id)
+            spec = MODEL_SPECS[part_id]
+            labels = spec["labels"]
             max_score = max(scores)
-            direction = "SELL" if scores[0] == max_score else "BUY" if scores[2] == max_score else "NEUTRAL"
-            if max_score < 0.55:
-                direction = "NEUTRAL"
-            result = {"status": "available", "direction": direction,
-                      "scores_uncalibrated": {"sell": scores[0], "neutral": scores[1], "buy": scores[2]},
+            winning_index = max(range(len(scores)), key=lambda i: scores[i])
+            prediction = labels[winning_index] if max_score >= 0.55 else "uncertain"
+            result = {"status": "available", "task": spec["task"],
+                      "prediction": prediction,
+                      "scores_uncalibrated": {label: scores[i] for i, label in enumerate(labels)},
+                      "head_kind": spec["kind"],
                       "role": "advisory_only_no_execution_authority",
-                      "model_version": str(model["training"].get("model_version", "1"))}
+                      "model_version": str(model["training"].get("model_version", "2"))}
+            if part_id == "part11_fusion":
+                result["direction"] = {"sell": "SELL", "neutral": "NEUTRAL", "buy": "BUY"}.get(prediction, "NEUTRAL")
+            if part_id == "part12_confidence":
+                result["consensus_correctness_score_uncalibrated"] = scores[1]
             with _LOCK:
                 _PREDICTION_CACHE[cache_key] = result
                 _PREDICTION_CACHE.move_to_end(cache_key)
@@ -543,9 +458,23 @@ def annotate_part_result(result: Any, data: Any, part_id: str,
     return out
 
 
+def annotate_mtf_result(result: Any, evidence: Any, part_id: str,
+                        context: Optional[Mapping[str, Any]] = None,
+                        *, artifact_dir: Optional[str] = None,
+                        now: Optional[float] = None) -> Any:
+    """Attach a task-specific advisory to Parts 11/12 from the full 8×10 matrix."""
+    if part_id not in ("part11_fusion", "part12_confidence"):
+        raise ValueError("mtf_advisory_only_for_parts_11_12")
+    if not isinstance(result, dict):
+        return result
+    out = dict(result)
+    out["neural_advisory"] = predict_advisory(evidence, part_id, context, now=now, artifact_dir=artifact_dir)
+    return out
+
+
 def not_applicable_result(part_id: str) -> Dict[str, str]:
-    return {"status": "not_applicable", "reason": f"{part_id} is deterministic fusion/confidence, not an independent predictor",
-            "role": "diagnostic_only"}
+    return {"status": "unavailable", "reason": f"{part_id}_requires_trained_task_artifact",
+            "role": "advisory_only_no_execution_authority"}
 
 
 def clear_caches() -> None:

@@ -39,7 +39,8 @@ from jarvis_strategy_approval import (
     REQUIRED_TIMEFRAMES, TIMEFRAME_WEIGHTS,
 )
 from jarvis_runtime import detect_backend, torch_device
-from neural_advisory import PARTS as NEURAL_ADVISORY_PARTS, annotate_part_result, not_applicable_result
+from neural_advisory import (PARTS as NEURAL_ADVISORY_PARTS, annotate_part_result,
+                             annotate_mtf_result, build_mtf_advisory_evidence)
 # Legacy Ollama context removed; deterministic gates are authoritative.
 pro_display = ProfessionalSignalDisplay()
 import warnings
@@ -6354,12 +6355,29 @@ class JarvisElite:
             # receives the old 1m-primary flattened list as a decision proxy.
             math_res = self.parts['part11_fusion'].analyze(mtf_breakdown)
             math_conf_res = self.parts['part12_confidence'].analyze(mtf_breakdown)
-            # Parts 11 and 12 remain deterministic aggregation/heuristic-score
-            # modules, not independent neural predictors or calibrated models.
-            if isinstance(math_res, dict):
-                math_res['neural_advisory'] = not_applicable_result('part11_fusion')
-            if isinstance(math_conf_res, dict):
-                math_conf_res['neural_advisory'] = not_applicable_result('part12_confidence')
+            active_snapshot = candle_snapshot or getattr(self, '_active_candle_snapshot', None)
+            base_frame = mtf_data.get('1m') if isinstance(mtf_data, dict) else None
+            base_closed_ts = (base_frame.index[-1] if base_frame is not None and len(base_frame.index) else None)
+            mtf_advisory_context = {
+                'selected_symbol': getattr(self, 'active_symbol', None) or getattr(data, 'attrs', {}).get('symbol'),
+                'symbol': getattr(self, 'active_symbol', None) or getattr(data, 'attrs', {}).get('symbol'),
+                'timeframe': '1m',
+                'analysis_identity': getattr(active_snapshot, 'identity', None),
+                'snapshot_fetched_at': getattr(active_snapshot, 'fetched_at', None),
+                'closed_candle_timestamp': base_closed_ts,
+                'is_backtest_mode': bool(self.is_backtest_mode),
+            }
+            # Isolate a provenance-tagged advisory view of the full 8×10 matrix;
+            # the deterministic Part 11/12 inputs and central policy stay intact.
+            try:
+                mtf_neural_evidence = build_mtf_advisory_evidence(mtf_breakdown, mtf_data, mtf_advisory_context)
+            except Exception as evidence_error:
+                logger.warning(f"Neural advisory evidence unavailable: {evidence_error}")
+                mtf_neural_evidence = {}
+            # Parts 11/12 have different matrix feature schemas and trained heads.
+            # They annotate only; deterministic fusion, confidence and gates win.
+            math_res = annotate_mtf_result(math_res, mtf_neural_evidence, 'part11_fusion', mtf_advisory_context)
+            math_conf_res = annotate_mtf_result(math_conf_res, mtf_neural_evidence, 'part12_confidence', mtf_advisory_context)
             part12_mtf_valid = (
                 isinstance(math_conf_res, dict)
                 and math_conf_res.get('data_status') == 'valid'

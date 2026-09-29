@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Offline chronological trainer for one Part's tiny advisory MLP.
+"""Offline trainer for twelve independent, task-specific Jarvis advisory heads.
 
-No network/API/bot calls are made. A JSON artifact is written only after strict
-chronological holdout checks pass. The target is an OHLCV forward-return proxy,
-not a strategy PnL target, calibrated probability, or evidence of profitability.
-Requires locally installed PyTorch; CPU is the conservative default.
+No bot, exchange or network calls are made. Each Part has a distinct feature
+contract, model topology/head and label definition. Artifacts are accepted only
+after chronological validation/test gates; labels are research proxies, not PnL,
+calibration, profitability or authorization. PyTorch is used only offline.
 """
 from __future__ import annotations
-
 import argparse
 import csv
 from datetime import datetime, timezone
@@ -19,11 +18,13 @@ from pathlib import Path
 import random
 import sys
 import tempfile
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from neural_advisory import (FEATURE_NAMES, FEATURE_SCHEMA, FORMAT, FORMAT_VERSION,
-                             _TIMEFRAME_SECONDS, artifact_path, feature_vector)
+    MODEL_SPECS, TIMEFRAMES, _TIMEFRAME_SECONDS, artifact_path, feature_vector,
+    validate_mtf_evidence)
+from neural_parts import label_target
 
 MAX_ROWS = 100_000
 MIN_TRAIN = 200
@@ -38,17 +39,19 @@ def parse_timestamp(value: str) -> float:
     return dt.timestamp()
 
 
-def _identity_arg(s: argparse.Namespace) -> Dict[str, str]:
-    vals = {"venue": s.venue.strip().lower(), "market_type": s.market_type.strip().lower(),
-            "instrument_id": s.instrument_id.strip(), "symbol": s.symbol.strip().upper(),
-            "timeframe": s.timeframe.strip()}
+def _identity_arg(args: argparse.Namespace) -> Dict[str, str]:
+    vals = {"venue": args.venue.strip().lower(), "market_type": args.market_type.strip().lower(),
+            "instrument_id": args.instrument_id.strip(), "symbol": args.symbol.strip().upper(),
+            "timeframe": args.timeframe.strip()}
     if not all(vals.values()) or vals["venue"] in ("unknown", "none", "null") or vals["market_type"] in ("unknown", "none", "null"):
         raise ValueError("Training unavailable: full known venue/market/instrument/symbol/timeframe identity is required.")
     return vals
 
 
-def read_closed_csv(path: Path, identity: Dict[str, str]) -> List[Dict[str, Any]]:
-    expected = {**identity}
+def read_closed_csv(path: Path, identity: Dict[str, str], part_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    expected = dict(identity)
+    if part_id in ("part11_fusion", "part12_confidence") and identity["timeframe"] != "1m":
+        raise ValueError("Parts 11/12 use one identity-bound 1m decision clock and the complete eight-frame evidence matrix.")
     records: List[Dict[str, Any]] = []
     last_ts = None
     try:
@@ -56,8 +59,10 @@ def read_closed_csv(path: Path, identity: Dict[str, str]) -> List[Dict[str, Any]
             reader = csv.DictReader(f)
             required = {"timestamp", "open", "high", "low", "close", "volume", "is_closed",
                         "venue", "market_type", "instrument_id", "symbol", "timeframe"}
+            if part_id in ("part11_fusion", "part12_confidence"):
+                required.add("evidence_json")
             if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
-                raise ValueError("CSV needs timestamp, OHLCV, is_closed, venue, market_type, instrument_id, symbol, timeframe columns.")
+                raise ValueError("CSV needs chronological closed OHLCV + exact identity; Parts 11/12 also require evidence_json with all 8 frames × Parts 1–10.")
             for line, row in enumerate(reader, start=2):
                 if len(records) >= MAX_ROWS:
                     raise ValueError(f"CSV exceeds {MAX_ROWS} rows; split into one bounded identity dataset.")
@@ -83,234 +88,201 @@ def read_closed_csv(path: Path, identity: Dict[str, str]) -> List[Dict[str, Any]
                 if min(vals[k] for k in ("open", "high", "low", "close")) <= 0 or vals["volume"] < 0 or vals["high"] < max(vals["open"], vals["close"], vals["low"]) or vals["low"] > min(vals["open"], vals["close"], vals["high"]):
                     raise ValueError(f"line {line}: invalid OHLCV values.")
                 vals["timestamp"] = row["timestamp"]
+                if "evidence_json" in required:
+                    try:
+                        evidence = json.loads(row["evidence_json"])
+                        # Training-only timestamp validity, identity binding and
+                        # feature checks use the exact runtime evidence contract.
+                        validate_mtf_evidence(evidence, identity, ts, is_backtest=True)
+                        feature_vector(part_id, evidence)
+                    except Exception as exc:
+                        raise ValueError(f"line {line}: invalid/incomplete eight-frame Part evidence: {exc}") from exc
+                    vals["evidence"] = evidence
                 records.append(vals)
     except FileNotFoundError as e:
         raise ValueError(f"Training unavailable: dataset not found: {path}") from e
     return records
 
 
+def _returns(rows: Sequence[Dict[str, Any]], i: int, horizon: int) -> float:
+    return rows[i + horizon]["close"] / rows[i]["close"] - 1.0
+
+
 def make_samples(rows: Sequence[Dict[str, Any]], part_id: str, horizon: int,
                  neutral_bps: float) -> Tuple[List[List[float]], List[int], List[int]]:
     if len(rows) < 400:
         raise ValueError("Training unavailable: at least 400 strictly identified closed candles are required before chronological holdouts.")
-    n = len(rows)
-    cut_train, cut_val = int(n * .70), int(n * .85)
-    # Purge horizon samples on both sides of split boundaries. X at any point
-    # uses only that point and its past 63 bars; Y uses only the future horizon.
-    indices = ([i for i in range(63, max(63, cut_train - horizon))]
-               + [i for i in range(cut_train + horizon, max(cut_train + horizon, cut_val - horizon))]
-               + [i for i in range(cut_val + horizon, n - horizon)])
-    # Build aligned samples explicitly, avoiding positional assumptions when a
-    # small input makes one split empty (which is rejected below).
-    samples: List[List[float]] = []
-    labels: List[int] = []
-    splits: List[int] = []
-    threshold = neutral_bps / 10_000.0
+    n = len(rows); cut_train, cut_val = int(n*.70), int(n*.85)
+    indices = ([i for i in range(63, max(63, cut_train-horizon))]
+               + [i for i in range(cut_train+horizon, max(cut_train+horizon, cut_val-horizon))]
+               + [i for i in range(cut_val+horizon, n-horizon)])
+    X: List[List[float]]=[]; y: List[int]=[]; split: List[int]=[]
     for i in indices:
-        future_return = rows[i + horizon]["close"] / rows[i]["close"] - 1.0
-        label = 2 if future_return > threshold else 0 if future_return < -threshold else 1
-        samples.append(list(feature_vector(part_id, rows[max(0, i - 63):i + 1])))
-        labels.append(label)
-        splits.append(0 if i < cut_train else 1 if i < cut_val else 2)
-    counts = [sum(1 for x in splits if x == s) for s in range(3)]
+        evidence = rows[i].get("evidence")
+        if part_id in ("part11_fusion", "part12_confidence"):
+            if evidence is None: raise ValueError("Training unavailable: Parts 11/12 require point-in-time evidence_json for every sample.")
+            vector = feature_vector(part_id, evidence)
+        else:
+            vector = feature_vector(part_id, rows[max(0, i-63):i+1])
+        label = label_target(part_id, rows, i, horizon, neutral_bps, vector)
+        if label is None: continue
+        X.append(list(vector)); y.append(label); split.append(0 if i<cut_train else 1 if i<cut_val else 2)
+    counts=[sum(s==j for s in split) for j in range(3)]
     if counts[0] < MIN_TRAIN or counts[1] < MIN_HOLDOUT or counts[2] < MIN_HOLDOUT:
-        raise ValueError(f"Training unavailable: chronological split too small after {horizon}-bar purge (train/validation/test={counts}). Supply more historical data.")
-    return samples, labels, splits
+        raise ValueError(f"Training unavailable: chronological split too small after {horizon}-bar purge/target filtering (train/validation/test={counts}). Supply more historical data.")
+    return X,y,split
 
 
-def _acc(pred: Sequence[int], actual: Sequence[int]) -> float:
-    return sum(int(a == b) for a, b in zip(pred, actual)) / max(1, len(actual))
+def _accuracy(pred: Sequence[int], actual: Sequence[int]) -> float:
+    return sum(int(a==b) for a,b in zip(pred,actual))/max(1,len(actual))
 
 
 def _majority(actual: Sequence[int]) -> float:
-    if not actual:
-        return 1.0
-    return max(actual.count(c) for c in (0, 1, 2)) / len(actual)
+    if not actual: return 1.0
+    return max(actual.count(c) for c in set(actual))/len(actual)
 
 
-def train_model(X: List[List[float]], y: List[int], split: List[int], device_request: str,
-                epochs: int, seed: int) -> Tuple[Any, Dict[str, Any], str]:
+def train_model(X: List[List[float]], y: List[int], split: List[int], part_id: str,
+                device_request: str, epochs: int, seed: int):
     try:
         import torch
         from torch import nn
         from torch.utils.data import DataLoader, TensorDataset
     except ImportError as e:
-        raise RuntimeError("Training unavailable: install a local PyTorch build first; live runtime itself has no PyTorch requirement.") from e
-    # The offline trainer is intentionally low-concurrency on the user's
-    # 8-GB host; live inference remains a separate stdlib-only process path.
+        raise RuntimeError("Training unavailable: install local PyTorch; live runtime has no PyTorch requirement.") from e
     torch.set_num_threads(1)
-    if device_request not in ("cpu", "cuda"):
-        raise ValueError("device must be cpu or cuda")
-    if device_request == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA requested but unavailable; rerun with --device cpu.")
-
-    # Train-only normalization; holdouts never affect scaler parameters.
-    train_rows = [X[i] for i, s in enumerate(split) if s == 0]
-    mean = [sum(row[j] for row in train_rows) / len(train_rows) for j in range(12)]
-    std = []
-    for j in range(12):
-        var = sum((row[j] - mean[j]) ** 2 for row in train_rows) / len(train_rows)
-        std.append(max(math.sqrt(var), 1e-6))
-    Z = [[max(-8.0, min(8.0, (row[j] - mean[j]) / std[j])) for j in range(12)] for row in X]
-    if len(Z) > MAX_ROWS:
-        raise ValueError("sample bound exceeded")
-
+    if device_request not in ("cpu", "cuda"): raise ValueError("device must be cpu or cuda")
+    if device_request=="cuda" and not torch.cuda.is_available(): raise ValueError("CUDA requested but unavailable; rerun with --device cpu.")
+    spec=MODEL_SPECS[part_id]; in_dim=len(FEATURE_NAMES[part_id])
+    train=[X[i] for i,s in enumerate(split) if s==0]
+    mean=[sum(r[j] for r in train)/len(train) for j in range(in_dim)]
+    std=[max(math.sqrt(sum((r[j]-mean[j])**2 for r in train)/len(train)),1e-6) for j in range(in_dim)]
+    Z=[[max(-8.,min(8.,(row[j]-mean[j])/std[j])) for j in range(in_dim)] for row in X]
     def run(device_name: str):
-        torch.manual_seed(seed)
-        random.seed(seed)
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        device = torch.device(device_name)
-        model = nn.Sequential(nn.Linear(12, 16), nn.ReLU(), nn.Linear(16, 3)).to(device=device, dtype=torch.float32)
-        tx = torch.tensor([Z[i] for i, s in enumerate(split) if s == 0], dtype=torch.float32)
-        ty = torch.tensor([y[i] for i, s in enumerate(split) if s == 0], dtype=torch.long)
-        vx = torch.tensor([Z[i] for i, s in enumerate(split) if s == 1], dtype=torch.float32, device=device)
-        vy = torch.tensor([y[i] for i, s in enumerate(split) if s == 1], dtype=torch.long, device=device)
-        dataset = TensorDataset(tx, ty)
-        loader = DataLoader(dataset, batch_size=128, shuffle=True, generator=torch.Generator().manual_seed(seed), num_workers=0)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-        loss_fn = nn.CrossEntropyLoss()
-        best_loss, best_state, patience = float("inf"), None, 0
+        torch.manual_seed(seed); random.seed(seed); torch.use_deterministic_algorithms(True,warn_only=True)
+        device=torch.device(device_name)
+        modules=[]; linear_ids=[]; idx=0
+        for layer_no,(out_dim,act) in enumerate(zip(spec["dims"][1:],spec["acts"])):
+            modules.append(nn.Linear(spec["dims"][layer_no],out_dim)); linear_ids.append(str(idx)); idx+=1
+            if act=="relu": modules.append(nn.ReLU()); idx+=1
+            elif act=="tanh": modules.append(nn.Tanh()); idx+=1
+        model=nn.Sequential(*modules).to(device=device,dtype=torch.float32)
+        train_ids=[i for i,s in enumerate(split) if s==0]; val_ids=[i for i,s in enumerate(split) if s==1]; test_ids=[i for i,s in enumerate(split) if s==2]
+        tx=torch.tensor([Z[i] for i in train_ids],dtype=torch.float32); ty=torch.tensor([y[i] for i in train_ids],dtype=torch.float32 if spec["kind"]=="sigmoid" else torch.long)
+        vx=torch.tensor([Z[i] for i in val_ids],dtype=torch.float32,device=device); vy=torch.tensor([y[i] for i in val_ids],dtype=torch.float32 if spec["kind"]=="sigmoid" else torch.long,device=device)
+        loader=DataLoader(TensorDataset(tx,ty),batch_size=128,shuffle=True,generator=torch.Generator().manual_seed(seed),num_workers=0)
+        opt=torch.optim.AdamW(model.parameters(),lr=1e-3,weight_decay=1e-4)
+        loss_fn=nn.BCEWithLogitsLoss() if spec["kind"]=="sigmoid" else nn.CrossEntropyLoss()
+        best=float("inf"); best_state=None; patience=0
         for _ in range(epochs):
             model.train()
-            for bx, by in loader:
-                bx, by = bx.to(device), by.to(device)
-                optimizer.zero_grad(set_to_none=True)
-                loss = loss_fn(model(bx), by)
-                loss.backward()
-                optimizer.step()
+            for bx,by in loader:
+                bx,by=bx.to(device),by.to(device)
+                opt.zero_grad(set_to_none=True); logits=model(bx)
+                loss=loss_fn(logits.squeeze(-1),by) if spec["kind"]=="sigmoid" else loss_fn(logits,by)
+                loss.backward(); opt.step()
             model.eval()
             with torch.no_grad():
-                vloss = float(loss_fn(model(vx), vy).item())
-            if vloss < best_loss - 1e-5:
-                best_loss, patience = vloss, 0
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                vl=model(vx); val_loss=loss_fn(vl.squeeze(-1),vy) if spec["kind"]=="sigmoid" else loss_fn(vl,vy)
+                vloss=float(val_loss.item())
+            if vloss<best-1e-5:
+                best=vloss; patience=0; best_state={k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
             else:
-                patience += 1
-                if patience >= 7:
-                    break
-        if best_state is None:
-            raise RuntimeError("no valid checkpoint during validation")
-        model.load_state_dict(best_state)
-        model.to(device)
-        model.eval()
-        with torch.no_grad():
-            preds = model(vx).argmax(dim=1).cpu().tolist()
-        val_actual = [y[i] for i, s in enumerate(split) if s == 1]
-        val_metrics = {"validation_accuracy": _acc(preds, val_actual),
-                       "validation_majority_accuracy": _majority(val_actual)}
-        test_x = torch.tensor([Z[i] for i, s in enumerate(split) if s == 2], dtype=torch.float32, device=device)
-        test_actual = [y[i] for i, s in enumerate(split) if s == 2]
-        with torch.no_grad():
-            test_preds = model(test_x).argmax(dim=1).cpu().tolist()
-        val_metrics.update({"test_accuracy": _acc(test_preds, test_actual),
-                            "test_majority_accuracy": _majority(test_actual)})
-        state = {k: v.detach().cpu().tolist() for k, v in model.state_dict().items()}
-        return model, state, mean, std, val_metrics, device_name
-
+                patience+=1
+                if patience>=7: break
+        if best_state is None: raise RuntimeError("no validation checkpoint")
+        model.load_state_dict(best_state); model.to(device); model.eval()
+        test_ids=[i for i,s in enumerate(split) if s==2]
+        def predict(ids):
+            xx=torch.tensor([Z[i] for i in ids],dtype=torch.float32,device=device)
+            with torch.no_grad(): out=model(xx)
+            if spec["kind"]=="sigmoid": return (torch.sigmoid(out.squeeze(-1))>=.5).long().cpu().tolist()
+            return out.argmax(dim=1).cpu().tolist()
+        val_actual=[y[i] for i in val_ids]; test_actual=[y[i] for i in test_ids]
+        vp=predict(val_ids); tp=predict(test_ids)
+        metrics={"validation_accuracy":_accuracy(vp,val_actual),"validation_majority_accuracy":_majority(val_actual),
+                 "test_accuracy":_accuracy(tp,test_actual),"test_majority_accuracy":_majority(test_actual),"pytorch_version":str(torch.__version__)}
+        state={idx:{"weights":model.state_dict()[idx+".weight"].detach().cpu().tolist(),"bias":model.state_dict()[idx+".bias"].detach().cpu().tolist()} for idx in linear_ids}
+        return state,mean,std,metrics,device_name
     try:
-        _, state, mean, std, metrics, used_device = run(device_request)
+        state,mean,std,metrics,device=run(device_request)
     except RuntimeError as e:
-        oom = "out of memory" in str(e).lower() or "cuda" in str(e).lower() and "memory" in str(e).lower()
-        if device_request != "cuda" or not oom:
-            raise
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        _, state, mean, std, metrics, used_device = run("cpu")
-        used_device = "cpu_fallback_after_cuda_oom"
-    return state, {"mean": mean, "std": std, "pytorch_version": str(torch.__version__), **metrics}, used_device
+        oom="out of memory" in str(e).lower() or ("cuda" in str(e).lower() and "memory" in str(e).lower())
+        if device_request!="cuda" or not oom: raise
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        state,mean,std,metrics,_=run("cpu"); device="cpu_fallback_after_cuda_oom"
+    return state,{"mean":mean,"std":std,**metrics},device
 
 
 def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
+    digest=hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda:f.read(1024*1024),b""): digest.update(block)
     return digest.hexdigest()
 
 
-def _artifact(identity: Dict[str, str], part_id: str, state: Dict[str, Any], stats: Dict[str, Any],
-              ncounts: List[int], horizon: int, neutral_bps: float, used_device: str,
-              dataset_sha256: str, dataset_last_timestamp: float) -> Dict[str, Any]:
-    val_ok = stats["validation_accuracy"] >= stats["validation_majority_accuracy"] + 0.02
-    test_ok = stats["test_accuracy"] >= stats["test_majority_accuracy"] + 0.02
-    if not val_ok or not test_ok:
-        raise ValueError("Training unavailable: the fixed offline validation/test acceptance gate did not beat the majority-label baseline by 2 percentage points; no artifact written.")
-    layers = [
-        {"weights": state["0.weight"], "bias": state["0.bias"], "activation": "relu"},
-        {"weights": state["2.weight"], "bias": state["2.bias"], "activation": "linear"},
-    ]
-    return {"format": FORMAT, "format_version": FORMAT_VERSION, "feature_schema": FEATURE_SCHEMA,
-            "part_id": part_id, "feature_names": list(FEATURE_NAMES[part_id]), "identity": identity,
-            "normalization": {"mean": stats["mean"], "std": stats["std"]}, "layers": layers,
-            "training": {"status": "validated", "approved_for_advisory": True,
-                         "split": "chronological_purged", "model_version": "1",
-                         "train_samples": ncounts[0], "validation_samples": ncounts[1], "test_samples": ncounts[2],
-                         "horizon_bars": horizon, "neutral_threshold_bps": neutral_bps,
-                         "dataset_sha256": dataset_sha256, "dataset_last_timestamp": dataset_last_timestamp,
-                         "trainer_version": "1.0",
-                         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
-                         "pytorch_version": stats.get("pytorch_version", "unknown"),
-                         "validation_accuracy": stats["validation_accuracy"],
-                         "validation_majority_accuracy": stats["validation_majority_accuracy"],
-                         "test_accuracy": stats["test_accuracy"],
-                         "test_majority_accuracy": stats["test_majority_accuracy"],
-                         "device": used_device, "dtype": "float32",
-                         "target_warning": "forward-return direction proxy; not calibrated and not a strategy PnL/profitability test"}}
+def _artifact(identity, part_id, state, stats, counts, horizon, neutral_bps, device, dataset_hash, last_ts):
+    if stats["validation_accuracy"] < stats["validation_majority_accuracy"]+.02 or stats["test_accuracy"] < stats["test_majority_accuracy"]+.02:
+        raise ValueError("Training unavailable: validation and test must each beat majority-label baseline by ≥2 percentage points; no artifact written.")
+    spec=MODEL_SPECS[part_id]; layers=[]
+    for i,act in enumerate(spec["acts"]):
+        layer=state[str(i*2)] if i*2 in [int(k) for k in state] else None
+        # Linear-module state indexes differ only by the activation modules preceding them.
+        if layer is None:
+            keys=sorted(state,key=int); layer=state[keys[i]]
+        layers.append({"weights":layer["weights"],"bias":layer["bias"],"activation":act})
+    contract={"task":spec["task"],"dims":list(spec["dims"]),"activations":list(spec["acts"]),"labels":list(spec["labels"]),"kind":spec["kind"]}
+    return {"format":FORMAT,"format_version":FORMAT_VERSION,"feature_schema":FEATURE_SCHEMA,
+        "part_id":part_id,"feature_names":list(FEATURE_NAMES[part_id]),"identity":identity,
+        "model_contract":contract,"normalization":{"mean":stats["mean"],"std":stats["std"]},"layers":layers,
+        "training":{"status":"validated","approved_for_advisory":True,"split":"chronological_purged",
+        "model_version":"3","train_samples":counts[0],"validation_samples":counts[1],"test_samples":counts[2],
+        "horizon_bars":horizon,"neutral_threshold_bps":neutral_bps,"dataset_sha256":dataset_hash,
+        "dataset_last_timestamp":last_ts,"trainer_version":"3.0","trained_at_utc":datetime.now(timezone.utc).isoformat(),
+        "pytorch_version":stats.get("pytorch_version","unknown"),
+        "validation_accuracy":stats["validation_accuracy"],"validation_majority_accuracy":stats["validation_majority_accuracy"],
+        "test_accuracy":stats["test_accuracy"],"test_majority_accuracy":stats["test_majority_accuracy"],
+        "device":device,"dtype":"float32","target_warning":"Part-specific research target; uncalibrated advisory proxy, not strategy PnL, live authorization or profitability evidence"}}
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("csv", type=Path, help="offline CSV of strictly closed OHLCV rows and full identity columns")
-    ap.add_argument("--part", required=True, choices=FEATURE_NAMES.keys())
-    ap.add_argument("--venue", required=True)
-    ap.add_argument("--market-type", required=True)
-    ap.add_argument("--instrument-id", required=True)
-    ap.add_argument("--symbol", required=True)
-    ap.add_argument("--timeframe", required=True, choices=("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"))
-    ap.add_argument("--horizon", type=int, default=3)
-    ap.add_argument("--neutral-bps", type=float, default=20.0, help="minimum forward return magnitude for BUY/SELL proxy label; default 20bp")
-    ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--device", choices=("cpu", "cuda"), default="cpu", help="CPU default; CUDA is opt-in, float32, with explicit CPU retry on CUDA OOM")
-    ap.add_argument("--seed", type=int, default=20260929)
-    ap.add_argument("--artifact-dir", type=Path, default=Path(os.environ.get("JARVIS_NEURAL_ARTIFACT_DIR", "models/advisory")))
-    ap.add_argument("--replace", action="store_true", help="explicitly replace an existing exact-identity artifact after passing holdout gates")
-    args = ap.parse_args()
-    if not 1 <= args.horizon <= 24 or not 0.0 <= args.neutral_bps <= 1000 or not 1 <= args.epochs <= 200:
-        ap.error("horizon 1-24, neutral-bps 0-1000 and epochs 1-200 are required")
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("csv",type=Path,help="offline chronological closed-OHLCV CSV; Parts 11/12 also need evidence_json per row")
+    ap.add_argument("--part",required=True,choices=FEATURE_NAMES.keys())
+    ap.add_argument("--venue",required=True); ap.add_argument("--market-type",required=True)
+    ap.add_argument("--instrument-id",required=True); ap.add_argument("--symbol",required=True)
+    ap.add_argument("--timeframe",required=True,choices=tuple(_TIMEFRAME_SECONDS))
+    ap.add_argument("--horizon",type=int,default=3)
+    ap.add_argument("--neutral-bps",type=float,default=20.0)
+    ap.add_argument("--epochs",type=int,default=50)
+    ap.add_argument("--device",choices=("cpu","cuda"),default="cpu",help="bounded CPU default; opt-in CUDA retries on CPU after CUDA OOM")
+    ap.add_argument("--seed",type=int,default=20260929)
+    ap.add_argument("--artifact-dir",type=Path,default=Path(os.environ.get("JARVIS_NEURAL_ARTIFACT_DIR","models/advisory")))
+    ap.add_argument("--replace",action="store_true")
+    args=ap.parse_args()
+    if not 1<=args.horizon<=24 or not 0<=args.neutral_bps<=1000 or not 1<=args.epochs<=200: ap.error("horizon 1-24, neutral-bps 0-1000 and epochs 1-200 required")
     try:
-        identity = _identity_arg(args)
-        dataset_sha256 = _sha256_file(args.csv)
-        rows = read_closed_csv(args.csv, identity)
-        dataset_last_timestamp = parse_timestamp(rows[-1]["timestamp"])
-        X, y, split = make_samples(rows, args.part, args.horizon, args.neutral_bps)
-        ncounts = [sum(1 for s in split if s == x) for x in range(3)]
-        state, stats, device = train_model(X, y, split, args.device, args.epochs, args.seed)
-        if _sha256_file(args.csv) != dataset_sha256:
-            raise ValueError("Training unavailable: input CSV changed during training; discard this run and retry.")
-        artifact = _artifact(identity, args.part, state, stats, ncounts, args.horizon, args.neutral_bps,
-                             device, dataset_sha256, dataset_last_timestamp)
-        target = artifact_path(identity, args.part, str(args.artifact_dir))
-        if target.exists() and not args.replace:
-            raise ValueError("An artifact for this exact part/instrument/timeframe already exists; pass --replace explicitly to retrain it.")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # JSON contains bounded plain arrays only (never pickle/state_dict); atomic replace.
-        fd, temporary = tempfile.mkstemp(prefix=".jarvis-model-", suffix=".json", dir=target.parent)
+        identity=_identity_arg(args); digest=_sha256_file(args.csv)
+        rows=read_closed_csv(args.csv,identity,args.part); last=parse_timestamp(rows[-1]["timestamp"])
+        X,y,split=make_samples(rows,args.part,args.horizon,args.neutral_bps); counts=[sum(s==k for s in split) for k in range(3)]
+        state,stats,device=train_model(X,y,split,args.part,args.device,args.epochs,args.seed)
+        if _sha256_file(args.csv)!=digest: raise ValueError("input CSV changed during training; discard and rerun")
+        artifact=_artifact(identity,args.part,state,stats,counts,args.horizon,args.neutral_bps,device,digest,last)
+        target=artifact_path(identity,args.part,str(args.artifact_dir))
+        if target.exists() and not args.replace: raise ValueError("exact-identity artifact exists; pass --replace explicitly")
+        target.parent.mkdir(parents=True,exist_ok=True)
+        fd,tmp=tempfile.mkstemp(prefix=".jarvis-model-",suffix=".json",dir=target.parent)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(artifact, f, separators=(",", ":"), allow_nan=False)
-                f.flush(); os.fsync(f.fileno())
-            os.replace(temporary, target)
+            with os.fdopen(fd,"w",encoding="utf-8") as f: json.dump(artifact,f,separators=(",",":"),allow_nan=False); f.flush(); os.fsync(f.fileno())
+            os.replace(tmp,target)
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
-        print(json.dumps({"status": "artifact_created", "path": str(target), "identity": identity,
-                          "part": args.part, "samples": ncounts, "device": device,
-                          "metrics": {k: stats[k] for k in ("validation_accuracy", "validation_majority_accuracy", "test_accuracy", "test_majority_accuracy")},
-                          "warning": "advisory only; forward-return direction test is not profitability validation"}, sort_keys=True))
+            if os.path.exists(tmp): os.unlink(tmp)
+        print(json.dumps({"status":"artifact_created","path":str(target),"identity":identity,"part":args.part,
+            "task":MODEL_SPECS[args.part]["task"],"model_contract":artifact["model_contract"],"samples":counts,"device":device,
+            "metrics":{k:stats[k] for k in ("validation_accuracy","validation_majority_accuracy","test_accuracy","test_majority_accuracy")},
+            "warning":"diagnostic-only task proxy; no calibration/PnL/profitability claim"},sort_keys=True))
         return 0
     except Exception as e:
-        print(f"TRAINING UNAVAILABLE: {e}", file=sys.stderr)
-        return 2
+        print(f"TRAINING UNAVAILABLE: {e}",file=sys.stderr); return 2
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__=="__main__": raise SystemExit(main())
