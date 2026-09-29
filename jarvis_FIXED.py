@@ -39,6 +39,7 @@ from jarvis_strategy_approval import (
     REQUIRED_TIMEFRAMES, TIMEFRAME_WEIGHTS,
 )
 from jarvis_runtime import detect_backend, torch_device
+from neural_advisory import PARTS as NEURAL_ADVISORY_PARTS, annotate_part_result, not_applicable_result
 # Legacy Ollama context removed; deterministic gates are authoritative.
 pro_display = ProfessionalSignalDisplay()
 import warnings
@@ -440,7 +441,7 @@ TRADE_CONFIG = {
     'consecutive_loss_limit': 2,
     'trade_cooldown_minutes': 3,
     'use_big_player_filter': True,
-    'use_neural_fusion': True
+    'use_neural_fusion': False  # no trained Part5 fusion artifact is deployed
 }
 
 TRADING_SESSIONS = {
@@ -6176,11 +6177,14 @@ class JarvisElite:
                         # no part can mutate the next adapter's input or the canonical MTF set.
                         selected_symbol = getattr(self, 'active_symbol', None) or getattr(data, 'attrs', {}).get('symbol')
                         part_context = dict(self.market_context)
+                        active_snapshot = candle_snapshot or getattr(self, '_active_candle_snapshot', None)
                         part_context.update({
                             'selected_symbol': selected_symbol,
                             'symbol': selected_symbol,
                             'timeframe': tf_name,
-                            'analysis_identity': getattr(candle_snapshot, 'identity', None),
+                            'analysis_identity': getattr(active_snapshot, 'identity', None),
+                            'snapshot_fetched_at': getattr(active_snapshot, 'fetched_at', None),
+                            'is_backtest_mode': bool(self.is_backtest_mode),
                         })
                         if isinstance(part_context.get('mtf_datasets'), dict):
                             part_context['mtf_datasets'] = {
@@ -6198,6 +6202,12 @@ class JarvisElite:
                                 'shared_candle_source': 'historical_replay' if self.is_backtest_mode else 'shared_exchange',
                             })
                         res = part.analyze(part_input, context=part_context)
+                        # Each Part 1-10 retains its deterministic signal as-is. A
+                        # separately trained, identity-bound local model may add
+                        # uncalibrated diagnostic evidence only; it cannot vote in
+                        # central strategy approval, risk, sizing, or execution.
+                        if name in NEURAL_ADVISORY_PARTS:
+                            res = annotate_part_result(res, part_input, name, part_context)
                         if isinstance(res, dict):
                             tf_results[name] = res
                             if 'telemetry' in res and tf_name == '1m':
@@ -6344,6 +6354,12 @@ class JarvisElite:
             # receives the old 1m-primary flattened list as a decision proxy.
             math_res = self.parts['part11_fusion'].analyze(mtf_breakdown)
             math_conf_res = self.parts['part12_confidence'].analyze(mtf_breakdown)
+            # Parts 11 and 12 remain deterministic aggregation/heuristic-score
+            # modules, not independent neural predictors or calibrated models.
+            if isinstance(math_res, dict):
+                math_res['neural_advisory'] = not_applicable_result('part11_fusion')
+            if isinstance(math_conf_res, dict):
+                math_conf_res['neural_advisory'] = not_applicable_result('part12_confidence')
             part12_mtf_valid = (
                 isinstance(math_conf_res, dict)
                 and math_conf_res.get('data_status') == 'valid'
