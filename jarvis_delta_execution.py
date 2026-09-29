@@ -147,7 +147,7 @@ def _require_analysis(result: Mapping[str, Any], policy: Mapping[str, Any], now:
         raise CandidateRejected("Binance reference candle is stale or from the future")
 
     decision = result.get("deterministic_decision")
-    if not isinstance(decision, Mapping) or decision.get("origin") != "jarvis_deterministic_parts11_12":
+    if not isinstance(decision, Mapping) or decision.get("origin") != "jarvis_FIXED_central_strategy":
         raise CandidateRejected("deterministic Parts 1-12 decision is missing")
     direction = _text(decision.get("direction")).upper()
     if direction in {"NO_TRADE", "NONE", "HOLD", "NEUTRAL", ""}:
@@ -390,6 +390,8 @@ class DeltaExecutionAdapter:
                           "identity": candidate.get("identity"),
                           "direction": candidate.get("direction"),
                           "quantity": candidate.get("quantity"),
+                          "stop_loss": candidate.get("stop_loss"),
+                          "take_profit": candidate.get("take_profit"),
                           "protective_exits": row.get("protective_exits"),
                           "client_order_id": client_id,
                           "close_order_id": row.get("close_order_id"),
@@ -456,6 +458,7 @@ class DeltaExecutionAdapter:
                 side="buy" if candidate.direction == "BUY" else "sell", size=int(candidate.quantity),
                 order_type="market", stop_loss=candidate.stop_loss, take_profit=candidate.take_profit,
                 leverage=int(candidate.leverage), client_order_id=client_id,
+                entry_authorization=candidate.entry_authorization,
             )
         except Exception:
             return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "reason": "Delta submit response lost"}
