@@ -84,8 +84,10 @@ def test_adverse_slippage_and_round_trip_fee_reduce_pnl():
 
 
 def test_size_is_stop_risk_based_and_exposure_capped():
-    _, Gate = _isolated_classes()
+    Position, Gate = _isolated_classes()
     gate = Gate()
     # A $1 account at 100x can expose at most $100, i.e. one unit at a $100 fill.
-    quantity = gate.calc_contracts(100.0, 99.8, "CALL", 1.0, fee_bps=10.0, slippage_bps=5.0)
+    position = Position("CALL", 100.0, datetime(2024, 1, 1), 0.0, slippage_bps=5.0, fee_bps=10.0)
+    position.sl_price = 99.8
+    quantity = gate.calc_contracts(position, 1.0)
     assert 0 < quantity <= 1.0
