@@ -1,3 +1,5 @@
+from neural_advisory import part_advisory_entry
+
 import numpy as np
 
 from collections import deque
@@ -1533,7 +1535,8 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
         except Exception:
             return "Analyze market context and respond with [BUY], [SELL], or [NO-TRADE]."
 
-    def analyze(self, market_data):
+    @part_advisory_entry("part1_breakout", data_parameter="advisory_data", context_parameter="context")
+    def analyze(self, market_data, context=None, advisory_data=None):
         try:
             levels_data = self.detect_smart_levels(market_data)
             liquidity_data = self.detect_liquidity(market_data, levels_data)

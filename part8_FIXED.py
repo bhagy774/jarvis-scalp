@@ -1,3 +1,5 @@
+from neural_advisory import part_advisory_entry
+
 # ---- Helpers inserted for Part-8 Fix ----
 from collections import deque
 
@@ -263,6 +265,7 @@ class MarketStructureEngineGPU:
     def __init__(self):
         self.device = torch.device('cuda' if (TORCH_AVAILABLE and torch.cuda.is_available()) else 'cpu')
 
+    @part_advisory_entry("part8_structure", data_parameter="data", context_parameter="context")
     def analyze(self, data: Any, context: Optional[Dict] = None) -> Dict[str, Any]:
         """
         Main market structure analysis called by Part8Structure in Jarvis.

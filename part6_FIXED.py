@@ -1,3 +1,5 @@
+from neural_advisory import part_advisory_entry
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -913,6 +915,7 @@ class TrendEngineGPU:
         self.min_adx_threshold = 20.0
         self.min_spread_threshold = 0.0008  # 0.08% spread between EMA8 and EMA21
 
+    @part_advisory_entry("part6_trend", data_parameter="data", context_parameter="context")
     def analyze(self, data, context=None):
         try:
             if data is None or len(data) < 50:

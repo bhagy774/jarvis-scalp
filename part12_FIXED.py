@@ -1,3 +1,5 @@
+from neural_advisory import part_advisory_entry
+
 # ---- Helpers Inserted for Part-12 Fix ----
 from collections import deque
 
@@ -1674,7 +1676,8 @@ class ConfidenceEngineGPU:
             "confluence_ratio": round(confluence_ratio, 2)
         }
 
-    def analyze_multi_timeframe(self, results_by_timeframe: Dict[str, Any]) -> Dict[str, Any]:
+    @part_advisory_entry("part12_confidence", data_parameter="results_by_timeframe", context_parameter="context", evidence_context_key="neural_advisory_evidence")
+    def analyze_multi_timeframe(self, results_by_timeframe: Dict[str, Any], context=None) -> Dict[str, Any]:
         """Score confidence independently on all eight native frame result sets."""
         timeframes = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
         tf_weights = {"1m": 1.0, "3m": 1.5, "5m": 2.0, "15m": 3.0,

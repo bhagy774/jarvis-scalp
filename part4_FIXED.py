@@ -1,3 +1,5 @@
+from neural_advisory import part_advisory_entry
+
 # ==============================================================================
 # JARVIS PART 4 - INSTITUTIONAL BACKTESTING & TRADE ANALYTICS ENGINE (GPU-OPTIMIZED & FIXED)
 # Fully hardened against hidden bugs, PyTorch 2.x incompatibilities, Windows platform limits,
@@ -1091,6 +1093,7 @@ class VolumeProfileEngineGPU:
         else:
             self.device = 'cpu'
 
+    @part_advisory_entry("part4_volume", data_parameter="data", context_parameter="context")
     def analyze(self, data, context=None):
         try:
             if data is None or len(data) < 30:
