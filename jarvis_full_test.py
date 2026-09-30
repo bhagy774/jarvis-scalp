@@ -146,14 +146,15 @@ def test_sizer():
             f"conf72={sz2['multiplier']}x | conf65={sz3['multiplier']}x")
 
 def test_position_manager():
-    from jarvis_position_manager import JarvisPositionManager, PositionRecord
+    from jarvis_position_manager import JarvisPositionManager, PositionRecord, PositionRequest
     class MockDelta:
         def get_wallet_balance(self): return 6.0
         def get_live_price(self, s): return 95000.0
         def place_order(self, *a, **kw): return {"success": True}
     pm = JarvisPositionManager(MockDelta())
     assert not pm.has_open_position()
-    pos = pm.register_position("T001", "CALL", 95000.0, 10, 85, "BTC", "SCALP")
+    req = PositionRequest(position_id="T001", direction="CALL", entry_price=95000.0, contracts=10, confidence=85, coin="BTC", trade_type="SCALP")
+    pos = pm.register_position(req)
     assert pm.has_open_position()
     assert pos.tp_price > 95000.0
     assert pos.sl_price < 95000.0
