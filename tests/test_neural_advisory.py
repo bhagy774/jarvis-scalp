@@ -160,6 +160,12 @@ class NeuralAdvisoryTests(unittest.TestCase):
         obj=artifact("part1_breakout"); obj["training"]["approved_for_advisory"]=False; self.write_artifact("part1_breakout",obj)
         self.assertEqual(na.predict_advisory(self.data,"part1_breakout",context(),now=NOW,artifact_dir=str(self.root))["reason"],"artifact_not_validation_gated")
 
+    def test_pre_quantitative_feature_schema_v3_is_incompatible(self):
+        obj=artifact("part1_breakout"); obj["feature_schema"]="jarvis-task-specific-features-v3"; self.write_artifact("part1_breakout",obj)
+        result=na.predict_advisory(self.data,"part1_breakout",context(),now=NOW,artifact_dir=str(self.root))
+        self.assertEqual(result["status"],"unavailable")
+        self.assertEqual(result["reason"],"artifact_feature_schema_or_part_mismatch")
+
     def test_noncontiguous_forming_nan_and_wrong_metadata_fail_closed(self):
         gap=[dict(r) for r in self.data]; gap[-1]["timestamp"]=(datetime.fromisoformat(gap[-1]["timestamp"])+timedelta(seconds=60)).isoformat()
         self.assertEqual(na.predict_advisory(gap,"part1_breakout",context(),now=NOW,artifact_dir=str(self.root))["reason"],"closed_candle_sequence_invalid")

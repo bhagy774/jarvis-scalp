@@ -1,9 +1,10 @@
-"""Part 2 owned model: volume-node and zone-rejection head."""
+"""Part 2 model: clustered structural zones and range-overlap auction evidence."""
 from .common import candle_math, clip
-FEATURE_NAMES=("range_pos32","dist_weighted_mean","dist_high32","dist_low32","volume_node_pos","volume_z","ret4","ret16","atr14_pct","range_pos8","trend_slope","range_expansion")
+FEATURE_NAMES=("support_distance_risk_scale","resistance_distance_risk_scale","support_cluster_strength","resistance_cluster_strength","poc_distance_risk_scale","close_location_in_value_area","range_position32","robust_trend_score","state_velocity_z","volume_surprise_robust_z","ohlcv_flow_imbalance_proxy","range_width50_pct")
 MODEL_SPEC={"task":"volume_zone_response","dims":(12,16,6,3),"acts":("tanh","relu","linear"),"labels":("support_rejection","zone_acceptance","resistance_rejection"),"kind":"softmax"}
 def prepare_features(data):
- s=candle_math(data); vals=(s["range_pos32"],s["weighted_dev"],s["highgap"](32),s["lowgap"](32),s["volume_node_pos"],s["volz"],s["ret4"],s["ret16"],s["atr_pct"],s["pos"](8),s["slope32"],s["range_expansion"])
+ s=candle_math(data); p=s["profile"]
+ vals=(s["support_distance_scale"],s["resistance_distance_scale"],s["support_strength"],s["resistance_strength"],s["poc_distance_scale"],s["close_location_in_value"],s["range_position_32"],s["trend_score"],s["state_velocity_z"],s["volume_surprise_z"],s["flow_proxy"],s["range_width_50_pct"])
  return tuple(clip(x) for x in vals)
 def interpret_scores(scores,prediction): return {"zone_response":prediction,"support_rejection_score_uncalibrated":scores[0],"resistance_rejection_score_uncalibrated":scores[2]}
 def label_target(rows,i,horizon,neutral_bps,x):

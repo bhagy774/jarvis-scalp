@@ -1,10 +1,9 @@
 """Shared, fail-closed Part 7 volatility analysis.
 
 Part 7 is an analysis consumer of the canonical native exchange candle snapshot;
-it is not a candle builder.  The implementation intentionally keeps the
-existing Bollinger/Keltner/ATR calculations in Pandas and reports that backend
-as CPU.  GPU benchmarking is a separate future change, not implied by legacy
-class names elsewhere in the repository.
+it is not a candle builder.  Pandas validates native frames; bounded standard-
+library quantitative math computes robust return distributions, state evidence,
+and price-unit risk metrics on CPU. Optional neural GPU inference is separate.
 """
 from __future__ import annotations
 
@@ -54,8 +53,8 @@ def _base_result(
         "volatility_status": volatility_status,
         "entry_blocked": bool(entry_blocked),
         "risk_veto": bool(risk_veto),
-        "computation_backend": "pandas_cpu",
-        "computation_engine": "pandas",
+        "computation_backend": "stdlib_cpu",
+        "computation_engine": "quantitative_math",
         "accelerator": "cpu",
         "telemetry": dict(telemetry or {}),
     }
@@ -138,70 +137,30 @@ def analyze_timeframe(data: Any, *, symbol: str, timeframe: str, context: Option
     if invalid is not None:
         return invalid
     try:
-        recent = data.loc[:, _REQUIRED_COLUMNS].tail(50).astype(float)
-        closes = recent["close"]
-        highs = recent["high"]
-        lows = recent["low"]
-        current_close = float(closes.iloc[-1])
-        sma20 = float(closes.tail(20).mean())
-        std20 = float(closes.tail(20).std()) + 1e-8
-        upper_bb = sma20 + 2.0 * std20
-        lower_bb = sma20 - 2.0 * std20
-        bb_width = (upper_bb - lower_bb) / max(sma20, 1.0)
-        pct_b = (current_close - lower_bb) / (upper_bb - lower_bb + 1e-8)
-        tr = pd.concat([
-            highs - lows,
-            (highs - closes.shift(1)).abs(),
-            (lows - closes.shift(1)).abs(),
-        ], axis=1).max(axis=1)
-        atr14 = float(tr.tail(14).mean())
-        atr50 = float(tr.tail(50).mean()) if len(tr) >= 50 else atr14
-        ema20 = float(closes.ewm(span=20).mean().iloc[-1])
-        upper_kc = ema20 + 1.5 * atr14
-        lower_kc = ema20 - 1.5 * atr14
-        is_squeeze = (upper_bb < upper_kc) and (lower_bb > lower_kc)
-        vol_ratio = atr14 / (atr50 + 1e-8)
-        norm_atr = atr14 / max(current_close, 1.0)
-        telemetry = {
-            "bb_width_pct": round(bb_width * 100, 3),
-            "pct_b": round(pct_b, 4),
-            "atr14": round(atr14, 8),
-            "vol_ratio": round(vol_ratio, 4),
-            "norm_atr_pct": round(norm_atr * 100, 4),
-            "is_squeeze": bool(is_squeeze),
-        }
-        if vol_ratio > 2.8 or norm_atr > 0.015:
-            return _base_result(
-                symbol=symbol, timeframe=timeframe, status="veto",
-                reason=f"Part7 extreme volatility veto: ATR={norm_atr * 100:.2f}% ratio={vol_ratio:.2f}x",
-                data_status="valid", volatility_status="extreme", entry_blocked=True,
-                risk_veto=True, telemetry=telemetry,
-            )
-        if is_squeeze:
-            return _base_result(
-                symbol=symbol, timeframe=timeframe, status="neutral",
-                reason=f"Part7 squeeze/normal volatility: BBw={bb_width * 100:.2f}%",
-                data_status="valid", volatility_status="compressed", telemetry=telemetry,
-            )
-        if pct_b >= 0.85 and current_close > upper_bb and vol_ratio >= 1.0:
-            conf = min(85.0, 60.0 + (pct_b - 0.85) * 100.0 + min(vol_ratio, 2.0) * 5.0)
-            return _base_result(
-                symbol=symbol, timeframe=timeframe, signal=1, status="ok",
-                reason=f"Part7 bullish volatility expansion: %B={pct_b:.2f} ratio={vol_ratio:.2f}x",
-                data_status="valid", volatility_status="expanding", telemetry={**telemetry, "confidence": round(conf, 1)},
-            )
-        if pct_b <= 0.15 and current_close < lower_bb and vol_ratio >= 1.0:
-            conf = min(85.0, 60.0 + (0.15 - pct_b) * 100.0 + min(vol_ratio, 2.0) * 5.0)
-            return _base_result(
-                symbol=symbol, timeframe=timeframe, signal=-1, status="ok",
-                reason=f"Part7 bearish volatility breakdown: %B={pct_b:.2f} ratio={vol_ratio:.2f}x",
-                data_status="valid", volatility_status="expanding", telemetry={**telemetry, "confidence": round(conf, 1)},
-            )
-        return _base_result(
-            symbol=symbol, timeframe=timeframe, status="neutral",
-            reason=f"Part7 stable volatility: %B={pct_b:.2f} BBw={bb_width * 100:.2f}%",
-            data_status="valid", volatility_status="normal", telemetry=telemetry,
-        )
+        import quantitative_math as qm
+        advisory = qm.part_signal("7", data.tail(128))
+        telemetry = dict(advisory.get("telemetry") or {})
+        state = telemetry.get("volatility_state", {})
+        high_p = float(state.get("high_state_posterior", 0.5)) if isinstance(state, Mapping) else 0.5
+        ratio = float(state.get("short_long_ratio", 1.0)) if isinstance(state, Mapping) else 1.0
+        blocked = bool(telemetry.get("risk_veto"))
+        signal = int(advisory.get("signal", 0))
+        if blocked:
+            status, reason, vol_status = "veto", str(advisory.get("thought", "Part7 volatility risk veto")), "extreme"
+        elif signal:
+            status, reason, vol_status = "ok", str(advisory.get("thought", "Part7 realized-variance expansion")), "expanding"
+        else:
+            status = "neutral"
+            reason = str(advisory.get("thought", "Part7 realized-variance state neutral"))
+            vol_status = "high" if high_p >= 0.80 else "compressed" if ratio <= 0.5 else "normal"
+        telemetry.update({"high_state_posterior_assumption": high_p,
+                          "short_long_realized_vol_ratio": ratio,
+                          "entry_blocked_by_part7": blocked,
+                          "confidence": float(advisory.get("confidence", 5.0))})
+        return _base_result(symbol=symbol, timeframe=timeframe, signal=signal,
+                            status=status, reason=reason, data_status="valid",
+                            volatility_status=vol_status, entry_blocked=blocked,
+                            risk_veto=blocked, telemetry=telemetry)
     except Exception as exc:
         return _blocked(symbol, timeframe, "error", f"Part7 analysis exception: {type(exc).__name__}", "error")
 
@@ -240,8 +199,8 @@ def aggregate_results(
         "volatility_status": ",".join(volatility_statuses),
         "entry_blocked": entry_blocked,
         "risk_veto": bool(vetoes),
-        "computation_backend": "pandas_cpu",
-        "computation_engine": "pandas",
+        "computation_backend": "stdlib_cpu",
+        "computation_engine": "quantitative_math",
         "accelerator": "cpu",
         "timeframe_results": per_timeframe,
         "blocked_timeframes": blocked_data,

@@ -695,39 +695,26 @@ class AutoTrainingEngine:
             return {'status': 'error', 'error': str(e)}
 
     def _prepare_training_data(self, data):
-        """Prepare features and labels for training"""
-        features = []
-        labels = []
-        
+        features, labels = [], []
         try:
+            import quantitative_math as qm
             for i in range(60, len(data) - 5):
-                # Create features from past data
                 window = data.iloc[i-50:i]
-                
-                # Technical indicators as features
-                feature_vector = [
-                    float(window['close'].pct_change().mean() or 0),
-                    float(window['close'].pct_change().std() or 0),
-                    float(window['high'].max() - window['low'].min()),
-                    float((window['close'] > window['open']).mean()),
-                    float(window['volume'].mean() if 'volume' in window else 0),
-                    float(window['close'].rolling(5).mean().iloc[-1]),
-                    float(window['close'].rolling(10).mean().iloc[-1]),
-                    float(window['close'].iloc[-1] - window['close'].rolling(20).mean().iloc[-1]),
-                ]
-                
-                # Create label (1 if price goes up in next 3 bars, 0 if down)
-                future_price = float(data['close'].iloc[i + 3])
-                current_price = float(data['close'].iloc[i])
-                label = 1 if future_price > current_price else 0
-                
-                features.append(feature_vector)
-                labels.append(label)
-            
+                qf = qm.quantitative_features(window, limit=128)
+                if not qf.get('available'):
+                    continue
+                r = qf.get('returns', ())
+                features.append([float(sum(r) / max(len(r), 1)), float(qf.get('realized_vol', 0.0)),
+                                 float(qf.get('range_scale_pct', 0.0)), float(qf.get('sign_persistence', 0.0)),
+                                 float(qf.get('volume_surprise_robust_z', 0.0)),
+                                 float(qf.get('kalman', {}).get('velocity', 0.0)),
+                                 float(qf.get('trend_score', 0.0)), float(qf.get('jump_share', 0.0))])
+                future = float(data['close'].iloc[i + 3])
+                current = float(data['close'].iloc[i])
+                labels.append(1 if future > current else 0)
             return np.array(features), np.array(labels)
-            
-        except Exception as e:
-            logger.error(f"Feature preparation error: {e}")
+        except Exception as exc:
+            logger.error("Feature preparation error: %s", exc)
             return np.array([]), np.array([])
 
     def _train_neural_network(self, X_train, y_train, X_test, y_test):
@@ -807,28 +794,21 @@ class AutoTrainingEngine:
             return 0
 
     def _prepare_features_for_prediction(self, data):
-        """Prepare features for real-time prediction"""
         try:
             if len(data) < 50:
                 return []
-                
-            window = data.tail(50)
-            
-            feature_vector = [
-                float(window['close'].pct_change().mean() or 0),
-                float(window['close'].pct_change().std() or 0),
-                float(window['high'].max() - window['low'].min()),
-                float((window['close'] > window['open']).mean()),
-                float(window['volume'].mean() if 'volume' in window else 0),
-                float(window['close'].rolling(5).mean().iloc[-1]),
-                float(window['close'].rolling(10).mean().iloc[-1]),
-                float(window['close'].iloc[-1] - window['close'].rolling(20).mean().iloc[-1]),
-            ]
-            
-            return feature_vector
-            
-        except Exception as e:
-            logger.error(f"Feature prediction error: {e}")
+            import quantitative_math as qm
+            qf = qm.quantitative_features(data.tail(50), limit=128)
+            if not qf.get('available'):
+                return []
+            r = qf.get('returns', ())
+            return [float(sum(r) / max(len(r), 1)), float(qf.get('realized_vol', 0.0)),
+                    float(qf.get('range_scale_pct', 0.0)), float(qf.get('sign_persistence', 0.0)),
+                    float(qf.get('volume_surprise_robust_z', 0.0)),
+                    float(qf.get('kalman', {}).get('velocity', 0.0)),
+                    float(qf.get('trend_score', 0.0)), float(qf.get('jump_share', 0.0))]
+        except Exception as exc:
+            logger.error("Feature prediction error: %s", exc)
             return []
 
 # ==================== 3. AUTO OPTIMIZER ENGINE ====================
@@ -1954,7 +1934,7 @@ class LiveTradingEngine:
         market_ctx = result.get('market_context', {})
 
         # ── SMART ENTRY: Compute optimal limit entry based on ATR ──
-        entry_price, entry_type = self._calculate_smart_entry(direction, current_price, result)
+        entry_price, entry_type = self._calculate_smart_entry(direction, current_price, result, data=df)
 
         # ── 1M ENTRY REFINEMENT: HTF decision stays; 1m swing SL + confirmation ──
         self.last_1m_entry = None
@@ -1983,60 +1963,28 @@ class LiveTradingEngine:
         }
         return direction, confidence, entry_price, tp1, tp2, sl, expiry
     
-    def _calculate_smart_entry(self, direction: str, current_price: float, result: dict):
-        """
-        Calculate optimal entry price using ATR-based pullback logic.
-        Returns: (entry_price, entry_type_label)
-
-        Rules:
-          CALL: Market price is good for strong momentum candles.
-                For weak signals, wait for a small pullback (0.1-0.25% below current)
-          PUT:  Wait for a small bounce (0.1-0.25% above current)
-
-        This improves R:R by getting better fill prices.
-        """
+    def _calculate_smart_entry(self, direction: str, current_price: float, result: dict, data=None):
+        """Return a bounded entry hint; it does not make or authorize an order."""
         if not direction or direction == 'NO_TRADE' or not current_price:
             return current_price, 'MARKET'
-
         try:
-            signal = result.get('trade_signal', {})
             market_ctx = result.get('market_context', {})
-
-            # Get ATR if available from signal, else estimate
-            atr = signal.get('atr', current_price * 0.003)  # default 0.3% ATR
-            if atr and atr > 0:
-                atr_pct = atr / current_price
-            else:
-                atr_pct = 0.003  # 0.3% default
-
-            # Clamp ATR pullback between 0.05% and 0.4%
-            pullback_pct = max(0.0005, min(0.004, atr_pct * 0.25))
-
-            # Strong momentum = enter at market (body > 60% of candle range)
+            import quantitative_math as qm
+            scale = qm.risk_scale_price(data, float(current_price), floor_pct=0.003)
+            scale_pct = scale / float(current_price) if scale > 0 else 0.003
+            pullback_pct = max(0.0005, min(0.004, scale_pct * 0.25))
+            signal = result.get('trade_signal', {})
             volatility = str(market_ctx.get('volatility', 'MEDIUM')).upper()
-            conf_str = signal.get('confidence_score')
-            confidence = normalize_confidence(conf_str)
+            confidence = normalize_confidence(signal.get('confidence_score'))
             confidence_for_entry = confidence if confidence is not None else -1
-
-            # HIGH confidence (≥85%) + LOW volatility → MARKET entry (momentum)
             if confidence_for_entry >= 85 and volatility in ('LOW', 'VERY_LOW'):
                 return current_price, 'MARKET (High Conf)'
-
-            # Compute limit entry
             if direction == 'CALL':
-                # Wait for small dip below current for better fill
-                entry = round(current_price * (1.0 - pullback_pct), 2)
-                label = f'LIMIT PULL ({pullback_pct*100:.2f}% below)'
-            else:  # PUT
-                # Wait for small bounce above current for better fill
-                entry = round(current_price * (1.0 + pullback_pct), 2)
-                label = f'LIMIT BOUNCE ({pullback_pct*100:.2f}% above)'
-
-            return entry, label
-
-        except Exception as e:
-            logger.debug(f"[SMART ENTRY] Fallback to market: {e}")
-            return current_price, 'MARKET'
+                return round(current_price * (1.0 - pullback_pct), 2), f'LIMIT PULL ({pullback_pct*100:.2f}% below)'
+            return round(current_price * (1.0 + pullback_pct), 2), f'LIMIT BOUNCE ({pullback_pct*100:.2f}% above)'
+        except Exception as exc:
+            logger.debug("Quantitative smart entry unavailable: %s", exc)
+            return current_price, 'MARKET (Fallback)'
 
     def _refine_entry_with_1m(self, direction, entry_price, sl, df, current_price):
         """
@@ -3066,64 +3014,41 @@ class ScalpingEngine:
         self.default_rr = 1.5
 
     def calculate_targets(self, data, direction, current_price, options_data=None, mtf_data=None):
-        """Calculates TP/SL with Chart + Options Confluence"""
+        """Preserve existing target and hard risk caps using robust OHLCV risk units."""
         try:
-            if len(data) < 20: return None
-            
-            # 1. Base SL using ATR
-            high_low = (data['high'] - data['low'])
-            atr = high_low.rolling(14).mean().iloc[-1]
-            
-            # FIX: Cap ATR-based SL to max 0.4% of price for scalp realism
-            max_sl_pct = 0.004  # 0.4%
-            atr = min(atr, current_price * max_sl_pct / 1.8)
+            if len(data) < 20 or not current_price or current_price <= 0:
+                return None
+            import quantitative_math as qm
+            risk_scale = qm.risk_scale_price(data, float(current_price), floor_pct=0.001)
+            if not math.isfinite(risk_scale) or risk_scale <= 0:
+                return None
+            max_sl_pct = 0.004
+            risk_scale = min(risk_scale, current_price * max_sl_pct / 1.8)
             sl_multiplier = 1.8
-            
-            # 2. Extract Options Walls
-            # FIX: Default walls now 0.3%/0.5% away (not 5%)
             support_wall = options_data.get('support', current_price * 0.997) if options_data else current_price * 0.997
             resistance_wall = options_data.get('resistance', current_price * 1.003) if options_data else current_price * 1.003
             max_pain = options_data.get('max_pain', current_price) if options_data else current_price
-            
-            # 3. Handle Direction
             if direction == 'CALL':
-                # SL should be below support wall or ATR-based SL
-                sl_price = min(current_price - (atr * sl_multiplier), support_wall - (current_price * 0.001))
-                
-                # Targets (TP1: ATR-based, TP2: Options-based Magnet)
+                sl_price = min(current_price - (risk_scale * sl_multiplier), support_wall - (current_price * 0.001))
                 risk = current_price - sl_price
                 tp_price1 = current_price + (risk * 1.5)
-                # TP2 is either Max Pain (Magnet) or Resistance Wall
                 tp_price2 = max(tp_price1 * 1.01, max_pain if max_pain > current_price else resistance_wall)
-                
-                # FIX: Hard cap - TP1 max 0.8% above entry, SL max 0.4% below
                 tp_price1 = min(tp_price1, current_price * 1.008)
                 sl_price = max(sl_price, current_price * 0.996)
                 tp_price2 = min(tp_price2, current_price * 1.015)
-                
-            else: # PUT
-                # SL above resistance wall or ATR-based SL
-                sl_price = max(current_price + (atr * sl_multiplier), resistance_wall + (current_price * 0.001))
-                
+            else:
+                sl_price = max(current_price + (risk_scale * sl_multiplier), resistance_wall + (current_price * 0.001))
                 risk = sl_price - current_price
                 tp_price1 = current_price - (risk * 1.5)
-                # TP2 is either Max Pain or Support Wall
                 tp_price2 = min(tp_price1 * 0.99, max_pain if max_pain < current_price else support_wall)
-                
-                # FIX: Hard cap - TP1 max 0.8% below entry, SL max 0.4% above
                 tp_price1 = max(tp_price1, current_price * 0.992)
                 sl_price = min(sl_price, current_price * 1.004)
                 tp_price2 = max(tp_price2, current_price * 0.985)
-            
-            return {
-                'entry': current_price,
-                'stop_loss': round(sl_price, 2),
-                'take_profit_1': round(tp_price1, 2),
-                'take_profit_2': round(tp_price2, 2),
-                'options_magnet': round(max_pain, 2)
-            }
-        except Exception as e:
-            logger.error(f"Scalping targets error: {e}")
+            return {'entry': current_price, 'stop_loss': round(sl_price, 2),
+                    'take_profit_1': round(tp_price1, 2), 'take_profit_2': round(tp_price2, 2),
+                    'options_magnet': round(max_pain, 2)}
+        except Exception as exc:
+            logger.error(f"Scalping targets error: {exc}")
             return None
 
 # ==================== EXISTING JARVIS CLASSES ====================
@@ -3190,45 +3115,16 @@ class Part1Breakout:
         if engine is not None:
             try:
                 market_data = _df_to_market_data(data)
-                if len(market_data['price_action']) >= 20:
-                    result = engine.analyze(market_data, context=context, advisory_data=data)
-                    brk = result.get('breakout', {})
-                    is_breakout = bool(brk.get('breakout_detected', False))
-                    brk_dir = int(brk.get('direction', 0))
-                    if not is_breakout or brk_dir == 0:
-                        sig = 0
-                    else:
-                        sig = result.get('signal', brk_dir)
-                    lvl = result.get('levels', {})
-                    thought = (
-                        f"P1-Engine: Breakout={'YES' if is_breakout else 'NO'} "
-                        f"dir={brk_dir} str={brk.get('strength',0):.2f} "
-                        f"conf={result.get('confidence',0):.1f}"
-                    )
-                    output = {"signal": sig, "thought": thought, "telemetry": {
-                        "breakout": brk, "levels": lvl, "momentum": result.get('momentum', {}),
-                        "fakeout": result.get('fakeout', {}), "regime": result.get('regime', {})
-                    }}
+                result = engine.analyze(market_data, context=context, advisory_data=data)
+                if isinstance(result, dict):
+                    output = dict(result)
                     if "neural_advisory" in result:
                         output["neural_advisory"] = result["neural_advisory"]
                     return output
-            except Exception as e:
-                logger.debug(f"Part1 engine error: {e}")
-
-        # ── Fallback: basic 20-bar breakout ───────────────────────────────
-        try:
-            if len(data) >= 20:
-                current = float(data['close'].iloc[-1])
-                high_20 = float(data['high'].tail(20).max())
-                low_20  = float(data['low'].tail(20).min())
-                prev    = float(data['close'].iloc[-2])
-                if current > high_20 and prev <= high_20:
-                    return {"signal": 1,  "thought": f"Bullish Breakout above {high_20:.0f} (fallback)"}
-                elif current < low_20 and prev >= low_20:
-                    return {"signal": -1, "thought": f"Bearish Breakdown below {low_20:.0f} (fallback)"}
-        except Exception:
-            pass
-        return {"signal": 0, "thought": "No Breakout Pattern"}
+            except Exception as exc:
+                logger.debug("Part1 quantitative analyzer unavailable: %s", exc)
+        import quantitative_math as qm
+        return qm.part_signal("1", data)
 
 
 class Part2Zone:
@@ -3251,21 +3147,21 @@ class Part2Zone:
             if version and version == self._last_snapshot_version and self._last_mtf_context is not None:
                 return dict(self._last_mtf_context)
             result = {"signal": 0, "thought": ""}
-            mtf = context.get('mtf_datasets')
-            if self._engine is not None and isinstance(mtf, dict):
-                try:
-                    df_1m, df_5m, df_15m = mtf.get('1m'), mtf.get('5m'), mtf.get('15m')
-                    if all(isinstance(frame, pd.DataFrame) and len(frame) for frame in (df_1m, df_5m, df_15m)):
-                        current_candle = df_1m.iloc[-1].to_dict()
-                        signals = self._engine.process_market_data(df_1m, df_5m, df_15m, current_candle)
-                        valid = [s for s in signals or [] if isinstance(s, tuple) and len(s) >= 3]
-                        if valid:
-                            best = max(valid, key=lambda item: item[1])
-                            direction = str(best[0]).upper()
-                            result = {"signal": 1 if direction in {'CALL', 'BUY', 'LONG'} else -1 if direction in {'PUT', 'SELL', 'SHORT'} else 0,
-                                      "thought": str(best[2])}
-                except Exception as error:
-                    logger.debug(f"Part2 shared MTF context error: {error}")
+            mtf = context.get('mtf_datasets') if isinstance(context, dict) else None
+            if isinstance(mtf, dict):
+                import quantitative_math as qm
+                observations = []
+                for tf in ('1m', '5m', '15m'):
+                    frame = mtf.get(tf)
+                    if frame is None or len(frame) == 0:
+                        continue
+                    observation = qm.part_signal("2", frame)
+                    if isinstance(observation, dict):
+                        observations.append((float(observation.get('confidence', 0.0)), observation))
+                if observations:
+                    _, best = max(observations, key=lambda pair: pair[0])
+                    result = {"signal": int(best.get('signal', 0) or 0),
+                              "thought": "Quantitative native-frame zone evidence: " + str(best.get('thought', ''))}
             if version:
                 self._last_snapshot_version = version
                 self._last_mtf_context = dict(result)
@@ -3273,26 +3169,10 @@ class Part2Zone:
 
     @staticmethod
     def _native_zone(data, timeframe):
-        try:
-            if len(data) < 20:
-                return {"signal": 0, "thought": f"Part2 {timeframe}: insufficient native bars"}
-            current = float(data['close'].iloc[-1])
-            for lookback in (20, 60, 100):
-                if len(data) < lookback:
-                    continue
-                high = float(data['high'].tail(lookback).max())
-                low = float(data['low'].tail(lookback).min())
-                span = high - low
-                if span <= 0:
-                    continue
-                pct = (current - low) / span
-                if pct >= 0.92:
-                    return {"signal": -1, "thought": f"Part2 {timeframe}: Resistance Zone top {pct*100:.0f}% ({lookback}-bar)"}
-                if pct <= 0.08:
-                    return {"signal": 1, "thought": f"Part2 {timeframe}: Support Zone bottom {pct*100:.0f}% ({lookback}-bar)"}
-            return {"signal": 0, "thought": f"Part2 {timeframe}: no native zone"}
-        except Exception:
-            return {"signal": 0, "thought": f"Part2 {timeframe}: invalid native zone data"}
+        import quantitative_math as qm
+        result = qm.part_signal("2", data)
+        result.setdefault('thought', f"Part2 {timeframe}: structural OHLCV zone evidence")
+        return result
 
     def analyze(self, data, context=None):
         context = context or {}
@@ -3325,52 +3205,16 @@ class Part3Psychology:
 
     def analyze(self, data, context=None):
         # ── Try real Part 3 CandlePsychologyMasterGPU ─────────────────────
-        if self._engine is not None:
+        engine = getattr(self, '_engine', None)
+        if engine is not None:
             try:
-                res = self._engine.analyze(data, context=context)
-                if isinstance(res, dict):
-                    return res
-            except Exception as e:
-                logger.debug(f"Part3 CandlePsychology error: {e}")
-
-        # ── Fallback: multi-candle ATR-backed pattern analysis ────────────
-        try:
-            if len(data) < 15:
-                return {"signal": 0, "thought": "Insufficient data (<15)"}
-
-            highs = data['high'].tail(20).astype(float)
-            lows = data['low'].tail(20).astype(float)
-            closes = data['close'].tail(20).astype(float)
-            opens = data['open'].tail(20).astype(float)
-
-            tr = pd.concat([highs - lows, (highs - closes.shift(1)).abs(), (lows - closes.shift(1)).abs()], axis=1).max(axis=1)
-            atr = float(tr.tail(14).mean())
-
-            c, o, h, l = float(closes.iloc[-1]), float(opens.iloc[-1]), float(highs.iloc[-1]), float(lows.iloc[-1])
-            rng = max(h - l, 1e-8)
-            body = abs(c - o)
-            body_ratio = body / rng
-            upper_wick = (h - max(c, o)) / rng
-            lower_wick = (min(c, o) - l) / rng
-
-            # Micro-noise filter
-            if rng < 0.55 * atr or atr == 0:
-                return {"signal": 0, "thought": f"Noise/Micro-candle ({rng:.1f} < 0.55*ATR) — Neutral"}
-
-            prev_c, prev_o = float(closes.iloc[-2]), float(opens.iloc[-2])
-            prev_body = abs(prev_c - prev_o)
-
-            if lower_wick >= 0.55 and upper_wick <= 0.22 and body_ratio <= 0.35:
-                return {"signal": 1, "thought": f"Bullish Hammer/Pin Bar (lower wick {lower_wick*100:.0f}%) (fallback)"}
-            elif upper_wick >= 0.55 and lower_wick <= 0.22 and body_ratio <= 0.35:
-                return {"signal": -1, "thought": f"Bearish Shooting Star (upper wick {upper_wick*100:.0f}%) (fallback)"}
-            elif prev_c < prev_o and c > o and c >= prev_o and o <= prev_c and body > prev_body * 1.15 and body_ratio > 0.6:
-                return {"signal": 1, "thought": f"Bullish Engulfing (fallback)"}
-            elif prev_c > prev_o and c < o and c <= prev_o and o >= prev_c and body > prev_body * 1.15 and body_ratio > 0.6:
-                return {"signal": -1, "thought": f"Bearish Engulfing (fallback)"}
-        except Exception:
-            pass
-        return {"signal": 0, "thought": "Neutral Psychology (fallback)"}
+                result = engine.analyze(data, context=context)
+                if isinstance(result, dict):
+                    return result
+            except Exception as exc:
+                logger.debug("Part3 analyzer unavailable: %s", exc)
+        import quantitative_math as qm
+        return qm.part_signal("3", data)
 
 
 class Part4Volume:
@@ -3384,78 +3228,16 @@ class Part4Volume:
 
     def analyze(self, data, context=None):
         # ── Try real Part 4 VolumeProfileEngineGPU ────────────────────────
-        if self._engine is not None:
+        engine = getattr(self, '_engine', None)
+        if engine is not None:
             try:
-                res = self._engine.analyze(data, context=context)
-                if isinstance(res, dict):
-                    return res
-            except Exception as e:
-                logger.debug(f"Part4 VolumeProfile error: {e}")
-
-        # ── Fallback: POC & Value Area (70%) analysis ──────────────────────
-        try:
-            if len(data) < 30:
-                return {"signal": 0, "thought": "Insufficient data (<30)"}
-
-            recent = data.tail(50).copy()
-            highs = recent['high'].astype(float)
-            lows = recent['low'].astype(float)
-            closes = recent['close'].astype(float)
-            volumes = recent['volume'].astype(float)
-
-            current_close = float(closes.iloc[-1])
-            current_vol = float(volumes.iloc[-1])
-            avg_vol = float(volumes.mean())
-            vol_ratio = current_vol / max(avg_vol, 1e-8)
-
-            last10 = recent.tail(10)
-            up_vol = float(last10.loc[last10['close'] > last10['open'], 'volume'].sum())
-            down_vol = float(last10.loc[last10['close'] < last10['open'], 'volume'].sum())
-            tot_vol = up_vol + down_vol
-            buy_delta_pct = (up_vol / tot_vol) if tot_vol > 0 else 0.5
-
-            min_p, max_p = float(lows.min()), float(highs.max())
-            if max_p <= min_p:
-                return {"signal": 0, "thought": "Flat price range"}
-
-            num_bins = 20
-            bin_size = (max_p - min_p) / num_bins
-            vol_bins = np.zeros(num_bins)
-            for _, row in recent.iterrows():
-                p = (float(row['high']) + float(row['low']) + float(row['close'])) / 3.0
-                b_idx = min(int((p - min_p) / bin_size), num_bins - 1)
-                vol_bins[b_idx] += float(row['volume'])
-
-            poc_idx = int(np.argmax(vol_bins))
-            poc_price = min_p + (poc_idx + 0.5) * bin_size
-
-            target_vol = 0.70 * vol_bins.sum()
-            va_indices = {poc_idx}
-            cur_vol = vol_bins[poc_idx]
-            up_idx, dn_idx = poc_idx + 1, poc_idx - 1
-            while cur_vol < target_vol and (up_idx < num_bins or dn_idx >= 0):
-                up_v = vol_bins[up_idx] if up_idx < num_bins else -1
-                dn_v = vol_bins[dn_idx] if dn_idx >= 0 else -1
-                if up_v >= dn_v and up_idx < num_bins:
-                    va_indices.add(up_idx); cur_vol += up_v; up_idx += 1
-                elif dn_idx >= 0:
-                    va_indices.add(dn_idx); cur_vol += dn_v; dn_idx -= 1
-                else: break
-
-            val_price = min_p + min(va_indices) * bin_size
-            vah_price = min_p + (max(va_indices) + 1) * bin_size
-
-            if vol_ratio < 0.6:
-                return {"signal": 0, "thought": f"Low Volume ({vol_ratio:.1f}x) — Neutral (fallback)"}
-            if val_price <= current_close <= vah_price:
-                return {"signal": 0, "thought": f"Inside Value Area (POC={poc_price:.0f}) — Neutral (fallback)"}
-            if current_close > vah_price and buy_delta_pct > 0.60 and vol_ratio >= 1.2:
-                return {"signal": 1, "thought": f"Bullish VA Breakout above {vah_price:.0f} (fallback)"}
-            if current_close < val_price and buy_delta_pct < 0.40 and vol_ratio >= 1.2:
-                return {"signal": -1, "thought": f"Bearish VA Breakdown below {val_price:.0f} (fallback)"}
-        except Exception:
-            pass
-        return {"signal": 0, "thought": "Normal Volume (fallback)"}
+                result = engine.analyze(data, context=context)
+                if isinstance(result, dict):
+                    return result
+            except Exception as exc:
+                logger.debug("Part4 analyzer unavailable: %s", exc)
+        import quantitative_math as qm
+        return qm.part_signal("4", data)
 
 
 class Part5ML:
@@ -3469,69 +3251,16 @@ class Part5ML:
 
     def analyze(self, data, context=None):
         # ── 1. Try real Part 5 MLEngineGPU ────────────────────────────────
-        if self._engine is not None:
+        engine = getattr(self, '_engine', None)
+        if engine is not None:
             try:
-                res = self._engine.analyze(data, context=context)
-                if isinstance(res, dict):
-                    return res
-            except Exception as e:
-                logger.debug(f"Part5 MLEngine error: {e}")
-
-        # Neural context is retired: only observed-data statistical features may vote.
-        # ── 2. High-Conviction Statistical Feature Check ─────────
-        try:
-            if len(data) >= 30:
-                closes = data['close'].tail(30).astype(float).values
-                vols = data['volume'].tail(30).astype(float).values
-
-                # Volatility-normalized Sharpe drift
-                rets = np.diff(closes) / np.maximum(closes[:-1], 1e-8)
-                ret_mean = float(np.mean(rets[-20:]))
-                ret_std = float(np.std(rets[-20:])) + 1e-8
-                sharpe_drift = ret_mean / ret_std
-
-                # Linear regression t-statistic (20 bars)
-                N = 20
-                x = np.arange(N, dtype=np.float64)
-                y_raw = closes[-N:]
-                y_std = float(np.std(y_raw)) + 1e-8
-                y = (y_raw - float(np.mean(y_raw))) / y_std
-                x_mean = float(np.mean(x))
-                x_dev = x - x_mean
-                ss_x = float(np.sum(x_dev ** 2)) + 1e-8
-                beta = float(np.sum(x_dev * y)) / ss_x
-                residuals = y - beta * x_dev
-                s_err = np.sqrt(float(np.sum(residuals ** 2)) / max(N - 2, 1)) / np.sqrt(ss_x)
-                t_stat = beta / (s_err + 1e-8)
-
-                # Volume & EMA
-                vol_curr = float(vols[-1])
-                vol_mean = float(np.mean(vols[-20:])) + 1e-8
-                vol_ratio = vol_curr / vol_mean
-                ema8 = float(pd.Series(closes).ewm(span=8).mean().iloc[-1])
-                ema21 = float(pd.Series(closes).ewm(span=21).mean().iloc[-1])
-
-                # RSI-14
-                diffs = np.diff(closes[-15:])
-                gains = np.where(diffs > 0, diffs, 0.0)
-                losses = np.where(diffs < 0, -diffs, 0.0)
-                avg_gain = float(np.mean(gains)) + 1e-8
-                avg_loss = float(np.mean(losses)) + 1e-8
-                rs = avg_gain / avg_loss
-                rsi = 100.0 - (100.0 / (1.0 + rs))
-                rsi_norm = (rsi - 50.0) / 25.0
-
-                composite = 0.35 * float(np.clip(sharpe_drift, -2.0, 2.0)) + \
-                            0.35 * float(np.clip(t_stat / 2.0, -2.0, 2.0)) + \
-                            0.30 * float(np.clip(rsi_norm, -2.0, 2.0))
-
-                if composite >= 0.50 and t_stat >= 2.0 and ema8 > ema21 and vol_ratio >= 0.8:
-                    return {"signal": 1,  "thought": f"ML Momentum Bullish Edge (comp={composite:.2f}, t={t_stat:.1f}, fallback)"}
-                elif composite <= -0.50 and t_stat <= -2.0 and ema8 < ema21 and vol_ratio >= 0.8:
-                    return {"signal": -1, "thought": f"ML Momentum Bearish Edge (comp={composite:.2f}, t={t_stat:.1f}, fallback)"}
-        except Exception:
-            pass
-        return {"signal": 0, "thought": "ML Neutral (fallback)"}
+                result = engine.analyze(data, context=context)
+                if isinstance(result, dict):
+                    return result
+            except Exception as exc:
+                logger.debug("Part5 analyzer unavailable: %s", exc)
+        import quantitative_math as qm
+        return qm.part_signal("5", data)
 
 
 class Part6Trend:
@@ -3545,55 +3274,16 @@ class Part6Trend:
 
     def analyze(self, data, context=None):
         # ── Try real Part 6 TrendEngineGPU ────────────────────────────────
-        if self._engine is not None:
+        engine = getattr(self, '_engine', None)
+        if engine is not None:
             try:
-                res = self._engine.analyze(data, context=context)
-                if isinstance(res, dict):
-                    return res
-            except Exception as e:
-                logger.debug(f"Part6 TrendEngine error: {e}")
-
-        # ── Fallback: multi-EMA + ADX chop filter ─────────────────────────
-        try:
-            if len(data) >= 50:
-                closes = data['close'].tail(50).astype(float)
-                highs  = data['high'].tail(50).astype(float)
-                lows   = data['low'].tail(50).astype(float)
-
-                current = float(closes.iloc[-1])
-                ema8   = float(closes.ewm(span=8).mean().iloc[-1])
-                ema21  = float(closes.ewm(span=21).mean().iloc[-1])
-                ema50  = float(closes.ewm(span=50).mean().iloc[-1])
-
-                spread = abs(ema8 - ema21) / max(ema21, 1.0)
-                
-                # ADX 14-period approximation
-                tr = pd.concat([highs - lows, (highs - closes.shift(1)).abs(), (lows - closes.shift(1)).abs()], axis=1).max(axis=1)
-                atr14 = float(tr.rolling(14).mean().iloc[-1])
-                up_move = highs.diff()
-                down_move = -lows.diff()
-                plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-                minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-                plus_di = 100.0 * float(pd.Series(plus_dm, index=highs.index).rolling(14).mean().iloc[-1] / max(atr14, 1e-8))
-                minus_di = 100.0 * float(pd.Series(minus_dm, index=lows.index).rolling(14).mean().iloc[-1] / max(atr14, 1e-8))
-                dx = 100.0 * abs(plus_di - minus_di) / max(plus_di + minus_di, 1e-8)
-
-                # Chop Filter: if spread < 0.08% or DX < 20, market is in CHOP / RANGE
-                if spread < 0.0008 or dx < 20.0:
-                    return {"signal": 0, "thought": f"Chop/Rangebound (DX={dx:.1f}, spread={spread*100:.3f}%) — Neutral"}
-
-                # Strong trend: price > ema8 > ema21 > ema50
-                if current > ema8 > ema21 > ema50 and plus_di > minus_di:
-                    return {"signal": 1,  "thought": f"Strong Uptrend EMA8>{ema21:.0f}>{ema50:.0f} (DX={dx:.1f})"}
-                elif current < ema8 < ema21 < ema50 and minus_di > plus_di:
-                    return {"signal": -1, "thought": f"Strong Downtrend EMA8<{ema21:.0f}<{ema50:.0f} (DX={dx:.1f})"}
-                elif ema8 > ema21 and current > ema21 and plus_di > minus_di and spread >= 0.0012:
-                    return {"signal": 1,  "thought": f"Moderate Uptrend EMA8>{ema21:.0f} (DX={dx:.1f})"}
-                elif ema8 < ema21 and current < ema21 and minus_di > plus_di and spread >= 0.0012:
-                    return {"signal": -1, "thought": f"Moderate Downtrend EMA8<{ema21:.0f} (DX={dx:.1f})"}
-        except Exception:
-            pass
-        return {"signal": 0, "thought": "No Clear Trend (fallback)"}
+                result = engine.analyze(data, context=context)
+                if isinstance(result, dict):
+                    return result
+            except Exception as exc:
+                logger.debug("Part6 analyzer unavailable: %s", exc)
+        import quantitative_math as qm
+        return qm.part_signal("6", data)
 
 
 class Part7Volatility:
@@ -3637,69 +3327,16 @@ class Part8Structure:
 
     def analyze(self, data, context=None):
         # ── 1. Try real Part 8 MarketStructureEngineGPU ────────────────────
-        if self._engine is not None:
+        engine = getattr(self, '_engine', None)
+        if engine is not None:
             try:
-                res = self._engine.analyze(data, context=context)
-                if isinstance(res, dict):
-                    return res
-            except Exception as e:
-                logger.debug(f"Part8 MarketStructureEngine error: {e}")
-
-        # ── 2. Fallback: Quantitative Fractal BOS / CHoCH Check ───────────
-        try:
-            if len(data) >= 30:
-                recent = data.tail(50).copy()
-                highs  = recent['high'].astype(float).values
-                lows   = recent['low'].astype(float).values
-                closes = recent['close'].astype(float).values
-                vols   = recent['volume'].astype(float).values
-                current_close = float(closes[-1])
-
-                tr = np.maximum(
-                    highs[1:] - lows[1:],
-                    np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1]))
-                )
-                atr14 = float(np.mean(tr[-14:])) if len(tr) >= 14 else float(highs[-1] - lows[-1])
-                noise_buffer = 0.20 * atr14
-
-                k = 2
-                lookback = min(len(recent) - k, 45)
-                swing_highs = []
-                swing_lows  = []
-
-                for idx in range(len(recent) - lookback, len(recent) - k):
-                    h = highs[idx]
-                    l = lows[idx]
-                    if all(h > highs[idx - i] for i in range(1, k + 1)) and all(h >= highs[idx + i] for i in range(1, k + 1)):
-                        swing_highs.append((idx, float(h)))
-                    if all(l < lows[idx - i] for i in range(1, k + 1)) and all(l <= lows[idx + i] for i in range(1, k + 1)):
-                        swing_lows.append((idx, float(l)))
-
-                if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-                    last_sh = swing_highs[-1][1]
-                    prev_sh = swing_highs[-2][1]
-                    last_sl = swing_lows[-1][1]
-                    prev_sl = swing_lows[-2][1]
-
-                    bullish_bos = current_close > (last_sh + noise_buffer)
-                    bearish_bos = current_close < (last_sl - noise_buffer)
-                    bullish_choch = (last_sh < prev_sh) and (current_close > last_sh + noise_buffer)
-                    bearish_choch = (last_sl > prev_sl) and (current_close < last_sl - noise_buffer)
-
-                    ema20 = float(pd.Series(closes).ewm(span=20).mean().iloc[-1])
-                    vol_curr = float(vols[-1])
-                    vol_mean = float(np.mean(vols[-20:])) + 1e-8
-                    vol_ok = (vol_curr / vol_mean) >= 0.75
-
-                    if (bullish_bos or bullish_choch) and current_close > ema20 and vol_ok:
-                        label = 'CHoCH' if bullish_choch else 'BOS'
-                        return {"signal": 1,  "thought": f"Bullish Structure {label} above {last_sh:.1f} (fallback)"}
-                    if (bearish_bos or bearish_choch) and current_close < ema20 and vol_ok:
-                        label = 'CHoCH' if bearish_choch else 'BOS'
-                        return {"signal": -1, "thought": f"Bearish Structure {label} below {last_sl:.1f} (fallback)"}
-        except Exception:
-            pass
-        return {"signal": 0, "thought": "Structure Consolidation / Neutral (fallback)"}
+                result = engine.analyze(data, context=context)
+                if isinstance(result, dict):
+                    return result
+            except Exception as exc:
+                logger.debug("Part8 analyzer unavailable: %s", exc)
+        import quantitative_math as qm
+        return qm.part_signal("8", data)
 
 
 class Part9Orderflow:
@@ -3713,57 +3350,16 @@ class Part9Orderflow:
 
     def analyze(self, data, context=None):
         # ── 1. Try real Part 9 OrderflowEngineGPU ──────────────────────────
-        if self._engine is not None:
+        engine = getattr(self, '_engine', None)
+        if engine is not None:
             try:
-                res = self._engine.analyze(data, context=context)
-                if isinstance(res, dict):
-                    return res
-            except Exception as e:
-                logger.debug(f"Part9 OrderflowEngine error: {e}")
-
-        # ── 2. Fallback: Quantitative CVD & Volume Delta Analysis ──────────
-        try:
-            if len(data) >= 20:
-                recent = data.tail(35).copy()
-                highs  = recent['high'].astype(float).values
-                lows   = recent['low'].astype(float).values
-                closes = recent['close'].astype(float).values
-                vols   = recent['volume'].astype(float).values
-
-                candle_ranges = np.maximum(highs - lows, 1e-8)
-                delta_ratios = (2.0 * (closes - lows) - candle_ranges) / candle_ranges
-                deltas = vols * delta_ratios
-
-                N = 20
-                cvd_20 = float(np.sum(deltas[-N:]))
-                tot_vol_20 = float(np.sum(vols[-N:])) + 1e-8
-                cvd_ratio = cvd_20 / tot_vol_20
-
-                cvd_5 = float(np.sum(deltas[-5:]))
-                tot_vol_5 = float(np.sum(vols[-5:])) + 1e-8
-                cvd_ratio_5 = cvd_5 / tot_vol_5
-
-                current_close = float(closes[-1])
-                price_chg_20 = float((current_close - closes[-N]) / max(closes[-N], 1e-8))
-                ema20 = float(pd.Series(closes).ewm(span=20).mean().iloc[-1])
-
-                bullish_div = (price_chg_20 < -0.0025) and (cvd_ratio > 0.25)
-                bearish_div = (price_chg_20 > 0.0025) and (cvd_ratio < -0.25)
-
-                bullish_flow = (cvd_ratio > 0.30) and (cvd_ratio_5 > 0.15) and (current_close > ema20)
-                bearish_flow = (cvd_ratio < -0.30) and (cvd_ratio_5 < -0.15) and (current_close < ema20)
-
-                if bullish_div:
-                    return {"signal": 1,  "thought": f"Bullish Absorption Divergence (CVD={cvd_ratio*100:+.0f}%, Price-) (fallback)"}
-                if bearish_div:
-                    return {"signal": -1, "thought": f"Bearish Absorption Divergence (CVD={cvd_ratio*100:+.0f}%, Price+) (fallback)"}
-                if bullish_flow:
-                    return {"signal": 1,  "thought": f"Bullish Volume Delta Imbalance (CVD={cvd_ratio*100:+.0f}%) (fallback)"}
-                if bearish_flow:
-                    return {"signal": -1, "thought": f"Bearish Volume Delta Imbalance (CVD={cvd_ratio*100:+.0f}%) (fallback)"}
-        except Exception:
-            pass
-        return {"signal": 0, "thought": "Balanced Orderflow / Neutral (fallback)"}
+                result = engine.analyze(data, context=context)
+                if isinstance(result, dict):
+                    return result
+            except Exception as exc:
+                logger.debug("Part9 analyzer unavailable: %s", exc)
+        import quantitative_math as qm
+        return qm.part_signal("9", data)
 
 
 class Part10Candlestats:
@@ -3777,62 +3373,16 @@ class Part10Candlestats:
 
     def analyze(self, data, context=None):
         # ── 1. Try real Part 10 CandleStatsEngineGPU ───────────────────────
-        if self._engine is not None:
+        engine = getattr(self, '_engine', None)
+        if engine is not None:
             try:
-                res = self._engine.analyze(data, context=context)
-                if isinstance(res, dict):
-                    return res
-            except Exception as e:
-                logger.debug(f"Part10 CandleStatsEngine error: {e}")
-
-        # ── 2. Fallback: Quantitative Multi-bar Candle Analytics ───────────
-        try:
-            if len(data) >= 20:
-                recent = data.tail(25).copy()
-                closes = recent['close'].astype(float).values
-                opens  = recent['open'].astype(float).values
-                highs  = recent['high'].astype(float).values
-                lows   = recent['low'].astype(float).values
-
-                tr = np.maximum(
-                    highs[1:] - lows[1:],
-                    np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1]))
-                )
-                atr14 = float(np.mean(tr[-14:])) if len(tr) >= 14 else float(np.mean(highs - lows))
-
-                bodies = np.abs(closes[-3:] - opens[-3:])
-                avg_recent_body = float(np.mean(bodies))
-
-                ranges = np.maximum(highs[-3:] - lows[-3:], 1e-8)
-                body_ratios = bodies / ranges
-                avg_body_ratio = float(np.mean(body_ratios))
-
-                if avg_recent_body < 0.40 * atr14 or avg_body_ratio < 0.50:
-                    return {"signal": 0, "thought": "Micro-noise / Indecisive Bodies (fallback)"}
-
-                is_bull_streak = all(closes[-i] > opens[-i] for i in range(1, 4)) and (closes[-1] > closes[-2] > closes[-3])
-                is_bear_streak = all(closes[-i] < opens[-i] for i in range(1, 4)) and (closes[-1] < closes[-2] < closes[-3])
-
-                last10_closes = closes[-10:]
-                last10_opens  = opens[-10:]
-                bull_count = int(np.sum(last10_closes > last10_opens))
-                bear_count = 10 - bull_count
-
-                baseline_bodies = np.abs(closes[-10:-3] - opens[-10:-3])
-                avg_baseline = float(np.mean(baseline_bodies)) if len(baseline_bodies) > 0 else avg_recent_body
-                body_accel = float(avg_recent_body / max(avg_baseline, 0.30 * atr14))
-
-                if is_bull_streak and avg_body_ratio >= 0.55 and body_accel >= 1.3 and bull_count >= 6:
-                    return {"signal": 1,  "thought": f"Bullish Candle Run Streak=3 Accel={body_accel:.1f}x (fallback)"}
-                if is_bear_streak and avg_body_ratio >= 0.55 and body_accel >= 1.3 and bear_count >= 6:
-                    return {"signal": -1, "thought": f"Bearish Candle Run Streak=3 Accel={body_accel:.1f}x (fallback)"}
-                if bull_count >= 8 and avg_recent_body >= 0.50 * atr14 and closes[-1] > opens[-1]:
-                    return {"signal": 1,  "thought": f"Overwhelming Bullish Run {bull_count}/10 green (fallback)"}
-                if bear_count >= 8 and avg_recent_body >= 0.50 * atr14 and closes[-1] < opens[-1]:
-                    return {"signal": -1, "thought": f"Overwhelming Bearish Run {bear_count}/10 red (fallback)"}
-        except Exception:
-            pass
-        return {"signal": 0, "thought": "Mixed / Indecisive Candles (fallback)"}
+                result = engine.analyze(data, context=context)
+                if isinstance(result, dict):
+                    return result
+            except Exception as exc:
+                logger.debug("Part10 analyzer unavailable: %s", exc)
+        import quantitative_math as qm
+        return qm.part_signal("10", data)
 
 
 class Part11Fusion:
@@ -4406,7 +3956,9 @@ class QuantumV5:
         current_price = float(data['close'].iloc[-1])
         
         # Calculate volatility
-        volatility = float(data['close'].pct_change().std() or 0.0)
+        import quantitative_math as qm
+        vol_features = qm.quantitative_features(data)
+        volatility = float(vol_features.get('realized_vol', 0.0)) if vol_features.get('available') else 0.0
         
         # Calculate trend bias (momentum) with velocity extrapolation
         recent_prices = data['close'].tail(5).values
@@ -4541,89 +4093,85 @@ class SafetyRiskBrain:
 class VolumePressureBrain:
     def analyze(self, data):
         try:
-            if len(data) < 20: return {"signal": 0, "thought": "VOL-PRESSURE: Insufficient volume history"}
-            volume_sma = data['volume'].rolling(20).mean().iloc[-1]
-            current_volume = float(data['volume'].iloc[-1])
-            if volume_sma == 0: return {"signal": 0, "thought": "Neutral volume"}
-            if current_volume > volume_sma * 1.3:
-                price_change = (float(data['close'].iloc[-1]) - float(data['close'].iloc[-2])) / (float(data['close'].iloc[-2]) + 1e-12)
-                side = "Buying" if price_change > 0 else "Selling"
-                return {"signal": 1 if price_change > 0 else -1, "thought": f"VOL-PRESSURE: Aggressive {side} burst detected ({current_volume/volume_sma:.1f}x SMA)"}
-            return {"signal": 0, "thought": "VOL-PRESSURE: Normal institutional flow"}
+            import quantitative_math as qm
+            features = qm.quantitative_features(data)
+            if not features.get('available') or len(features.get('returns', ())) < 8:
+                return {"signal": 0, "thought": "VOL-PRESSURE: Insufficient valid OHLCV history"}
+            surprise = float(features.get('volume_surprise_robust_z', 0.0))
+            flow = float(features.get('flow_imbalance_proxy', 0.0))
+            ret = float(features['returns'][-1])
+            if surprise >= 1.5 and ret > 0 and flow > 0.15:
+                return {"signal": 1, "thought": f"VOL-PRESSURE: Positive OHLCV close-location proxy ({surprise:.2f} robust σ; not tape)"}
+            if surprise >= 1.5 and ret < 0 and flow < -0.15:
+                return {"signal": -1, "thought": f"VOL-PRESSURE: Negative OHLCV close-location proxy ({surprise:.2f} robust σ; not tape)"}
+            return {"signal": 0, "thought": "VOL-PRESSURE: No unusual aligned OHLCV evidence"}
         except Exception:
-            return {"signal": 0, "thought": "Volume analysis failure"}
+            return {"signal": 0, "thought": "Volume analysis unavailable"}
 
 class TrendAccelerationBrain:
     def analyze(self, data):
         try:
-            if len(data) < 10: return {"signal": 0, "thought": "ACCEL: Trend warming up"}
-            sma_5 = data['close'].rolling(5).mean()
-            sma_10 = data['close'].rolling(10).mean()
-            accel_5 = sma_5.diff().iloc[-1]
-            accel_10 = sma_10.diff().iloc[-1]
-            if accel_5 > 0 and accel_10 > 0: 
-                return {"signal": 1, "thought": "ACCEL: Bullish momentum accelerating (Dual SMA shift)"}
-            if accel_5 < 0 and accel_10 < 0: 
-                return {"signal": -1, "thought": "ACCEL: Bearish momentum accelerating (Dual SMA shift)"}
-            return {"signal": 0, "thought": "ACCEL: Trend velocity is stalling"}
+            import quantitative_math as qm
+            features = qm.quantitative_features(data)
+            if not features.get('available') or len(features.get('returns', ())) < 10:
+                return {"signal": 0, "thought": "ACCEL: Insufficient trend history"}
+            velocity = float(features.get('kalman', {}).get('velocity_z', 0.0))
+            trend = float(features.get('trend_score', 0.0))
+            if velocity > 0 and trend > 0:
+                return {"signal": 1, "thought": "ACCEL: Positive local-linear state velocity and robust trend"}
+            if velocity < 0 and trend < 0:
+                return {"signal": -1, "thought": "ACCEL: Negative local-linear state velocity and robust trend"}
+            return {"signal": 0, "thought": "ACCEL: State velocity/trend evidence is mixed"}
         except Exception:
-            return {"signal": 0, "thought": "Acceleration check skipped"}
+            return {"signal": 0, "thought": "Acceleration evidence unavailable"}
 
 class RiskFilterBrain:
     def analyze(self, data, signal):
         try:
-            if len(data) < 5: return {"approved": True, "thought": "RISK: Entry phase"}
-            max_drawdown = (data['close'].rolling(5).max() - data['close']).iloc[-1] / (data['close'].iloc[-1] + 1e-12)
-            if max_drawdown > 0.01 and signal > 0:
-                return {"approved": False, "thought": f"RISK: Excessive Drawdown ({max_drawdown*100:.2f}%) inhibits long entry"}
+            import quantitative_math as qm
+            rows = qm.candles_from(data, limit=5)
+            if len(rows) < 5:
+                return {"approved": True, "thought": "RISK: Entry phase (insufficient 5-bar window)"}
+            closes = [row['close'] for row in rows]
+            drawdown = closes[-1] / max(closes) - 1.0
+            if drawdown < -0.01 and signal > 0:
+                return {"approved": False, "thought": f"RISK: Excessive Drawdown ({-drawdown*100:.2f}%) inhibits long entry"}
             return {"approved": True, "thought": "RISK: Exposure remains within limits"}
         except Exception:
             return {"approved": True, "thought": "Risk filter bypassed"}
 
 class MarketMoodEngine:
     def detect_mood(self, data):
-        """Analyze market condition and predict Daily Bias"""
         try:
-            if len(data) < 20: return "NEUTRAL (Insufficient Data)"
-            
-            # 1. Volatility Analysis
-            volatility = float(data['close'].pct_change().std() or 0.0)
-            
-            # 2. Trend Strength (ADX-like proxy)
-            trend_strength = abs(float(data['close'].diff().tail(10).mean()) / (float(data['close'].iloc[-1]) + 1e-12))
-            
-            # 3. Volume Delta Analysis (Buying vs Selling Pressure)
-            delta_bias = "NEUTRAL"
-            if 'taker_buy_volume' in data.columns:
-                recent_buy = data['taker_buy_volume'].tail(10).sum()
-                recent_total = data['volume'].tail(10).sum()
-                buy_ratio = recent_buy / (recent_total + 1e-12)
-                if buy_ratio > 0.55: delta_bias = "BULLISH"
-                elif buy_ratio < 0.45: delta_bias = "BEARISH"
-            
-            # Combine Factors for Prediction
-            if volatility > 0.004:
-                return f"VOLATILE ({delta_bias} Bias) - Caution"
-            
-            if trend_strength > 0.0015:
-                # Strong Trend
-                direction = "UP" if data['close'].iloc[-1] > data['close'].iloc[-20] else "DOWN"
-                return f"TRENDING {direction} (Strong {delta_bias} Flow)"
-                
+            import quantitative_math as qm
+            features = qm.quantitative_features(data)
+            if not features.get('available') or len(features.get('returns', ())) < 8:
+                return "NEUTRAL (Insufficient Data)"
+            volatility = float(features.get('realized_vol', 0.0))
+            trend = float(features.get('trend_score', 0.0))
+            flow = float(features.get('flow_imbalance_proxy', 0.0))
+            bias = "BULLISH" if flow > 0.15 else "BEARISH" if flow < -0.15 else "NEUTRAL"
+            if volatility > 0.005:
+                return f"VOLATILE ({bias} OHLCV Proxy) - Caution"
+            if trend >= 1.0:
+                return f"TRENDING UP ({bias} OHLCV Proxy)"
+            if trend <= -1.0:
+                return f"TRENDING DOWN ({bias} OHLCV Proxy)"
             if volatility < 0.001:
                 return "RANGING / CHOPPY (Wait for Breakout)"
-                
-            return f"NORMAL ({delta_bias} Lean)"
+            return f"NORMAL ({bias} OHLCV Proxy)"
         except Exception:
             return "NEUTRAL"
 
 class HighVolatilityRegimeShield:
     def check_safety(self, data):
         try:
-            if len(data) < 10: return {"approved": True, "thought": "SHIELD: Scanning volatility..."}
-            volatility = float(data['close'].pct_change().std() or 0.0)
-            if volatility > 0.005:
-                return {"approved": False, "thought": f"SHIELD: High-Vol Regime ({volatility*100:.2f}%) - Trades prohibited"}
+            if len(data) < 10:
+                return {"approved": True, "thought": "SHIELD: Scanning volatility..."}
+            import quantitative_math as qm
+            features = qm.quantitative_features(data)
+            if features.get('available') and float(features.get('realized_vol', 0.0)) > 0.005:
+                return {"approved": False, "thought": "SHIELD: High realized-volatility regime - Trades prohibited"}
             return {"approved": True, "thought": "SHIELD: Stability confirmed"}
         except Exception:
             return {"approved": True, "thought": "Shield inactive"}
@@ -4979,11 +4527,8 @@ class TradeScoringMatrix:
             return 0
 
     def _score_entry_timing(self, data, context):
-        """Score entry timing precision (0-15)"""
         try:
-            score = 5  # Base score
-            
-            # Market session timing
+            score = 5
             current_hour = datetime.now().hour
             session_quality = self._get_current_session_quality(current_hour)
             if session_quality == 'BEST':
@@ -4992,19 +4537,15 @@ class TradeScoringMatrix:
                 score += 3
             elif session_quality == 'MEDIUM':
                 score += 1
-                
-            # Volatility timing
-            volatility = float(data['close'].pct_change().std() or 0.0)
-            if 0.001 < volatility < 0.004:  # Ideal volatility range
+            import quantitative_math as qm
+            features = qm.quantitative_features(data)
+            volatility = float(features.get('realized_vol', 0.0)) if features.get('available') else 0.0
+            if 0.001 < volatility < 0.004:
                 score += 3
-            elif volatility > 0.006:  # Too volatile
+            elif volatility > 0.006:
                 score -= 2
-                
-            # News timing (simplified - would integrate with news API)
-            score += 2  # Assume no major news
-            
+            score += 2
             return min(15, max(0, score))
-            
         except Exception:
             return 5
 
@@ -7076,54 +6617,53 @@ class JarvisElite:
             pass
             
     def _get_market_context(self, data):
-        """Get current market context"""
-        volatility = float(data['close'].pct_change().std() or 0.0)
+        """Descriptive closed-OHLCV context; final strategy authority stays elsewhere."""
+        import quantitative_math as qm
+        features = qm.quantitative_features(data)
+        volatility = float(features.get('realized_vol', 0.0)) if features.get('available') else 0.0
         trend = self._get_trend_direction(data)
         mood = self._get_market_mood(data)
-        
-        # Calculate volatility status
-        if volatility > 0.005: 
-            vol_status = 'HIGH'
-        elif volatility < 0.001: 
-            vol_status = 'LOW'
-        else: 
-            vol_status = 'NORMAL'
-        
-        return {
-            'volatility': volatility,
-            'volatility_status': vol_status,
-            'trend': trend,
-            'mood': mood,
-            'session': self._get_current_session(),
-            'timestamp': datetime.now().isoformat()
-        }
+        if not features.get('available'):
+            status = 'UNKNOWN'
+        elif volatility > 0.005:
+            status = 'HIGH'
+        elif volatility < 0.001:
+            status = 'LOW'
+        else:
+            status = 'NORMAL'
+        return {'volatility': volatility, 'volatility_status': status, 'trend': trend,
+                'mood': mood, 'session': self._get_current_session(),
+                'timestamp': datetime.now().isoformat()}
         
     def _get_trend_direction(self, data):
-        """Get market trend direction"""
-        if len(data) < 10:
+        """A robust close-only log-return trend label, not a calibrated forecast."""
+        import quantitative_math as qm
+        rows = qm.candles_from(data)
+        evidence = qm.close_return_trend([row['close'] for row in rows])
+        if not evidence.get('available'):
             return 'SIDEWAYS'
-            
-        sma_5 = data['close'].rolling(5).mean().iloc[-1]
-        sma_10 = data['close'].rolling(10).mean().iloc[-1]
-        
-        if sma_5 > sma_10 * 1.001:
+        score = float(evidence.get('trend_score', 0.0))
+        if score >= 0.5:
             return 'UPTREND'
-        elif sma_5 < sma_10 * 0.999:
+        if score <= -0.5:
             return 'DOWNTREND'
-        else:
-            return 'SIDEWAYS'
+        return 'SIDEWAYS'
             
     def _get_market_mood(self, data):
-        """Get market mood/condition from Engine"""
+        """Return descriptive realized-volatility mood, never an entry signal."""
         try:
             if 'market_mood_engine' in self.brains:
                 return self.brains['market_mood_engine'].detect_mood(data)
-            
-            # Fallback
-            volatility = float(data['close'].pct_change().std() or 0.0)
-            if volatility > 0.005: return 'VOLATILE'
-            elif volatility < 0.001: return 'RANGING'
-            else: return 'NORMAL'
+            import quantitative_math as qm
+            features = qm.quantitative_features(data)
+            if not features.get('available'):
+                return 'UNKNOWN'
+            volatility = float(features.get('realized_vol', 0.0))
+            if volatility > 0.005:
+                return 'VOLATILE'
+            if volatility < 0.001:
+                return 'RANGING'
+            return 'NORMAL'
         except Exception:
             return 'NORMAL'
             
@@ -7692,8 +7232,10 @@ Follow the tag with a 1-sentence CEO executive directive.
             
             # BUG FIX #9: upgrades is on self.jarvis not self — use jarvis reference
             market_mood = self.upgrades['market_mood_engine'].detect_mood(data)
+            import quantitative_math as qm
+            market_features = qm.quantitative_features(data)
             market_context = {
-                'volatility': float(data['close'].pct_change().std() or 0.0),
+                'volatility': float(market_features.get('realized_vol', 0.0)) if market_features.get('available') else 0.0,
                 'trend': trend_res['signal'],
                 'mood': market_mood
             }
@@ -7765,7 +7307,9 @@ Follow the tag with a 1-sentence CEO executive directive.
                 elif p14_signal == 0 and not is_high_conf: # Neutral but low conf
                     final_signal = 0
                     r1_reasoning["reasoning"] = (r1_reasoning.get("reasoning","") + " | 🛡️ Blocked: Waiting for Institutional Confirm or High Confidence")
-            volatility = float(data['close'].pct_change().std() or 0.0)
+            import quantitative_math as qm
+            vol_features = qm.quantitative_features(data)
+            volatility = float(vol_features.get('realized_vol', 0.0)) if vol_features.get('available') else 0.0
             if volatility > 0.003:
                 expiry = "SCALP"
             elif final_signal != 0:

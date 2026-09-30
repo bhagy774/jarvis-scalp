@@ -1,11 +1,11 @@
-"""Part 3 owned model: body/wick anatomy reversal detector."""
-from .common import candle_math, clip, div
-FEATURE_NAMES=("body_ratio","upper_wick_ratio","lower_wick_ratio","close_location","range_atr","gap_atr","prev_body_signed","engulf_proxy","doji_proxy","ret1","ret4","volume_z")
+"""Part 3 model: robust candle-body, auction-location and anomaly evidence."""
+from .common import candle_math, clip
+FEATURE_NAMES=("body_fraction","upper_wick_fraction","lower_wick_fraction","auction_close_location","body_anomaly_robust_z","body_change","return1_robust_z","return4_robust_z","range_scale_pct","state_innovation_z","volume_surprise_robust_z","opening_gap_risk_scale")
 MODEL_SPEC={"task":"candle_reversal","dims":(12,10,4,1),"acts":("tanh","relu","linear"),"labels":("no_reversal","reversal"),"kind":"sigmoid"}
 def prepare_features(data):
- s=candle_math(data); r=s["rows"][-1]; body=s["body"][-1]; prev=s["body"][-2]; rng=s["range"][-1]
- gap=div(r["open"]-s["prior_close"],s["atr14"]); engulf=(1.0 if body>0 else -1.0) if abs(body)>abs(prev) and body*prev<0 else 0.0
- vals=(s["body_ratio"],s["upper"][-1],s["lower"][-1],s["close_location"],s["range_atr"],gap,prev,engulf,1-s["body_ratio"],s["ret1"],s["ret4"],s["volz"])
+ s=candle_math(data); g=s["candle"]; rows=s["rows"]
+ gap=(rows[-1]["open"]-rows[-2]["close"])/s["range_scale_price"]
+ vals=(g["body_fraction"],g["upper_wick"],g["lower_wick"],g["close_location"],s["body_robust_z"],s["body_acceleration"],s["ret1_z"],s["ret4_z"],s["range_scale_pct"],s["state_innovation_z"],s["volume_surprise_z"],gap)
  return tuple(clip(x) for x in vals)
 def interpret_scores(scores,prediction): return {"candle_reversal":prediction,"reversal_score_uncalibrated":scores[1]}
 def label_target(rows,i,horizon,neutral_bps,x):
