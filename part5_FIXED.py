@@ -408,27 +408,9 @@ class MLEngineGPU:
 
 # ==================== GPU-ACCELERATED FUSION ENGINE ====================
 
-class NeuralFusionNetwork(nn.Module):
-    """
-    Advanced Neural Network (MLP) for Dynamic Signal Fusion.
-    Learns non-linear interactions between sub-engine signals.
-    """
-    def __init__(self, input_dim=4):
-        super(NeuralFusionNetwork, self).__init__()
-        self.fc1 = nn.Linear(input_dim * 2, 16)  # Signals + Confidences
-        self.fc2 = nn.Linear(16, 8)
-        self.fc3 = nn.Linear(8, 3) # output probabilities for (PUT, NO_TRADE, CALL)
-        self.dropout = nn.Dropout(0.2)
-
-    def forward(self, signals, confidences):
-        # inputs are shape (batch, num_engines)
-        x = torch.cat([signals, confidences], dim=-1)
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return F.softmax(x, dim=-1) # returns probability dist
-
+# The former random-initialized NeuralFusionNetwork is retired. Neural inference
+# in this engine is deliberately disabled until a separately validated local
+# artifact is integrated through neural_advisory.py.
 class GPUEnhancedFusionEngine:
     """
     INSTITUTIONAL-Grade Fusion Engine
@@ -451,14 +433,9 @@ class GPUEnhancedFusionEngine:
         self.confidence_matrix = None
         self.strategy_weights_gpu = None
         
-        # Advanced Math: Neural Fusion Model
-        try:
-            self.neural_fusion = NeuralFusionNetwork(input_dim=4).to(self.device)
-            self.neural_fusion.eval() # inference mode by default
-            self.use_neural = True
-        except Exception:
-            self.neural_fusion = None
-            self.use_neural = False
+        # No runtime model construction or inference: untrained weights are never used.
+        self.neural_fusion = None
+        self.use_neural = False
 
         # Advanced Math: Kalman Smoothing state
         self.kalman_state = 0.0
@@ -667,20 +644,8 @@ class GPUEnhancedFusionEngine:
                 
                 n = len(signals)
 
-                # --- Advanced Math: Neural Fusion Path ---
-                neural_fused = 0.0
-                if self.use_neural and n == 4:
-                    # Expecting exactly 4 inputs for our MLP
-                    try:
-                        with torch.no_grad():
-                            sig_batch = signal_tensor.unsqueeze(0)
-                            conf_batch = confidence_tensor.unsqueeze(0)
-                            probs = self.neural_fusion(sig_batch, conf_batch).squeeze(0)
-                            # probs is [P(PUT), P(NO_TRADE), P(CALL)]
-                            # Convert probabilities to a continuous score [-1, 1]
-                            neural_fused = float(probs[2].item() - probs[0].item())
-                    except Exception as e:
-                        neural_fused = 0.0
+                # The learned component was never trained/loaded. Preserve the
+                # deterministic weighted evidence path and never infer random logits.
 
                 # --- Traditional Math: Weighted Sum Path ---
                 if self.strategy_weights_gpu is not None and len(self.strategy_weights_gpu) >= n:
@@ -691,8 +656,9 @@ class GPUEnhancedFusionEngine:
                 weighted_signals = signal_tensor * confidence_tensor * weights
                 trad_fused = float(torch.sum(weighted_signals).item() if hasattr(torch.sum(weighted_signals), 'item') else torch.sum(weighted_signals))
 
-                # Ensemble (Bayesian blend of Neural + Traditional)
-                blended_raw = (0.4 * neural_fused) + (0.6 * trad_fused)
+                # Preserve the legacy deterministic contribution of the retired
+                # neural blend (0.6 * weighted score); no random model is called.
+                blended_raw = 0.6 * trad_fused
 
                 # Apply Kalman Smoothing to the blended signal
                 fused_signal = self._apply_kalman_filter(blended_raw)
@@ -730,38 +696,6 @@ class GPUEnhancedFusionEngine:
                 final_weights = adjusted_weights / (torch.sum(adjusted_weights) + 1e-8)
                 self.strategy_weights_gpu = final_weights
 
-                # --- Advanced Math: Online Learning / Training Step ---
-                # We apply a simple online learning step to update our MLP weights
-                # using the realized performance of the strategies as a proxy for the true target.
-                if self.use_neural and self.neural_fusion is not None and hasattr(self, 'last_neural_inputs'):
-                    try:
-                        sig_batch, conf_batch = self.last_neural_inputs
-                        self.neural_fusion.train()
-
-                        # Forward pass
-                        probs = self.neural_fusion(sig_batch, conf_batch)
-
-                        # Pseudo-target based on top performing strategy
-                        best_strat_idx = torch.argmax(final_weights).item()
-                        target_direction = sig_batch[0, best_strat_idx].item()
-
-                        target_class = 1 # NO_TRADE
-                        if target_direction > 0.5: target_class = 2 # CALL
-                        elif target_direction < -0.5: target_class = 0 # PUT
-
-                        target_tensor = torch.tensor([target_class], device=self.device, dtype=torch.long)
-
-                        # Loss and optimizer step
-                        loss_fn = nn.CrossEntropyLoss()
-                        optimizer = optim.Adam(self.neural_fusion.parameters(), lr=0.01)
-                        optimizer.zero_grad()
-                        loss = loss_fn(probs, target_tensor)
-                        loss.backward()
-                        optimizer.step()
-
-                        self.neural_fusion.eval() # revert back to inference mode
-                    except Exception as train_e:
-                        self.neural_fusion.eval() # ensure we revert if training fails
         except Exception:
             pass
 
