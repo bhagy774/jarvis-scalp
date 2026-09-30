@@ -1,8 +1,8 @@
 # Scalp/Swing 8-Timeframe Implementation Report
 
-**Repository:** `bhagy774/jarvis-scalp`
-**PR:** [#97 — Centralize Parts 1–12 strategy entry authority](https://github.com/bhagy774/jarvis-scalp/pull/97)
-**Pinned `main`:** `89ace9b7600abb2c1bb153b2d86245fe57e752c6`
+**Repository:** `bhagy774/jarvis-scalp`  
+**PR:** [#97 — Centralize Parts 1–12 strategy entry authority](https://github.com/bhagy774/jarvis-scalp/pull/97)  
+**Pinned `main`:** `89ace9b7600abb2c1bb153b2d86245fe57e752c6`  
 **PR head before this update:** `840fcab136852f7041c7a5ab69e97bdc432a67e0` (`feat/jarvis-central-entry-authority-20260929`). Both pins were rechecked against GitHub; PR #97 was open, unreviewed, and unmerged. PR #98 is also open and separately touches `jarvis_FIXED.py` and `jarvis_live_trader.py` for read-only dashboard work; it does not implement this strategy change.
 
 ## Implementation

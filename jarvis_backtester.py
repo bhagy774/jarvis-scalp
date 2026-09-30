@@ -13,12 +13,24 @@ import logging
 import math
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+
+@dataclass
+class BacktestMetrics:
+    net: float
+    gross: float
+    fees: float
+    wr: float
+    dd: float
+    sharpe: float
 
 # The replay safety mode is set immediately before importing the brain in
 # ``_init_jarvis``.  Do not mutate the process environment at module import:
@@ -254,41 +266,52 @@ class BacktestRiskGate:
         self.daily_pnl += position.pnl_usdt
         self.consec_losses = 0 if position.result == "WIN" else self.consec_losses + 1
 
-    def calc_contracts(self, entry_price: float, stop_trigger: float, direction: str,
-                       cash_balance: float, fee_bps: float, slippage_bps: float) -> float:
+    def calc_contracts(self, position: BacktestPosition, cash_balance: float) -> float:
         """Size base-asset quantity by worst stop loss, then cap gross exposure."""
-        if entry_price <= 0 or cash_balance <= 0:
+        if position.entry_price <= 0 or cash_balance <= 0:
             return 0.0
-        is_call = direction in ("CALL", "BUY")
-        adverse_stop = stop_trigger * (1 - slippage_bps / 10_000 if is_call else 1 + slippage_bps / 10_000)
-        loss_per_unit = abs(entry_price - adverse_stop) + (entry_price + adverse_stop) * fee_bps / 20_000
+        is_call = position.direction in ("CALL", "BUY")
+        adverse_stop = position.sl_price * (1 - position.slippage_bps / 10_000 if is_call else 1 + position.slippage_bps / 10_000)
+        loss_per_unit = abs(position.entry_price - adverse_stop) + (position.entry_price + adverse_stop) * position.fee_bps / 20_000
         if loss_per_unit <= 0:
             return 0.0
         used_notional = sum(p.entry_price * p.contracts for p in self.open_positions)
         exposure_room = max(0.0, cash_balance * LEVERAGE - used_notional)
-        quantity = min(MAX_RISK_USDT / loss_per_unit, exposure_room / entry_price)
+        quantity = min(MAX_RISK_USDT / loss_per_unit, exposure_room / position.entry_price)
         # Deterministic quantity precision without forcing an unaffordable one-unit trade.
         return math.floor(max(0.0, quantity) * 100_000_000) / 100_000_000
+
+
+@dataclass
+class BacktestConfig:
+    symbol: str = "BTCUSDT"
+    timeframe: str = "5m"
+    years: int = 3
+    starting_capital: float = 1000.0
+    warmup: int = 100
+    slippage_bps: float = 5.0
+    fee_bps: float = 10.0
+    scalp_tp: float = SCALP_TP_PCT
+    scalp_sl: float = SCALP_SL_PCT
+    swing_tp: float = SWING_TP_PCT
+    swing_sl: float = SWING_SL_PCT
+    live_audit: bool = True
 
 
 class JarvisFullBacktester:
     """Historical-only replay with central math/GPU decision analysis in isolation mode."""
 
-    def __init__(self, symbol: str = "BTCUSDT", timeframe: str = "5m", years: int = 3,
-                 starting_capital: float = 1000.0, warmup: int = 100,
-                 slippage_bps: float = 5.0, fee_bps: float = 10.0,
-                 scalp_tp: float = SCALP_TP_PCT, scalp_sl: float = SCALP_SL_PCT,
-                 swing_tp: float = SWING_TP_PCT, swing_sl: float = SWING_SL_PCT,
-                 live_audit: bool = True):
-        self.symbol, self.timeframe, self.years = symbol.upper(), timeframe, years
-        self.starting_capital, self.warmup = starting_capital, warmup
-        self.slippage_bps, self.fee_bps = slippage_bps, fee_bps
-        self.scalp_tp, self.scalp_sl = scalp_tp, scalp_sl
-        self.swing_tp, self.swing_sl = swing_tp, swing_sl
-        self.live_audit = live_audit
+    def __init__(self, config: Optional[BacktestConfig] = None):
+        config = config or BacktestConfig()
+        self.symbol, self.timeframe, self.years = config.symbol.upper(), config.timeframe, config.years
+        self.starting_capital, self.warmup = config.starting_capital, config.warmup
+        self.slippage_bps, self.fee_bps = config.slippage_bps, config.fee_bps
+        self.scalp_tp, self.scalp_sl = config.scalp_tp, config.scalp_sl
+        self.swing_tp, self.swing_sl = config.swing_tp, config.swing_sl
+        self.live_audit = config.live_audit
         self.gate = BacktestRiskGate()
         self.all_trades: List[BacktestPosition] = []
-        self.balance = self.peak = starting_capital
+        self.balance = self.peak = config.starting_capital
         self.equity_curve: List[Dict[str, object]] = []
         self.n_no_signal = self.n_skip_gate = self.n_unaffordable = 0
         self.part_activity = {name: {'decisions_seen': 0, 'non_neutral': 0, 'offline': 0}
@@ -452,8 +475,7 @@ class JarvisFullBacktester:
                                             self.slippage_bps, self.fee_bps,
                                             scalp_tp=self.scalp_tp, scalp_sl=self.scalp_sl,
                                             swing_tp=self.swing_tp, swing_sl=self.swing_sl)
-            quantity = self.gate.calc_contracts(entry_price, provisional.sl_price, direction,
-                                                self.balance, self.fee_bps, self.slippage_bps)
+            quantity = self.gate.calc_contracts(provisional, self.balance)
             if quantity <= 0:
                 self.n_unaffordable += 1
                 continue
@@ -558,7 +580,8 @@ class JarvisFullBacktester:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         prefix = RESULT_DIR / f"backtest_{self.symbol}_{self.timeframe}_{stamp}"
         self._csv(closed, prefix)
-        self._html(prefix, closed, net, gross, fees, wr, dd, sharpe, stamp, fault_summary)
+        metrics = BacktestMetrics(net=net, gross=gross, fees=fees, wr=wr, dd=dd, sharpe=sharpe)
+        self._html(prefix, closed, metrics, stamp, fault_summary)
         coverage = self._part_coverage()
         coverage_path = prefix.with_name(prefix.name + '_part_coverage.json')
         coverage_path.write_text(json.dumps({
@@ -584,8 +607,7 @@ class JarvisFullBacktester:
                 } for t in closed]
         pd.DataFrame(rows).to_csv(f"{prefix}.csv", index=False)
 
-    def _html(self, prefix: Path, closed: List[BacktestPosition], net: float, gross: float,
-              fees: float, wr: float, dd: float, sharpe: float, stamp: str,
+    def _html(self, prefix: Path, closed: List[BacktestPosition], metrics: BacktestMetrics, stamp: str,
               fault_summary: Optional[dict] = None) -> None:
         rows = "".join(
             f"<tr><td>{t.id}</td><td>{t.direction}</td><td>{t.confidence}%</td><td>{t.entry_price:.2f}</td><td>{t.exit_price:.2f}</td><td>{t.close_reason}</td><td>{t.pnl_usdt:.4f}</td></tr>"
@@ -599,7 +621,7 @@ class JarvisFullBacktester:
         html = f"""<!doctype html><html><head><meta charset='utf-8'><title>JARVIS historical replay</title>
 <style>body{{font-family:system-ui;background:#10151c;color:#e8edf2;margin:2rem}}section,table{{background:#19212b;padding:1rem;margin:1rem 0;border-radius:8px}}table{{border-collapse:collapse;width:100%}}td,th{{padding:.5rem;text-align:left;border-bottom:1px solid #334}}</style></head><body>
 <h1>JARVIS Historical Replay</h1><p>{stamp} · {self.symbol} · {self.timeframe}</p>
-<section><h2>Results</h2><p>Net PnL: ${net:.2f}; gross PnL: ${gross:.2f}; modeled fees: ${fees:.2f}; net win rate: {wr:.1f}%; max drawdown: {dd:.2f}%; Sharpe: {sharpe:.2f}</p></section>
+<section><h2>Results</h2><p>Net PnL: ${metrics.net:.2f}; gross PnL: ${metrics.gross:.2f}; modeled fees: ${metrics.fees:.2f}; net win rate: {metrics.wr:.1f}%; max drawdown: {metrics.dd:.2f}%; Sharpe: {metrics.sharpe:.2f}</p></section>
 <section><h2>Execution assumptions (Option B)</h2><p>Conservative, user-configurable assumptions: adverse entry/exit slippage {self.slippage_bps:.2f} bps each side; round-trip trading fee {self.fee_bps:.2f} bps. Scalp TP: {self.scalp_tp*100:.2f}%, SL: {self.scalp_sl*100:.2f}%. Swing TP: {self.swing_tp*100:.2f}%, SL: {self.swing_sl*100:.2f}%. Entries fill at next candle open; TP/SL use high/low; same-candle dual touch resolves to SL first.</p></section>
 <section><h2>Core Part Accuracy & Fault Breakdown (Kaya Part no Vak Hato)</h2>
 <table><thead><tr><th>Part Name</th><th>Total Votes</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Fault Share</th><th>Assessment</th></tr></thead><tbody>{fault_rows}</tbody></table>
@@ -635,11 +657,22 @@ def main() -> None:
     args = parser.parse_args()
     if args.capital <= 0 or args.warmup < 20 or args.slippage_bps < 0 or args.fee_bps < 0:
         parser.error("capital must be positive; warmup >=20; costs must be non-negative")
-    runner = JarvisFullBacktester(args.symbol, args.tf, args.years, args.capital, args.warmup,
-                                  args.slippage_bps, args.fee_bps,
-                                  scalp_tp=args.scalp_tp, scalp_sl=args.scalp_sl,
-                                  swing_tp=args.swing_tp, swing_sl=args.swing_sl,
-                                  live_audit=not args.no_audit)
+
+    config = BacktestConfig(
+        symbol=args.symbol,
+        timeframe=args.tf,
+        years=args.years,
+        starting_capital=args.capital,
+        warmup=args.warmup,
+        slippage_bps=args.slippage_bps,
+        fee_bps=args.fee_bps,
+        scalp_tp=args.scalp_tp,
+        scalp_sl=args.scalp_sl,
+        swing_tp=args.swing_tp,
+        swing_sl=args.swing_sl,
+        live_audit=not args.no_audit
+    )
+    runner = JarvisFullBacktester(config)
     runner.run(args.data_file)
 
 

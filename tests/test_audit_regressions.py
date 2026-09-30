@@ -5,7 +5,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from jarvis_decision import build_final_decision, confidence_text, normalize_confidence
+from jarvis_decision import build_final_decision, confidence_text, normalize_confidence, DecisionContext
 from jarvis_risk import calculate_trade_size, contract_quote_value_usdt
 from jarvis_dashboard import render_dashboard
 
@@ -39,14 +39,16 @@ class AuditRegressionTests(unittest.TestCase):
     def test_conflict_and_non_primary_options_block_execution(self):
         conflict = build_final_decision(
             {"direction": "CALL", "confidence_score": "85%"},
-            symbol="ETHUSDT", opinions=["BUY", "SELL"]
+            DecisionContext(symbol="ETHUSDT", opinions=["BUY", "SELL"])
         )
         self.assertFalse(conflict["execution_allowed"])
         self.assertEqual(conflict["direction"], "NO_TRADE")
         macro = build_final_decision(
             {"direction": "CALL", "confidence_score": 85},
-            symbol="ETHUSDT", require_options=True,
-            options_context={"available": True, "role": "btc_macro_confirmation"}
+            DecisionContext(
+                symbol="ETHUSDT", require_options=True,
+                options_context={"available": True, "role": "btc_macro_confirmation"}
+            )
         )
         self.assertFalse(macro["execution_allowed"])
 
@@ -135,8 +137,10 @@ class AuditRegressionTests(unittest.TestCase):
     def test_unavailable_selected_options_block_required_execution(self):
         decision = build_final_decision(
             {"direction": "BUY", "confidence_score": "90%"},
-            symbol="SOLUSDT", require_options=True,
-            options_context={"available": False, "role": "unavailable"},
+            DecisionContext(
+                symbol="SOLUSDT", require_options=True,
+                options_context={"available": False, "role": "unavailable"},
+            )
         )
         self.assertFalse(decision["execution_allowed"])
         self.assertEqual(decision["direction"], "NO_TRADE")

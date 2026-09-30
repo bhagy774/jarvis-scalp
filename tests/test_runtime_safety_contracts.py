@@ -80,7 +80,7 @@ class RuntimeSafetyContracts(unittest.TestCase):
         self.assertEqual(status.backend, "cpu")
         self.assertFalse(status.detected)
         self.assertIn("unavailable", status.fallback_reason.lower())
-        self.assertEqual(safe_device("not-a-device"), "cpu")
+        self.assertEqual(str(safe_device("not-a-device")), "cpu")
 
     def test_synthetic_selected_symbol_parts_to_validated_advisory(self):
         # Offline integration contract: every adapter is callable, the same

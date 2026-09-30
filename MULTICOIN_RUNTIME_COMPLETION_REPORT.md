@@ -1,7 +1,7 @@
 # Jarvis multicoin runtime bridge — offline implementation and verification
 
-**Repository:** `bhagy774/jarvis-scalp`
-**PR:** [#97 — Centralize Parts 1–12 strategy entry authority](https://github.com/bhagy774/jarvis-scalp/pull/97)
+**Repository:** `bhagy774/jarvis-scalp`  
+**PR:** [#97 — Centralize Parts 1–12 strategy entry authority](https://github.com/bhagy774/jarvis-scalp/pull/97)  
 **Verified base before work:** `main` at `89ace9b7600abb2c1bb153b2d86245fe57e752c6`; this was confirmed as the live `main` tip using GitHub commit listing. PR #97 was open at `32cc2a3e0e09e56c209a24800e3d37515b99c543`, base `main`, no reviews. The implementation/test/docs push is commit `edd9f73ba9ad14ecb36d0f6f71764e208263d507`; PR #97 remains open on the same `main` base, with no submitted reviews. GitHub reports zero check runs for the pushed implementation commit (not a passing CI result). PR #81 is also open, based on older `a5d6e7810995580c53dfb7c440b312eeabdde363`, and overlaps `jarvis_FIXED.py` / `jarvis_live_trader.py`; review overlap before either PR is merged.
 
 ## Changes made

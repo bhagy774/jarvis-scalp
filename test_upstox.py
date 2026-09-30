@@ -14,7 +14,7 @@ def main():
 
     # ============ UPSTOX CREDENTIALS ============
     API_KEY = os.environ.get("UPSTOX_API_KEY", "")
-    SECRET_KEY = "nijffoydyv"
+    SECRET_KEY = os.environ.get("UPSTOX_SECRET_KEY", "")
     REDIRECT_URI = "https://127.0.0.1"  # default for testing
 
     print("=" * 60)

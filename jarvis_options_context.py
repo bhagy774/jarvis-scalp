@@ -22,6 +22,7 @@ class OptionsContext:
     strength: int = 0
     pcr: float | None = None
     reason: str = ""
+    expiry_coverage: Dict[str, Any] | None = None
     validation: Dict[str, Any] | None = None
     macro_contexts: list[Dict[str, Any]] = field(default_factory=list)
 
@@ -73,6 +74,7 @@ def _valid_bias(raw: Any, asset: str) -> OptionsContext | None:
         return None
     if any(str(reason).strip().lower() == "no data" for reason in reasons):
         return None
+    coverage = raw.get("raw_data", {}).get("expiry_coverage") if isinstance(raw.get("raw_data"), dict) else None
     return OptionsContext(
         selected_asset=asset,
         source_asset=asset,
@@ -82,9 +84,9 @@ def _valid_bias(raw: Any, asset: str) -> OptionsContext | None:
         strength=abs(int(score_value)),
         pcr=pcr_value,
         reason="; ".join(str(x) for x in reasons[:2]),
+        expiry_coverage=coverage,
         validation=validation,
     )
-
 
 def _macro_entry(raw: Any, asset: str) -> Dict[str, Any] | None:
     context = _valid_bias(raw, asset)

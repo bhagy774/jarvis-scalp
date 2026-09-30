@@ -48,20 +48,38 @@ class AutoRiskDashboardTests(unittest.TestCase):
 
     def test_live_missing_product_metadata_blocks_before_leverage_or_order(self):
         import jarvis_live_trader
+        from jarvis_live_trader import TradeRequest
         venue = VenueStub(metadata=None)
         trader = jarvis_live_trader.JarvisAutoTrader(venue)
         trader.is_enabled = True
-        result = trader._place_trade("CALL", 90, 100.0, "SCALP", {"do_hedge": False}, "BTCUSDT")
+        req = TradeRequest(
+            direction="CALL",
+            confidence=90,
+            price=100.0,
+            trade_type="SCALP",
+            hedge_plan={"do_hedge": False},
+            symbol="BTCUSDT"
+        )
+        result = trader._place_trade(req)
         self.assertFalse(result["success"])
         self.assertEqual(venue.leverage_calls, [])
         self.assertEqual(venue.order_calls, [])
 
     def test_leverage_rejection_blocks_order(self):
         import jarvis_live_trader
+        from jarvis_live_trader import TradeRequest
         venue = VenueStub(metadata={"id": 1, "symbol": "BTCUSD", "contract_value": 1, "contract_value_currency": "USDT"}, leverage_ok=False)
         trader = jarvis_live_trader.JarvisAutoTrader(venue)
         trader.is_enabled = True
-        result = trader._place_trade("CALL", 90, 100.0, "SCALP", {"do_hedge": False}, "BTCUSDT")
+        req = TradeRequest(
+            direction="CALL",
+            confidence=90,
+            price=100.0,
+            trade_type="SCALP",
+            hedge_plan={"do_hedge": False},
+            symbol="BTCUSDT"
+        )
+        result = trader._place_trade(req)
         self.assertFalse(result["success"])
         self.assertEqual(len(venue.leverage_calls), 1)
         self.assertEqual(venue.order_calls, [])
