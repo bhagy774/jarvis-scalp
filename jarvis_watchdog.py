@@ -57,13 +57,23 @@ def save_state(open_trades: List[Dict], path: str = STATE_FILE, extra: Optional[
         }
         if extra:
             payload["extra"] = extra
-        tmp = f"{path}.tmp"
+
+        tmp = f"{path}.{threading.get_ident()}.tmp"
+
+        # Serialize and perform I/O outside the lock to increase concurrency
+        payload_str = json.dumps(payload, indent=2, default=str)
+        with open(tmp, "w") as fh:
+            fh.write(payload_str)
+
         with _state_lock:
-            with open(tmp, "w") as fh:
-                json.dump(payload, fh, indent=2, default=str)
             os.replace(tmp, path)
         return True
     except Exception as exc:  # fail-safe
+        if 'tmp' in locals() and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         logger.warning("[WATCHDOG] state save failed: %s", exc)
         return False
 
@@ -73,7 +83,10 @@ def load_state(path: str = STATE_FILE) -> Dict[str, Any]:
     try:
         with _state_lock:
             with open(path) as fh:
-                data = json.load(fh)
+                content = fh.read()
+
+        # Parse JSON outside the lock
+        data = json.loads(content)
         if not isinstance(data, dict):
             raise ValueError("state file is not a JSON object")
         data.setdefault("open_trades", [])
