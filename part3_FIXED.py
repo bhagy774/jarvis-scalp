@@ -301,162 +301,9 @@ class CandlePsychologyMasterGPU:
 
     @part_advisory_entry("part3_psychology", data_parameter="data", context_parameter="context")
     def analyze(self, data, context=None):
-        try:
-            if data is None or len(data) < 15:
-                return {"signal": 0, "thought": "Insufficient candle history (<15)", "telemetry": {}}
-
-            if isinstance(data, pd.DataFrame):
-                df = data
-            else:
-                df = pd.DataFrame(data)
-
-            highs = df['high'].tail(20).astype(float)
-            lows = df['low'].tail(20).astype(float)
-            closes = df['close'].tail(20).astype(float)
-            opens = df['open'].tail(20).astype(float)
-            volumes = df['volume'].tail(20).astype(float) if 'volume' in df.columns else pd.Series(1.0, index=df.index).tail(20)
-
-            tr = pd.concat([highs - lows, (highs - closes.shift(1)).abs(), (lows - closes.shift(1)).abs()], axis=1).max(axis=1)
-            atr = float(tr.tail(14).mean())
-            avg_vol = float(volumes.tail(14).mean()) if len(volumes) >= 14 else 1.0
-
-            c = float(closes.iloc[-1])
-            o = float(opens.iloc[-1])
-            h = float(highs.iloc[-1])
-            l = float(lows.iloc[-1])
-            v = float(volumes.iloc[-1])
-
-            rng = max(h - l, 1e-8)
-            body = abs(c - o)
-            body_ratio = body / rng
-            upper_wick = (h - max(c, o)) / rng
-            lower_wick = (min(c, o) - l) / rng
-
-            telemetry = {
-                'body_ratio': round(body_ratio, 3),
-                'upper_wick': round(upper_wick, 3),
-                'lower_wick': round(lower_wick, 3),
-                'atr': round(atr, 4),
-                'candle_range': round(rng, 4)
-            }
-
-            # 1. Micro-Noise Filter: Candle range must be meaningful compared to ATR
-            if rng < 0.55 * atr or atr == 0:
-                return {
-                    "signal": 0,
-                    "thought": f"Noise/Micro-candle ({rng:.1f} < 0.55*ATR {atr:.1f}) — Neutral",
-                    "telemetry": telemetry
-                }
-
-            prev_c = float(closes.iloc[-2])
-            prev_o = float(opens.iloc[-2])
-            prev_h = float(highs.iloc[-2])
-            prev_l = float(lows.iloc[-2])
-            prev_rng = max(prev_h - prev_l, 1e-8)
-            prev_body = abs(prev_c - prev_o)
-            prev_body_ratio = prev_body / prev_rng
-            prev_lower_wick = (min(prev_c, prev_o) - prev_l) / prev_rng
-            prev_upper_wick = (prev_h - max(prev_c, prev_o)) / prev_rng
-
-            # 2. Dragonfly Doji (Bullish Rejection at lows)
-            if lower_wick >= 0.65 and body_ratio <= 0.12 and upper_wick <= 0.10:
-                telemetry['detected_pattern'] = 'Dragonfly Doji'
-                return {"signal": 1, "thought": "Dragonfly Doji (Strong Bullish Rejection)", "confidence": 7.5, "telemetry": telemetry}
-
-            # 3. Gravestone Doji (Bearish Rejection at highs)
-            if upper_wick >= 0.65 and body_ratio <= 0.12 and lower_wick <= 0.10:
-                telemetry['detected_pattern'] = 'Gravestone Doji'
-                return {"signal": -1, "thought": "Gravestone Doji (Strong Bearish Rejection)", "confidence": 7.5, "telemetry": telemetry}
-
-            # 4. Long-Legged Doji & Standard Doji (Market Indecision)
-            if body_ratio <= 0.10:
-                telemetry['detected_pattern'] = 'Doji'
-                return {"signal": 0, "thought": "Doji / Indecision Candle — Neutral", "telemetry": telemetry}
-
-            # 5. Bullish Hammer / Pin Bar Rejection
-            if lower_wick >= 0.55 and upper_wick <= 0.22 and body_ratio <= 0.35:
-                vol_boost = v >= avg_vol * 0.9
-                conf = 7.5 if vol_boost else 6.0
-                telemetry['detected_pattern'] = 'Bullish Hammer'
-                return {"signal": 1, "thought": f"Bullish Hammer/Pin Bar (lower wick {lower_wick*100:.0f}%, body {body_ratio*100:.0f}%)", "confidence": conf, "telemetry": telemetry}
-
-            # 6. Bearish Shooting Star / Pin Bar Rejection
-            if upper_wick >= 0.55 and lower_wick <= 0.22 and body_ratio <= 0.35:
-                vol_boost = v >= avg_vol * 0.9
-                conf = 7.5 if vol_boost else 6.0
-                telemetry['detected_pattern'] = 'Bearish Shooting Star'
-                return {"signal": -1, "thought": f"Bearish Shooting Star (upper wick {upper_wick*100:.0f}%, body {body_ratio*100:.0f}%)", "confidence": conf, "telemetry": telemetry}
-
-            # 7. Bullish Marubozu (Extreme Buyer Momentum)
-            if body_ratio >= 0.85 and c > o and rng >= 0.8 * atr:
-                telemetry['detected_pattern'] = 'Bullish Marubozu'
-                return {"signal": 1, "thought": f"Bullish Marubozu Power Candle (body {body_ratio*100:.0f}%)", "confidence": 8.0, "telemetry": telemetry}
-
-            # 8. Bearish Marubozu (Extreme Seller Momentum)
-            if body_ratio >= 0.85 and c < o and rng >= 0.8 * atr:
-                telemetry['detected_pattern'] = 'Bearish Marubozu'
-                return {"signal": -1, "thought": f"Bearish Marubozu Power Candle (body {body_ratio*100:.0f}%)", "confidence": 8.0, "telemetry": telemetry}
-
-            # 9. Bullish Engulfing
-            if prev_c < prev_o and c > o and c >= prev_o and o <= prev_c and body > prev_body * 1.15 and body_ratio > 0.6:
-                telemetry['detected_pattern'] = 'Bullish Engulfing'
-                return {"signal": 1, "thought": f"Bullish Engulfing Pattern ({body:.1f} > prev {prev_body:.1f})", "confidence": 7.5, "telemetry": telemetry}
-
-            # 10. Bearish Engulfing
-            if prev_c > prev_o and c < o and c <= prev_o and o >= prev_c and body > prev_body * 1.15 and body_ratio > 0.6:
-                telemetry['detected_pattern'] = 'Bearish Engulfing'
-                return {"signal": -1, "thought": f"Bearish Engulfing Pattern ({body:.1f} > prev {prev_body:.1f})", "confidence": 7.5, "telemetry": telemetry}
-
-            # 11. Piercing Line (Bullish 2-bar reversal)
-            if prev_c < prev_o and c > o and o <= prev_l and c >= (prev_o + prev_c) / 2.0 and c < prev_o:
-                telemetry['detected_pattern'] = 'Piercing Line'
-                return {"signal": 1, "thought": "Bullish Piercing Line Reversal", "confidence": 7.0, "telemetry": telemetry}
-
-            # 12. Dark Cloud Cover (Bearish 2-bar reversal)
-            if prev_c > prev_o and c < o and o >= prev_h and c <= (prev_o + prev_c) / 2.0 and c > prev_o:
-                telemetry['detected_pattern'] = 'Dark Cloud Cover'
-                return {"signal": -1, "thought": "Bearish Dark Cloud Cover Reversal", "confidence": 7.0, "telemetry": telemetry}
-
-            # 13. Tweezer Bottoms & Tweezer Tops
-            if abs(l - prev_l) <= 0.08 * atr and lower_wick >= 0.40 and prev_lower_wick >= 0.40:
-                telemetry['detected_pattern'] = 'Tweezer Bottom'
-                return {"signal": 1, "thought": "Tweezer Bottom Support Rejection", "confidence": 7.0, "telemetry": telemetry}
-            elif abs(h - prev_h) <= 0.08 * atr and upper_wick >= 0.40 and prev_upper_wick >= 0.40:
-                telemetry['detected_pattern'] = 'Tweezer Top'
-                return {"signal": -1, "thought": "Tweezer Top Resistance Rejection", "confidence": 7.0, "telemetry": telemetry}
-
-            # 14. 3-Bar Patterns (Morning Star / Evening Star)
-            if len(df) >= 3:
-                p2_c, p2_o = float(closes.iloc[-3]), float(opens.iloc[-3])
-                p2_body = abs(p2_c - p2_o)
-                # Morning Star: Bearish -> Small Doji/Star -> Strong Bullish
-                if p2_c < p2_o and prev_body_ratio <= 0.35 and c > o and c >= (p2_o + p2_c) / 2.0:
-                    telemetry['detected_pattern'] = 'Morning Star'
-                    return {"signal": 1, "thought": "Morning Star 3-Bar Reversal Pattern", "confidence": 8.5, "telemetry": telemetry}
-                # Evening Star: Bullish -> Small Doji/Star -> Strong Bearish
-                elif p2_c > p2_o and prev_body_ratio <= 0.35 and c < o and c <= (p2_o + p2_c) / 2.0:
-                    telemetry['detected_pattern'] = 'Evening Star'
-                    return {"signal": -1, "thought": "Evening Star 3-Bar Reversal Pattern", "confidence": 8.5, "telemetry": telemetry}
-
-                # Three White Soldiers & Three Black Crows
-                if c > o and prev_c > prev_o and p2_c > p2_o and body_ratio > 0.60:
-                    if (c - p2_o) >= 1.4 * atr:
-                        telemetry['detected_pattern'] = 'Three White Soldiers'
-                        return {"signal": 1, "thought": "Three White Soldiers Momentum Continuation", "confidence": 8.0, "telemetry": telemetry}
-                elif c < o and prev_c < prev_o and p2_c < p2_o and body_ratio > 0.60:
-                    if (p2_o - c) >= 1.4 * atr:
-                        telemetry['detected_pattern'] = 'Three Black Crows'
-                        return {"signal": -1, "thought": "Three Black Crows Momentum Continuation", "confidence": 8.0, "telemetry": telemetry}
-
-            # 15. Spinning Top / High Wave (Indecision)
-            if body_ratio <= 0.30 and upper_wick >= 0.25 and lower_wick >= 0.25:
-                telemetry['detected_pattern'] = 'Spinning Top'
-                return {"signal": 0, "thought": "Spinning Top / High Wave Indecision — Neutral", "telemetry": telemetry}
-
-            return {"signal": 0, "thought": "Normal / Mixed Candles — Neutral", "telemetry": telemetry}
-
-        except Exception as e:
-            return {"signal": 0, "thought": f"Candle psychology fallback: {e}", "telemetry": {}}
+        """Task-specific OHLCV evidence. The analyzer decorator still adds only its own advisory."""
+        import quantitative_math as qm
+        return qm.part_signal("3", data)
 
     def analyze_candle_psychology(self, current_candle=None, prev1=None, prev2=None):
         if not current_candle or not isinstance(current_candle, dict):
@@ -785,72 +632,25 @@ Provide a concise 1-2 sentence institutional analysis, then end your response wi
             return {'signals': [], 'components': {}, 'mtf_consensus': 0.0}
 
     def _gpu_detect_market_regime(self, df_5min) -> str:
-        """GPU-ACCELERATED MARKET REGIME DETECTION WITH BUG FIXES"""
-        try:
-            if df_5min is None or len(df_5min) < 10:
-                return "NEUTRAL"
-            
-            closes_np = df_5min['close'].dropna().values
-            highs_np = df_5min['high'].dropna().values
-            lows_np = df_5min['low'].dropna().values
-            vols_np = df_5min['volume'].dropna().values if 'volume' in df_5min.columns else None
-            
-            if len(closes_np) < 10:
-                return "NEUTRAL"
-            
-            lookback = min(25, len(closes_np))
-            recent_closes = closes_np[-lookback:]
-            
-            # Linear regression for slope
-            x = np.arange(len(recent_closes))
-            if np.std(recent_closes) > 1e-8:
-                poly = np.polyfit(x, recent_closes, 1)
-                slope_np = poly[0]
-            else:
-                slope_np = 0.0
-                
-            price_range = np.max(recent_closes) - np.min(recent_closes)
-            trend_strength_val = abs(slope_np) / (price_range / lookback + 1e-8) if price_range > 0 else 0.0
-            
-            # Volume confirmation
-            if vols_np is not None and len(vols_np) >= lookback:
-                recent_vols = vols_np[-lookback:]
-                if np.std(recent_vols) > 1e-8:
-                    vol_slope = np.polyfit(x, recent_vols, 1)[0]
-                    vol_confirm = 1.0 if (slope_np * vol_slope > 0) else 0.7
-                else:
-                    vol_confirm = 1.0
-            else:
-                vol_confirm = 1.0
-            trend_strength_val *= vol_confirm
-            
-            # Volatility calculation
-            returns = np.diff(np.log(np.maximum(recent_closes, 1e-8)))
-            volatility_val = float(np.std(returns) * np.sqrt(252)) if len(returns) > 1 else 0.0
-            
-            # Ranging score
-            lookback_20 = min(20, len(highs_np))
-            rec_high = np.max(highs_np[-lookback_20:])
-            rec_low = np.min(lows_np[-lookback_20:])
-            rng = rec_high - rec_low
-            current_pos = (closes_np[-1] - rec_low) / rng if rng > 0 else 0.5
-            oscillation_score_val = 1.0 - abs(current_pos - 0.5) * 2.0
-            
-            # Classification
-            if trend_strength_val > 0.7 and slope_np > 0:
-                return "TRENDING_UP"
-            elif trend_strength_val > 0.7 and slope_np < 0:
-                return "TRENDING_DOWN"
-            elif volatility_val > 0.12:
-                return "VOLATILE"
-            elif oscillation_score_val > 0.75:
-                return "RANGING"
-            else:
-                return "NEUTRAL"
-                
-        except Exception as e:
-            print(f"ERROR GPU Institutional regime detection error: {e}")
+        import quantitative_math as qm
+        features = qm.quantitative_features(df_5min, limit=128)
+        if not features.get('available') or len(features.get('returns', ())) < 8:
             return "NEUTRAL"
+        trend = float(features.get('trend_score', 0.0))
+        state = features.get('volatility_state', {})
+        high_p = float(state.get('high_state_posterior', 0.5))
+        ratio = float(state.get('short_long_ratio', 0.0))
+        close_location = float(features.get('candle', {}).get('close_location', 0.0))
+        persistence = float(features.get('sign_persistence', 0.0))
+        if trend >= 2.0:
+            return "TRENDING_UP"
+        if trend <= -2.0:
+            return "TRENDING_DOWN"
+        if high_p >= 0.90 and ratio >= 1.5:
+            return "VOLATILE"
+        if persistence < 0.45 and abs(close_location) < 0.40:
+            return "RANGING"
+        return "NEUTRAL"
 
     def _calculate_support_resistance_touches(self, highs, lows, closes) -> float:
         """Calculate support/resistance touch frequency"""
@@ -936,88 +736,51 @@ Provide a concise 1-2 sentence institutional analysis, then end your response wi
             return []
 
     def _generate_trend_signals(self, df_5min, regime: str) -> List[Dict]:
-        """Generate trend signals with dynamic period handling"""
         signals = []
         try:
             if df_5min is None or len(df_5min) < 15:
                 return signals
-            
-            closes = df_5min['close'].dropna()
-            if len(closes) < 15:
+            import quantitative_math as qm
+            features = qm.quantitative_features(df_5min, limit=128)
+            if not features.get('available') or len(features.get('returns', ())) < 12:
                 return signals
-                
-            current_price = float(closes.iloc[-1])
-            p_20 = min(20, len(closes))
-            p_50 = min(50, len(closes))
-            p_100 = min(100, len(closes))
-            
-            ma_20 = float(closes.rolling(p_20).mean().iloc[-1])
-            ma_50 = float(closes.rolling(p_50).mean().iloc[-1])
-            ma_100 = float(closes.rolling(p_100).mean().iloc[-1])
-            
-            if any(math.isnan(x) for x in [current_price, ma_20, ma_50, ma_100]):
-                return signals
-                
-            high_20 = float(df_5min['high'].tail(p_20).max())
-            low_20 = float(df_5min['low'].tail(p_20).min())
-            price_range_denom = max(high_20 - low_20, 1e-8)
-            trend_strength = abs(current_price - ma_20) / price_range_denom
-            
-            if current_price > ma_20 >= ma_50 and "UP" in regime and trend_strength > 0.2:
-                signals.append({
-                    'type': 'TREND',
-                    'signal': 'CALL',
-                    'confidence': 7.5,
-                    'reason': f"Institutional Trend Following in {regime} (Strength: {trend_strength:.2f})",
-                    'timestamp': time.time()
-                })
-            elif current_price < ma_20 <= ma_50 and "DOWN" in regime and trend_strength > 0.2:
-                signals.append({
-                    'type': 'TREND',
-                    'signal': 'PUT',
-                    'confidence': 7.5,
-                    'reason': f"Institutional Trend Following in {regime} (Strength: {trend_strength:.2f})",
-                    'timestamp': time.time()
-                })
+            strength = abs(float(features.get('trend_score', 0.0)))
+            velocity = float(features.get('kalman', {}).get('velocity_z', 0.0))
+            change = features.get('change_point', {})
+            significant_change = float(change.get('bic_gain', 0.0)) >= 2.0
+            if velocity >= 1.25 and strength >= 1.25 and significant_change and "UP" in regime:
+                signals.append({'type': 'TREND', 'signal': 'CALL', 'confidence': 7.5,
+                                'reason': f"State-space trend in {regime} (robust strength: {strength:.2f})",
+                                'timestamp': time.time()})
+            elif velocity <= -1.25 and strength >= 1.25 and significant_change and "DOWN" in regime:
+                signals.append({'type': 'TREND', 'signal': 'PUT', 'confidence': 7.5,
+                                'reason': f"State-space trend in {regime} (robust strength: {strength:.2f})",
+                                'timestamp': time.time()})
             return signals
-        except Exception as e:
-            print(f"ERROR Institutional trend signal generation: {e}")
-            return []
+        except Exception:
+            return signals
 
     def _generate_volume_signals(self, df_1min, regime: str) -> List[Dict]:
-        """Generate volume breakout signals safely"""
         signals = []
         try:
             if df_1min is None or len(df_1min) < 10 or 'volume' not in df_1min.columns:
                 return signals
-            
-            closes = df_1min['close'].dropna()
-            vols = df_1min['volume'].dropna()
-            if len(closes) < 5 or len(vols) < 5:
+            import quantitative_math as qm
+            features = qm.quantitative_features(df_1min, limit=128)
+            if not features.get('available') or len(features.get('returns', ())) < 8:
                 return signals
-                
-            curr_vol = float(vols.iloc[-1])
-            p_lookback = min(20, len(vols))
-            avg_vol = float(vols.rolling(p_lookback).mean().iloc[-1])
-            vol_ratio = curr_vol / avg_vol if avg_vol > 0 else 1.0
-            
-            prev_close = float(closes.iloc[-2])
-            curr_close = float(closes.iloc[-1])
-            price_change = (curr_close - prev_close) / prev_close if prev_close > 0 else 0.0
-            
-            vol_confirm = 1.0 if (price_change != 0 and vol_ratio > 1.2) else 0.5
-            if vol_ratio > 1.4 and vol_confirm > 0.8:
-                signals.append({
-                    'type': 'VOLUME',
-                    'signal': 'CALL' if price_change > 0 else 'PUT',
-                    'confidence': min(9.5, 7.0 * vol_confirm * (vol_ratio / 1.5)),
-                    'reason': f"Institutional Volume Breakout (Ratio: {vol_ratio:.2f})",
-                    'timestamp': time.time()
-                })
+            surprise = float(features.get('volume_surprise_robust_z', 0.0))
+            flow = float(features.get('flow_imbalance_proxy', 0.0))
+            latest_return = float(features['returns'][-1])
+            if surprise >= 1.5 and latest_return != 0.0 and latest_return * flow > 0.0 and abs(flow) >= 0.15:
+                confidence = min(9.5, 7.0 * min(surprise / 1.5, 1.5) * min(abs(flow) / 0.3, 1.0))
+                signals.append({'type': 'VOLUME', 'signal': 'CALL' if latest_return > 0 else 'PUT',
+                                'confidence': confidence,
+                                'reason': f"Robust surprise with aligned close-location OHLCV proxy ({surprise:.2f}σ; not tape data)",
+                                'timestamp': time.time()})
             return signals
-        except Exception as e:
-            print(f"ERROR Institutional volume signal generation: {e}")
-            return []
+        except Exception:
+            return signals
 
     def _get_institutional_support_rejection_signals(self, current_candle, psychology, regime: str) -> List[Dict]:
         signals = []

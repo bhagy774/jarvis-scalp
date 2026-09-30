@@ -917,77 +917,9 @@ class TrendEngineGPU:
 
     @part_advisory_entry("part6_trend", data_parameter="data", context_parameter="context")
     def analyze(self, data, context=None):
-        try:
-            if data is None or len(data) < 50:
-                return {"signal": 0, "thought": "Insufficient candles for trend analysis (<50)", "telemetry": {}}
-
-            if pd is not None and isinstance(data, pd.DataFrame):
-                closes = data['close'].tail(50).astype(float)
-                highs  = data['high'].tail(50).astype(float)
-                lows   = data['low'].tail(50).astype(float)
-            else:
-                return {"signal": 0, "thought": "Invalid dataframe", "telemetry": {}}
-
-            current = float(closes.iloc[-1])
-            ema8   = float(closes.ewm(span=8).mean().iloc[-1])
-            ema21  = float(closes.ewm(span=21).mean().iloc[-1])
-            ema50  = float(closes.ewm(span=50).mean().iloc[-1])
-
-            # 1. EMA Spread (Measures divergence between fast and medium moving average)
-            spread = abs(ema8 - ema21) / max(ema21, 1.0)
-
-            # 2. ADX (Directional Movement Index - 14 periods)
-            tr1 = highs - lows
-            tr2 = (highs - closes.shift(1)).abs()
-            tr3 = (lows - closes.shift(1)).abs()
-            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-            atr14 = float(tr.rolling(14).mean().iloc[-1])
-
-            up_move = highs.diff()
-            down_move = -lows.diff()
-            plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-            minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-            plus_di = 100.0 * float(pd.Series(plus_dm, index=highs.index).rolling(14).mean().iloc[-1] / max(atr14, 1e-8))
-            minus_di = 100.0 * float(pd.Series(minus_dm, index=lows.index).rolling(14).mean().iloc[-1] / max(atr14, 1e-8))
-            denom = plus_di + minus_di
-            dx = 100.0 * abs(plus_di - minus_di) / max(denom, 1e-8)
-
-            telemetry = {
-                'ema8': ema8, 'ema21': ema21, 'ema50': ema50,
-                'spread': spread, 'dx': dx, 'plus_di': plus_di, 'minus_di': minus_di
-            }
-
-            # 3. Chop Filter: If spread is tiny (<0.08%) OR ADX < 20, market is in CHOP / RANGE
-            if spread < self.min_spread_threshold or dx < self.min_adx_threshold:
-                thought = f"Chop/Rangebound (DX={dx:.1f} < 20 or Spread={spread*100:.3f}% < 0.08%) — Neutral"
-                return {"signal": 0, "thought": thought, "telemetry": telemetry}
-
-            # 4. Perfect Trend Stacking
-            if current > ema8 > ema21 > ema50 and plus_di > minus_di:
-                confidence = min(10.0, max(2.0, (dx / 25.0) * 8.0))
-                thought = f"Strong Uptrend (Bullish Stack: Price>{ema8:.0f}>{ema21:.0f}>{ema50:.0f}, DX={dx:.1f})"
-                return {"signal": 1, "thought": thought, "telemetry": telemetry, "confidence": confidence}
-
-            elif current < ema8 < ema21 < ema50 and minus_di > plus_di:
-                confidence = min(10.0, max(2.0, (dx / 25.0) * 8.0))
-                thought = f"Strong Downtrend (Bearish Stack: Price<{ema8:.0f}<{ema21:.0f}<{ema50:.0f}, DX={dx:.1f})"
-                return {"signal": -1, "thought": thought, "telemetry": telemetry, "confidence": confidence}
-
-            # 5. Moderate Trend (Price leading EMA8 and EMA21)
-            elif ema8 > ema21 and current > ema21 and plus_di > minus_di and spread >= 0.0012:
-                thought = f"Moderate Uptrend (EMA8>{ema21:.0f}, DX={dx:.1f})"
-                return {"signal": 1, "thought": thought, "telemetry": telemetry, "confidence": 5.0}
-
-            elif ema8 < ema21 and current < ema21 and minus_di > plus_di and spread >= 0.0012:
-                thought = f"Moderate Downtrend (EMA8<{ema21:.0f}, DX={dx:.1f})"
-                return {"signal": -1, "thought": thought, "telemetry": telemetry, "confidence": 5.0}
-
-            # 6. Tangled or Conflicting Indicators -> Neutral
-            return {"signal": 0, "thought": f"Conflicting EMAs/Momentum (DX={dx:.1f}) — Neutral", "telemetry": telemetry}
-
-        except Exception as e:
-            return {"signal": 0, "thought": f"Trend analysis fallback: {e}", "telemetry": {}}
+        """Task-specific OHLCV evidence. The analyzer decorator still adds only its own advisory."""
+        import quantitative_math as qm
+        return qm.part_signal("6", data)
 
 
 # ==================== INTEGRATION CLASS ====================

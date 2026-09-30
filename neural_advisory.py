@@ -21,7 +21,7 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 FORMAT = "jarvis-advisory-task-model"
 FORMAT_VERSION = 3
-FEATURE_SCHEMA = "jarvis-task-specific-features-v3"
+FEATURE_SCHEMA = "jarvis-task-specific-features-v4-quantitative"
 from neural_parts import PARTS, FEATURE_NAMES, MODEL_SPECS, TASKS, prepare_features
 from neural_parts.common import TIMEFRAMES, mtf_signal_matrix as _mtf_signal_matrix
 _TIMEFRAME_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400}
@@ -327,6 +327,18 @@ def _validate_closed_series(data: Any, interval: int) -> None:
     if any(str(value).strip().lower() not in ("1", "true", "yes")
            for value in closed_values):
         raise ValueError("forming_candle_rejected")
+    # Reject non-finite raw OHLCV explicitly before quantitative projection so
+    # malformed bars cannot be misreported as merely insufficient history.
+    if isinstance(data, (list, tuple)):
+        for row in data[-64:]:
+            for field in ("open", "high", "low", "close", "volume"):
+                raw = row.get(field, 0.0)
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError("invalid_ohlcv") from exc
+                if not math.isfinite(value):
+                    raise ValueError("non_finite_ohlcv")
 
 
 def _softmax(logits: Sequence[float]) -> Tuple[float, ...]:
