@@ -1,3 +1,5 @@
+from neural_advisory import part_advisory_entry
+
 # ==================== GPU-ACCELERATED AI LEARNING & ADAPTIVE STRATEGY OPTIMIZATION ENGINE ====================
 # DEEPSEEK AI-POWERED REWRITE - INSTITUTIONAL GRADE REINFORCEMENT LEARNING
 # LINUX UBUNTU + GTX 1650 CUDA + i5 10th Gen OPTIMIZED
@@ -153,6 +155,7 @@ class OrderflowEngineGPU:
     def __init__(self):
         self.device = torch.device('cuda' if (TORCH_AVAILABLE and torch.cuda.is_available()) else 'cpu')
 
+    @part_advisory_entry("part9_orderflow", data_parameter="data", context_parameter="context")
     def analyze(self, data: Any, context: Optional[Dict] = None) -> Dict[str, Any]:
         """
         Main orderflow analysis called by Part9Orderflow in Jarvis.

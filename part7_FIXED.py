@@ -1,3 +1,5 @@
+from neural_advisory import part_advisory_entry
+
 # ---- Helpers inserted for Part-7 Fix ----
 from collections import deque
 from typing import Dict, List, Optional, Any, Tuple
@@ -382,6 +384,7 @@ class VolatilityEngineGPU:
     def __init__(self):
         self.device = torch.device('cuda' if (TORCH_AVAILABLE and torch.cuda.is_available()) else 'cpu')
 
+    @part_advisory_entry("part7_volatility", data_parameter="data", context_parameter="context")
     def analyze(self, data: Any, context: Optional[Dict] = None) -> Dict[str, Any]:
         """
         Advanced Math: Includes Hidden Markov Model (HMM) proxy for regime detection
