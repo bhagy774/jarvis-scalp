@@ -502,11 +502,31 @@ Follow the tag with a 1-sentence risk justification.
     
     # ==================== INTELLIGENT ORDER EXECUTION ====================
     
-    async def execute_trade(self, signal_type: str, confidence: float, current_bid: float, current_ask: float) -> Dict:
-        """
-        Execute trade with GPU-accelerated risk management
-        """
+    async def execute_trade(self, signal_type: str, confidence: float, current_bid: float, current_ask: float, *,
+                            central_decision=None, central_approval=None, part_results=None,
+                            part7_gate=None, symbol=None, exchange=None, contract=None,
+                            instrument_id=None, market_type=None, snapshot_version=None) -> Dict:
+        """Execute only with current Jarvis central authority and scope."""
         try:
+            from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval
+            central_direction = {'CALL': 'BUY', 'BUY': 'BUY', 'PUT': 'SELL', 'SELL': 'SELL'}.get(str(signal_type).upper())
+            if not isinstance(central_decision, dict) or central_decision.get('approved') is not True:
+                return {'status': 'rejected', 'reason': 'Jarvis central strategy approval is required'}
+            if central_direction is None or str(central_decision.get('direction', '')).upper() != central_direction:
+                return {'status': 'rejected', 'reason': 'Jarvis central direction mismatch'}
+            recomputed = evaluate_central_strategy(
+                part_results, part7_gate, confidence=central_decision.get('confidence'),
+                expected_symbol=symbol,
+            )
+            if not recomputed.get('approved') or recomputed.get('direction') != central_direction:
+                return {'status': 'rejected', 'reason': 'Jarvis central evidence or Part7 gate rejected entry'}
+            valid, reason = validate_entry_approval(
+                central_approval, direction=central_direction, symbol=symbol, exchange=exchange,
+                contract=contract, instrument_id=instrument_id, market_type=market_type,
+                snapshot_version=snapshot_version, confidence=central_decision.get('confidence'),
+            )
+            if not valid:
+                return {'status': 'rejected', 'reason': reason}
             if confidence < self.risk_config['confidence_threshold']:
                 return {'status': 'rejected', 'reason': 'Low confidence'}
             
@@ -1196,7 +1216,37 @@ class AdvancedTradeExecutionSystem:
             
             signal_type = signal.get('signal')
             confidence = signal.get('confidence', 0.0)
-            
+            # Legacy Part12 is not a strategy authority. Require Jarvis evidence,
+            # Part7's explicit clear gate, and the complete instrument scope.
+            from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval
+            central_decision = signal.get('central_strategy_decision')
+            central_approval = signal.get('central_strategy_approval')
+            part_results = signal.get('part_results')
+            part7_gate = signal.get('part7_gate')
+            central_direction = {'CALL': 'BUY', 'BUY': 'BUY', 'PUT': 'SELL', 'SELL': 'SELL'}.get(str(signal_type).upper())
+            identity = market_data.get('execution_identity') or market_data.get('identity') or {}
+            scope = {
+                'symbol': market_data.get('symbol') or identity.get('symbol'),
+                'exchange': market_data.get('exchange') or identity.get('venue'),
+                'contract': market_data.get('contract') or identity.get('symbol'),
+                'instrument_id': market_data.get('instrument_id') or identity.get('instrument_id'),
+                'market_type': market_data.get('market_type') or identity.get('market_type'),
+                'snapshot_version': market_data.get('snapshot_version'),
+            }
+            if not isinstance(central_decision, dict) or central_decision.get('approved') is not True or central_direction is None or str(central_decision.get('direction', '')).upper() != central_direction:
+                return {'status': 'rejected', 'reason': 'Jarvis central strategy approval is required'}
+            recomputed = evaluate_central_strategy(
+                part_results, part7_gate, confidence=central_decision.get('confidence'),
+                expected_symbol=scope['symbol'],
+            )
+            if not recomputed.get('approved') or recomputed.get('direction') != central_direction:
+                return {'status': 'rejected', 'reason': 'Jarvis central evidence or Part7 gate rejected entry'}
+            valid, reason = validate_entry_approval(
+                central_approval, direction=central_direction, **scope,
+                confidence=central_decision.get('confidence'),
+            )
+            if not valid:
+                return {'status': 'rejected', 'reason': reason}
             if confidence < self.confidence_threshold:
                 return {'status': 'rejected', 'reason': f'Low confidence: {confidence:.2f}'}
             
@@ -1230,7 +1280,12 @@ class AdvancedTradeExecutionSystem:
                 signal_type,
                 confidence,
                 market_data['bid'],
-                market_data['ask']
+                market_data['ask'],
+                central_decision=central_decision,
+                central_approval=central_approval,
+                part_results=part_results,
+                part7_gate=part7_gate,
+                **scope,
             )
             
             # Log execution
@@ -1525,13 +1580,13 @@ class ConfidenceEngineGPU:
             if any(k in thought for k in ["error", "offline", "fallback", "missing"]):
                 continue
 
-            # MTF Penalty: If signal is 1m noise (MTF: 1/4), treat it as Neutral (chop)
+            # MTF annotation accepts the live 8-frame denominator and older /4 telemetry.
             import re
-            mtf_match = re.search(r'mtf: (\d)/4', thought)
+            mtf_match = re.search(r'mtf: (\d+)/(\d+)', thought)
             if mtf_match and sig != 0:
-                mtf_agree = int(mtf_match.group(1))
-                if mtf_agree < 2:
-                    sig = 0  # Force to Neutral because higher timeframes don't support it
+                mtf_agree, mtf_total = int(mtf_match.group(1)), int(mtf_match.group(2))
+                if mtf_total > 0 and mtf_agree / mtf_total < 0.5:
+                    sig = 0  # Low cross-frame support remains neutral.
 
             w = self.weights.get(name, 1.0)
             total_weight_den += w  # FULL weight goes to denominator regardless of signal strength
@@ -1618,6 +1673,41 @@ class ConfidenceEngineGPU:
             "weighted_dissent": round(w_dissent, 2),
             "confluence_ratio": round(confluence_ratio, 2)
         }
+
+    def analyze_multi_timeframe(self, results_by_timeframe: Dict[str, Any]) -> Dict[str, Any]:
+        """Score confidence independently on all eight native frame result sets."""
+        timeframes = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+        tf_weights = {"1m": 1.0, "3m": 1.5, "5m": 2.0, "15m": 3.0,
+                      "30m": 4.0, "1h": 5.0, "2h": 6.0, "4h": 7.0}
+        if not isinstance(results_by_timeframe, dict) or set(results_by_timeframe) != set(timeframes):
+            return {"confidence": 10, "thought": "Part12 MTF evidence incomplete",
+                    "data_status": "error", "timeframe_coverage": []}
+        required_parts = set(self.weights)
+        per_timeframe = {}
+        weighted_confidence = 0.0
+        for timeframe in timeframes:
+            parts = results_by_timeframe.get(timeframe)
+            if not isinstance(parts, dict) or not required_parts.issubset(parts):
+                return {"confidence": 10, "thought": f"Part12 {timeframe} evidence incomplete",
+                        "data_status": "error", "timeframe_coverage": list(per_timeframe)}
+            result = self.analyze(parts)
+            try:
+                frame_confidence = float(result.get("confidence"))
+            except (TypeError, ValueError, OverflowError):
+                return {"confidence": 10, "thought": f"Part12 {timeframe} confidence malformed",
+                        "data_status": "error", "timeframe_coverage": list(per_timeframe)}
+            if not math.isfinite(frame_confidence) or not 0 <= frame_confidence <= 100:
+                return {"confidence": 10, "thought": f"Part12 {timeframe} confidence invalid",
+                        "data_status": "error", "timeframe_coverage": list(per_timeframe)}
+            per_timeframe[timeframe] = result
+            weighted_confidence += tf_weights[timeframe] * frame_confidence
+        total_weight = sum(tf_weights.values())
+        aggregate = int(round(weighted_confidence / total_weight))
+        return {"confidence": aggregate,
+                "thought": f"Part12 native MTF confidence {aggregate}% from 8/8 frames",
+                "data_status": "valid", "timeframe": "aggregate",
+                "timeframe_coverage": list(timeframes), "timeframe_results": per_timeframe,
+                "timeframe_weights": dict(tf_weights)}
 
 
 # ==================== MAIN EXECUTION ====================

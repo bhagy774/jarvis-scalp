@@ -8,10 +8,55 @@ from jarvis_multicoin_execution import (
     CandidateRejected, DeterministicPaperAdapter, PortfolioCoordinator,
     candidate_from_analysis,
 )
+from jarvis_strategy_approval import REQUIRED_TIMEFRAMES, evaluate_mtf_central_strategy, make_entry_approval
 
 
 NOW = 1_800_000_000.0
 POLICIES = {"BTC": "btc-paper-v1", "ETH": "eth-paper-v1", "SOL": "sol-paper-v1"}
+
+
+def bullish_evidence():
+    return {
+        "part1_breakout": {"signal": 1, "thought": "bullish breakout"},
+        "part2_zone": {"signal": 1, "thought": "bullish demand zone"},
+        "part3_psychology": {"signal": 1, "thought": "bullish candle"},
+        "part4_volume": {"signal": 1, "thought": "volume confirmation"},
+        "part5_ml": {"signal": 1, "thought": "model confirms"},
+        "part6_trend": {"signal": 1, "thought": "trend bullish"},
+        "part7_volatility": {"signal": 1, "thought": "volatility expansion"},
+        "part8_structure": {"signal": 1, "thought": "structure bullish"},
+        "part9_orderflow": {"signal": 1, "thought": "orderflow bullish"},
+        "part10_candlestats": {"signal": 1, "thought": "candlestats bullish"},
+    }
+
+
+def part7_gate(symbol):
+    return {
+        "symbol": symbol, "entry_blocked": False, "risk_veto": False,
+        "status": "ok", "data_status": "valid", "timeframe": "aggregate",
+        "blocked_timeframes": [], "veto_timeframes": [],
+        "timeframe_results": {
+            tf: {"symbol": symbol, "timeframe": tf, "status": "neutral",
+                 "data_status": "valid", "entry_blocked": False, "risk_veto": False}
+            for tf in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+        },
+    }
+
+
+def timeframe_evidence(symbol):
+    result = {}
+    for timeframe in REQUIRED_TIMEFRAMES:
+        row = {}
+        for name, item in bullish_evidence().items():
+            scoped = {**item, "symbol": symbol, "timeframe": timeframe}
+            if name == "part7_volatility":
+                scoped.update({"signal": 0, "thought": "neutral volatility", "status": "neutral",
+                               "data_status": "valid", "entry_blocked": False, "risk_veto": False})
+            if name == "part2_zone":
+                scoped["native_timeframe"] = timeframe
+            row[name] = scoped
+        result[timeframe] = row
+    return result
 
 
 def analysis(symbol="BTCUSDT", product_id="101", *, plan=None, status="COMPLETE", fetched=NOW-10, completed=NOW-2):
@@ -20,12 +65,26 @@ def analysis(symbol="BTCUSDT", product_id="101", *, plan=None, status="COMPLETE"
         if asset.endswith(quote):
             asset = asset[:-len(quote)]
             break
+    identity = {"venue": "delta", "market_type": "perpetual", "instrument_id": product_id, "symbol": symbol}
+    evidence = bullish_evidence()
+    native_evidence = timeframe_evidence(symbol)
+    gate = part7_gate(symbol)
+    decision = evaluate_mtf_central_strategy(native_evidence, gate, confidence=80, expected_symbol=symbol)
+    approval = make_entry_approval(
+        decision, direction="BUY", symbol=symbol, exchange="delta", contract=symbol,
+        instrument_id=product_id, market_type="perpetual", analysis_symbol=symbol,
+        analysis_exchange="delta", snapshot_version="snap-abc",
+        analysis_timestamp=completed-1, confidence=80,
+    )
     return {
         "status": status, "scope": "parts1-12-analysis-only", "analysis_only": True,
         "decision_authority": "none", "execution_eligible": False,
-        "request_identity": {"venue": "delta", "market_type": "perpetual", "instrument_id": product_id, "symbol": symbol},
+        "request_identity": identity, "execution_identity": identity,
+        "parts_by_timeframe": native_evidence,
         "snapshot_version": "snap-abc", "snapshot_fetched_at": fetched,
         "analysis_completed_at": completed, "freshness_status": "FRESH",
+        "central_strategy_decision": decision, "central_strategy_evidence": evidence,
+        "central_strategy_approval": approval, "part7_gate": gate,
         "execution_plan": plan if plan is not None else {
             "timeframe": "5m", "decision_timestamp": NOW-3, "reference_price_timestamp": NOW-3,
             "reference_price": 100.0, "max_slippage_pct": 0.1, "max_chase_pct": 0.25,
@@ -72,8 +131,18 @@ def test_candidate_contract_requires_all_explicit_fields_and_asset_policy():
     contract_plan = {**analysis()["execution_plan"], "size_unit": "contracts", "contract_multiplier": 10.0, "risk_notional": 20.0}
     contract_candidate = candidate_from_analysis(analysis(plan=contract_plan), policy_registry=POLICIES, now=NOW)
     assert contract_candidate.notional == 1000.0 and contract_candidate.risk_notional == 20.0
+    zone_veto = analysis()
+    zone_veto["parts_by_timeframe"]["3m"]["part2_zone"].update({
+        "signal": -1, "thought": "resistance zone", "symbol": "BTCUSDT",
+        "timeframe": "3m", "native_timeframe": "3m",
+    })
+    wrong_frame = analysis()
+    wrong_frame["parts_by_timeframe"]["4h"]["part6_trend"]["symbol"] = "ETHUSDT"
     for bad_result, policies in [
         (analysis(status="PARTIAL"), POLICIES),
+        (zone_veto, POLICIES),
+        ({**analysis(), "parts_by_timeframe": {}}, POLICIES),
+        (wrong_frame, POLICIES),
         ({**analysis(), "snapshot_fetched_at": NOW-500}, POLICIES),
         ({**analysis(), "execution_plan": None}, POLICIES),
         ({**analysis(), "request_identity": {"venue": "delta", "symbol": "BTCUSDT"}}, POLICIES),
@@ -193,6 +262,12 @@ def test_live_engine_paper_handoff_rejects_native_analysis_but_accepts_explicit_
     import jarvis_FIXED as jarvis
 
     engine = object.__new__(jarvis.LiveTradingEngine)
+    engine.paper_open_trades = []
+    engine._dashboard_events = []
+    assert engine._open_paper_trade(
+        'CALL', 100.0, 80, 'SCALP', 101.0, 102.0, 99.0, symbol='BTCUSDT'
+    ) is None
+    assert engine.paper_open_trades == []
     engine.multicoin_paper_coordinator = coordinator(tmp_path)
     engine.multicoin_paper_adapter = DeterministicPaperAdapter()
     engine._multicoin_paper_policies = POLICIES
