@@ -1,3 +1,5 @@
+from neural_advisory import part_advisory_entry
+
 # ==============================================================================
 # JARVIS PART 3 - INSTITUTIONAL SWING/SCALP TRADING ENGINE (GPU-OPTIMIZED & FIXED)
 # Fully hardened against hidden bugs, NaN/Inf issues, PyTorch compatibility,
@@ -297,6 +299,7 @@ class CandlePsychologyMasterGPU:
         else:
             self.device = 'cpu'
 
+    @part_advisory_entry("part3_psychology", data_parameter="data", context_parameter="context")
     def analyze(self, data, context=None):
         try:
             if data is None or len(data) < 15:

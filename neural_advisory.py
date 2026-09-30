@@ -1,15 +1,16 @@
-"""Shared bounded runtime validation/CPU-kernel for twelve task-specific models.
+"""Bounded advisory runtime for twelve task-specific, identity-bound models.
 
-Part-specific features, architecture contracts, heads and targets are versioned
-separately per task. Runtime has no PyTorch/CUDA/network/model-construction path.
-Only validated local JSON weights can produce diagnostic, never-authoritative
-advisories; central Jarvis policy retains all strategy and execution authority.
+CPU inference is the default. PyTorch/CUDA is imported only when explicitly
+requested, and every result discloses the actual execution device or fallback.
+Only validated local JSON weights can produce advisory-only outputs.
 """
 from __future__ import annotations
 
 from collections import OrderedDict
 from datetime import datetime, timezone
 import hashlib
+import inspect
+from functools import wraps
 import json
 import math
 import os
@@ -26,15 +27,19 @@ from neural_parts import PARTS, FEATURE_NAMES, MODEL_SPECS, TASKS, prepare_featu
 from neural_parts.common import TIMEFRAMES, mtf_signal_matrix as _mtf_signal_matrix
 _TIMEFRAME_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400}
 _MAX_ARTIFACT_BYTES = 128 * 1024
-_MAX_ARTIFACTS = 16
+_MAX_ARTIFACTS = 16             # CPU metadata/weights only; never a default GPU-resident set
+_MAX_GPU_CACHED_MODELS = 1       # One small task model resident on CUDA at a time
 _MAX_PREDICTIONS = 256
 # Re-train rather than keep using a predictor whose source history is too old.
 _MAX_TRAINING_DATA_AGE_SECONDS = 90 * 24 * 60 * 60
 _MAX_NUMERIC_ARTIFACT_VALUE = 1_000_000.0
 _LOCK = threading.RLock()
-_INFERENCE_SLOT = threading.BoundedSemaphore(1)
+_GPU_LOCK = threading.RLock()
+_INFERENCE_SLOT = threading.BoundedSemaphore(1)  # serializes CPU/CUDA inference
 _ARTIFACT_CACHE: "OrderedDict[Tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
 _PREDICTION_CACHE: "OrderedDict[Tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
+_GPU_MODEL_CACHE_KEY: Optional[Tuple[Any, ...]] = None
+_GPU_MODEL_CACHE_LAYERS: Optional[Tuple[Any, ...]] = None
 
 
 def feature_vector(part_id: str, data: Any) -> Tuple[float, ...]:
@@ -239,7 +244,8 @@ def _load_artifact(path: Path, part_id: str, identity: Mapping[str, str]) -> Dic
     if (training["validation_accuracy"] < training["validation_majority_accuracy"] + 0.02
             or training["test_accuracy"] < training["test_majority_accuracy"] + 0.02):
         raise ValueError("artifact_out_of_sample_gate_failed")
-    model = {"mean": mean, "std": std, "layers": tuple(parsed_layers), "training": training}
+    model = {"mean": mean, "std": std, "layers": tuple(parsed_layers),
+             "training": training, "artifact_cache_key": key}
     with _LOCK:
         _ARTIFACT_CACHE[key] = model
         _ARTIFACT_CACHE.move_to_end(key)
@@ -320,7 +326,103 @@ def _softmax(logits: Sequence[float]) -> Tuple[float, ...]:
     return tuple(x / den for x in exps)
 
 
-def _infer(model: Mapping[str, Any], vector: Sequence[float], part_id: str) -> Tuple[float, ...]:
+def _device_config() -> Tuple[str, bool, Optional[str]]:
+    raw = os.environ.get("JARVIS_NEURAL_DEVICE")
+    if raw is None:
+        raw = "cuda" if os.environ.get("JARVIS_NEURAL_GPU", "0") == "1" else "cpu"
+    requested = str(raw).strip().lower()
+    strict = os.environ.get("JARVIS_NEURAL_REQUIRE_GPU", "0") == "1"
+    if strict:
+        requested = "cuda"
+    if requested not in ("cpu", "cuda"):
+        return requested, strict, "invalid_device_configuration"
+    return requested, strict, None
+
+
+def _resolve_device() -> Tuple[Dict[str, Any], Any]:
+    """Resolve actual compute without allocating model tensors; CPU default imports no Torch."""
+    requested, strict, config_error = _device_config()
+    common = {"requested_device": requested, "strict_gpu": strict,
+              "gpu_model_cache_limit": _MAX_GPU_CACHED_MODELS, "max_concurrent_inferences": 1}
+    if config_error:
+        return {**common, "inference_device": "unavailable", "device_name": None,
+                "fallback_reason": config_error}, None
+    if requested == "cpu":
+        return {**common, "inference_device": "cpu", "device_name": "CPU",
+                "fallback_reason": None}, None
+    try:
+        import torch  # deliberately lazy: do not import/initialize CUDA in default CPU mode
+    except Exception:
+        reason = "pytorch_cuda_unavailable"
+        return {**common, "inference_device": "unavailable" if strict else "cpu",
+                "device_name": None, "fallback_reason": reason}, None
+    try:
+        if not torch.cuda.is_available():
+            reason = "cuda_device_unavailable"
+            return {**common, "inference_device": "unavailable" if strict else "cpu",
+                    "device_name": None, "fallback_reason": reason}, torch
+        device = torch.device("cuda:0")
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        except TypeError:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+        except Exception:
+            # No reliable free-memory telemetry means do not allocate on CUDA.
+            reason = "cuda_memory_status_unavailable"
+            return {**common, "inference_device": "unavailable" if strict else "cpu",
+                    "device_name": None, "fallback_reason": reason}, torch
+        try:
+            min_free_mb = int(os.environ.get("JARVIS_NEURAL_GPU_MIN_FREE_MB", "256"))
+        except (TypeError, ValueError):
+            min_free_mb = 256
+        min_free_mb = max(64, min(min_free_mb, 2048))
+        free_mb, total_mb = int(free_bytes // (1024 * 1024)), int(total_bytes // (1024 * 1024))
+        if free_mb < min_free_mb:
+            reason = "cuda_free_memory_below_safety_floor"
+            return {**common, "inference_device": "unavailable" if strict else "cpu",
+                    "device_name": None, "gpu_free_mb": free_mb, "gpu_total_mb": total_mb,
+                    "fallback_reason": reason}, torch
+        try:
+            name = str(torch.cuda.get_device_name(device))
+        except Exception:
+            name = "CUDA device 0"
+        return {**common, "inference_device": "cuda:0", "device_name": name,
+                "gpu_free_mb": free_mb, "gpu_total_mb": total_mb, "fallback_reason": None}, torch
+    except Exception:
+        reason = "cuda_runtime_unavailable"
+        return {**common, "inference_device": "unavailable" if strict else "cpu",
+                "device_name": None, "fallback_reason": reason}, torch
+
+
+def get_neural_runtime_status() -> Dict[str, Any]:
+    """Read-only device/capacity status; CUDA is probed only when explicitly requested."""
+    status, _ = _resolve_device()
+    return dict(status)
+
+
+def _gpu_layers(model: Mapping[str, Any], torch: Any) -> Tuple[Any, ...]:
+    """Materialize only one artifact's tiny tensors on CUDA; callers hold the inference slot."""
+    global _GPU_MODEL_CACHE_KEY, _GPU_MODEL_CACHE_LAYERS
+    key = model.get("artifact_cache_key")
+    with _GPU_LOCK:
+        if key == _GPU_MODEL_CACHE_KEY and _GPU_MODEL_CACHE_LAYERS is not None:
+            return _GPU_MODEL_CACHE_LAYERS
+        # Drop references to a prior Part model before loading another. This is
+        # intentionally a one-model cache even though the CPU artifact cache is larger.
+        _GPU_MODEL_CACHE_KEY = None
+        _GPU_MODEL_CACHE_LAYERS = None
+        torch.set_num_threads(1)
+        device = torch.device("cuda:0")
+        created = []
+        for weights, bias, activation in model["layers"]:
+            created.append((torch.tensor(weights, dtype=torch.float32, device=device),
+                            torch.tensor(bias, dtype=torch.float32, device=device), activation))
+        _GPU_MODEL_CACHE_KEY = key
+        _GPU_MODEL_CACHE_LAYERS = tuple(created)
+        return _GPU_MODEL_CACHE_LAYERS
+
+
+def _cpu_forward(model: Mapping[str, Any], vector: Sequence[float]) -> list[float]:
     x = [max(-8.0, min(8.0, (v - m) / s)) for v, m, s in zip(vector, model["mean"], model["std"])]
     for weights, bias, activation in model["layers"]:
         x = [sum(wi * xi for wi, xi in zip(row, x)) + b for row, b in zip(weights, bias)]
@@ -332,23 +434,79 @@ def _infer(model: Mapping[str, Any], vector: Sequence[float], part_id: str) -> T
             x = [math.tanh(v) for v in x]
         elif activation != "linear":
             raise ValueError("unsupported_artifact_activation")
+    return x
+
+
+def _infer(model: Mapping[str, Any], vector: Sequence[float], part_id: str,
+           device_status: Optional[Mapping[str, Any]] = None, torch_module: Any = None) -> Tuple[Tuple[float, ...], Dict[str, Any]]:
+    status = dict(device_status or _resolve_device()[0])
+    strict = bool(status.get("strict_gpu"))
+    raw = None
+    if status.get("inference_device") == "cuda:0":
+        try:
+            torch = torch_module
+            if torch is None:
+                import torch as torch_local
+                torch = torch_local
+            layers = _gpu_layers(model, torch)
+            normalized = [max(-8.0, min(8.0, (v - m) / s))
+                          for v, m, s in zip(vector, model["mean"], model["std"])]
+            with torch.inference_mode():
+                x = torch.tensor(normalized, dtype=torch.float32, device=torch.device("cuda:0"))
+                for weights, bias, activation in layers:
+                    x = torch.matmul(x, weights.t()) + bias
+                    if activation == "relu":
+                        x = torch.relu(x)
+                    elif activation == "tanh":
+                        x = torch.tanh(x)
+                    elif activation != "linear":
+                        raise ValueError("unsupported_artifact_activation")
+                raw = x.detach().cpu().tolist()
+            if not all(math.isfinite(float(v)) for v in raw):
+                raise ValueError("non_finite_inference")
+        except Exception as exc:
+            global _GPU_MODEL_CACHE_KEY, _GPU_MODEL_CACHE_LAYERS
+            with _GPU_LOCK:
+                _GPU_MODEL_CACHE_KEY = None
+                _GPU_MODEL_CACHE_LAYERS = None
+            try:
+                if torch_module is not None and torch_module.cuda.is_available():
+                    torch_module.cuda.empty_cache()
+            except Exception:
+                pass
+            if strict:
+                raise ValueError("gpu_required_inference_failed") from exc
+            raw = _cpu_forward(model, vector)
+            status["inference_device"] = "cpu"
+            status["device_name"] = "CPU fallback"
+            status["fallback_reason"] = "cuda_inference_failed"
+    elif status.get("inference_device") == "unavailable":
+        raise ValueError("gpu_required_unavailable" if strict else "neural_device_unavailable")
+    else:
+        raw = _cpu_forward(model, vector)
     spec = MODEL_SPECS[part_id]
     if spec["kind"] == "sigmoid":
-        if len(x) != 1:
+        if len(raw) != 1:
             raise ValueError("binary_head_shape_invalid")
-        z = max(-80.0, min(80.0, x[0]))
+        z = max(-80.0, min(80.0, float(raw[0])))
         probability_like_score = 1.0 / (1.0 + math.exp(-z))
-        return (1.0 - probability_like_score, probability_like_score)
-    scores = _softmax(x)
-    if len(scores) != len(spec["labels"]):
-        raise ValueError("classification_head_shape_invalid")
-    return scores
-
+        scores = (1.0 - probability_like_score, probability_like_score)
+    else:
+        scores = _softmax([float(v) for v in raw])
+        if len(scores) != len(spec["labels"]):
+            raise ValueError("classification_head_shape_invalid")
+    return scores, status
 
 def predict_advisory(data: Any, part_id: str, context: Optional[Mapping[str, Any]] = None,
                      *, now: Optional[float] = None, artifact_dir: Optional[str] = None) -> Dict[str, Any]:
     """Return an explicit status; unavailable/malformed artifacts never infer."""
     c = context if isinstance(context, Mapping) else {}
+    device_status, torch_module = _resolve_device()
+    if device_status.get("inference_device") == "unavailable":
+        return {"status": "unavailable",
+                "reason": str(device_status.get("fallback_reason") or "neural_device_unavailable"),
+                "requested_device": device_status.get("requested_device"),
+                "inference_device": "unavailable"}
     if part_id not in FEATURE_NAMES:
         return {"status": "unavailable", "reason": "unknown_part_id"}
     identity = _identity(c)
@@ -419,7 +577,7 @@ def predict_advisory(data: Any, part_id: str, context: Optional[Mapping[str, Any
                 if cached is not None:
                     _PREDICTION_CACHE.move_to_end(cache_key)
                     return dict(cached)
-            scores = _infer(model, vector, part_id)
+            scores, execution_status = _infer(model, vector, part_id, device_status, torch_module)
             spec = MODEL_SPECS[part_id]
             labels = spec["labels"]
             max_score = max(scores)
@@ -430,6 +588,12 @@ def predict_advisory(data: Any, part_id: str, context: Optional[Mapping[str, Any
                       "scores_uncalibrated": {label: scores[i] for i, label in enumerate(labels)},
                       "head_kind": spec["kind"],
                       "role": "advisory_only_no_execution_authority",
+                      "requested_device": execution_status.get("requested_device"),
+                      "inference_device": execution_status.get("inference_device"),
+                      "device_name": execution_status.get("device_name"),
+                      "gpu_free_mb": execution_status.get("gpu_free_mb"),
+                      "gpu_total_mb": execution_status.get("gpu_total_mb"),
+                      "fallback_reason": execution_status.get("fallback_reason"),
                       "model_version": str(model["training"].get("model_version", "3")),
                       "task_output": TASKS[part_id].interpret_scores(scores, prediction)}
             if part_id == "part11_fusion":
@@ -446,6 +610,34 @@ def predict_advisory(data: Any, part_id: str, context: Optional[Mapping[str, Any
         reason = str(exc) if str(exc) and re.fullmatch(r"[a-zA-Z0-9_-]{1,96}", str(exc)) else "artifact_or_feature_validation_failed"
         return {"status": "unavailable", "reason": reason}
 
+
+def part_advisory_entry(part_id: str, *, data_parameter: str = "data",
+                        context_parameter: str = "context",
+                        evidence_context_key: Optional[str] = None):
+    """Decorate an original Part analyzer entry so it owns its advisory call.
+
+    The deterministic function runs first and its result fields are copied without
+    edits. MTF Parts 11/12 take their task evidence from the explicitly named
+    context envelope. A pre-existing advisory is not recomputed or overwritten.
+    """
+    if part_id not in FEATURE_NAMES:
+        raise ValueError("unknown_part_id")
+    def decorate(function):
+        signature = inspect.signature(function)
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            bound = signature.bind_partial(*args, **kwargs)
+            result = function(*args, **kwargs)
+            if not isinstance(result, dict) or "neural_advisory" in result:
+                return result
+            context_value = bound.arguments.get(context_parameter)
+            context = dict(context_value) if isinstance(context_value, Mapping) else {}
+            data = context.get(evidence_context_key) if evidence_context_key else bound.arguments.get(data_parameter)
+            out = dict(result)
+            out["neural_advisory"] = predict_advisory(data, part_id, context)
+            return out
+        return wrapped
+    return decorate
 
 def annotate_part_result(result: Any, data: Any, part_id: str,
                          context: Optional[Mapping[str, Any]] = None,
@@ -480,6 +672,10 @@ def not_applicable_result(part_id: str) -> Dict[str, str]:
 
 def clear_caches() -> None:
     """Test/support hook; caches are bounded regardless of caller use."""
+    global _GPU_MODEL_CACHE_KEY, _GPU_MODEL_CACHE_LAYERS
     with _LOCK:
         _ARTIFACT_CACHE.clear()
         _PREDICTION_CACHE.clear()
+    with _GPU_LOCK:
+        _GPU_MODEL_CACHE_KEY = None
+        _GPU_MODEL_CACHE_LAYERS = None

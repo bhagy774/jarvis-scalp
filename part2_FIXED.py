@@ -1,3 +1,5 @@
+from neural_advisory import part_advisory_entry
+
 # PyTorch with robust fallback for Windows/Linux/CPU compatibility
 try:
     import torch
@@ -4383,6 +4385,30 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
         report += f"\n{fusion_report}"
         
         return report
+
+    @part_advisory_entry("part2_zone", data_parameter="data", context_parameter="context")
+    def analyze_native_zone(self, data, timeframe="1m", context=None):
+        """Analyze one native candle frame and attach Part 2's advisory."""
+        try:
+            if len(data) < 20:
+                return {"signal": 0, "thought": f"Part2 {timeframe}: insufficient native bars"}
+            current = float(data["close"].iloc[-1])
+            for lookback in (20, 60, 100):
+                if len(data) < lookback:
+                    continue
+                high = float(data["high"].tail(lookback).max())
+                low = float(data["low"].tail(lookback).min())
+                span = high - low
+                if span <= 0:
+                    continue
+                pct = (current - low) / span
+                if pct >= 0.92:
+                    return {"signal": -1, "thought": f"Part2 {timeframe}: Resistance Zone top {pct*100:.0f}% ({lookback}-bar)"}
+                if pct <= 0.08:
+                    return {"signal": 1, "thought": f"Part2 {timeframe}: Support Zone bottom {pct*100:.0f}% ({lookback}-bar)"}
+            return {"signal": 0, "thought": f"Part2 {timeframe}: no native zone"}
+        except Exception:
+            return {"signal": 0, "thought": f"Part2 {timeframe}: invalid native zone data"}
 
 # ==================== SYSTEM INITIALIZATION ====================
 

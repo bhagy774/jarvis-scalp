@@ -1,3 +1,5 @@
+from neural_advisory import part_advisory_entry
+
 # ==============================================================================
 # JARVIS PART 5 - INSTITUTIONAL GPU FUSION ENGINE (GTX 1650 & CPU OPTIMIZED)
 # Fully hardened against hidden bugs, missing CUDA helpers, syntax flaws,
@@ -295,6 +297,7 @@ class MLEngineGPU:
         self.device = torch.device('cuda' if (TORCH_AVAILABLE and torch.cuda.is_available()) else 'cpu')
         self.gpu_manager = GPUMemoryManager()
 
+    @part_advisory_entry("part5_ml", data_parameter="data", context_parameter="context")
     def analyze(self, data: Any, context: Optional[Dict] = None) -> Dict[str, Any]:
         """
         Main analysis method called by Part5ML adapter in Jarvis.

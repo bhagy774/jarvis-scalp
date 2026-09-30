@@ -1,3 +1,5 @@
+from neural_advisory import part_advisory_entry
+
 # ---- Helpers inserted for Part-11 Fix ----
 from collections import deque
 
@@ -1174,7 +1176,8 @@ class SignalFusionEngineGPU:
             "active_count": total_active_engines
         }
 
-    def analyze_multi_timeframe(self, results_by_timeframe: Dict[str, Any]) -> Dict[str, Any]:
+    @part_advisory_entry("part11_fusion", data_parameter="results_by_timeframe", context_parameter="context", evidence_context_key="neural_advisory_evidence")
+    def analyze_multi_timeframe(self, results_by_timeframe: Dict[str, Any], context=None) -> Dict[str, Any]:
         """Fuse each native frame independently, then summarize all eight frames.
 
         This remains Parts 1–10 evidence, not execution authority. Every row is

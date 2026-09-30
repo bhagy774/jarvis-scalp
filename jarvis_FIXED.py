@@ -39,8 +39,7 @@ from jarvis_strategy_approval import (
     REQUIRED_TIMEFRAMES, TIMEFRAME_WEIGHTS,
 )
 from jarvis_runtime import detect_backend, torch_device
-from neural_advisory import (PARTS as NEURAL_ADVISORY_PARTS, annotate_part_result,
-                             annotate_mtf_result, build_mtf_advisory_evidence)
+from neural_advisory import build_mtf_advisory_evidence
 # Legacy Ollama context removed; deterministic gates are authoritative.
 pro_display = ProfessionalSignalDisplay()
 import warnings
@@ -3192,7 +3191,7 @@ class Part1Breakout:
             try:
                 market_data = _df_to_market_data(data)
                 if len(market_data['price_action']) >= 20:
-                    result = engine.analyze(market_data)
+                    result = engine.analyze(market_data, context=context, advisory_data=data)
                     brk = result.get('breakout', {})
                     is_breakout = bool(brk.get('breakout_detected', False))
                     brk_dir = int(brk.get('direction', 0))
@@ -3206,10 +3205,13 @@ class Part1Breakout:
                         f"dir={brk_dir} str={brk.get('strength',0):.2f} "
                         f"conf={result.get('confidence',0):.1f}"
                     )
-                    return {"signal": sig, "thought": thought, "telemetry": {
+                    output = {"signal": sig, "thought": thought, "telemetry": {
                         "breakout": brk, "levels": lvl, "momentum": result.get('momentum', {}),
                         "fakeout": result.get('fakeout', {}), "regime": result.get('regime', {})
                     }}
+                    if "neural_advisory" in result:
+                        output["neural_advisory"] = result["neural_advisory"]
+                    return output
             except Exception as e:
                 logger.debug(f"Part1 engine error: {e}")
 
@@ -3298,7 +3300,11 @@ class Part2Zone:
         version = context.get('snapshot_version')
         # The former fallback thresholds are retained, but now each result is
         # derived from this exact native frame rather than a 1m master/cache.
-        result = self._native_zone(data, timeframe)
+        native_analyzer = getattr(self._engine, 'analyze_native_zone', None) if self._engine is not None else None
+        if callable(native_analyzer):
+            result = native_analyzer(data, timeframe=timeframe, context=context)
+        else:
+            result = self._native_zone(data, timeframe)
         shared = self._shared_mtf_context(context, version)
         result['native_timeframe'] = timeframe
         result['shared_1m_5m_15m_context'] = dict(shared)
@@ -3839,13 +3845,13 @@ class Part11Fusion:
         except Exception:
             self._engine = None
 
-    def analyze(self, part_results):
+    def analyze(self, part_results, context=None):
         if isinstance(part_results, dict) and any(tf in part_results for tf in REQUIRED_TIMEFRAMES):
             if set(part_results) != set(REQUIRED_TIMEFRAMES):
                 return {"signal": 0, "thought": "Part11 MTF evidence incomplete", "data_status": "error", "timeframe_coverage": []}
             if self._engine is not None and callable(getattr(self._engine, 'analyze_multi_timeframe', None)):
                 try:
-                    result = self._engine.analyze_multi_timeframe(part_results)
+                    result = self._engine.analyze_multi_timeframe(part_results, context=context)
                     if isinstance(result, dict) and result.get('data_status') == 'valid':
                         return result
                 except Exception:
@@ -3965,13 +3971,13 @@ class Part12Confidence:
         except Exception:
             self._engine = None
 
-    def analyze(self, part_results):
+    def analyze(self, part_results, context=None):
         if isinstance(part_results, dict) and any(tf in part_results for tf in REQUIRED_TIMEFRAMES):
             if set(part_results) != set(REQUIRED_TIMEFRAMES):
                 return {"confidence": 10, "thought": "Part12 MTF evidence incomplete", "data_status": "error", "timeframe_coverage": []}
             if self._engine is not None and callable(getattr(self._engine, 'analyze_multi_timeframe', None)):
                 try:
-                    result = self._engine.analyze_multi_timeframe(part_results)
+                    result = self._engine.analyze_multi_timeframe(part_results, context=context)
                     if isinstance(result, dict) and result.get('data_status') == 'valid':
                         return result
                 except Exception:
@@ -6203,12 +6209,6 @@ class JarvisElite:
                                 'shared_candle_source': 'historical_replay' if self.is_backtest_mode else 'shared_exchange',
                             })
                         res = part.analyze(part_input, context=part_context)
-                        # Each Part 1-10 retains its deterministic signal as-is. A
-                        # separately trained, identity-bound local model may add
-                        # uncalibrated diagnostic evidence only; it cannot vote in
-                        # central strategy approval, risk, sizing, or execution.
-                        if name in NEURAL_ADVISORY_PARTS:
-                            res = annotate_part_result(res, part_input, name, part_context)
                         if isinstance(res, dict):
                             tf_results[name] = res
                             if 'telemetry' in res and tf_name == '1m':
@@ -6353,8 +6353,6 @@ class JarvisElite:
             # Part 11 fuses each frame's named Parts 1–10 evidence; Part 12
             # computes confidence over all eight native-frame results. Neither
             # receives the old 1m-primary flattened list as a decision proxy.
-            math_res = self.parts['part11_fusion'].analyze(mtf_breakdown)
-            math_conf_res = self.parts['part12_confidence'].analyze(mtf_breakdown)
             active_snapshot = candle_snapshot or getattr(self, '_active_candle_snapshot', None)
             base_frame = mtf_data.get('1m') if isinstance(mtf_data, dict) else None
             base_closed_ts = (base_frame.index[-1] if base_frame is not None and len(base_frame.index) else None)
@@ -6367,17 +6365,16 @@ class JarvisElite:
                 'closed_candle_timestamp': base_closed_ts,
                 'is_backtest_mode': bool(self.is_backtest_mode),
             }
-            # Isolate a provenance-tagged advisory view of the full 8×10 matrix;
-            # the deterministic Part 11/12 inputs and central policy stay intact.
+            # The full, provenance-tagged 8×10 matrix is passed into the Part 11/12
+            # analyzers; each analyzer owns its task-specific advisory entry.
             try:
                 mtf_neural_evidence = build_mtf_advisory_evidence(mtf_breakdown, mtf_data, mtf_advisory_context)
             except Exception as evidence_error:
                 logger.warning(f"Neural advisory evidence unavailable: {evidence_error}")
                 mtf_neural_evidence = {}
-            # Parts 11/12 have different matrix feature schemas and trained heads.
-            # They annotate only; deterministic fusion, confidence and gates win.
-            math_res = annotate_mtf_result(math_res, mtf_neural_evidence, 'part11_fusion', mtf_advisory_context)
-            math_conf_res = annotate_mtf_result(math_conf_res, mtf_neural_evidence, 'part12_confidence', mtf_advisory_context)
+            mtf_advisory_context['neural_advisory_evidence'] = mtf_neural_evidence
+            math_res = self.parts['part11_fusion'].analyze(mtf_breakdown, context=mtf_advisory_context)
+            math_conf_res = self.parts['part12_confidence'].analyze(mtf_breakdown, context=mtf_advisory_context)
             part12_mtf_valid = (
                 isinstance(math_conf_res, dict)
                 and math_conf_res.get('data_status') == 'valid'
