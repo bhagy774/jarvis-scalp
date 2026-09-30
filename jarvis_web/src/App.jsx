@@ -57,6 +57,10 @@ export default function App() {
   const bearishCount = Object.values(data?.parts || {}).filter(p => p.direction === 'BEARISH').length;
   const totalParts = Object.keys(data?.parts || {}).length;
   const consensus = bullishCount > bearishCount ? 'BULLISH' : bearishCount > bullishCount ? 'BEARISH' : 'NEUTRAL';
+  const dashboard = data?.dashboard || {};
+  const finalDecision = dashboard.decision || 'NO_TRADE';
+  const finalDecisionColor = ['CALL', 'BUY', 'BULLISH'].includes(finalDecision) ? 'var(--c-green)' : ['PUT', 'SELL', 'BEARISH'].includes(finalDecision) ? 'var(--c-red)' : 'var(--c-yellow)';
+  const part7Blocked = Boolean(dashboard?.part7?.entry_blocked);
 
   return (
     <HashRouter>
@@ -155,6 +159,10 @@ export default function App() {
                 {(data?.stats?.total_pnl || 0) >= 0 ? '+' : ''}${(data?.stats?.total_pnl || 0).toFixed(2)}
               </span>
               <div style={{ width: '1px', height: '16px', background: 'var(--c-border)' }} />
+              <span style={{ color: 'var(--c-text-muted)' }}>FINAL:</span>
+              <span title={dashboard.reason || 'Awaiting deterministic analysis'} style={{ color: finalDecisionColor, fontWeight: 700 }}>
+                {finalDecision}{part7Blocked ? ' · P7 BLOCK' : ''}
+              </span>
               <span style={{ color: 'var(--c-text-muted)' }}>WIN RATE:</span>
               <span style={{ color: 'var(--c-cyan)', fontWeight: 700 }}>{(data?.stats?.win_rate || 0).toFixed(1)}%</span>
             </div>

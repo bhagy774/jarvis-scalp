@@ -4,7 +4,7 @@
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Mapping
 import os
 # PyTorch with fallback for Windows/WSL compatibility
 try:
@@ -763,8 +763,33 @@ class SwingScalpTradeExecutor:
             "avg_profit": 0.0
         }
         
-    async def execute_trade(self, direction: str, expiry_seconds: int = 60) -> Dict[str, Any]:
-        """Execute trade trade with microsecond-precision timing"""
+    async def execute_trade(self, direction: str, expiry_seconds: int = 60, *,
+                            central_decision=None, central_approval=None, part_results=None,
+                            part7_gate=None, symbol=None, exchange=None, contract=None,
+                            instrument_id=None, market_type=None, snapshot_version=None) -> Dict[str, Any]:
+        """Run this legacy simulator only after Jarvis central entry approval."""
+        try:
+            from jarvis_strategy_approval import evaluate_central_strategy, validate_entry_approval
+            central_direction = {'CALL': 'BUY', 'BUY': 'BUY', 'PUT': 'SELL', 'SELL': 'SELL'}.get(str(direction).upper())
+            if not isinstance(central_decision, Mapping) or central_decision.get('approved') is not True:
+                return {'status': 'rejected', 'reason': 'Jarvis central strategy approval is required'}
+            if central_direction is None or str(central_decision.get('direction', '')).upper() != central_direction:
+                return {'status': 'rejected', 'reason': 'Jarvis central direction mismatch'}
+            recomputed = evaluate_central_strategy(
+                part_results, part7_gate, confidence=central_decision.get('confidence'),
+                expected_symbol=symbol,
+            )
+            if not recomputed.get('approved') or recomputed.get('direction') != central_direction:
+                return {'status': 'rejected', 'reason': 'Jarvis central evidence or Part7 gate rejected entry'}
+            valid, reason = validate_entry_approval(
+                central_approval, direction=central_direction, symbol=symbol, exchange=exchange,
+                contract=contract, instrument_id=instrument_id, market_type=market_type,
+                snapshot_version=snapshot_version, confidence=central_decision.get('confidence'),
+            )
+            if not valid:
+                return {'status': 'rejected', 'reason': reason}
+        except Exception as exc:
+            return {'status': 'rejected', 'reason': f'Jarvis central approval validation failed: {exc}'}
         trade_id = self._generate_trade_id()
         start_time = datetime.now()
         expiry_time = start_time + timedelta(seconds=expiry_seconds)

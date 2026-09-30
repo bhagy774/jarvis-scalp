@@ -4,6 +4,10 @@ import pytest
 
 from jarvis_delta_execution import DeltaExecutionAdapter, build_delta_candidate
 from jarvis_multicoin_execution import CandidateRejected, PortfolioCoordinator
+from jarvis_strategy_approval import (
+    REQUIRED_TIMEFRAMES, build_execution_plan, evaluate_mtf_central_strategy,
+    make_entry_approval,
+)
 
 
 NOW = 1_800_000_000.0
@@ -28,20 +32,80 @@ ASSET_POLICY = {
 }
 
 
+def central_evidence():
+    return {
+        "part1_breakout": {"signal": 1, "thought": "bullish breakout"},
+        "part2_zone": {"signal": 1, "thought": "bullish demand zone"},
+        "part3_psychology": {"signal": 1, "thought": "bullish candle"},
+        "part4_volume": {"signal": 1, "thought": "volume confirmation"},
+        "part5_ml": {"signal": 1, "thought": "model confirms"},
+        "part6_trend": {"signal": 1, "thought": "trend bullish"},
+        "part7_volatility": {"signal": 1, "thought": "volatility expansion"},
+        "part8_structure": {"signal": 1, "thought": "structure bullish"},
+        "part9_orderflow": {"signal": 1, "thought": "orderflow bullish"},
+        "part10_candlestats": {"signal": 1, "thought": "candlestats bullish"},
+    }
+
+
+def valid_part7_gate(symbol):
+    return {
+        "symbol": symbol, "entry_blocked": False, "risk_veto": False,
+        "status": "ok", "data_status": "valid", "timeframe": "aggregate",
+        "blocked_timeframes": [], "veto_timeframes": [],
+        "timeframe_results": {
+            tf: {"symbol": symbol, "timeframe": tf, "status": "neutral",
+                 "data_status": "valid", "entry_blocked": False, "risk_veto": False}
+            for tf in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+        },
+    }
+
+
+def native_parts_by_timeframe(symbol="ETHUSDT"):
+    rows = {}
+    for timeframe in REQUIRED_TIMEFRAMES:
+        frame = {}
+        for index, (name, item) in enumerate(central_evidence().items(), 1):
+            scoped = {**item, "symbol": symbol, "timeframe": timeframe}
+            if name == "part7_volatility":
+                scoped.update({"signal": 0, "thought": "neutral volatility", "status": "neutral",
+                               "data_status": "valid", "entry_blocked": False, "risk_veto": False})
+            if name == "part2_zone":
+                scoped["native_timeframe"] = timeframe
+            frame[f"part{index}"] = scoped
+        rows[timeframe] = frame
+    return rows
+
+
 def analysis(**changes):
+    snapshot_version = changes.get("snapshot_version", "snap-eth-1m-abc")
+    evidence = central_evidence()
+    by_timeframe = native_parts_by_timeframe("ETHUSDT")
+    gate = valid_part7_gate("ETHUSDT")
+    normalized = {
+        timeframe: {canonical: dict(row[f"part{index}"])
+                    for index, canonical in enumerate(evidence, 1)}
+        for timeframe, row in by_timeframe.items()
+    }
+    decision = evaluate_mtf_central_strategy(normalized, gate, confidence=90, expected_symbol="ETHUSDT")
+    approval = make_entry_approval(
+        decision, direction="BUY", symbol="ETHUSDT", exchange="delta", contract="ETHUSDT",
+        instrument_id="22", market_type="perpetual_futures", analysis_symbol="ETHUSDT",
+        analysis_exchange="binance", snapshot_version=snapshot_version,
+        analysis_timestamp=NOW - 3, confidence=90,
+    )
     result = {
         "status": "COMPLETE",
         "scope": "parts1-12-analysis-only",
         "analysis_only": True,
         "decision_authority": "none",
         "execution_eligible": False,
+        "central_strategy_decision": decision,
+        "central_strategy_evidence": evidence,
+        "central_strategy_approval": approval,
         "freshness_status": "FRESH",
         "coverage": [f"Part{i}" for i in range(1, 13)],
         "snapshot_version": "snap-eth-1m-abc",
-        "parts_by_timeframe": {
-            tf: {f"part{i}": {"signal": 0} for i in range(1, 11)}
-            for tf in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
-        },
+        "parts_by_timeframe": by_timeframe,
         "request_identity": {"venue": "binance", "market_type": "spot", "instrument_id": "ETHUSDT", "symbol": "ETHUSDT"},
         "execution_identity": {"venue": "delta", "market_type": "perpetual_futures", "instrument_id": "22", "symbol": "ETHUSDT"},
         "mapping_policy_id": ASSET_POLICY["ETH"]["mapping_policy_id"],
@@ -49,9 +113,9 @@ def analysis(**changes):
         "analysis_completed_at": NOW - 2,
         "analysis_reference": {"source": "binance", "symbol": "ETHUSDT", "timeframe": "1m", "timestamp": NOW - 60, "price": 100.0},
         "once_per_symbol_parts": {"part11": {"signal": 1}, "part12": {"confidence": 90}},
-        "part7_gate": {"entry_blocked": False, "risk_veto": False},
+        "part7_gate": gate,
         "deterministic_decision": {
-            "origin": "jarvis_deterministic_parts11_12", "direction": "BUY", "confidence": 90,
+            "origin": "jarvis_FIXED_central_strategy", "direction": "BUY", "confidence": 90,
             "entry_price": 100.0, "stop_loss": 98.0, "take_profit": 105.0,
         },
     }
@@ -153,7 +217,12 @@ def test_valid_eth_bridge_sizes_from_delta_metadata_quote_and_risk_engine():
 
 def test_mapping_quote_product_freshness_and_missing_data_all_fail_closed():
     fake = FakeDelta()
+    zone_veto = analysis()
+    zone_veto["parts_by_timeframe"]["3m"]["part2"]["signal"] = -1
+    zone_veto["parts_by_timeframe"]["3m"]["part2"]["thought"] = "resistance zone"
     bad_results = [
+        zone_veto,
+        analysis(parts_by_timeframe=None),
         analysis(request_identity={"venue": "binance", "market_type": "spot", "instrument_id": "SOLUSDT", "symbol": "SOLUSDT"}),
         analysis(request_identity={"venue": "binance", "market_type": "spot", "instrument_id": "unrelated-id", "symbol": "ETHUSDT"}),
         analysis(execution_identity={"venue": "delta", "market_type": "perpetual_futures", "instrument_id": "33", "symbol": "SOLUSDT"}),
@@ -162,6 +231,7 @@ def test_mapping_quote_product_freshness_and_missing_data_all_fail_closed():
         analysis(deterministic_decision={"origin": "jarvis_deterministic_parts11_12", "direction": "NO_TRADE", "confidence": 90}),
         analysis(part7_gate={"entry_blocked": True, "risk_veto": True}),
         analysis(part7_gate={"entry_blocked": False}),
+        analysis(part7_gate={"symbol": "BTCUSDT", "entry_blocked": False, "risk_veto": False}),
         analysis(freshness_status=None),
         analysis(coverage=["Part1"]),
         analysis(parts_by_timeframe={"1m": {"part1": {}}}),
@@ -295,3 +365,139 @@ def test_live_authorization_accepts_configured_numeric_true_flags(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setenv("JARVIS_KILL_SWITCH", "0")
     assert DeltaExecutionAdapter._live_flags_authorized() is True
+
+
+def test_protected_broker_authorization_binds_plan_and_broker_levels(monkeypatch):
+    import importlib
+    import sys
+    import time
+    import types
+
+    shim = types.ModuleType("options_chain")
+    shim.build_provider_chain = lambda *args, **kwargs: {}
+    shim.combine_provider_chains = lambda *args, **kwargs: {}
+    shim.payout_max_pain = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "options_chain", shim)
+    wrapper = importlib.import_module("delta_api_wrapper")
+
+    evidence = central_evidence()
+    by_timeframe = native_parts_by_timeframe("ETHUSDT")
+    gate = valid_part7_gate("ETHUSDT")
+    normalized = {
+        timeframe: {canonical: dict(row[f"part{index}"])
+                    for index, canonical in enumerate(evidence, 1)}
+        for timeframe, row in by_timeframe.items()
+    }
+    decision = evaluate_mtf_central_strategy(normalized, gate, confidence=90, expected_symbol="ETHUSDT")
+    plan = build_execution_plan(
+        direction="BUY", recommended_expiry="SWING", entry_price=100,
+        stop_loss=99.2, take_profit=102, symbol="ETHUSDT",
+        snapshot_version="snap-protected", confidence=90,
+    )
+    approval = make_entry_approval(
+        decision, direction="BUY", symbol="ETHUSDT", exchange="delta",
+        contract="ETHUSDT", instrument_id="22", market_type="perpetual_futures",
+        analysis_symbol="ETHUSDT", analysis_exchange="delta",
+        snapshot_version="snap-protected", analysis_timestamp=time.time(),
+        confidence=90, execution_plan=plan,
+    )
+    auth = {
+        "central_approval": approval, "part_results": evidence,
+        "parts_by_timeframe": normalized, "part7_gate": gate,
+        "strategy_plan": plan, "snapshot_version": "snap-protected",
+        "analysis_symbol": "ETHUSDT", "confidence": 90,
+        "broker_plan": {"symbol": "ETHUSDT", "instrument_id": "22", "direction": "BUY",
+            "quantity": 1, "leverage": 2, "entry_price": 100,
+            "stop_loss": 99.2, "take_profit": 102, "risk_budget_usdt": 5,
+            "trade_mode": "SWING"},
+    }
+    args = {"symbol": "ETHUSDT", "side": "buy", "product_id": 22,
+            "size": 1, "stop_loss": 99.2, "take_profit": 102, "leverage": 2}
+    assert wrapper._validate_jarvis_broker_entry_authorization(auth, **args)[0]
+    mutated = {**auth, "broker_plan": {**auth["broker_plan"], "stop_loss": 98}}
+    rejected, reason = wrapper._validate_jarvis_broker_entry_authorization(
+        mutated, **(args | {"stop_loss": 98}),
+    )
+    assert not rejected and "plan" in reason.lower()
+    moved_entry = {**auth, "broker_plan": {**auth["broker_plan"], "entry_price": 100.01}}
+    rejected_entry, entry_reason = wrapper._validate_jarvis_broker_entry_authorization(
+        moved_entry, **args,
+    )
+    assert not rejected_entry and "plan" in entry_reason.lower()
+    assert wrapper._same_decimal_price("100.00", 100.0)
+    assert not wrapper._same_decimal_price("100.01", 100.0)
+
+    for name in ("JARVIS_MULTICOIN_DELTA_EXECUTION", "JARVIS_AUTO_TRADE", "JARVIS_LIVE_EXECUTION",
+                 "DELTA_USE_MAINNET", "DELTA_ORDER_EXECUTION_ENABLED"):
+        monkeypatch.setenv(name, "true")
+    monkeypatch.setenv("JARVIS_KILL_SWITCH", "0")
+    delta = object.__new__(wrapper.DeltaExchangeData)
+    delta._USE_MAINNET = True
+    delta.get_available_products_snapshot = lambda: {"complete": True, "products": [{
+        "id": 22, "symbol": "ETHUSDT", "state": "active", "product_type": "perpetual_futures",
+        "base_asset": "ETH", "quote_asset": "USDT", "settling_asset": "USDT",
+        "product_specs": {}, "tick_size": 0.01,
+    }]}
+    delta.get_delta_executable_quote = lambda **kwargs: {
+        "source": "delta", "symbol": "ETHUSDT", "product_id": "22", "bid": 100.0,
+        "ask": 100.01, "observed_at": time.time(),
+    }
+    delta._request = lambda *args, **kwargs: pytest.fail("quote mismatch must block before venue mutation")
+    mismatch = delta.place_protected_order(
+        product_id=22, symbol="ETHUSDT", side="buy", size=1, order_type="market",
+        stop_loss=99.2, take_profit=102, leverage=2, client_order_id="quote-mismatch-test",
+        entry_authorization=auth,
+    )
+    assert mismatch["status"] == "REJECTED"
+    assert "exact Jarvis plan entry" in mismatch["reason"]
+
+
+def test_protective_child_reconciliation_binds_prices_quantity_and_reduce_only(monkeypatch):
+    import importlib
+    import sys
+    import types
+
+    shim = types.ModuleType("options_chain")
+    shim.build_provider_chain = lambda *args, **kwargs: {}
+    shim.combine_provider_chains = lambda *args, **kwargs: {}
+    shim.payout_max_pain = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "options_chain", shim)
+    wrapper = importlib.import_module("delta_api_wrapper")
+    row = {"id": "stop-1", "product_id": 22, "state": "open", "reduce_only": True,
+           "side": "sell", "stop_order_type": "stop_loss_order", "size": 2,
+           "stop_price": "99", "limit_price": "98.9"}
+    expected = {"product_id": 22, "side": "sell", "kind": "stop_loss_order",
+                "quantity": 2, "trigger": 99, "limit": 98.9}
+    assert wrapper._valid_protective_child(row, **expected)
+    mutations = [
+        ("stop_price", "98.9"), ("limit_price", "99"), ("size", 1),
+        ("reduce_only", False), ("side", "buy"), ("state", "filled"),
+        ("product_id", 33),
+    ]
+    for field, value in mutations:
+        assert not wrapper._valid_protective_child(row | {field: value}, **expected)
+
+
+def test_raw_delta_entries_are_rejected_but_reduce_only_close_route_remains(monkeypatch):
+    import importlib
+    import sys
+    import types
+
+    shim = types.ModuleType("options_chain")
+    shim.build_provider_chain = lambda *args, **kwargs: {}
+    shim.combine_provider_chains = lambda *args, **kwargs: {}
+    shim.payout_max_pain = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "options_chain", shim)
+    wrapper = importlib.import_module("delta_api_wrapper")
+    delta = object.__new__(wrapper.DeltaExchangeData)
+    calls = []
+    delta.get_product_id = lambda symbol: 22
+    delta._request = lambda *args, **kwargs: (calls.append((args, kwargs)) or {
+        "success": True, "data": {"result": {"id": "close-1"}},
+    })
+    monkeypatch.setenv("DELTA_ORDER_EXECUTION_ENABLED", "true")
+    denied = delta.place_order("ETHUSDT", "buy", 1)
+    assert not denied["success"] and not calls
+    closed = delta.place_order("ETHUSDT", "sell", 1, reduce_only=True)
+    assert closed["success"] and len(calls) == 1
+    assert calls[0][0][2]["reduce_only"] is True

@@ -26,6 +26,7 @@ import copy
 from urllib.parse import urlencode
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 
 from options_chain import build_provider_chain, combine_provider_chains, payout_max_pain
 
@@ -46,6 +47,146 @@ DEMO_API_KEY = os.environ.get("DELTA_API_KEY")
 DEMO_API_SECRET = os.environ.get("DELTA_API_SECRET")
 
 logger = logging.getLogger(__name__)
+
+
+def _same_decimal_price(left: Any, right: Any) -> bool:
+    """Require exact price equality; no unconfigured slippage is authorized."""
+    try:
+        a, b = Decimal(str(left)), Decimal(str(right))
+        return a.is_finite() and b.is_finite() and a == b
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
+def _valid_protective_child(row: Any, *, product_id: Any, side: str, kind: str,
+                            quantity: float, trigger: float, limit: float) -> bool:
+    """Verify an exact active reduce-only bracket child, not just its label."""
+    try:
+        return (isinstance(row, dict)
+                and int(row.get("product_id", -1)) == int(product_id)
+                and str(row.get("state") or "").lower() in {"open", "pending"}
+                and row.get("reduce_only") is True
+                and str(row.get("side") or "").lower() == str(side).lower()
+                and str(row.get("stop_order_type") or "").lower() == str(kind).lower()
+                and math.isclose(abs(float(row.get("size"))), float(quantity), rel_tol=1e-10, abs_tol=1e-10)
+                and _same_decimal_price(row.get("stop_price"), trigger)
+                and _same_decimal_price(row.get("limit_price"), limit)
+                and row.get("id") is not None)
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return False
+
+
+def _validate_jarvis_broker_entry_authorization(
+    authorization: Any, *, symbol: str, side: str, product_id: Any,
+    size: Any, stop_loss: Any, take_profit: Any, leverage: Any,
+) -> tuple[bool, str]:
+    """Recompute Jarvis policy and bind a protected broker entry to its plan."""
+    if not isinstance(authorization, dict):
+        return False, "Jarvis central entry authorization is required"
+    approval = authorization.get("central_approval")
+    timeframe_evidence = authorization.get("parts_by_timeframe")
+    gate = authorization.get("part7_gate")
+    strategy_plan = authorization.get("strategy_plan")
+    broker_plan = authorization.get("broker_plan")
+    snapshot_version = authorization.get("snapshot_version")
+    analysis_symbol = authorization.get("analysis_symbol")
+    try:
+        from jarvis_strategy_approval import (
+            PART_WEIGHTS, REQUIRED_TIMEFRAMES, evaluate_mtf_central_strategy,
+            validate_entry_approval, validate_execution_plan,
+        )
+        direction = "BUY" if str(side).strip().lower() == "buy" else "SELL" if str(side).strip().lower() == "sell" else "NO_TRADE"
+        try:
+            confidence = int(authorization.get("confidence"))
+        except (TypeError, ValueError, OverflowError):
+            return False, "Jarvis central entry confidence is malformed"
+        if direction == "NO_TRADE" or not analysis_symbol:
+            return False, "Jarvis central entry scope is incomplete"
+        if (not isinstance(timeframe_evidence, dict)
+                or set(timeframe_evidence) != set(REQUIRED_TIMEFRAMES)):
+            return False, "Complete native 8-timeframe Jarvis evidence is required"
+        from jarvis_strategy_approval import _clean_symbol
+        expected_clean = _clean_symbol(analysis_symbol)
+        for timeframe in REQUIRED_TIMEFRAMES:
+            frame = timeframe_evidence.get(timeframe)
+            if not isinstance(frame, dict) or set(frame) != set(PART_WEIGHTS):
+                return False, f"{timeframe} Jarvis part evidence is incomplete"
+            for part_name in PART_WEIGHTS:
+                item = frame.get(part_name)
+                item_symbol = item.get("symbol", item.get("selected_symbol")) if isinstance(item, dict) else None
+                item_timeframe = (item.get("timeframe", item.get("native_timeframe"))
+                                  if isinstance(item, dict) else None)
+                if (_clean_symbol(item_symbol) != expected_clean
+                        or str(item_timeframe or "") != timeframe):
+                    return False, f"{timeframe} {part_name} symbol/timeframe identity mismatch"
+        central = evaluate_mtf_central_strategy(
+            timeframe_evidence, gate, confidence=confidence, expected_symbol=analysis_symbol,
+        )
+        if (not central.get("approved") or central.get("direction") != direction
+                or str(central.get("trade_mode") or "").upper()
+                != str((strategy_plan or {}).get("trade_mode") or "").upper()):
+            return False, "Jarvis central MTF strategy does not approve this broker entry/mode"
+        if not isinstance(approval, dict):
+            return False, "Jarvis central approval is missing"
+        # The approved execution symbol must be exact; instrument_id can be the
+        # selected canonical symbol for the ordinary route or Delta's exact
+        # product id for an explicitly mapped multicoin route. The protected
+        # broker call separately verifies that product id maps to this symbol.
+        from jarvis_strategy_approval import _clean_symbol
+        if (_clean_symbol(approval.get("symbol")) != _clean_symbol(symbol)
+                or _clean_symbol(approval.get("contract")) != _clean_symbol(symbol)
+                or str(approval.get("exchange") or "").strip().lower() != "delta"
+                or str(approval.get("instrument_id") or "").strip() not in {str(product_id).strip(), _clean_symbol(symbol)}):
+            return False, "Jarvis approval does not match the exact Delta symbol/product"
+        market_type = str(approval.get("market_type") or "").strip().lower()
+        if market_type not in {"unverified", "perpetual", "perpetual_futures", "perpetual_swap", "perpetual_swaps"}:
+            return False, "Jarvis approval market type is unsupported"
+        approval_ok, reason = validate_entry_approval(
+            approval, direction=direction, symbol=symbol, exchange="delta",
+            contract=symbol, instrument_id=approval.get("instrument_id"),
+            market_type=market_type, snapshot_version=snapshot_version,
+            confidence=confidence, execution_plan=strategy_plan,
+        )
+        if not approval_ok:
+            return False, reason
+        strategy_ok, plan_reason = validate_execution_plan(
+            strategy_plan, direction=direction, symbol=approval.get("symbol"),
+            snapshot_version=snapshot_version, confidence=confidence,
+            trade_mode=central.get("trade_mode"),
+        )
+        if not strategy_ok:
+            return False, plan_reason
+        if not isinstance(broker_plan, dict):
+            return False, "Jarvis protected broker plan is missing"
+        try:
+            requested_size, requested_lev = int(size), int(leverage)
+            stop, target = float(stop_loss), float(take_profit)
+            planned_size, planned_lev = int(broker_plan.get("quantity")), int(broker_plan.get("leverage"))
+            planned_stop, planned_target = float(broker_plan.get("stop_loss")), float(broker_plan.get("take_profit"))
+            planned_entry = float(broker_plan.get("entry_price"))
+            risk_budget = float(broker_plan.get("risk_budget_usdt"))
+            strategy_stop = float(strategy_plan.get("stop_loss"))
+            strategy_target = float(strategy_plan.get("take_profit"))
+            strategy_entry = float(strategy_plan.get("entry_price"))
+        except (TypeError, ValueError, OverflowError):
+            return False, "Jarvis protected broker plan values are malformed"
+        if (_clean_symbol(broker_plan.get("symbol")) != _clean_symbol(symbol)
+                or str(broker_plan.get("instrument_id") or "").strip() != str(product_id).strip()
+                or str(broker_plan.get("direction") or "").upper() != direction
+                or str(broker_plan.get("trade_mode") or "").upper() != str(central.get("trade_mode") or "").upper()
+                or requested_size != planned_size or requested_lev != planned_lev
+                or not math.isclose(stop, planned_stop, rel_tol=1e-10, abs_tol=1e-10)
+                or not math.isclose(target, planned_target, rel_tol=1e-10, abs_tol=1e-10)
+                or not math.isclose(planned_stop, strategy_stop, rel_tol=1e-10, abs_tol=1e-10)
+                or not math.isclose(planned_target, strategy_target, rel_tol=1e-10, abs_tol=1e-10)
+                or not math.isclose(planned_entry, strategy_entry, rel_tol=1e-10, abs_tol=1e-10)
+                or not math.isfinite(risk_budget) or risk_budget <= 0
+                or risk_budget > float(os.environ.get("JARVIS_MAX_RISK_USDT", "10")) + 1e-8):
+            return False, "Broker request differs from Jarvis protected plan"
+        return True, "Jarvis protected entry authorization validated"
+    except Exception as exc:
+        return False, f"Jarvis central authorization validation failed: {type(exc).__name__}"
+
 
 class DeltaExchangeData:
     """
@@ -429,13 +570,20 @@ class DeltaExchangeData:
 
     def place_protected_order(self, *, product_id: int, symbol: str, side: str, size: int,
                               order_type: str, stop_loss: float, take_profit: float,
-                              leverage: int, client_order_id: str) -> Dict[str, Any]:
+                              leverage: int, client_order_id: str,
+                              entry_authorization: Any = None) -> Dict[str, Any]:
         """Stage a Delta entry, then attach documented TP/SL bracket orders after confirmed fill.
 
         Delta's documented bracket endpoint attaches exits to an existing position;
         this is NOT atomic entry+protection. Any unclear fill/protection outcome
         returns SUBMISSION_UNKNOWN and preserves the coordinator reservation.
         """
+        auth_ok, auth_reason = _validate_jarvis_broker_entry_authorization(
+            entry_authorization, symbol=symbol, side=side, product_id=product_id,
+            size=size, stop_loss=stop_loss, take_profit=take_profit, leverage=leverage,
+        )
+        if not auth_ok:
+            return {"status": "REJECTED", "authoritative": True, "reason": auth_reason}
         truthy = {"1", "true", "yes", "on"}
         required = ("JARVIS_MULTICOIN_DELTA_EXECUTION", "JARVIS_AUTO_TRADE", "JARVIS_LIVE_EXECUTION",
                     "DELTA_USE_MAINNET", "DELTA_ORDER_EXECUTION_ENABLED")
@@ -470,7 +618,7 @@ class DeltaExchangeData:
         trading_status = str(product.get("trading_status") or "").strip().lower()
         if (state not in {"active", "live", "trading", "listed"}
                 or product_type not in {"perpetual", "perpetual_futures", "perpetual_swap", "perpetual_swaps"}
-                or not base or not quote or not settle or quote != settle
+                or not base or quote != "USDT" or settle != "USDT" or quote != settle
                 or str(product.get("notional_type") or "").strip().lower() == "inverse"
                 or product.get("is_quanto") is True or specs.get("only_reduce_only_orders_allowed") is True
                 or trading_status not in {"", "operational"}):
@@ -481,7 +629,16 @@ class DeltaExchangeData:
         if not isinstance(executable, dict):
             return {"status": "REJECTED", "authoritative": True, "reason": "fresh Delta executable quote unavailable"}
         current_entry = float(executable["ask"] if entry == "buy" else executable["bid"])
-        if (entry == "buy" and not stop < current_entry < target) or (entry == "sell" and not target < current_entry < stop):
+        try:
+            planned_entry = float(entry_authorization["broker_plan"]["entry_price"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return {"status": "REJECTED", "authoritative": True, "reason": "Jarvis approved entry price is unavailable"}
+        if not _same_decimal_price(current_entry, planned_entry):
+            return {"status": "REJECTED", "authoritative": True,
+                    "reason": "fresh Delta executable quote differs from the exact Jarvis plan entry; no slippage policy is configured"}
+        if (not math.isfinite(current_entry) or current_entry <= 0
+                or (entry == "buy" and not stop < current_entry < target)
+                or (entry == "sell" and not target < current_entry < stop)):
             return {"status": "REJECTED", "authoritative": True, "reason": "Delta quote invalidates protective price geometry"}
         try:
             from jarvis_risk import contract_quote_value_in_currency
@@ -542,7 +699,7 @@ class DeltaExchangeData:
                         "client_order_id": client_id, "filled_quantity": 0}
             return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
                     "client_order_id": client_id, "reason": "Delta did not confirm a positive fill"}
-        if average <= 0 or average == float("inf"):
+        if not math.isfinite(average) or average <= 0:
             return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
                     "client_order_id": client_id, "filled_quantity": filled,
                     "reason": "filled entry has no authoritative average fill price"}
@@ -586,6 +743,34 @@ class DeltaExchangeData:
                 "order_type": "market_order", "reduce_only": True,
                 "client_order_id": emergency_client_id,
             }, authorized=True)
+        fill_entry_match = _same_decimal_price(average, planned_entry)
+        fill_geometry_ok = ((entry == "buy" and stop < average < target)
+                            or (entry == "sell" and target < average < stop))
+        try:
+            risk_budget = float(entry_authorization["broker_plan"]["risk_budget_usdt"])
+            from jarvis_risk import contract_quote_value_in_currency
+            fill_contract_value = contract_quote_value_in_currency(product, average, settle)
+            fill_risk = (abs(signed_size) * float(fill_contract_value)
+                         * abs(average - stop) / average) if fill_contract_value else float("inf")
+            risk_within_budget = (math.isfinite(risk_budget) and risk_budget > 0
+                                  and risk_budget <= float(os.environ.get("JARVIS_MAX_RISK_USDT", "10")) + 1e-8
+                                  and math.isfinite(fill_risk) and fill_risk <= risk_budget + 1e-8)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            risk_within_budget = False
+            fill_risk = float("inf")
+        if not fill_entry_match or not fill_geometry_ok or not risk_within_budget:
+            close = emergency_reduce_only_close()
+            close_order = self._order_result(close) if isinstance(close, dict) and close.get("success") else None
+            reason = ("Delta fill price differs from the exact Jarvis plan entry" if not fill_entry_match
+                      else "Delta fill is outside Jarvis stop/target geometry" if not fill_geometry_ok
+                      else "Delta filled exposure exceeds Jarvis risk budget")
+            return {"status": "SUBMISSION_UNKNOWN", "authoritative": False, "order_id": str(order_id),
+                    "client_order_id": client_id, "filled_quantity": filled,
+                    "average_fill_price": average, "protection_state": "RISK_CLOSE_ATTEMPTED",
+                    "reason": reason,
+                    "close_order_id": str(close_order.get("id")) if close_order and close_order.get("id") is not None else None,
+                    "close_client_order_id": emergency_client_id,
+                    "close_order_response_received": close_order is not None}
         pad = max(tick, stop * 0.001)
         stop_limit = stop - pad if closing_side == "sell" else stop + pad
         bracket_payload = {
@@ -623,13 +808,18 @@ class DeltaExchangeData:
                     "reason": "protective child-order verification incomplete; reduce-only close outcome requires reconciliation"}
         def active_child(row, kind):
             try:
+                expected_trigger = stop if kind == "stop_loss_order" else target
+                expected_limit = stop_limit if kind == "stop_loss_order" else target
                 return (int(row.get("product_id")) == pid
                         and str(row.get("state") or "").lower() in {"open", "pending"}
                         and str(row.get("stop_order_type") or "").lower() == kind
                         and row.get("reduce_only") is True
                         and str(row.get("side") or "").lower() == closing_side
+                        and int(row.get("size")) == filled
+                        and _same_decimal_price(row.get("stop_price"), expected_trigger)
+                        and _same_decimal_price(row.get("limit_price"), expected_limit)
                         and row.get("id") is not None)
-            except (TypeError, ValueError, AttributeError):
+            except (TypeError, ValueError, AttributeError, OverflowError):
                 return False
         stop_orders = [o for o in active_orders if active_child(o, "stop_loss_order")]
         target_orders = [o for o in active_orders if active_child(o, "take_profit_order")]
@@ -828,20 +1018,42 @@ class DeltaExchangeData:
                 expected_sign = 1 if str(owned.get("direction") or "").upper() in {"BUY", "CALL"} else -1
                 if (expected_sign > 0 and signed_size < 0) or (expected_sign < 0 and signed_size > 0):
                     return {"complete": False, "reason": "owned position direction mismatches candidate"}
-                if not stop_id or not target_id:
-                    return {"complete": False, "reason": "owned open position lacks visible bracket child orders"}
+                try:
+                    expected_stop = float(owned.get("stop_loss"))
+                    expected_target = float(owned.get("take_profit"))
+                    tick = float(product_by_id[pid].get("tick_size", 0) or 0)
+                    if (not math.isfinite(expected_stop) or not math.isfinite(expected_target)
+                            or expected_stop <= 0 or expected_target <= 0
+                            or not math.isfinite(tick) or tick <= 0):
+                        raise ValueError
+                    closing_side = "sell" if signed_size > 0 else "buy"
+                    stop_pad = max(tick, expected_stop * 0.001)
+                    expected_stop_limit = (expected_stop - stop_pad if closing_side == "sell"
+                                           else expected_stop + stop_pad)
+                    expected_qty = abs(signed_size)
+                except (TypeError, ValueError, OverflowError, KeyError):
+                    return {"complete": False, "reason": "owned protective levels or product tick are missing"}
+
+                def exact_protective(row, kind):
+                    trigger = expected_stop if kind == "stop_loss_order" else expected_target
+                    limit = expected_stop_limit if kind == "stop_loss_order" else expected_target
+                    return _valid_protective_child(
+                        row, product_id=pid, side=closing_side, kind=kind,
+                        quantity=expected_qty, trigger=trigger, limit=limit,
+                    )
+
                 active_by_id = {str(row.get("id")): row for row in all_orders}
                 stop_row, target_row = active_by_id.get(stop_id), active_by_id.get(target_id)
-                if not stop_row or not target_row:
-                    return {"complete": False, "reason": "protective child order is not active"}
-                try:
-                    if (int(stop_row.get("product_id", -1)) != int(pid) or int(target_row.get("product_id", -1)) != int(pid)
-                            or stop_row.get("reduce_only") is not True or target_row.get("reduce_only") is not True
-                            or str(stop_row.get("stop_order_type") or "").lower() != "stop_loss_order"
-                            or str(target_row.get("stop_order_type") or "").lower() != "take_profit_order"):
-                        return {"complete": False, "reason": "protective child identity/type/reduce-only status invalid"}
-                except (TypeError, ValueError):
-                    return {"complete": False, "reason": "protective child schema malformed"}
+                if not stop_id or not exact_protective(stop_row or {}, "stop_loss_order"):
+                    matches = [row for row in all_orders if exact_protective(row, "stop_loss_order")]
+                    if len(matches) != 1:
+                        return {"complete": False, "reason": "exact active stop child cannot be reconciled"}
+                    stop_row, stop_id = matches[0], str(matches[0].get("id"))
+                if not target_id or not exact_protective(target_row or {}, "take_profit_order"):
+                    matches = [row for row in all_orders if exact_protective(row, "take_profit_order")]
+                    if len(matches) != 1:
+                        return {"complete": False, "reason": "exact active target child cannot be reconciled"}
+                    target_row, target_id = matches[0], str(matches[0].get("id"))
                 detail = {"status": "FILLED" if filled >= total else "PARTIAL", "authoritative": True,
                           "filled_quantity": filled, "average_fill_price": average,
                           "protection_state": "ACTIVE",
@@ -1600,7 +1812,12 @@ class DeltaExchangeData:
         Delta supports ``reduce_only`` and ``client_order_id`` on order payloads.
         Close paths must set both so a retry cannot intentionally reverse a
         position and the venue can deduplicate a stable close identity.
+        New entries cannot use this raw endpoint because it cannot attach and
+        independently verify Jarvis-authorized stop/target protection; use
+        place_protected_order with a fresh central authorization instead.
         """
+        if not reduce_only:
+            return {"success": False, "error": "Unprotected raw Delta entries are disabled; use Jarvis-authorized place_protected_order"}
         # An explicit process-level opt-in is required even on testnet.  This
         # prevents a caller or configuration mistake from turning analysis into
         # an order submission.
