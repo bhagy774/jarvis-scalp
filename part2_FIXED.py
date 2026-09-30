@@ -2927,55 +2927,19 @@ class TrendAnalysisBrainGPU:
             return {}
 
     def _analyze_single_timeframe_trend(self, df, timeframe):
-        """Analyze trend for a single timeframe"""
-        # Move data to GPU
-        closes = torch.tensor(df['close'].values, device=self.device, dtype=torch.float32)
-        highs = torch.tensor(df['high'].values, device=self.device, dtype=torch.float32)
-        lows = torch.tensor(df['low'].values, device=self.device, dtype=torch.float32)
-        
-        trend_info = {
-            'direction': 'SIDEWAYS',
-            'strength': 0.5,
-            'slope': 0.0,
-            'last_update': time.time()
-        }
-        
-        # Calculate moving averages for different periods
-        ma_short = torch.mean(closes[-20:])
-        ma_medium = torch.mean(closes[-50:])
-        ma_long = torch.mean(closes[-100:])
-        
-        # Determine trend direction
-        if ma_short > ma_medium and ma_medium > ma_long:
-            trend_info['direction'] = 'BULLISH'
-            trend_info['strength'] = min(
-                ((ma_short - ma_medium) / ma_medium + (ma_medium - ma_long) / ma_long) * 100, 1.0
-            )
-        elif ma_short < ma_medium and ma_medium < ma_long:
-            trend_info['direction'] = 'BEARISH'
-            trend_info['strength'] = min(
-                ((ma_medium - ma_short) / ma_short + (ma_long - ma_medium) / ma_medium) * 100, 1.0
-            )
-        else:
-            trend_info['direction'] = 'SIDEWAYS'
-            trend_info['strength'] = 0.5
-        
-        # Calculate trend slope using linear regression
-        if len(closes) >= 50:
-            x = torch.arange(50, device=self.device, dtype=torch.float32)
-            y = closes[-50:]
-            
-            x_mean = torch.mean(x)
-            y_mean = torch.mean(y)
-            
-            numerator = torch.sum((x - x_mean) * (y - y_mean))
-            denominator = torch.sum((x - x_mean) ** 2)
-            
-            if denominator > 0:
-                slope = numerator / denominator
-                trend_info['slope'] = slope.item()
-        
-        return trend_info
+        import quantitative_math as qm
+        closes = df['close'] if hasattr(df, 'columns') and 'close' in df.columns else []
+        evidence = qm.close_return_trend(closes)
+        now = time.time()
+        if not evidence.get('available'):
+            return {'direction': 'SIDEWAYS', 'strength': 0.5, 'slope': 0.0, 'last_update': now,
+                    'evidence_status': 'insufficient_or_invalid_ohlcv'}
+        score = float(evidence.get('trend_score', 0.0))
+        direction = 'BULLISH' if score >= 1.0 else 'BEARISH' if score <= -1.0 else 'SIDEWAYS'
+        strength = min(1.0, abs(score) / 5.0) if direction != 'SIDEWAYS' else 0.5
+        return {'direction': direction, 'strength': strength,
+                'slope': float(evidence.get('slope', 0.0)), 'last_update': now,
+                'evidence_status': 'robust_log_return_trend'}
 
     def _analyze_multi_tf_alignment(self, trend_analysis):
         """Analyze alignment of trends across timeframes"""
@@ -4388,27 +4352,9 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
 
     @part_advisory_entry("part2_zone", data_parameter="data", context_parameter="context")
     def analyze_native_zone(self, data, timeframe="1m", context=None):
-        """Analyze one native candle frame and attach Part 2's advisory."""
-        try:
-            if len(data) < 20:
-                return {"signal": 0, "thought": f"Part2 {timeframe}: insufficient native bars"}
-            current = float(data["close"].iloc[-1])
-            for lookback in (20, 60, 100):
-                if len(data) < lookback:
-                    continue
-                high = float(data["high"].tail(lookback).max())
-                low = float(data["low"].tail(lookback).min())
-                span = high - low
-                if span <= 0:
-                    continue
-                pct = (current - low) / span
-                if pct >= 0.92:
-                    return {"signal": -1, "thought": f"Part2 {timeframe}: Resistance Zone top {pct*100:.0f}% ({lookback}-bar)"}
-                if pct <= 0.08:
-                    return {"signal": 1, "thought": f"Part2 {timeframe}: Support Zone bottom {pct*100:.0f}% ({lookback}-bar)"}
-            return {"signal": 0, "thought": f"Part2 {timeframe}: no native zone"}
-        except Exception:
-            return {"signal": 0, "thought": f"Part2 {timeframe}: invalid native zone data"}
+        """Task-specific OHLCV evidence. The analyzer decorator still adds only its own advisory."""
+        import quantitative_math as qm
+        return qm.part_signal("2", data)
 
 # ==================== SYSTEM INITIALIZATION ====================
 

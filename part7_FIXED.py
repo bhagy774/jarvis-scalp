@@ -369,163 +369,24 @@ def _cuda_guard(device):
 
 class VolatilityEngineGPU:
     """
-    JARVIS PART 7 - GPU-ACCELERATED VOLATILITY & REGIME ENGINE
-    GTX 1650 CUDA & CPU Optimized.
-
-    Quantitative Volatility Architecture:
-    1. Bollinger Bands (20-period SMA, 2.0 Std Dev) & Bandwidth
-    2. Keltner Channels (20-period EMA, 1.5 * ATR14)
-    3. John Carter TTM Squeeze Detection (Bollinger Bands compressing inside Keltner Channel)
-    4. Volatility Expansion / Breakout Direction (%B >= 0.85 with expanding ATR)
-    5. Volatility Breakdown Direction (%B <= 0.15 with expanding ATR)
-    6. Extreme Volatility / Panic Spike Risk Veto (ATR ratio > 2.8x or ATR% > 1.5% -> Veto)
-    7. Stable Rotation / Mean-Reverting Chop Deadband (Signals 0 during normal vol)
+    Part 7 deterministic volatility advisory over validated raw OHLCV.
+    Uses realized/downside/jump variation, bounded state evidence, and explicit
+    conservative risk vetoes. Neural features are a separate advisory-only path.
     """
     def __init__(self):
         self.device = torch.device('cuda' if (TORCH_AVAILABLE and torch.cuda.is_available()) else 'cpu')
 
     @part_advisory_entry("part7_volatility", data_parameter="data", context_parameter="context")
     def analyze(self, data: Any, context: Optional[Dict] = None) -> Dict[str, Any]:
-        """
-        Advanced Math: Includes Hidden Markov Model (HMM) proxy for regime detection
-        Main volatility analysis called by Part7Volatility in Jarvis.
-        """
-        try:
-            if data is None or not isinstance(data, pd.DataFrame) or len(data) < 30:
-                return {"signal": 0, "confidence": 5.0, "thought": "Part7 Vol: Insufficient data (<30)"}
-
-            # ── Check regime override from context ────────────────────────
-            if context:
-                regime = str(context.get('institutional_components', {}).get('regime', 'NEUTRAL')).upper()
-                if 'VOLATILE' in regime or 'PANIC' in regime:
-                    return {
-                        "signal": 0,
-                        "confidence": 5.0,
-                        "thought": f"Part7 Vol: High Volatility Regime ({regime}) — No trade veto",
-                        "telemetry": {"regime": regime}
-                    }
-
-            recent = data.tail(50).copy()
-            closes = recent['close'].astype(float)
-            highs  = recent['high'].astype(float)
-            lows   = recent['low'].astype(float)
-
-            if len(closes) < 20:
-                return {"signal": 0, "confidence": 5.0, "thought": "Part7 Vol: Insufficient closes"}
-
-            current_close = float(closes.iloc[-1])
-
-            # --- Advanced Math: Simple Hidden Markov Model (HMM) Transition Proxy ---
-            # We track two states: 0 (Low Volatility) and 1 (High Volatility)
-            # using emission probabilities based on historical returns distribution
-            returns = closes.pct_change().dropna().values
-            vol = np.std(returns)
-
-            # Transition matrix probabilities (simplified assumption)
-            # P(Low->Low) = 0.8, P(Low->High) = 0.2
-            # P(High->High) = 0.7, P(High->Low) = 0.3
-            emission_prob_high = 1.0 / (1.0 + np.exp(-(vol - 0.002) * 1000)) # Sigmoid probability
-            hmm_state = "HIGH" if emission_prob_high > 0.6 else "LOW"
-
-            if hmm_state == "HIGH" and vol > 0.015:
-                return {
-                    "signal": 0,
-                    "confidence": 5.0,
-                    "thought": f"Part7 Vol: HMM High Volatility State Detected (P={emission_prob_high:.2f}) — Risk Veto",
-                    "telemetry": {"regime": hmm_state, "emission_prob": emission_prob_high}
-                }
-
-            # 1. Bollinger Bands (20-period SMA, 2.0 std)
-            sma20 = float(closes.tail(20).mean())
-            std20 = float(closes.tail(20).std()) + 1e-8
-            upper_bb = sma20 + 2.0 * std20
-            lower_bb = sma20 - 2.0 * std20
-            bb_width = (upper_bb - lower_bb) / max(sma20, 1.0)
-            pct_b = (current_close - lower_bb) / (upper_bb - lower_bb + 1e-8)
-
-            # 2. True Range & ATR(14), ATR(50)
-            tr = pd.concat([
-                highs - lows,
-                (highs - closes.shift(1)).abs(),
-                (lows - closes.shift(1)).abs()
-            ], axis=1).max(axis=1)
-            atr14 = float(tr.tail(14).mean())
-            atr50 = float(tr.tail(50).mean()) if len(tr) >= 50 else atr14
-            ema20 = float(closes.ewm(span=20).mean().iloc[-1])
-
-            # 3. Keltner Channel (20 EMA, 1.5 * ATR14)
-            upper_kc = ema20 + 1.5 * atr14
-            lower_kc = ema20 - 1.5 * atr14
-
-            # 4. TTM Squeeze Detection (BB inside KC)
-            is_squeeze = (upper_bb < upper_kc) and (lower_bb > lower_kc)
-
-            # 5. Volatility Expansion Ratio (Short-term ATR vs Long-term ATR)
-            vol_ratio = atr14 / (atr50 + 1e-8)
-            norm_atr = atr14 / max(current_close, 1.0)
-
-            telemetry = {
-                "bb_width_pct": round(bb_width * 100, 2),
-                "pct_b": round(pct_b, 3),
-                "atr14": round(atr14, 2),
-                "vol_ratio": round(vol_ratio, 2),
-                "is_squeeze": is_squeeze,
-                "norm_atr_pct": round(norm_atr * 100, 3)
-            }
-
-            # 6. Extreme Volatility Spike Risk Gate (> 2.8x vol expansion or > 1.5% candle ATR)
-            if vol_ratio > 2.8 or norm_atr > 0.015:
-                return {
-                    "signal": 0,
-                    "confidence": 5.0,
-                    "thought": f"Part7 Vol: Extreme Volatility Spike ({vol_ratio:.1f}x, ATR={norm_atr*100:.2f}%) — Risk Veto",
-                    "telemetry": telemetry
-                }
-
-            # 7. Squeeze Compression Coiling (Pre-Breakout Consolidation)
-            if is_squeeze:
-                return {
-                    "signal": 0,
-                    "confidence": 5.0,
-                    "thought": f"Part7 Vol: TTM Squeeze Coiling (BBw={bb_width*100:.2f}%) — Neutral",
-                    "telemetry": telemetry
-                }
-
-            # 8. Directional Volatility Expansion (Breakout above Upper BB with expanding ATR)
-            if pct_b >= 0.85 and current_close > upper_bb and vol_ratio >= 1.0:
-                conf = min(85.0, 60.0 + (pct_b - 0.85) * 100.0 + min(vol_ratio, 2.0) * 5.0)
-                return {
-                    "signal": 1,
-                    "confidence": round(conf, 1),
-                    "thought": f"Part7 Vol: Bullish Volatility Expansion (%B={pct_b:.2f}, VolRatio={vol_ratio:.2f})",
-                    "telemetry": telemetry
-                }
-
-            # 9. Directional Volatility Breakdown (Breakdown below Lower BB with expanding ATR)
-            if pct_b <= 0.15 and current_close < lower_bb and vol_ratio >= 1.0:
-                conf = min(85.0, 60.0 + (0.15 - pct_b) * 100.0 + min(vol_ratio, 2.0) * 5.0)
-                return {
-                    "signal": -1,
-                    "confidence": round(conf, 1),
-                    "thought": f"Part7 Vol: Bearish Volatility Breakdown (%B={pct_b:.2f}, VolRatio={vol_ratio:.2f})",
-                    "telemetry": telemetry
-                }
-
-            # 10. Normal / Sideways Volatility (Mean Reversion / Chop) -> Strictly 0 (Neutral)
-            return {
-                "signal": 0,
-                "confidence": 5.0,
-                "thought": f"Part7 Vol: Stable Volatility (%B={pct_b:.2f}, BBw={bb_width*100:.2f}%) — Neutral",
-                "telemetry": telemetry
-            }
-
-        except Exception as e:
-            return {
-                "signal": 0,
-                "confidence": 5.0,
-                "thought": f"Part7 Vol: Neutral (error: {e})",
-                "telemetry": {}
-            }
+        """Task-specific OHLCV evidence. The analyzer decorator still adds only its own advisory."""
+        import quantitative_math as qm
+        result = qm.part_signal("7", data)
+        telemetry = dict(result.get("telemetry") or {})
+        # Preserve Part 7's established top-level veto contract as well as telemetry.
+        for key in ("risk_veto", "entry_blocked"):
+            if telemetry.get(key):
+                result[key] = True
+        return result
 
 
 class EnhancedGPULiveDataEngine:
@@ -865,54 +726,45 @@ class EnhancedGPULiveDataEngine:
     # ==================== ENHANCED GPU-ACCELERATED FEATURE ENGINEERING ====================
     
     async def _update_feature_tensors(self):
-        """એન્હાન્સ્ડ ફીચર એન્જિનિયરિંગ with more indicators"""
+        """Build bounded quantitative state features from at most 128 closed OHLCV bars."""
         try:
             buffer_1m = self.candle_buffers_gpu['1m']
-            if buffer_1m['count'] < 20:  # Increased minimum data
+            count = min(int(buffer_1m.get('count', 0)), 128)
+            if count < 20:
                 return
-            
-            with _cuda_guard(self.device):  # BUG FIX: CPU-safe cuda guard
-                # Get recent data
-                start_idx = (buffer_1m['pointer'] - 99) % len(buffer_1m['open'])
-                recent_opens = self._get_circular_slice(buffer_1m['open'], start_idx, 100)
-                recent_highs = self._get_circular_slice(buffer_1m['high'], start_idx, 100)
-                recent_lows = self._get_circular_slice(buffer_1m['low'], start_idx, 100)
-                recent_closes = self._get_circular_slice(buffer_1m['close'], start_idx, 100)
-                recent_volumes = self._get_circular_slice(buffer_1m['volume'], start_idx, 100)
-                
-                # Enhanced feature set
-                features = {}
-                
-                # Basic features
-                features['returns'] = self._calculate_returns_gpu(recent_closes)
-                features['volatility'] = self._calculate_enhanced_volatility_gpu(recent_highs, recent_lows, recent_closes)
-                features['momentum'] = self._calculate_enhanced_momentum_gpu(recent_closes)
-                
-                # Volume features
-                features['volume_profile'] = self._calculate_volume_profile_gpu(recent_volumes)
-                features['volume_velocity'] = self._calculate_volume_velocity_gpu(recent_volumes)
-                features['volume_oscillator'] = self._calculate_volume_oscillator_gpu(recent_volumes)
-                
-                # Advanced technical features
-                features['rsi'] = self._calculate_rsi_gpu(recent_closes)
-                features['macd'] = self._calculate_macd_gpu(recent_closes)
-                features['bollinger_bands'] = self._calculate_bollinger_bands_gpu(recent_closes)
-                
-                # Market microstructure
-                features['microstructure'] = self._calculate_enhanced_microstructure_gpu(
-                    recent_opens, recent_highs, recent_lows, recent_closes, recent_volumes
-                )
-                
-                # Price patterns
-                features['price_patterns'] = self._detect_price_patterns_gpu(
-                    recent_opens, recent_highs, recent_lows, recent_closes
-                )
-                
-                self.feature_tensors_gpu = features
-                self._normalize_features_gpu()
-                
+            capacity = len(buffer_1m['open'])
+            start_idx = (int(buffer_1m['pointer']) - count + 1) % capacity
+            tensors = [self._get_circular_slice(buffer_1m[k], start_idx, count)
+                       for k in ('open', 'high', 'low', 'close', 'volume')]
+            columns = [t.detach().cpu().tolist() if hasattr(t, 'detach') else list(t) for t in tensors]
+            rows = [dict(zip(('open', 'high', 'low', 'close', 'volume'), values))
+                    for values in zip(*columns)]
+            import quantitative_math as qm
+            evidence = qm.quantitative_features(rows, limit=128)
+            if not evidence.get('available'):
+                self.feature_tensors_gpu = {}
+                return
+            state = evidence['kalman']
+            vol_state = evidence['volatility_state']
+            values = {
+                'log_returns': evidence['returns'],
+                'realized_volatility': evidence['realized_vol'],
+                'downside_volatility': evidence['downside_vol'],
+                'jump_variation_share': evidence['jump_share'],
+                'robust_trend_score': evidence['trend_score'],
+                'state_velocity_z': state['velocity_z'],
+                'state_innovation_z': state['innovation_z'],
+                'change_point_bic_gain': evidence['change_point']['bic_gain'],
+                'high_variance_state_posterior': vol_state['high_state_posterior'],
+                'volume_surprise_robust_z': evidence['volume_surprise_robust_z'],
+                'close_location_volume_proxy': evidence['flow_imbalance_proxy'],
+            }
+            self.feature_tensors_gpu = {
+                name: torch.tensor(value, dtype=torch.float32, device=self.device)
+                for name, value in values.items()
+            }
         except Exception as e:
-            self.logger.error(f"❌ Enhanced feature error: {e}")
+            self.logger.error(f"❌ Quantitative feature update failed: {e}")
     
     def _get_circular_slice(self, tensor: torch.Tensor, start_idx: int, length: int) -> torch.Tensor:
         """Get circular slice from tensor buffer"""

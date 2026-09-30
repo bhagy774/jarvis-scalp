@@ -1,9 +1,10 @@
-"""Part 10 owned model: candle-state transitions and streak statistics."""
+"""Part 10 owned model: candle-state transition and streak evidence."""
 from .common import candle_math, clip
-FEATURE_NAMES=("body_ratio","body_acceleration","streak8","transition_rate16","green_fraction16","range_atr","ret1","ret4","ret16","drawdown16","volume_z","vol_ratio")
+FEATURE_NAMES=("latest_body_fraction","body_acceleration","directional_streak_fraction","transition_rate","green_fraction16","range_scale_pct","return1_robust_z","return4_robust_z","return16_robust_z","drawdown_from_peak","volume_surprise_robust_z","recent_volume_share")
 MODEL_SPEC={"task":"candle_transition","dims":(12,12,6,3),"acts":("relu","tanh","linear"),"labels":("reversal","indecision","continuation"),"kind":"softmax"}
 def prepare_features(data):
- s=candle_math(data); vals=(s["body_ratio"],s["body"][-1]-s["body"][-2],s["streak"],s["transition"],s["green_fraction"],s["range_atr"],s["ret1"],s["ret4"],s["ret16"],s["drawdown16"],s["volz"],s["vol_ratio"])
+ s=candle_math(data); rows=s["rows"]; vols=[r["volume"] for r in rows]; recent=sum(vols[-4:])/max(sum(vols[-32:]),1e-12)
+ vals=(s["candle"]["body_fraction"],s["body_acceleration"],s["directional_streak_fraction"],s["transition_rate"],s["green_fraction"],s["range_scale_pct"],s["ret1_z"],s["ret4_z"],s["ret16_z"],s["drawdown_from_peak"],s["volume_surprise_z"],recent)
  return tuple(clip(x) for x in vals)
 def interpret_scores(scores,prediction): return {"candle_transition":prediction,"reversal_score_uncalibrated":scores[0],"continuation_score_uncalibrated":scores[2]}
 def label_target(rows,i,horizon,neutral_bps,x):

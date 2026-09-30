@@ -1,6 +1,9 @@
-"""Shared data coercion and mathematical primitives, not Part model logic."""
-import math
+"""Shared bounded OHLCV coercion and feature primitives; Parts own projections."""
 from collections.abc import Mapping
+import math
+import statistics
+
+import quantitative_math as qm
 
 TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
 PART_NAMES = tuple(f"part{i}_" + name for i, name in enumerate((
@@ -16,21 +19,19 @@ def clip(value, limit=10.0):
 
 
 def div(a, b, eps=1e-12):
-    return float(a) / (abs(float(b)) + eps)
+    return float(a) / max(abs(float(b)), eps)
 
 
 def mean(xs):
-    return sum(xs) / max(1, len(xs))
+    return statistics.fmean(xs) if xs else 0.0
 
 
 def std(xs):
-    if not xs:
-        return 0.0
-    m = mean(xs)
-    return math.sqrt(mean([(x - m) ** 2 for x in xs]))
+    return statistics.pstdev(xs) if len(xs) > 1 else 0.0
 
 
 def slope(xs):
+    """Least-squares slope retained only as a generic numerical helper."""
     n = len(xs)
     if n < 2:
         return 0.0
@@ -38,100 +39,110 @@ def slope(xs):
     return sum((i - xm) * (v - ym) for i, v in enumerate(xs)) / (n * (n*n - 1) / 12.0)
 
 
-def ema(xs, period):
-    if not xs:
-        return 0.0
-    alpha, value = 2.0 / (period + 1.0), xs[0]
-    for item in xs[1:]:
-        value = alpha * item + (1.0 - alpha) * value
-    return value
-
-
 def ohlcv_rows(data):
-    if isinstance(data, (list, tuple)):
-        source = data[-64:]
-    elif hasattr(data, "columns") and hasattr(data, "iloc"):
-        if not {"open", "high", "low", "close", "volume"}.issubset(set(data.columns)):
-            raise ValueError("missing_ohlcv_columns")
-        frame = data.tail(64)
-        source = [{k: frame[k].iloc[i] for k in ("open", "high", "low", "close", "volume")} for i in range(len(frame))]
-    else:
-        raise ValueError("invalid_ohlcv_data")
-    result = []
-    for row in source:
-        if not isinstance(row, Mapping):
-            raise ValueError("invalid_ohlcv_row")
-        values = tuple(float(row[k]) for k in ("open", "high", "low", "close", "volume"))
-        if not all(math.isfinite(v) for v in values):
-            raise ValueError("non_finite_ohlcv")
-        o, h, l, c, v = values
-        if min(o, h, l, c) <= 0 or v < 0 or h < max(o, c, l) or l > min(o, c, h):
-            raise ValueError("invalid_ohlcv")
-        result.append({"open": o, "high": h, "low": l, "close": c, "volume": v})
-    if len(result) < 64:
+    rows = qm.candles_from(data, limit=128)
+    if len(rows) < 64:
         raise ValueError("insufficient_closed_candles")
-    return result
+    return rows
 
 
 def candle_math(data):
-    """Return shared rolling primitives; Parts own the actual projections/heads."""
+    """Return bounded robust-distribution, state, geometry and structure evidence.
+
+    Every price feature uses closed OHLCV bars. The function intentionally has
+    no EMA/RSI/MACD/ATR/ADX/band calculation or exchange-flow assumption.
+    """
     rows = ohlcv_rows(data)
-    op, hi, lo, cl, vol = ([r[k] for r in rows] for k in ("open", "high", "low", "close", "volume"))
-    n, price = len(cl), cl[-1]
-    ranges = [max(h-l, 1e-12) for h, l in zip(hi, lo)]
-    body = [(c-o)/r for c,o,r in zip(cl,op,ranges)]
-    upper = [(h-max(o,c))/r for h,o,c,r in zip(hi,op,cl,ranges)]
-    lower = [(min(o,c)-l)/r for l,o,c,r in zip(lo,op,cl,ranges)]
-    rets = [cl[i]/cl[i-1]-1.0 for i in range(1,n)]
-    logc = [math.log(x) for x in cl]
-    ret = lambda k: cl[-1]/cl[max(0,n-1-k)]-1.0
-    pos = lambda w: div(price-min(lo[-w:]),max(hi[-w:])-min(lo[-w:]))
-    highgap = lambda w: div(price-max(hi[-w:]),price)
-    lowgap = lambda w: div(price-min(lo[-w:]),price)
-    atr14, atr50 = mean(ranges[-14:]), mean(ranges[-50:])
-    volmean, volstd = mean(vol[-32:]), std(vol[-32:])
-    flow = [b*v for b,v in zip(body,vol)]
-    signed_flow = lambda w: div(sum(flow[-w:]),sum(vol[-w:]))
-    ema8, ema21, ema50 = (ema(cl[-50:], p) for p in (8,21,50))
-    weighted_center = div(sum(c*v for c,v in zip(cl[-32:],vol[-32:])),sum(vol[-32:]))
-    profile_low, profile_high = min(lo[-32:]), max(hi[-32:])
-    width = max(profile_high-profile_low,1e-12)
-    bins=[0.0]*20
-    for h,l,c,v in zip(hi[-32:],lo[-32:],cl[-32:],vol[-32:]):
-        idx=min(19,max(0,int((((h+l+c)/3.0)-profile_low)/width*20)))
-        bins[idx]+=v
-    node=(max(range(20),key=bins.__getitem__)+.5)/20.0 if sum(bins)>0 else pos(32)
-    transitions=sum(body[i]*body[i+1]<0 for i in range(-16,-1))/15.0
-    streak=1
-    for i in range(n-2,max(-1,n-9),-1):
-        if body[i]==0 or body[i]*body[-1]<=0: break
-        streak+=1
-    ups=sum(max(hi[i]-hi[i-1],0.0) for i in range(n-14,n))
-    downs=sum(max(lo[i-1]-lo[i],0.0) for i in range(n-14,n))
-    flow12, ret16 = signed_flow(12), ret(16)
-    ret8std, ret32std = std(rets[-8:]),std(rets[-32:])
-    rsi_changes=[cl[i]-cl[i-1] for i in range(max(1,n-14),n)]
-    gains=mean([max(x,0.0) for x in rsi_changes]); losses=mean([max(-x,0.0) for x in rsi_changes])
-    rsi=1.0 if losses==0 and gains else 0.0 if losses==0 else gains/(gains+losses)
-    return {"rows":rows,"open":op,"high":hi,"low":lo,"close":cl,"volume":vol,"range":ranges,
-        "body":body,"upper":upper,"lower":lower,"returns":rets,"log_close":logc,"ret":ret,"pos":pos,
-        "highgap":highgap,"lowgap":lowgap,"atr14":atr14,"atr50":atr50,"atr_pct":div(atr14,price),
-        "range_atr":div(ranges[-1],atr14),"ret8std":ret8std,"ret32std":ret32std,"vol_ratio":div(ret8std,ret32std),
-        "volmean32":volmean,"volz":div(vol[-1]-volmean,volstd),"volume_ratio":div(vol[-1],volmean),
-        "flow":flow,"signed_flow":signed_flow,"flow4":signed_flow(4),"flow12":flow12,
-        "ema821":div(ema8-ema21,price),"ema2150":div(ema21-ema50,price),"slope16":slope(logc[-16:]),
-        "slope32":slope(logc[-32:]),"ret1":ret(1),"ret4":ret(4),"ret16":ret16,
-        "break_hi20":div(cl[-1]-max(hi[-21:-1]),price),"break_lo20":div(cl[-1]-min(lo[-21:-1]),price),
-        "break_hi50":div(cl[-1]-max(hi[-51:-1]),price),"break_lo50":div(cl[-1]-min(lo[-51:-1]),price),
-        "weighted_dev":div(price-weighted_center,price),"volume_node_pos":node,
-        "voltrend":slope([math.log1p(v) for v in vol[-16:]]),
-        "flow_ret_div":flow12-max(-1.0,min(1.0,ret16*100.0)),"flow_price_div":flow12-ret16*100.0,
-        "transition":transitions,"streak":(streak-1)/7.0,"green_fraction":sum(x>0 for x in body[-16:])/16.0,
-        "drawdown16":div(price-max(hi[-16:]),price),"range_pos32":pos(32),"range_pos20":pos(20),"range_pos50":pos(50),
-        "range_expansion":div(mean(ranges[-5:]),mean(ranges[-20:])),"close_location":2*div(cl[-1]-lo[-1],ranges[-1])-1,
-        "body_ratio":abs(body[-1]),"wick_imbalance":upper[-1]-lower[-1],"ema_rsi":rsi-.5,
-        "up_move14":div(ups,price),"down_move14":div(downs,price),"directional_imbalance":div(ups-downs,ups+downs),
-        "profile_concentration":div(sum(vol[-4:]),sum(vol[-32:])),"prior_close":cl[-2]}
+    f = qm.quantitative_features(rows, limit=128)
+    if not f.get("available"):
+        raise ValueError("invalid_ohlcv")
+    closes = [r["close"] for r in rows]
+    highs = [r["high"] for r in rows]
+    lows = [r["low"] for r in rows]
+    volumes = [r["volume"] for r in rows]
+    rets = list(f["returns"])
+    scale = max(float(f["return_scale"]), 1e-12)
+    price = float(f["price"])
+    risk_price = max(float(f["range_scale_price"]), price * 1e-9)
+    geom = []
+    for r in rows:
+        span = max(r["high"] - r["low"], r["close"] * 1e-12)
+        body = (r["close"] - r["open"]) / span
+        geom.append({"body_signed": max(-1.0, min(1.0, body)),
+                     "body_fraction": min(1.0, abs(body)),
+                     "close_location": max(-1.0, min(1.0, (2*r["close"]-r["high"]-r["low"])/span)),
+                     "upper_wick": max(0.0, (r["high"]-max(r["open"],r["close"]))/span),
+                     "lower_wick": max(0.0, (min(r["open"],r["close"])-r["low"])/span)})
+    current = geom[-1]
+    prior_bodies = [g["body_fraction"] for g in geom[-33:-1]]
+    body_scale = max(qm.robust_scale(prior_bodies), 1e-6)
+    body_z = (current["body_fraction"] - statistics.median(prior_bodies)) / body_scale if prior_bodies else 0.0
+    def position(window):
+        lo, hi = min(lows[-window:]), max(highs[-window:])
+        return (price-lo) / max(hi-lo, price*1e-12)
+    def ret_z(window):
+        return sum(rets[-window:]) / scale if rets else 0.0
+    recent_signs = [1 if x > 0 else -1 if x < 0 else 0 for x in rets[-20:]]
+    nonzero = [x for x in recent_signs if x]
+    coherence = sum(nonzero) / max(1, len(nonzero))
+    transitions = sum(1 for a,b in zip(nonzero, nonzero[1:]) if a != b) / max(1,len(nonzero)-1)
+    streak = 0
+    if nonzero:
+        for sign in reversed(nonzero):
+            if sign != nonzero[-1]: break
+            streak += 1
+    profile = qm.price_volume_distribution(rows, bins=24, limit=128)
+    zones = qm.structural_zones(rows, limit=128)
+    seq = qm.sequential_direction_evidence(rows)
+    sup = zones.get("nearest_support") if zones.get("available") else None
+    res = zones.get("nearest_resistance") if zones.get("available") else None
+    vol_state = f["volatility_state"]
+    tail_scale = max(scale, 1e-12)
+    flow = float(f["flow_imbalance_proxy"])
+    return {
+        "rows": rows, "price": price, "returns": rets, "return_scale": scale,
+        "ret1_z": rets[-1] / scale if rets else 0.0,
+        "ret4_z": ret_z(4), "ret16_z": ret_z(16),
+        "trend_score": float(f["trend_score"]),
+        "theil_sen_slope_z": float(f["theil_sen_log_slope"]) / scale,
+        "state_velocity_z": float(f["kalman"]["velocity_z"]),
+        "state_innovation_z": float(f["kalman"]["innovation_z"]),
+        "change_point_bic_gain": float(f["change_point"]["bic_gain"]),
+        "change_point_shift_z": float(f["change_point"].get("shift_z", 0.0)),
+        "realized_vol": float(f["realized_vol"]), "downside_vol": float(f["downside_vol"]),
+        "drawdown_from_peak": float(f["drawdown_from_peak"]),
+        "jump_share": float(f["jump_share"]), "range_scale_pct": float(f["range_scale_pct"]),
+        "range_scale_price": risk_price,
+        "high_state_posterior": float(vol_state["high_state_posterior"]),
+        "short_long_realized_vol_ratio": float(vol_state["short_long_ratio"]),
+        "volume_surprise_z": float(f["volume_surprise_robust_z"]),
+        "flow_proxy": flow, "flow_is_measured_orderbook": False,
+        "flow_trend_divergence": flow - max(-1.0,min(1.0,ret_z(16)/5.0)),
+        "sign_persistence": float(f["sign_persistence"]),
+        "directional_coherence": coherence, "transition_rate": transitions,
+        "directional_streak_fraction": min(1.0, streak/8.0),
+        "green_fraction": sum(g["body_signed"]>0 for g in geom[-16:])/16.0,
+        "candle": current, "body_robust_z": body_z,
+        "body_acceleration": current["body_signed"]-geom[-2]["body_signed"],
+        "range_position_8": position(8), "range_position_20": position(20),
+        "range_position_32": position(32), "range_position_50": position(50),
+        "range_width_20_pct": (max(highs[-20:])-min(lows[-20:]))/price,
+        "range_width_50_pct": (max(highs[-50:])-min(lows[-50:]))/price,
+        "break_high20_scale": (price-max(highs[-21:-1]))/risk_price,
+        "break_low20_scale": (min(lows[-21:-1])-price)/risk_price,
+        "break_high50_scale": (price-max(highs[-51:-1]))/risk_price,
+        "break_low50_scale": (min(lows[-51:-1])-price)/risk_price,
+        "profile": profile, "zones": zones, "sequential": seq,
+        "support_distance_scale": (float(sup["center"])-price)/risk_price if sup else 0.0,
+        "resistance_distance_scale": (float(res["center"])-price)/risk_price if res else 0.0,
+        "support_strength": float(sup["strength"]) if sup else 0.0,
+        "resistance_strength": float(res["strength"]) if res else 0.0,
+        "poc_distance_scale": (price-float(profile["poc"]))/risk_price if profile.get("available") else 0.0,
+        "close_location_in_value": float(profile["close_location_in_value"]) if profile.get("available") else 0.5,
+        "volume_concentration_4_32": sum(volumes[-4:])/max(sum(volumes[-32:]),1e-12),
+        "tail_downside_scale": float(f["tail_return_q05"])/tail_scale,
+        "tail_upside_scale": float(f["tail_return_q95"])/tail_scale,
+    }
 
 
 def mtf_signal_matrix(data):
