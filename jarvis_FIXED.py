@@ -1419,9 +1419,13 @@ class LiveTradingEngine:
             reasons = (result.get('intelligence_board', []) or [])[:3]
             if part7.get('entry_blocked'):
                 reasons = [part7.get('reason', 'Part7 entry gate blocked')] + reasons
+            # Dashboard is display-only.  Use the latest central decision only
+            # for its symbol label; it never alters execution authority.
+            final_decision = getattr(self, 'last_decision', None) or {}
+            decision_symbol = final_decision.get('symbol') if isinstance(final_decision, dict) else None
             self.dashboard.update(
                 timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                symbol=(_decision.get('symbol') if _decision else None) or symbol or self.active_symbol,
+                symbol=decision_symbol or symbol or self.active_symbol,
                 price=f"${float(current_price):,.2f}" if current_price else '—',
                 signal={'direction': signal.get('direction', 'NO_TRADE'), 'confidence': signal.get('confidence_score', signal.get('confidence', 0))},
                 reasons=reasons or [result.get('no_trade_reason', 'Awaiting analysis')],
@@ -6972,9 +6976,11 @@ class JarvisElite:
                     'execution_identity': dict(execution_identity) if execution_identity else None,
                 })
 
+            # The HUD receives every completed deterministic analysis, including
+            # NO_TRADE.  This is display telemetry only and cannot submit orders.
+            if self.hud_enabled:
+                self._sync_to_hud(final_decision)
             if score >= self.scoring_matrix.minimum_trade_score:
-                if self.hud_enabled:
-                    self._sync_to_hud(final_decision)
                 return final_decision
                 
             else:  # Never override a deterministic minimum score with an advisor's direction.
@@ -7026,7 +7032,17 @@ class JarvisElite:
                 "market_data": {
                     "price": signal_data.get('trade_signal', {}).get('entry_price'),
                     "volatility": signal_data.get('market_context', {}).get('volatility')
-                }
+                },
+                "dashboard": {
+                    "symbol": signal_data.get('symbol') or getattr(self, 'active_symbol', None),
+                    "decision": signal_data.get('trade_signal', {}).get('direction', 'NO_TRADE'),
+                    "confidence": signal_data.get('trade_signal', {}).get('confidence_score', 0),
+                    "reason": signal_data.get('no_trade_reason', ''),
+                    "part7": signal_data.get('part7_volatility', {}),
+                    "updated_at": datetime.now().isoformat(),
+                    "source": "jarvis_FIXED.py",
+                    "read_only": True,
+                },
             }
             # Add CNS Data if available
             if hasattr(self, 'cns'):
