@@ -1,0 +1,58 @@
+SYNTHETIC FIXTURE OUTPUT — NOT LIVE DATA
+JARVIS | LIVE ANALYSIS DIAGNOSTICS (display only)
+Market: SYNTHETIC-BTCUSDT | analysis uses closed candles; forming candle is not a signal input.
+Analysis cycle: COMPLETE; reason=synthetic fixture completes all diagnostics fields
+Snapshot: symbol=SYNTHETIC-BTCUSDT; selected-symbol identity=MATCH; source venue=synthetic_fixture; fetched age=1.0s.
+Timeframe input readiness (freshness per-frame) — STALE is a display label using closed age > 120.0s or fetch age > 45.0s (not a strategy gate).
+   1m PRESENT identity=VERIFIED bars=500 source=synthetic_fixture fetch_age=1.0s closed_age=2.0s last_closed_index=2026-10-01T06:46:10.981860+00:00; current=FORMING / UNCONFIRMED
+   3m PRESENT identity=VERIFIED bars=500 source=synthetic_fixture fetch_age=1.0s closed_age=2.0s last_closed_index=2026-10-01T06:44:10.981860+00:00; current=FORMING / UNCONFIRMED
+   5m PRESENT identity=VERIFIED bars=500 source=synthetic_fixture fetch_age=1.0s closed_age=2.0s last_closed_index=2026-10-01T06:42:10.981860+00:00; current=FORMING / UNCONFIRMED
+  15m PRESENT identity=VERIFIED bars=500 source=synthetic_fixture fetch_age=1.0s closed_age=2.0s last_closed_index=2026-10-01T06:32:10.981860+00:00; current=FORMING / UNCONFIRMED
+  30m PRESENT identity=VERIFIED bars=500 source=synthetic_fixture fetch_age=1.0s closed_age=2.0s last_closed_index=2026-10-01T06:17:10.981860+00:00; current=FORMING / UNCONFIRMED
+   1h PRESENT identity=VERIFIED bars=500 source=synthetic_fixture fetch_age=1.0s closed_age=2.0s last_closed_index=2026-10-01T05:47:10.981860+00:00; current=FORMING / UNCONFIRMED
+   2h PRESENT identity=VERIFIED bars=500 source=synthetic_fixture fetch_age=1.0s closed_age=2.0s last_closed_index=2026-10-01T04:47:10.981860+00:00; current=FORMING / UNCONFIRMED
+   4h PRESENT identity=VERIFIED bars=500 source=synthetic_fixture fetch_age=1.0s closed_age=2.0s last_closed_index=2026-10-01T02:47:10.981860+00:00; current=FORMING / UNCONFIRMED
+Parts 1–10 raw analyzer output by native timeframe (not extra votes):
+  Legend: BUY/SELL/NEUTRAL are reported signal values; c is the exact reported confidence field, not a calibrated probability; c=? means absent; c=0 is a reported zero.
+  Part |    1m |    3m |    5m |   15m |   30m |    1h |    2h |    4h
+  P01 | BUY c=0 | NEUTRAL c=0.55 | BUY c=0.55 | NEUTRAL c=0.55 | NEUTRAL c=0.55 | NEUTRAL c=0.55 | NEUTRAL c=0.55 | NEUTRAL c=0.55
+  P02 | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=?
+  P03 | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=?
+  P04 | NEUTRAL c=? | ERROR c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=?
+  P05 | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | UNAVAILABLE c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=?
+  P06 | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | MISSING c=0.62 | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=?
+  P07 | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | BLOCKED/NEUTRAL c=0
+  P08 | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=?
+  P09 | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=?
+  P10 | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=? | NEUTRAL c=?
+Parts 11–12 are fused evidence outputs, not per-candle analyzers:
+  Part 11 fusion: status=NEUTRAL signal=NEUTRAL confidence(raw)=0.
+  Part 12 confidence over all available Part 1–10 MTF evidence: confidence(raw)=0; status=heuristic; reason=synthetic illustrative heuristic output (not a calibrated probability).
+Setup mode (reported/derived execution mapping): NO TRADE; reason=synthetic Part 7 risk veto | plan values are candidates only (not proof of submission/fill): Entry=100.25; TP1=101.5; TP2=102.25; SL=99.5.
+Final decision: NO_TRADE; execution_allowed=BLOCKED; status=BLOCKED; reason(s)=synthetic Part 7 risk veto; no entry authorized.
+1m entry trigger: waiting / not confirmed; synthetic 1m confirmation wait.
+Risk/Part 7 gate (reported): status=blocked; entry_blocked=True; risk_veto=True; data_status=valid; reason=synthetic Part 7 risk veto
+Runtime backend (reported by process): backend=cpu; device=cpu; detected=True
+Neural/advisory result (not a rule Part result): status=not_run; availability=not probed; reason=synthetic deterministic fixture; no model invoked
+Per-timeframe reasons/status changes:
+  part1_breakout @ 1m: BUY/OK; reason: synthetic directional example
+  part1_breakout @ 3m: NEUTRAL/NEUTRAL; reason: synthetic directional example
+  part1_breakout @ 5m: BUY/OK; reason: synthetic directional example
+  part1_breakout @ 15m: NEUTRAL/NEUTRAL; reason: synthetic directional example
+  part2_zone: same result across 8 TFs; 1m reason: synthetic baseline
+  part3_psychology: same result across 8 TFs; 1m reason: synthetic baseline
+  part4_volume @ 1m: NEUTRAL/NEUTRAL; reason: synthetic baseline
+  part4_volume @ 3m: —/ERROR; reason: synthetic test exception
+  part4_volume @ 5m: NEUTRAL/NEUTRAL; reason: synthetic baseline
+  part5_ml @ 1m: NEUTRAL/NEUTRAL; reason: synthetic baseline
+  part5_ml @ 15m: —/UNAVAILABLE; reason: synthetic result unavailable
+  part5_ml @ 30m: NEUTRAL/NEUTRAL; reason: synthetic baseline
+  part6_trend @ 1m: NEUTRAL/NEUTRAL; reason: synthetic baseline
+  part6_trend @ 30m: —/MISSING; reason: synthetic missing signal
+  part6_trend @ 1h: NEUTRAL/NEUTRAL; reason: synthetic baseline
+  part7_volatility @ 1m: NEUTRAL/NEUTRAL; reason: synthetic baseline
+  part7_volatility @ 4h: NEUTRAL/BLOCKED; reason: synthetic Part 7 risk veto
+  part8_structure: same result across 8 TFs; 1m reason: synthetic baseline
+  part9_orderflow: same result across 8 TFs; 1m reason: synthetic baseline
+  part10_candlestats: same result across 8 TFs; 1m reason: synthetic baseline
+Terminal diagnostics are read-only; neutral signals are not promoted, and unavailable/error/stale outputs are not treated as neutral.

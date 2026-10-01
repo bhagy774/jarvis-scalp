@@ -208,6 +208,16 @@ except Exception:
     _aggregate_part7_results = None
     PART7_SHARED_ANALYZER_AVAILABLE = False
 try:
+    from terminal_live_diagnostics import classify_part_output as _classify_part_output
+    from terminal_live_diagnostics import build_timeframe_inputs as _build_timeframe_inputs
+    from terminal_live_diagnostics import TIMEFRAMES as _DIAGNOSTIC_TIMEFRAMES
+    from terminal_live_diagnostics import PART_KEYS as _DIAGNOSTIC_PART_KEYS
+except Exception:
+    _classify_part_output = None
+    _build_timeframe_inputs = None
+    _DIAGNOSTIC_TIMEFRAMES = ('1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h')
+    _DIAGNOSTIC_PART_KEYS = ()
+try:
     from jarvis_backtester import JarvisFullBacktester as _JarvisFullBacktester
     BACKTESTER_AVAILABLE = True
 except Exception:
@@ -1859,6 +1869,67 @@ class LiveTradingEngine:
             logger.debug('[OPTIONS] confirmation skipped: %s', options_error)
         return result
 
+    def _print_unavailable_live_diagnostics(self, symbol, stage, reason, snapshot=None):
+        """Print a throttled, current-cycle unavailable summary; never reuse old evidence."""
+        try:
+            safe_reason = type(reason).__name__ if isinstance(reason, BaseException) else str(reason or 'no reason supplied')
+            reason_key = (str(symbol or ''), str(stage or ''), safe_reason[:120])
+            now_mono = time.monotonic()
+            try:
+                configured_interval = float(os.getenv('JARVIS_DIAGNOSTICS_UNAVAILABLE_INTERVAL_SECONDS', '60'))
+                if not math.isfinite(configured_interval):
+                    configured_interval = 60.0
+            except (TypeError, ValueError, OverflowError):
+                configured_interval = 60.0
+            min_interval = max(5.0, configured_interval)
+            last_key = getattr(self, '_last_unavailable_diagnostics_key', None)
+            last_time = getattr(self, '_last_unavailable_diagnostics_time', 0.0)
+            if reason_key == last_key and now_mono - last_time < min_interval:
+                return False
+            self._last_unavailable_diagnostics_key = reason_key
+            self._last_unavailable_diagnostics_time = now_mono
+
+            from terminal_live_diagnostics import build_timeframe_inputs, format_live_diagnostics, TIMEFRAMES
+            jarvis = getattr(self, 'jarvis', None)
+            frames = {}
+            if isinstance(snapshot, dict):
+                snapshot_frames = snapshot.get('frames', {})
+            else:
+                snapshot_frames = getattr(snapshot, 'frames', {}) if snapshot is not None else {}
+            if callable(getattr(snapshot_frames, 'items', None)):
+                for tf, candle_frame in snapshot_frames.items():
+                    closed = candle_frame.get('closed') if isinstance(candle_frame, dict) else getattr(candle_frame, 'closed', None)
+                    if closed is not None:
+                        frames[tf] = closed
+            cache = getattr(jarvis, 'direct_candle_cache', None)
+            timeframe_inputs = build_timeframe_inputs(
+                frames, snapshot,
+                timeframes=tuple(TIMEFRAMES), expected_symbol=symbol,
+                stale_intervals=getattr(cache, 'stale_intervals', 2.0) if cache is not None else 2.0,
+                fetch_ttl_seconds=getattr(cache, 'ttl_seconds', 45.0) if cache is not None else 45.0,
+            )
+            # A failed route/fetch with no snapshot is unavailable input, not
+            # evidence that eight individually requested frames were absent.
+            if snapshot is None:
+                for item in timeframe_inputs.values():
+                    if isinstance(item, dict) and item.get('status') == 'MISSING':
+                        item['status'] = 'UNAVAILABLE'
+            text = format_live_diagnostics(
+                symbol=symbol, snapshot=snapshot, timeframe_inputs=timeframe_inputs,
+                parts_by_timeframe={}, fused_parts={}, decision={'status': 'NOT GENERATED'},
+                setup_mode={'mode': 'NOT EVALUATED', 'reason': safe_reason},
+                part7_gate=None, entry_trigger=None,
+                runtime=getattr(jarvis, 'gpu_status', None) if jarvis is not None else None,
+                neural_status={'status': 'not_run', 'availability': 'not probed',
+                               'reason': 'analysis not evaluated without a valid current native snapshot'},
+                cycle_status={'status': 'UNAVAILABLE', 'reason': safe_reason},
+            )
+            print(text)
+            return True
+        except Exception as diagnostic_error:
+            logger.debug('[LIVE-DIAGNOSTICS] unavailable-cycle display failed: %s', type(diagnostic_error).__name__)
+            return False
+
     def _print_decision_audit(self, decision, symbol, parts=None, blockers=None, stage="FINAL_GATE", order_outcome=None):
         """Best-effort display of observed values; formatting never gates trading."""
         try:
@@ -1870,7 +1941,10 @@ class LiveTradingEngine:
             jarvis = getattr(self, 'jarvis', None)
             snapshot = getattr(jarvis, '_active_candle_snapshot', None) if jarvis is not None else None
             trader = getattr(self, 'auto_trader', None)
-            execution_mode = 'LIVE' if trader is not None and getattr(trader, 'is_enabled', False) else 'PAPER'
+            if trader is None:
+                execution_mode = 'UNKNOWN'
+            else:
+                execution_mode = 'LIVE' if getattr(trader, 'is_enabled', False) else 'PAPER'
             position_state = {
                 'live': getattr(trader, 'open_positions', None) if trader is not None else None,
                 'paper': getattr(self, 'paper_open_trades', None),
@@ -1883,13 +1957,53 @@ class LiveTradingEngine:
                     else 'mixed/current pipeline; AI-assisted components may participate (not claimed pure algorithm)'
                 )
             from terminal_decision_display import format_decision_audit
-            print(format_decision_audit(
+            audit_text = format_decision_audit(
                 decision, symbol, parts=parts, blockers=blockers,
                 candidate=candidate, analysis_result=last_result,
                 market_context=market_context, snapshot=snapshot,
                 position_state=position_state, execution_mode=execution_mode,
                 stage=stage, order_outcome=order_outcome, provenance=provenance,
-            ))
+            )
+            # The full MTF report is emitted once per completed analysis cycle,
+            # not again for the subsequent order-return audit. It is strictly
+            # best-effort display code and has no decision or execution authority.
+            if str(stage).upper() == 'FINAL_GATE':
+                try:
+                    from terminal_live_diagnostics import format_live_diagnostics
+                    final_direction = str(decision.get('execution_direction') or decision.get('direction') or '').upper()
+                    expiry = str(candidate.get('recommended_expiry') or '').upper() if isinstance(candidate, dict) else ''
+                    if final_direction in ('CALL', 'PUT') and decision.get('execution_allowed') is True:
+                        if expiry in ('DAY_TRADE', 'SWING', '15M', '30M'):
+                            setup_mode = {'mode': 'SWING', 'reason': f"auto-execution expiry route: recommended_expiry={expiry}"}
+                        else:
+                            setup_mode = {'mode': 'SCALP', 'reason': f"auto-execution default route for recommended_expiry={expiry or 'UNKNOWN'}"}
+                    else:
+                        _mode_reasons = decision.get('reasons')
+                        _mode_reason = ' | '.join(str(x) for x in _mode_reasons[:3]) if isinstance(_mode_reasons, (list, tuple)) else str(_mode_reasons or '')
+                        setup_mode = {'mode': 'NO TRADE', 'reason': _mode_reason or f"final decision direction={final_direction or 'UNKNOWN'}; execution_allowed={decision.get('execution_allowed', 'UNKNOWN')}"}
+                    part7_gate = getattr(jarvis, 'latest_part7_cycle_display', None) if jarvis is not None else None
+                    if not isinstance(part7_gate, dict) and isinstance(last_result, dict):
+                        part7_gate = last_result.get('part7_volatility')
+                    live_text = format_live_diagnostics(
+                        symbol=symbol,
+                        snapshot=snapshot,
+                        timeframe_inputs=getattr(jarvis, 'latest_timeframe_inputs', None) if jarvis is not None else None,
+                        parts_by_timeframe=getattr(jarvis, 'latest_part_timeframe_results', None) if jarvis is not None else None,
+                        fused_parts=getattr(jarvis, 'latest_fusion_results', None) if jarvis is not None else None,
+                        decision=decision,
+                        candidate=last_result,
+                        part7_gate=part7_gate,
+                        entry_trigger=getattr(self, 'last_1m_entry', None),
+                        setup_mode=setup_mode,
+                        runtime=getattr(jarvis, 'gpu_status', None) if jarvis is not None else None,
+                        neural_status=getattr(jarvis, 'latest_neural_cycle_status', None) if jarvis is not None else None,
+                        cycle_status=getattr(jarvis, 'latest_diagnostics_cycle_status', None) if jarvis is not None else None,
+                        verbose=os.getenv('JARVIS_DIAGNOSTICS_VERBOSE', '0').strip().lower() in ('1', 'true', 'yes', 'on'),
+                    )
+                    audit_text = live_text + '\n\n' + audit_text
+                except Exception as live_diag_error:
+                    logger.debug('[LIVE-DIAGNOSTICS] display unavailable: %s', type(live_diag_error).__name__)
+            print(audit_text)
             # Experimental commentary only at FINAL_GATE; never repeated for order return.
             # Worker is daemonized and never gates execution.
             try:
@@ -1911,7 +2025,7 @@ class LiveTradingEngine:
             logger.debug("[AUDIT] terminal summary unavailable: %s", type(audit_error).__name__)
 
     def _print_live_signal(self, result, current_price, symbol='BTCUSDT', df=None):
-        """Print live signal in professional format"""
+        """Prepare live signal/dashboard fields; this method itself does not print."""
         signal = result.get('trade_signal', {})
         direction = signal.get('direction', 'NO_TRADE')
         
@@ -2582,6 +2696,10 @@ class LiveTradingEngine:
                         if route.status != 'READY':
                             self._set_readiness('NOT_READY', f'venue route unavailable: {route.reason}')
                             logger.warning('[MARKET-ROUTER] Cycle blocked: %s', route.reason)
+                            self._print_unavailable_live_diagnostics(
+                                getattr(route, 'symbol', 'UNKNOWN'), 'MARKET_ROUTE',
+                                getattr(route, 'reason', 'market route not ready'), snapshot=None,
+                            )
                             time.sleep(float(os.getenv('JARVIS_ROUTE_RETRY_SECONDS', '5')))
                             continue
                     symbol = route.symbol if route else os.getenv('JARVIS_DEFAULT_SYMBOL', 'BTCUSDT')
@@ -2615,8 +2733,11 @@ class LiveTradingEngine:
                         try:
                             snapshot = self.jarvis.direct_candle_cache.refresh(symbol)
                         except Exception as candle_error:
-                            self._set_readiness('NOT_READY', f'candle feed rejected: {candle_error}')
-                            logger.warning('[CANDLES] Cycle blocked for %s: %s', symbol, candle_error)
+                            self._set_readiness('NOT_READY', f'candle feed rejected ({type(candle_error).__name__})')
+                            logger.warning('[CANDLES] Cycle blocked for %s (%s)', symbol, type(candle_error).__name__)
+                            self._print_unavailable_live_diagnostics(
+                                symbol, 'CANDLE_FETCH', candle_error, snapshot=None,
+                            )
                             time.sleep(float(os.getenv('JARVIS_ROUTE_RETRY_SECONDS', '5')))
                             continue
                     if snapshot is not None and '1m' in snapshot.frames:
@@ -2796,7 +2917,16 @@ class LiveTradingEngine:
                         else:
                             logger.debug("[LIVE] No candle data received")
                     else:
-                        logger.warning("[LIVE] No delta_data available")
+                        _available_frames = sorted(getattr(snapshot, 'frames', {}).keys()) if snapshot is not None else []
+                        _missing_reason = (
+                            f"current native candle snapshot missing 1m frame; observed={_available_frames}"
+                            if snapshot is not None else
+                            'direct candle snapshot unavailable; analysis not evaluated'
+                        )
+                        self._print_unavailable_live_diagnostics(
+                            symbol, 'CANDLE_SNAPSHOT', _missing_reason, snapshot=snapshot,
+                        )
+                        logger.warning("[LIVE] Current native candle snapshot unavailable for %s", symbol)
                     
                     self._render_unified_dashboard(
                         symbol=symbol, current_price=current_price,
@@ -5686,15 +5816,73 @@ class JarvisElite:
 
     def analyze_trade_setup(self, data, mtf_context=None, candle_snapshot=None):
         """Analyze verified closed native candles; current candle stays metadata-only."""
+        # Clear only display snapshots at cycle start: an early data-gate return
+        # must not render yesterday's/previous-cycle Parts as current evidence.
+        self.latest_part_timeframe_results = {}
+        self.latest_timeframe_inputs = {}
+        self.latest_fusion_results = {}
+        self.latest_part7_cycle_display = None
+        self.latest_neural_cycle_status = {
+            'status': 'not_reported',
+            'reason': 'analysis did not reach deterministic fusion',
+            'availability': 'not probed',
+        }
+        self.latest_part_results = {}
+        self.latest_diagnostics_cycle_status = {
+            'status': 'NOT RUN', 'reason': 'current-cycle analysis has not started',
+        }
+
+        def _record_diagnostics_cycle(status, reason):
+            try:
+                self.latest_diagnostics_cycle_status = {
+                    'status': str(status or 'UNKNOWN'),
+                    'reason': str(reason or 'no reason recorded'),
+                }
+            except Exception:
+                pass
+
+        def _capture_diagnostics_inputs(frames, snapshot):
+            if _build_timeframe_inputs is None:
+                return
+            cache = getattr(self, 'direct_candle_cache', None)
+            stale_intervals = getattr(cache, 'stale_intervals', 2.0) if cache is not None else 2.0
+            fetch_ttl = getattr(cache, 'ttl_seconds', 45.0) if cache is not None else 45.0
+            try:
+                self.latest_timeframe_inputs = _build_timeframe_inputs(
+                    frames,
+                    snapshot=snapshot,
+                    timeframes=tuple(LIVE_TIMEFRAMES) or _DIAGNOSTIC_TIMEFRAMES,
+                    expected_symbol=getattr(self, 'active_symbol', None),
+                    stale_intervals=stale_intervals,
+                    fetch_ttl_seconds=fetch_ttl,
+                )
+            except Exception as diagnostic_error:
+                logger.debug('[LIVE-DIAGNOSTICS] timeframe metadata unavailable: %s', type(diagnostic_error).__name__)
+                self.latest_timeframe_inputs = {}
+
         try:
+            _initial_snapshot = candle_snapshot or getattr(self, '_active_candle_snapshot', None)
+            if _initial_snapshot is not None:
+                try:
+                    _snapshot_frames = getattr(_initial_snapshot, 'frames', {})
+                    _initial_frames = {
+                        tf: getattr(frame, 'closed', None)
+                        for tf, frame in _snapshot_frames.items()
+                        if getattr(frame, 'closed', None) is not None
+                    }
+                except Exception:
+                    _initial_frames = {}
+                _capture_diagnostics_inputs(_initial_frames, _initial_snapshot)
             if candle_snapshot is not None:
                 self._active_candle_snapshot = candle_snapshot
                 if not self.is_backtest_mode:
                     snapshot_symbol = str(candle_snapshot.symbol)
                     active_symbol = str(getattr(self, 'active_symbol', '') or '')
                     if active_symbol and snapshot_symbol != active_symbol.upper().replace('/', '').replace('-', '').replace('_', ''):
+                        _record_diagnostics_cycle('BLOCKED', 'current candle snapshot symbol does not match selected symbol')
                         return self._get_no_trade_signal('WAIT/NO-DATA: candle symbol mismatch')
             elif not self.is_backtest_mode and self._active_candle_snapshot is None:
+                _record_diagnostics_cycle('UNAVAILABLE', 'no direct candle snapshot supplied for current cycle')
                 return self._get_no_trade_signal('WAIT/NO-DATA: no direct candle snapshot')
             # Auto-start Double-Brain AI Chain on first run
             # DISABLED for Performance: Prevents resource contention with Trading Judge
@@ -5703,6 +5891,7 @@ class JarvisElite:
             #     self.ai_chain_brain.start_sequential_loop(self)
                 
             if len(data) < 20:
+                _record_diagnostics_cycle('INSUFFICIENT', f'only {len(data)} closed candles supplied; minimum analysis window is 20')
                 return self._get_no_trade_signal("Insufficient data")
 
             # ── DATA VALIDATOR GATE (pre-brain quality check) ────────────
@@ -5725,6 +5914,11 @@ class JarvisElite:
                             "🛡️ DATA-VALIDATOR GATE: %s — %s",
                             _dv_result.status, "; ".join(_dv_result.failures)
                         )
+                        _record_diagnostics_cycle(
+                            'BLOCKED',
+                            f"data-validator status={getattr(_dv_result, 'status', 'unknown')}; "
+                            f"failures={'; '.join(_dv_result.failures)}",
+                        )
                         return self._get_no_trade_signal(
                             f"WAIT/NO-DATA: {'; '.join(_dv_result.failures)}"
                         )
@@ -5742,6 +5936,10 @@ class JarvisElite:
                                     logger.warning(
                                         "🛡️ DATA-VALIDATOR CROSS-SOURCE BLOCK: %s",
                                         "; ".join(_xs_result.failures)
+                                    )
+                                    _record_diagnostics_cycle(
+                                        'BLOCKED',
+                                        f"cross-source validator failures={'; '.join(_xs_result.failures)}",
                                     )
                                     return self._get_no_trade_signal(
                                         f"WAIT/NO-DATA: {'; '.join(_xs_result.failures)}"
@@ -5791,6 +5989,7 @@ class JarvisElite:
                             logger.warning('[GPU] Direct native snapshot incomplete; external analysis blocked')
                             engine_tf_data = {}
                     if not engine_tf_data:
+                        _record_diagnostics_cycle('UNAVAILABLE', 'direct native timeframe frames unavailable before Part analysis')
                         return self._get_no_trade_signal('WAIT/NO-DATA: direct native frames unavailable')
                     self.market_context['mtf_datasets'] = engine_tf_data
                     if not self.is_backtest_mode and self._active_candle_snapshot is not None:
@@ -5944,13 +6143,22 @@ class JarvisElite:
                 # cycle; there is no synthetic/resampled fallback or BTC swap.
                 mtf_data = self._fetch_mtf_from_api(getattr(self, 'active_symbol', None))
                 if set(mtf_data) != set(LIVE_TIMEFRAMES):
+                    _record_diagnostics_cycle('UNAVAILABLE', f'incomplete native timeframe snapshot; received={sorted(mtf_data)}')
+                    _capture_diagnostics_inputs(mtf_data, self._active_candle_snapshot)
                     return self._get_no_trade_signal('WAIT/NO-DATA: incomplete native timeframe snapshot')
                 self._api_mtf_cache = mtf_data
                 self.market_context['mtf_datasets'] = mtf_data
                 if self._active_candle_snapshot is not None:
                     self.market_context['current_candles'] = self._active_candle_snapshot.current_candles
                     self.market_context['current_candle_is_confirmed'] = False
-            
+
+            # Capture only safe, bounded metadata from the exact closed frames
+            # being analyzed. This is display-only and has no strategy inputs.
+            _capture_diagnostics_inputs(
+                mtf_data,
+                snapshot=None if self.is_backtest_mode else self._active_candle_snapshot,
+            )
+
             logger.info(f"📊 MTF Analysis: {len(mtf_data)} timeframes active: {list(mtf_data.keys())}")
             
             # Timeframe weights (higher TF = higher weight for trend direction)
@@ -5973,10 +6181,13 @@ class JarvisElite:
             # Accumulate weighted signals across timeframes
             weighted_signals = {}    # part_name -> weighted sum
             weight_totals = {}       # part_name -> total weight applied
+            mtf_diagnostics = {}     # Display-only raw Part 1-10 outcomes, keyed by native TF
+            _record_diagnostics_cycle('ANALYZING', 'Parts 1–10 analyzing current native timeframe inputs')
             
             for tf_name, tf_data in mtf_data.items():
                 tf_weight = tf_weights.get(tf_name, 1.0)
                 tf_results = {}
+                tf_diagnostics = {}
                 
                 for name, part in self.parts.items():
                     if name in ['part11_fusion', 'part12_confidence']:
@@ -6002,6 +6213,18 @@ class JarvisElite:
                                 tf_data.attrs['symbol'] = self.active_symbol
                             tf_data.attrs['timeframe'] = tf_name
                         res = part.analyze(tf_data, context=part_context)
+                        if name in _DIAGNOSTIC_PART_KEYS:
+                            try:
+                                tf_diagnostics[name] = (
+                                    _classify_part_output(res) if _classify_part_output is not None
+                                    else {'status': 'UNKNOWN', 'signal': None, 'confidence': None,
+                                          'reason': 'diagnostic formatter unavailable'}
+                                )
+                            except Exception as diagnostic_error:
+                                tf_diagnostics[name] = {
+                                    'status': 'UNKNOWN', 'signal': None, 'confidence': None,
+                                    'reason': f'diagnostic normalization failed: {type(diagnostic_error).__name__}',
+                                }
                         if isinstance(res, dict):
                             tf_results[name] = res
                             raw_signal = res.get('signal', 0)
@@ -6034,10 +6257,29 @@ class JarvisElite:
                             if 'telemetry' in res and tf_name == '1m':
                                 full_telemetry[name] = res['telemetry']
                     except Exception as e:
+                        if name in _DIAGNOSTIC_PART_KEYS:
+                            try:
+                                tf_diagnostics[name] = (
+                                    _classify_part_output(error_type=type(e).__name__)
+                                    if _classify_part_output is not None
+                                    else {'status': 'ERROR', 'signal': None, 'confidence': None,
+                                          'reason': f'Analyzer exception: {type(e).__name__}'}
+                                )
+                            except Exception as diagnostic_error:
+                                tf_diagnostics[name] = {
+                                    'status': 'ERROR', 'signal': None, 'confidence': None,
+                                    'reason': f'Analyzer exception: {type(e).__name__}; diagnostic normalization failed',
+                                }
                         if tf_name == '1m':  # Only log errors for primary TF
                             logger.error(f"❌ Part {name} error on {tf_name}: {e}")
                 
+                mtf_diagnostics[tf_name] = tf_diagnostics
                 mtf_breakdown[tf_name] = tf_results
+
+            # Only diagnostics retain the full per-timeframe raw returns; the
+            # existing 1m + HTF reduction and all strategy calculations below
+            # remain unchanged.
+            self.latest_part_timeframe_results = mtf_diagnostics
             
             # Aggregate Part 7 explicitly by native timeframe.  A neutral frame
             # remains neutral, while extreme volatility, missing/stale/wrong-
@@ -6058,6 +6300,7 @@ class JarvisElite:
                     'entry_blocked': True, 'risk_veto': False, 'data_status': 'error',
                     'computation_backend': 'pandas_cpu', 'timeframe_results': part7_by_timeframe,
                 }
+            self.latest_part7_cycle_display = dict(self.latest_part7)
 
             # Build final part_results with MTF confirmation & veto protection
             for name, part in self.parts.items():
@@ -6196,6 +6439,18 @@ class JarvisElite:
             # --- MATHEMATICAL ANALYST OPINION (First) ---
             math_res = self.parts['part11_fusion'].analyze(part_results)
             math_conf_res = self.parts['part12_confidence'].analyze(list(part_results.values()))
+            # Save the actual fusion returns for the read-only terminal report.
+            # Whitelist display fields; do not copy arbitrary analyzer payloads.
+            _fusion_display_keys = {'signal', 'direction', 'bias', 'confidence', 'confidence_score',
+                                    'status', 'thought', 'reason', 'reasoning', 'message', 'data_status'}
+            try:
+                self.latest_fusion_results = {
+                    'part11_fusion': {k: v for k, v in math_res.items() if k in _fusion_display_keys},
+                    'part12_confidence': {k: v for k, v in math_conf_res.items() if k in _fusion_display_keys},
+                }
+            except Exception as diagnostic_error:
+                logger.debug('[LIVE-DIAGNOSTICS] fusion output unavailable: %s', type(diagnostic_error).__name__)
+                self.latest_fusion_results = {}
             
             math_signal = math_res.get('signal', 0)
             math_confidence = math_conf_res.get('confidence', 10)
@@ -6204,6 +6459,14 @@ class JarvisElite:
             # Judge is now ENABLED and validates high-confidence signals (score >= 10)
             # System uses: Mathematical Analyst + Quantum V5 + DeepSeek Judge
             neural_res = None
+            # This deterministic route intentionally did not run a neural model;
+            # model availability is not probed or implied by Part rule outputs.
+            self.latest_neural_cycle_status = {
+                'status': 'not_run',
+                'reason': 'neural_res=None in the current deterministic fusion cycle',
+                'availability': 'not probed',
+            }
+            _record_diagnostics_cycle('COMPLETE', 'Parts 1–12 deterministic analysis/fusion returns recorded')
             logic_signal = math_signal
             confidence = math_confidence
             ai_thought = "Deterministic mathematical fusion (model judge retired)"
@@ -6622,6 +6885,7 @@ class JarvisElite:
                 return self._get_no_trade_signal(f"Score too low: {score}/100")
                 
         except Exception as e:
+            _record_diagnostics_cycle('ERROR', f'analysis exception: {type(e).__name__}')
             logger.error(f"SwingScalp analysis error: {e}")
             return self._get_no_trade_signal(f"Analysis error: {str(e)}")
             
