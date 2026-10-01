@@ -2,7 +2,7 @@
 
 **Repository:** `bhagy774/jarvis-scalp`  
 **Audited baseline:** current `main` at `ef2c34b78e31c14358716a22fd04aac3d010a3e1` (latest commit query, 2026-10-01); freshly re-fetched `jarvis_FIXED.py` blob `afa7e754a2134762b5b7141c1fb6b18ba1be0dd6` and `terminal_decision_display.py` blob `c61b743e2ad1bc5eeb9a1a72d3d0d6ca9979cb18`.  
-**Status:** offline display-only implementation, prepared for a separate PR against `main`; not merged/deployed and no bot/live exchange flow was run.
+**Status:** offline display-only implementation published as draft PR #103, branch `feat/terminal-mtf-diagnostics-20261001`, commit `687e284fb6fbd67c1b42deb04edad8ec234151be`; base `main` at `ef2c34b78e31c14358716a22fd04aac3d010a3e1`. PR URL: https://github.com/bhagy774/jarvis-scalp/pull/103. Not merged/deployed; no bot/live exchange flow was run.
 
 ## Verified code evidence and diagnosis
 
@@ -39,7 +39,7 @@ The local implementation was diffed against freshly downloaded current `main`: `
 - PRs #97–#102 are closed/merged into current main; PR #100 was evaluation-only. PR #98, the read-only dashboard status PR, is merged. This work does not reuse the old stacked draft branch.
 - PR #81 is still open and edits `jarvis_FIXED.py` among other reliability/order files. Current `main` vs PR #81 head is diverged (PR 1 ahead / 226 behind, merge base `a5d6e7810995580c53dfb7c440b312eeabdde363`); its unmerged safety work was not imported.
 - PR #84 (“Fix terminal live trading signal display”) is also open, edits `jarvis_FIXED.py`, and is diverged from current `main` by the same 1-ahead/226-behind comparison. This implementation addresses its overlapping user-visible concern by adding a bounded full diagnostic report at the existing final-decision stage; it does not cherry-pick PR #84’s `pro_display` code. If #84 is merged first or later, the `_print_live_signal` / terminal rendering edits must be reconciled and the focused tests rerun.
-- The proposed branch should start from fresh `main`, target `main`, and remain a separate PR; do not stack on PR #81/#84 or modify them.
+- Branch `feat/terminal-mtf-diagnostics-20261001` was created directly from fresh `main` and PR #103 targets `main`; it is a separate draft PR (no dependency on #81/#84). Do not stack on or modify those open PRs.
 
 ## Verification actually run (offline only)
 
@@ -49,4 +49,4 @@ The local implementation was diffed against freshly downloaded current `main`: `
 - Synthetic sample generator ran successfully after the final formatter readability change; the sample is reproducible by `/tasklet/threads/a_8w1rcjc5kvy2tw9vtjrz/work/generate_terminal_sample.py`.
 - Focused tests cover neutral vs missing/error/unavailable/blocked, absent vs zero confidence, aliases/sequence schema, eight timeframe identity and age, stale/forming candle metadata, Part 7 veto, fused Parts 11/12, order lifecycle unknown-vs-explicit states, sanitization, output bounds, no input-matrix mutation, early-cycle not-run state, and throttled unavailable-path wiring.
 
-No bot startup, external market/account request, exchange call, order, merge, or deployment was performed. Hardware/backend display reports only runtime fields available to the process; no CPU/GPU capability/performance claim is made. The changes have not yet been pushed or opened as a PR in this report.
+No bot startup, external market/account request, exchange call, order, merge, or deployment was performed. Hardware/backend display reports only runtime fields available to the process; no CPU/GPU capability/performance claim is made. PR #103 was created as a draft and rechecked: it is open, based on current `main`, with seven changed files; no review has yet occurred.
