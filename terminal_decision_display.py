@@ -14,8 +14,9 @@ from collections.abc import Mapping
 from numbers import Real
 from typing import Any
 
-_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _MISSING = {"", "N/A", "NA", "NONE", "NULL", "UNKNOWN", "UNAVAILABLE", "MISSING", "—", "-"}
+_REDACT = re.compile(r"(?i)(api[_ -]?key|secret|token|credential|authorization|password|account(?:[_ -]?(?:id|identifier|number|no))?|wallet(?:[_ -]?(?:id|identifier))?|(?:client[_ -]?)?order[_ -]?(?:id|identifier)|position[_ -]?(?:id|identifier))\s*[:=]\s*[^\s,;]+")
+_URL_CREDENTIALS = re.compile(r"(https?://)[^/@\s:]+:[^/@\s]+@", re.IGNORECASE)
 
 
 def _present(value: Any) -> bool:
@@ -29,7 +30,9 @@ def _present(value: Any) -> bool:
 def _text(value: Any, limit: int = 180) -> str:
     if not _present(value):
         return ""
-    text = _ANSI.sub("", str(value)).replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", str(value))
+    text = _URL_CREDENTIALS.sub(r"\1[redacted]@", text)
+    text = _REDACT.sub(lambda match: f"{match.group(1)}=[redacted]", text)
     text = " ".join(text.split())
     if len(text) > limit:
         return text[: limit - 1].rstrip() + "…"
@@ -169,6 +172,19 @@ def _position_summary(position_state: Any) -> list[str]:
     return lines
 
 
+def _runtime_value(value: Any) -> str:
+    """Render an explicit lifecycle field while suppressing identifiers/payloads."""
+    if isinstance(value, Mapping):
+        fields = []
+        for key in ("status", "state", "success", "submitted", "acknowledged", "confirmed", "filled", "protected"):
+            if key in value and isinstance(value[key], (str, bool, int, float)):
+                fields.append(f"{key}={_text(value[key], 40)}")
+        return ", ".join(fields) if fields else "recorded (details suppressed)"
+    if isinstance(value, (list, tuple)):
+        return f"{len(value)} record(s); identifiers/details suppressed"
+    return _text(value, 80)
+
+
 def _reported_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -209,13 +225,13 @@ def _runtime_order_lines(outcome: Any) -> list[str]:
         submitted = outcome.get("submitted", outcome.get("order_submitted"))
         acknowledged = outcome.get("acknowledged", outcome.get("ack_status"))
         if submitted is not None:
-            lines.append(f"  Raw submitted field: {_text(submitted)}.")
+            lines.append(f"  Reported submitted field: {_runtime_value(submitted)}.")
         elif success is False:
             lines.append("  Submission state: UNKNOWN — success=False can reflect a preflight gate or a failed request.")
         else:
             lines.append("  Submission state: no distinct submitted flag supplied; executor return alone is not a separate submission record.")
         if acknowledged is not None:
-            lines.append(f"  Raw acknowledgement field: {_text(acknowledged)}.")
+            lines.append(f"  Reported venue acknowledgement field: {_runtime_value(acknowledged)}.")
         else:
             lines.append("  Venue acknowledgement: UNKNOWN — no separate acknowledgement field supplied.")
 
@@ -239,14 +255,14 @@ def _runtime_order_lines(outcome: Any) -> list[str]:
     if position_fields:
         lines.append("  Executor-reported sizing (local record; not venue-reconciled): " + "; ".join(position_fields) + ".")
     status = _text(position.get("status"))
-    position_id = _text(position.get("id"))
-    if position_id or status:
-        detail = []
-        if position_id:
-            detail.append(f"id={position_id}")
-        if status:
-            detail.append(f"local status={status}")
-        lines.append("  Position record: " + "; ".join(detail) + " (not an independent fill/position confirmation).")
+    if status:
+        lines.append("  Position record: local status=" + status + " (not an independent fill/position confirmation; identifiers suppressed).")
+    # Show only explicit runtime-record fields; never infer these from order success.
+    for key, label in (("fill_price", "reported fill price"), ("average_fill_price", "reported average fill price"),
+                       ("filled_quantity", "reported filled quantity"), ("filled_qty", "reported filled quantity")):
+        value = _number(position.get(key))
+        if value is not None:
+            lines.append(f"  {label}: {_amount(value)}.")
     if outcome.get("fill_status") is not None:
         lines.append(f"  Raw fill_status field: {_text(outcome.get('fill_status'))}.")
     elif outcome.get("filled") is not None:
@@ -254,11 +270,37 @@ def _runtime_order_lines(outcome: Any) -> list[str]:
     else:
         lines.append("  Fill confirmation: not supplied; not inferred from success or local OPEN status.")
     if outcome.get("close_status") is not None:
-        lines.append(f"  Raw close_status field: {_text(outcome.get('close_status'))}.")
+        lines.append(f"  Reported close_status field: {_runtime_value(outcome.get('close_status'))}.")
     elif outcome.get("closed") is not None:
-        lines.append(f"  Raw closed field: {_text(outcome.get('closed'))}.")
+        lines.append(f"  Reported closed field: {_runtime_value(outcome.get('closed'))}.")
     else:
         lines.append("  Close status: not supplied / not observed in this return.")
+
+    protective = outcome.get("protective_orders", outcome.get("protection"))
+    protection_fields = []
+    for keys, label in ((("stop_loss_order_status", "sl_order_status", "stop_loss_status", "sl_status"), "stop-loss"),
+                        (("take_profit_order_status", "tp_order_status", "take_profit_status", "tp_status"), "take-profit"),
+                        (("protection_status", "protective_status"), "overall")):
+        value = next((outcome[key] for key in keys if key in outcome and outcome[key] is not None), None)
+        if value is None and isinstance(protective, Mapping):
+            nested_keys = keys + (("stop_loss", "sl") if label == "stop-loss" else ("take_profit", "tp") if label == "take-profit" else ())
+            value = next((protective[key] for key in nested_keys if key in protective and protective[key] is not None), None)
+        if value is not None:
+            protection_fields.append(f"{label}={_runtime_value(value)}")
+    if isinstance(protective, (list, tuple)) and protective:
+        safe_states = []
+        for record in protective[:4]:
+            if isinstance(record, Mapping):
+                side = _text(record.get("type", record.get("role")), 24)
+                state = _runtime_value(record)
+                safe_states.append((side + ": " if side else "") + state)
+            else:
+                safe_states.append(_runtime_value(record))
+        protection_fields.append("records=" + ", ".join(safe_states))
+    if protection_fields:
+        lines.append("  Protective-order status (reported fields only; IDs suppressed): " + "; ".join(protection_fields) + ".")
+    else:
+        lines.append("  Protective-order status: UNKNOWN — no stop/target protection state supplied in this executor return.")
     return lines
 
 
