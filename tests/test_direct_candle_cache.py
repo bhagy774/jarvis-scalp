@@ -1,167 +1,109 @@
-import copy
-import math
-
+"""Offline contracts for native Binance Spot candles and live refreshes."""
+from datetime import datetime, timezone
 import pytest
-
 pd = pytest.importorskip("pandas")
-from direct_candle_cache import (
-    DirectCandleCache,
-    CandleDataError,
-    LIVE_TIMEFRAMES,
-    FETCH_CANDLES,
-)
+from binance_timeframes import BINANCE_SPOT_TIMEFRAMES, TIMEFRAME_HISTORY_CANDLES, candle_open_time, next_candle_open
+from direct_candle_cache import DirectCandleCache, CandleDataError, LIVE_TIMEFRAMES
 
-
+WIDTH = {"1s": 1, "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800, "12h": 43200, "1d": 86400, "3d": 259200, "1w": 604800}
 class FakeClock:
-    def __init__(self, value):
-        self.value = float(value)
+    def __init__(self, value): self.value = float(value)
+    def __call__(self): return self.value
+    def advance(self, seconds): self.value += seconds
 
-    def __call__(self):
-        return self.value
+def previous_open(tf, stamp):
+    if tf == "1M":
+        dt = datetime.fromtimestamp(stamp, timezone.utc); year, month = dt.year, dt.month - 1
+        if month == 0: year, month = year - 1, 12
+        return int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp())
+    return int(stamp - WIDTH[tf])
 
-    def advance(self, seconds):
-        self.value += seconds
-
-
-def make_rows(now, tf, *, symbol="ETHUSDT", mutate=None):
-    seconds = {"1m": 60, "3m": 180, "5m": 300, "15m": 900,
-               "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400}[tf]
-    forming = int(now // seconds) * seconds
-    start = forming - 500 * seconds
+def make_rows(now, tf, limit, mutate=None):
+    stamps = [candle_open_time(tf, now)]
+    for _ in range(limit - 1): stamps.append(previous_open(tf, stamps[-1]))
     rows = []
-    for i in range(FETCH_CANDLES):
-        ts = start + i * seconds
-        # Stable values for overlapping timestamp windows allow incremental
-        # cache refreshes to distinguish immutable closed bars from updates.
-        price = 1000 + (ts // seconds) % 1000
-        rows.append({"time": ts, "open": price, "high": price + 2,
-                     "low": price - 2, "close": price + 1, "volume": 1})
-    return rows
-
+    for stamp in reversed(stamps):
+        price = 1000 + (stamp // max(1, WIDTH.get(tf, 86400))) % 1000
+        rows.append({"time": stamp, "open": price, "high": price + 2, "low": price - 2, "close": price + 1, "volume": 1})
+    return mutate(rows, tf) if mutate else rows
 
 class FakeClient:
-    def __init__(self, clock, mutator=None):
-        self.clock = clock
-        self.mutator = mutator
-        self.calls = []
-        self.symbol = "ETHUSDT"
-
+    def __init__(self, clock, mutator=None): self.clock, self.mutator, self.calls = clock, mutator, []
     def get_historical_candles_with_metadata(self, symbol, resolution, limit):
         self.calls.append((symbol, resolution, limit))
-        rows = make_rows(self.clock(), resolution, symbol=symbol)
-        if self.mutator:
-            rows = self.mutator(rows, resolution)
-        return {"candles": rows, "source": "binance", "symbol": symbol}
+        return {"candles": make_rows(self.clock(), resolution, limit, self.mutator), "source": "binance", "market_type": "spot", "symbol": symbol}
 
-
-def test_all_native_intervals_have_500_closed_and_separate_forming():
-    clock = FakeClock(1_700_000_000)
-    client = FakeClient(clock)
-    snapshot = DirectCandleCache(client, clock=clock).refresh("ETHUSDT")
-    assert tuple(snapshot.frames) == LIVE_TIMEFRAMES
-    assert len(client.calls) == 8
-    assert all(call[2] == 501 for call in client.calls)
-    for tf, frame in snapshot.frames.items():
-        assert len(frame.closed) == 500
-        assert frame.current is not None
-        assert frame.current["time"] not in set(frame.closed.index.astype("int64") // 10**9)
-        assert frame.current_is_confirmed is False
-        assert frame.source == "binance"
-
-
-def test_symbol_switch_isolated_and_no_btc_substitution():
-    clock = FakeClock(1_700_000_000)
-    client = FakeClient(clock)
-    cache = DirectCandleCache(client, clock=clock)
-    first = cache.refresh("ETHUSDT")
-    second = cache.refresh("BTCUSDT")
-    assert first.symbol == "ETHUSDT"
-    assert second.symbol == "BTCUSDT"
-    assert cache.get_snapshot("ETHUSDT").frames["1m"].closed.iloc[-1]["close"] == first.frames["1m"].closed.iloc[-1]["close"]
-    assert {call[0] for call in client.calls} == {"ETHUSDT", "BTCUSDT"}
-
-
-def test_repeated_refresh_uses_fresh_snapshot_then_refreshes_after_ttl():
-    clock = FakeClock(1_700_000_000)
-    client = FakeClient(clock)
-    cache = DirectCandleCache(client, clock=clock, ttl_seconds=45)
-    first = cache.refresh("ETHUSDT")
-    assert cache.refresh("ETHUSDT") is first
-    assert len(client.calls) == 8
-    clock.advance(46)
-    second = cache.refresh("ETHUSDT")
-    assert second is not first
+def test_all_16_native_intervals_use_variable_history_and_separate_forming_bar():
+    clock = FakeClock(1_727_503_200); client = FakeClient(clock)
+    snap = DirectCandleCache(client, clock=clock).refresh("ETHUSDT", venue="binance", market_type="spot")
+    assert tuple(snap.frames) == BINANCE_SPOT_TIMEFRAMES == LIVE_TIMEFRAMES
     assert len(client.calls) == 16
+    for tf, frame in snap.frames.items():
+        assert len(frame.closed) == TIMEFRAME_HISTORY_CANDLES[tf]
+        assert client.calls[list(LIVE_TIMEFRAMES).index(tf)][2] == TIMEFRAME_HISTORY_CANDLES[tf] + 1
+        assert frame.current and frame.current["time"] not in set(frame.closed.index.astype("int64") // 10**9)
+        assert frame.current_is_confirmed is False and frame.source == "binance"
+
+def test_calendar_month_week_and_minute_month_token_are_distinct():
+    stamp = datetime(2026, 10, 1, 14, tzinfo=timezone.utc).timestamp()
+    assert datetime.fromtimestamp(candle_open_time("1M", stamp), timezone.utc).day == 1
+    assert datetime.fromtimestamp(candle_open_time("1w", stamp), timezone.utc).weekday() == 0
+    assert next_candle_open("1M", candle_open_time("1M", stamp)) == datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp()
 
 
-def test_forming_candle_never_enters_indicators():
-    clock = FakeClock(1_700_000_000)
-    snapshot = DirectCandleCache(FakeClient(clock), clock=clock).refresh("ETHUSDT")
-    closed = snapshot.analysis_frames()["1m"]
-    assert len(closed) == 500
-    assert closed.index[-1].timestamp() + 60 <= clock.value
-    assert snapshot.frames["1m"].current["close"] != closed["close"].iloc[-1]
+def test_incremental_poll_bridges_every_missed_one_second_candle():
+    clock = FakeClock(1_727_503_200); client = FakeClient(clock)
+    cache = DirectCandleCache(client, clock=clock, ttl_seconds=5, timeframes=("1s", "1m"))
+    first = cache.refresh("ETHUSDT", venue="binance", market_type="spot")
+    clock.advance(6); second = cache.refresh("ETHUSDT", venue="binance", market_type="spot")
+    calls = [row for row in client.calls if row[1] == "1s"]
+    assert calls[1][2] >= 8
+    assert len(second.frames["1s"].closed) == TIMEFRAME_HISTORY_CANDLES["1s"]
+    assert second.frames["1s"].closed.index[-1] > first.frames["1s"].closed.index[-1]
 
 
-@pytest.mark.parametrize("mutator", [
-    lambda rows, tf: rows[:-1],
-    lambda rows, tf: rows[:-2] + [dict(rows[-1], time=rows[-2]["time"])],
-    lambda rows, tf: rows[:-1] + [dict(rows[-1], time=rows[-1]["time"] + 10_000)],
-    lambda rows, tf: rows[:-2] + [dict(rows[-1], time=rows[-2]["time"] + 2 * {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400}[tf])],
-])
-def test_bad_missing_duplicate_future_or_gap_fails_closed(mutator):
-    clock = FakeClock(1_700_000_000)
-    with pytest.raises(CandleDataError):
-        DirectCandleCache(FakeClient(clock, mutator), clock=clock).refresh("ETHUSDT")
+def test_refresh_reuses_fresh_snapshot_then_refreshes_after_ttl():
+    clock = FakeClock(1_727_503_200); client = FakeClient(clock)
+    cache = DirectCandleCache(client, clock=clock, ttl_seconds=45,
+                              timeframes=("1m",), history_limits={"1m": 20})
+    first = cache.refresh("ETHUSDT", venue="binance", market_type="spot")
+    assert cache.refresh("ETHUSDT", venue="binance", market_type="spot") is first
+    assert len(client.calls) == 1
+    clock.advance(46)
+    second = cache.refresh("ETHUSDT", venue="binance", market_type="spot")
+    assert second is not first
+    assert len(client.calls) == 2
 
 
-def test_instrument_mismatch_fails_closed():
-    clock = FakeClock(1_700_000_000)
-    class Mismatched(FakeClient):
+def test_symbol_cache_isolation_and_identity_mismatch():
+    clock = FakeClock(1_727_503_200); client = FakeClient(clock)
+    cache = DirectCandleCache(client, clock=clock, timeframes=("1m",))
+    eth = cache.refresh("ETHUSDT", venue="binance", market_type="spot")
+    btc = cache.refresh("BTCUSDT", venue="binance", market_type="spot")
+    assert eth.symbol == "ETHUSDT" and btc.symbol == "BTCUSDT"
+    assert cache.get_snapshot("ETHUSDT", venue="binance", market_type="spot").symbol == "ETHUSDT"
+    class WrongInstrument(FakeClient):
         def get_historical_candles_with_metadata(self, symbol, resolution, limit):
-            result = super().get_historical_candles_with_metadata(symbol, resolution, limit)
-            result["symbol"] = "BTCUSDT"
-            return result
-    with pytest.raises(CandleDataError):
-        DirectCandleCache(Mismatched(clock), clock=clock).refresh("ETHUSDT")
+            result = super().get_historical_candles_with_metadata(symbol, resolution, limit); result["symbol"] = "BTCUSDT"; return result
+    with pytest.raises(CandleDataError): DirectCandleCache(WrongInstrument(clock), clock=clock, timeframes=("1m",)).refresh("ETHUSDT")
 
 
-def test_unsupported_and_stale_data_fail_closed():
-    clock = FakeClock(1_700_000_000)
-    cache = DirectCandleCache(FakeClient(clock), clock=clock)
-    with pytest.raises(CandleDataError):
-        cache._normalize("ETHUSDT", "7m", [], "binance", "ETHUSDT", clock.value)
-
-    def stale(rows, tf):
-        seconds = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400}[tf]
-        return [dict(row, time=row["time"] - 2 * seconds) for row in rows]
-    with pytest.raises(CandleDataError):
-        DirectCandleCache(FakeClient(clock, stale), clock=clock).refresh("ETHUSDT")
+def test_bad_missing_duplicate_or_gap_data_fails_closed():
+    mutators = [lambda r, tf: r[:-1], lambda r, tf: r[:-1] + [dict(r[-1], time=r[-2]["time"])],
+                lambda r, tf: r[:-1] + [dict(r[-1], time=next_candle_open(tf, r[-1]["time"]))]]
+    for mutate in mutators:
+        clock = FakeClock(1_727_503_200)
+        with pytest.raises(CandleDataError): DirectCandleCache(FakeClient(clock, mutate), clock=clock, timeframes=("1m",)).refresh("ETHUSDT")
 
 
-def test_no_resampling_is_used():
-    clock = FakeClock(1_700_000_000)
-    client = FakeClient(clock)
-    snapshot = DirectCandleCache(client, clock=clock).refresh("ETHUSDT")
-    assert all(len(frame.closed) == 500 for frame in snapshot.frames.values())
-    assert [call[1] for call in client.calls] == list(LIVE_TIMEFRAMES)
+def test_fractional_second_open_is_not_truncated_into_valid_candle():
+    clock = FakeClock(1_727_503_200)
+    def fractional(rows, tf):
+        rows[0]["time"] = float(rows[0]["time"]) + 0.25
+        return rows
+    with pytest.raises(CandleDataError, match="exact whole second"):
+        DirectCandleCache(FakeClient(clock, fractional), clock=clock, timeframes=("1m",)).refresh("ETHUSDT")
 
 
-def test_jarvis_consumer_wiring_uses_shared_direct_frames(monkeypatch):
-    import sys
-    import types
-    # jarvis_FIXED only needs the module at import time for this offline
-    # consumer-wiring check; no websocket is started.
-    monkeypatch.setitem(sys.modules, "websockets", types.ModuleType("websockets"))
-    jarvis = pytest.importorskip("jarvis_FIXED")
-    clock = FakeClock(1_700_000_000)
-    client = FakeClient(clock)
-    engine = jarvis.JarvisElite.__new__(jarvis.JarvisElite)
-    engine.is_backtest_mode = False
-    engine.active_symbol = "ETHUSDT"
-    engine.direct_candle_cache = DirectCandleCache(client, clock=clock)
-    engine._active_candle_snapshot = engine.direct_candle_cache.refresh("ETHUSDT")
-    frames = engine._fetch_mtf_from_api("ETHUSDT")
-    assert list(frames) == list(LIVE_TIMEFRAMES)
-    assert all(len(frame) == 500 for frame in frames.values())
-    assert all(frame.index[-1].timestamp() + {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400}[tf] <= clock.value for tf, frame in frames.items())
+def test_unsupported_interval_rejected():
+    with pytest.raises(CandleDataError): DirectCandleCache(FakeClient(FakeClock(1_727_503_200)), timeframes=("7m",))

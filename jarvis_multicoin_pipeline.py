@@ -113,20 +113,47 @@ class BinanceSpotCandleClient:
         self._next_request_at = 0.0
 
     def get_historical_candles_with_metadata(self, *, symbol: str, resolution: str, limit: int) -> Mapping[str, Any]:
-        method = getattr(self._client, "get_historical_candles", None)
-        if not callable(method):
+        method = getattr(self._client, "get_historical_candles_with_metadata", None)
+        legacy_method = getattr(self._client, "get_historical_candles", None)
+        if not callable(method) and not callable(legacy_method):
             raise CandleDataError("Binance-spot candle adapter unavailable")
         with self._rate_lock:
             wait = self._next_request_at - self._clock()
             if wait > 0:
                 self._sleep(wait)
             self._next_request_at = self._clock() + self._interval
-        candles = method(symbol=symbol, resolution=resolution, limit=limit)
-        if str(getattr(self._client, "last_candle_source", "")).lower() != "binance":
-            raise CandleDataError("Binance provider fallback rejected")
-        if not isinstance(candles, (list, tuple)):
-            raise CandleDataError("Binance candle response is malformed")
-        return {"candles": candles, "source": "binance", "symbol": symbol}
+        # Do not infer a cross-quote mapping from ticker spelling (e.g. USD to
+        # USDT). The Delta-to-Spot mapping must be explicit and exact before
+        # candles may be attached to a selected execution product.
+        normalized_symbol = str(symbol or "").upper().replace("/", "").replace("-", "").replace("_", "")
+        if not normalized_symbol.endswith("USDT") or normalized_symbol != str(symbol or "").upper():
+            raise CandleDataError("explicit exact Binance Spot USDT symbol required")
+        if callable(method):
+            result = method(symbol=normalized_symbol, resolution=resolution, limit=limit)
+            if not isinstance(result, Mapping):
+                raise CandleDataError("Binance candle metadata response is malformed")
+            candles = result.get("candles")
+            source = str(result.get("source", "")).lower()
+            market_type = str(result.get("market_type", "spot")).lower()
+            result_symbol = str(result.get("symbol", "")).upper()
+        else:
+            try:
+                candles = legacy_method(symbol=normalized_symbol, resolution=resolution,
+                                        limit=limit, allow_fallback=False)
+            except TypeError as exc:
+                raise CandleDataError("Binance client does not support strict no-fallback candles") from exc
+            source = "binance" if isinstance(candles, (list, tuple)) and candles else "unavailable"
+            market_type = "spot"
+            result_symbol = normalized_symbol
+        if (not isinstance(candles, (list, tuple)) or not candles
+                or source != "binance" or market_type != "spot"
+                or result_symbol != normalized_symbol):
+            raise CandleDataError("Binance provider source/market/symbol verification failed")
+        if any(not isinstance(row, Mapping) or row.get("source") != "binance_spot"
+               or row.get("market_semantics") != "spot" for row in candles):
+            raise CandleDataError("Binance candle rows lack verified Spot provenance")
+        return {"candles": candles, "source": "binance", "market_type": "spot",
+                "symbol": normalized_symbol}
 
 
 class MultiCoinPipeline:
@@ -310,7 +337,8 @@ class MultiCoinPipeline:
             )
             if snapshot.identity != key.as_tuple() or snapshot.symbol != key.symbol:
                 raise CandleDataError("snapshot full identity mismatch")
-            if set(snapshot.frames) != set(LIVE_TIMEFRAMES):
+            required_timeframes = tuple(getattr(self.candle_cache, "timeframes", LIVE_TIMEFRAMES))
+            if set(snapshot.frames) != set(required_timeframes):
                 raise CandleDataError("incomplete native timeframe snapshot")
             # For this Delta adapter no Binance/other venue fallback is allowed.
             for tf, frame in snapshot.frames.items():
@@ -318,8 +346,9 @@ class MultiCoinPipeline:
                     raise CandleDataError(f"{tf}: frame identity mismatch")
                 if frame.source.lower() != key.venue:
                     raise CandleDataError(f"{tf}: candle provider does not match venue identity")
-                if len(frame.closed) != 500 or frame.current is None:
-                    raise CandleDataError(f"{tf}: expected 500 closed plus one forming candle")
+                required = int(getattr(self.candle_cache, "history_limits", {}).get(tf, 500))
+                if len(frame.closed) != required or frame.current is None:
+                    raise CandleDataError(f"{tf}: expected {required} closed plus one forming candle")
             now = float(self.clock())
             age = now - float(snapshot.fetched_at)
             if age < -2 or age > self.result_max_age_seconds:
@@ -333,14 +362,14 @@ class MultiCoinPipeline:
             parts_by_tf = raw.get("parts_by_timeframe")
             expected_adapter_parts = {f"part{i}" for i in range(1, 11)}
             complete = (isinstance(parts_by_tf, Mapping)
-                        and set(parts_by_tf) == set(LIVE_TIMEFRAMES)
-                        and all(expected_adapter_parts.issubset(set(parts_by_tf[tf])) for tf in LIVE_TIMEFRAMES)
+                        and set(parts_by_tf) == set(required_timeframes)
+                        and all(expected_adapter_parts.issubset(set(parts_by_tf[tf])) for tf in required_timeframes)
                         and set(raw.get("once_per_symbol_parts", ())) == {"part11", "part12"})
             versions = {tf: {
                 "source": snapshot.frames[tf].source,
                 "last_closed": str(snapshot.frames[tf].closed.index[-1]),
                 "forming_time": snapshot.frames[tf].current.get("time"),
-            } for tf in LIVE_TIMEFRAMES}
+            } for tf in required_timeframes}
             version = hashlib.sha256(json.dumps({"identity": key.as_tuple(), "frames": versions}, sort_keys=True).encode()).hexdigest()[:24]
             return {
                 "symbol": key.symbol, "request_identity": key.as_dict(),

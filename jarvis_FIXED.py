@@ -37,7 +37,7 @@ from jarvis_runtime import detect_backend, torch_device
 pro_display = ProfessionalSignalDisplay()
 import warnings
 from collections import deque, defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from queue import Queue
 from typing import Dict, List, Tuple, Optional, Union, Any
 from dataclasses import dataclass
@@ -163,11 +163,25 @@ except Exception:
     DATA_VALIDATOR_AVAILABLE = False
 try:
     from direct_candle_cache import DirectCandleCache, CandleDataError, LIVE_TIMEFRAMES
+    from binance_timeframes import (BINANCE_SPOT_TIMEFRAMES, DEFAULT_STRATEGY_TIMEFRAMES,
+        TIMEFRAME_HISTORY_CANDLES, TIMEFRAME_CORRELATION_GROUPS, TIMEFRAME_GROUP_WEIGHTS,
+        grouped_timeframe_consensus, grouped_timeframe_values,
+        validate_closed_candle_timestamps, next_candle_open,
+        synchronize_native_frames_to_1m_close)
     DIRECT_CANDLE_CACHE_AVAILABLE = True
 except Exception:
     DirectCandleCache = None
     CandleDataError = ValueError
     LIVE_TIMEFRAMES = ()
+    BINANCE_SPOT_TIMEFRAMES = ()
+    DEFAULT_STRATEGY_TIMEFRAMES = ()
+    TIMEFRAME_HISTORY_CANDLES = {}
+    TIMEFRAME_CORRELATION_GROUPS = {}
+    TIMEFRAME_GROUP_WEIGHTS = {}
+    grouped_timeframe_consensus = lambda values, **kwargs: (0.0, {})
+    grouped_timeframe_values = lambda values, **kwargs: {}
+    validate_closed_candle_timestamps = lambda timeframe, stamps, decision: (_ for _ in ()).throw(ValueError('native timestamp validator unavailable'))
+    next_candle_open = lambda timeframe, stamp: float('inf')
     DIRECT_CANDLE_CACHE_AVAILABLE = False
 try:
     from jarvis_multicoin_analysis import multicoin_analysis_enabled
@@ -253,7 +267,7 @@ except ImportError:
 
 # FIX: Set EXTERNAL_ENGINES_AVAILABLE BEFORE imports to avoid circular dependency
 EXTERNAL_ENGINES_AVAILABLE = False
-OPENROUTER_ENABLED = False  # Using local Ollama models instead
+OPENROUTER_ENABLED = False  # All remote/model decision routes are retired; Laya is advisory-only.
 
 # External Engines Imports (Mapped to actual part files)
 try:
@@ -489,8 +503,21 @@ class AutoBacktestEngine:
         self.results = {}
         
     def run_backtest(self, historical_data, initial_balance=1000):
-        """Run comprehensive backtest on historical data"""
+        """Run backtest on supplied candles; only recorded point-in-time options are eligible."""
         logger.info("🔄 Starting Auto Backtest Engine...")
+        if not isinstance(historical_data, pd.DataFrame):
+            raise ValueError("backtest requires one symbol's timestamped OHLCV DataFrame")
+        if not isinstance(historical_data.index, pd.DatetimeIndex) and 'timestamp' in historical_data.columns:
+            historical_data = historical_data.copy()
+            historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], utc=True, errors='coerce')
+            historical_data = historical_data.dropna(subset=['timestamp']).set_index('timestamp')
+        _asset_attrs = getattr(historical_data, 'attrs', {}) or {}
+        _selected_symbol = str(_asset_attrs.get('symbol') or '').upper().replace('/', '').replace('-', '').replace('_', '')
+        self.jarvis.active_symbol = _selected_symbol or None
+        self.jarvis.active_base_asset = next(
+            (_selected_symbol[:-len(q)] for q in ('USDT', 'USDC', 'USD') if _selected_symbol.endswith(q)),
+            _selected_symbol,
+        ) or None
         
         # Bypass trade manager checks (like session time) for backtesting
         original_can_trade = self.jarvis.trade_manager.can_trade
@@ -1262,11 +1289,19 @@ class LiveTradingEngine:
                 and MULTICOIN_PIPELINE_AVAILABLE and getattr(self.jarvis, 'delta_data', None) is not None
                 and getattr(self.jarvis, 'binance_data', None) is not None and BinanceSpotCandleClient is not None):
             try:
+                # The optional scanner uses the same full native interval set
+                # and history profile as the selected-asset path. Keep its
+                # default candidate budget conservative: 16 intervals are a
+                # much heavier REST workload than the former 8-frame runner.
+                _multi_timeframes = tuple(BINANCE_SPOT_TIMEFRAMES)
+                _multi_history = {tf: TIMEFRAME_HISTORY_CANDLES[tf] for tf in _multi_timeframes}
+                _multi_candidates = int(os.getenv('JARVIS_MULTICOIN_MAX_CANDIDATES', '10'))
                 _multi_cache = DirectCandleCache(
                     BinanceSpotCandleClient(self.jarvis.binance_data),
                     ttl_seconds=float(os.getenv('JARVIS_MULTICOIN_CANDLE_TTL_SEC', '60')),
                     max_concurrent_fetches=1,
-                    max_cached_identities=max(64, min(256, int(os.getenv('JARVIS_MULTICOIN_MAX_CANDIDATES', '100')))),
+                    max_cached_identities=max(64, min(256, _multi_candidates)),
+                    timeframes=_multi_timeframes, history_limits=_multi_history,
                 )
                 self.multicoin_pipeline = MultiCoinPipeline(
                     _multi_cache,
@@ -1274,7 +1309,7 @@ class LiveTradingEngine:
                     self._analyze_multicoin_instrument,
                     enabled=True,
                     max_workers=int(os.getenv('JARVIS_MULTICOIN_MAX_WORKERS', '1')),
-                    max_candidates=int(os.getenv('JARVIS_MULTICOIN_MAX_CANDIDATES', '100')),
+                    max_candidates=_multi_candidates,
                     discovery_interval_seconds=float(os.getenv('JARVIS_MULTICOIN_CANDIDATE_REFRESH_SEC', '300')),
                     retry_interval_seconds=float(os.getenv('JARVIS_MULTICOIN_RETRY_SEC', '60')),
                     result_max_age_seconds=float(os.getenv('JARVIS_MULTICOIN_RESULT_MAX_AGE_SEC', '180')),
@@ -1597,15 +1632,70 @@ class LiveTradingEngine:
             logger.debug(f"[SCENARIO] gate error (fail-open → pass): {e}")
             return direction
 
-    def _open_paper_trade(self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl, current_price=None, symbol='BTCUSDT'):
-        """Open a new paper trade"""
+    def _open_paper_trade(
+        self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl,
+        current_price=None, symbol='BTCUSDT', *, central_approval=None,
+        snapshot_version=None, part_results=None, timeframe_parts=None,
+        part7_gate=None, execution_plan=None,
+    ):
+        """Open a paper position only from a fresh, centrally approved bound plan."""
+        try:
+            from jarvis_strategy_approval import (
+                evaluate_mtf_central_strategy, validate_entry_approval,
+                validate_execution_plan,
+            )
+            expected = 'BUY' if str(direction).upper() in ('CALL', 'BUY') else 'SELL' if str(direction).upper() in ('PUT', 'SELL') else 'NO_TRADE'
+            _paper_min_confidence = 0
+            try:
+                _paper_min_confidence = float(getattr(self, 'PAPER_CONFIG', {}).get('min_confidence', 0))
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError('paper minimum confidence is invalid')
+            decision = evaluate_mtf_central_strategy(
+                timeframe_parts, part7_gate, confidence=confidence,
+                minimum_confidence=_paper_min_confidence,
+                expected_symbol=symbol,
+            )
+            if not decision.get('approved') or decision.get('direction') != expected:
+                raise ValueError('central MTF strategy did not approve paper entry')
+            mode = decision.get('trade_mode')
+            plan_ok, plan_reason = validate_execution_plan(
+                execution_plan, direction=expected, symbol=symbol,
+                snapshot_version=snapshot_version, confidence=confidence,
+                trade_mode=mode,
+            )
+            if not plan_ok:
+                raise ValueError(plan_reason)
+            if str((execution_plan or {}).get('trade_mode') or '').upper() != str(expiry_name or '').upper():
+                raise ValueError('paper expiry/mode differs from the approved plan')
+            approval_ok, approval_reason = validate_entry_approval(
+                central_approval, direction=expected, symbol=symbol,
+                exchange='delta', contract=symbol, instrument_id=symbol,
+                market_type='unverified', snapshot_version=snapshot_version,
+                confidence=confidence, execution_plan=execution_plan,
+            )
+            if not approval_ok:
+                raise ValueError(approval_reason)
+            # The authorized plan is the sole source of paper entry/SL/TP.
+            # Caller-supplied prices and a second TP cannot alter the plan.
+            entry_price = float(execution_plan['entry_price'])
+            sl = float(execution_plan['stop_loss'])
+            tp1 = float(execution_plan['take_profit'])
+            tp2 = tp1
+            direction = 'CALL' if expected == 'BUY' else 'PUT'
+            confidence = int(execution_plan['confidence'])
+        except Exception as approval_error:
+            try:
+                self._dashboard_events.append('paper entry blocked: ' + str(approval_error)[:180])
+            except Exception:
+                pass
+            return None
         if len(self.paper_open_trades) >= self.PAPER_CONFIG['max_open_trades']:
             return None
-            
+
         is_limit = False
         if current_price and abs(entry_price - current_price) / current_price > 0.0001:
             is_limit = True
-        
+
         expiry_min = self.PAPER_CONFIG['expiry_map'].get(expiry_name, 3)
         trade = {
             'id': datetime.now().strftime('%H%M%S'),
@@ -2192,7 +2282,7 @@ class LiveTradingEngine:
             # 1m direction confirmation (last CLOSED candle)
             confirmed = True
             if os.getenv('JARVIS_ENTRY_1M_CONFIRM', '1').lower() not in ('0', 'false', 'off'):
-                last = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+                last = df.iloc[-1]
                 candle_bull = float(last['close']) > float(last['open'])
                 if direction == 'CALL' and not candle_bull:
                     confirmed = False
@@ -2386,7 +2476,28 @@ class LiveTradingEngine:
             owner.coin_scanner = None
             owner._active_candle_snapshot = snapshot
             native_frames = {tf: frame.copy(deep=True) for tf, frame in native_frames.items()}
-            for tf, frame in native_frames.items():
+            # Use a single point-in-time cut for this analysis-only replay.
+            # In particular, 1s candles can close after the latest 1m candle;
+            # passing their newer values beside that 1m reference would leak
+            # future information into a supposedly synchronized MTF result.
+            if '1m' not in native_frames or native_frames['1m'].empty:
+                return {}
+            _one_minute_last = pd.Timestamp(native_frames['1m'].index[-1])
+            if _one_minute_last.tzinfo is None:
+                _one_minute_last = _one_minute_last.tz_localize('UTC')
+            else:
+                _one_minute_last = _one_minute_last.tz_convert('UTC')
+            _decision_epoch = next_candle_open('1m', _one_minute_last.timestamp())
+            for tf, frame in list(native_frames.items()):
+                if not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None:
+                    return {}
+                _utc_index = frame.index.tz_convert('UTC')
+                _keep = [next_candle_open(tf, _stamp.timestamp()) <= _decision_epoch
+                         for _stamp in _utc_index]
+                frame = frame.loc[_keep].copy(deep=True)
+                if len(frame) < 30:
+                    return {}
+                native_frames[tf] = frame
                 frame.attrs.update({'symbol': key.symbol, 'timeframe': tf})
             owner.analyze_trade_setup(
                 native_frames['1m'].copy(deep=True), candle_snapshot=snapshot,
@@ -2726,12 +2837,16 @@ class LiveTradingEngine:
                         self._check_paper_trades(current_price)
 
                     # 3. Fetch one direct native-interval snapshot for the
-                    # selected coin.  It contains 500 CLOSED candles per
-                    # interval plus a separate unconfirmed forming candle.
+                    # selected coin from strict Binance Spot. Each interval has
+                    # its configured CLOSED history plus a separate forming candle.
                     snapshot = None
                     if getattr(self.jarvis, 'direct_candle_cache', None) is not None:
                         try:
-                            snapshot = self.jarvis.direct_candle_cache.refresh(symbol)
+                            _candle_symbol = str(symbol).upper().replace('/', '').replace('-', '').replace('_', '')
+                            snapshot = self.jarvis.direct_candle_cache.refresh(
+                                _candle_symbol, venue='binance', market_type='spot',
+                                instrument_id=_candle_symbol,
+                            )
                         except Exception as candle_error:
                             self._set_readiness('NOT_READY', f'candle feed rejected ({type(candle_error).__name__})')
                             logger.warning('[CANDLES] Cycle blocked for %s (%s)', symbol, type(candle_error).__name__)
@@ -2896,11 +3011,53 @@ class LiveTradingEngine:
                                     self.last_hedged_result = hedged_result
                                     self._dashboard_events.append(f"Hedge: {hedged_result.get('status')} / applied={hedged_result.get('hedge_applied')}")
                                 
-                                # Always open paper trade to track P&L
+                                # Paper entries use the same complete native
+                                # MTF approval and plan-bound levels; a raw AI
+                                # direction or caller-supplied TP/SL is not enough.
+                                _paper_auth = {}
+                                try:
+                                    from jarvis_strategy_approval import build_execution_plan, make_entry_approval
+                                    _analysis = getattr(self.jarvis, 'latest_multicoin_analysis', {}) or {}
+                                    _central = _analysis.get('central_strategy_approval', {})
+                                    _snapshot = getattr(self.jarvis, '_active_candle_snapshot', None)
+                                    _canonical_symbol = str(symbol).upper().replace('/', '').replace('-', '').replace('_', '')
+                                    if (_snapshot is None or _snapshot.symbol != _canonical_symbol
+                                            or _snapshot.identity != ('binance', 'spot', _canonical_symbol, _canonical_symbol)
+                                            or not isinstance(_central, dict) or _central.get('approved') is not True):
+                                        raise ValueError('fresh Binance snapshot or approved native MTF decision is unavailable')
+                                    _snapshot_version = f"{_canonical_symbol}:{int(float(_snapshot.fetched_at) * 1000)}"
+                                    _side = 'BUY' if direction == 'CALL' else 'SELL'
+                                    _bound_plan = build_execution_plan(
+                                        direction=_side, recommended_expiry=expiry,
+                                        entry_price=entry_price or current_price,
+                                        stop_loss=sl, take_profit=tp1,
+                                        symbol=_canonical_symbol, snapshot_version=_snapshot_version,
+                                        confidence=confidence,
+                                    )
+                                    _bound_approval = make_entry_approval(
+                                        {**_central, 'symbol': _canonical_symbol},
+                                        direction=_side, symbol=_canonical_symbol,
+                                        exchange='delta', contract=_canonical_symbol,
+                                        instrument_id=_canonical_symbol, market_type='unverified',
+                                        analysis_symbol=_canonical_symbol, analysis_exchange='binance',
+                                        snapshot_version=_snapshot_version,
+                                        analysis_timestamp=float(_snapshot.fetched_at),
+                                        confidence=confidence, execution_plan=_bound_plan,
+                                    )
+                                    _paper_auth = {
+                                        'central_approval': _bound_approval,
+                                        'snapshot_version': _snapshot_version,
+                                        'part_results': getattr(self.jarvis, 'latest_part_results', {}),
+                                        'timeframe_parts': _analysis.get('parts_by_timeframe'),
+                                        'part7_gate': _analysis.get('part7_gate'),
+                                        'execution_plan': _bound_plan,
+                                    }
+                                except Exception as _paper_auth_error:
+                                    self._dashboard_events.append(f"Paper entry blocked: {_paper_auth_error}")
                                 trade = self._open_paper_trade(
                                     direction, entry_price or current_price,
                                     confidence, expiry, tp1, tp2, sl, current_price=current_price,
-                                    symbol=symbol
+                                    symbol=symbol, **_paper_auth,
                                 )
                                 if trade:
                                     self._dashboard_events.append(
@@ -2942,7 +3099,7 @@ class LiveTradingEngine:
                     traceback.print_exc()
                     # Report main loop error to Cognitive Bus
                     if hasattr(self.jarvis, 'bus') and self.jarvis.bus:
-                        self.jarvis.bus.report_error('JarvisElite_LiveLoop', e, context='main _live_loop cycle', try_ollama=True)
+                        self.jarvis.bus.report_error('JarvisElite_LiveLoop', e, context='main _live_loop cycle', try_ollama=False)
                     time.sleep(30)
             self.is_running = False
             if self.readiness.get('status') not in {'STOPPING', 'STOPPED'}:
@@ -3164,11 +3321,29 @@ class ScalpingEngine:
             atr = min(atr, current_price * max_sl_pct / 1.8)
             sl_multiplier = 1.8
             
-            # 2. Extract Options Walls
-            # FIX: Default walls now 0.3%/0.5% away (not 5%)
-            support_wall = options_data.get('support', current_price * 0.997) if options_data else current_price * 0.997
-            resistance_wall = options_data.get('resistance', current_price * 1.003) if options_data else current_price * 1.003
-            max_pain = options_data.get('max_pain', current_price) if options_data else current_price
+            # 2. Extract only finite, positive option levels. Provider responses
+            # often include an explicit None when a wall is unavailable; dict.get
+            # would preserve that None and break arithmetic below. Missing or
+            # invalid observations are not treated as options evidence.
+            def _positive_level(value, fallback):
+                try:
+                    parsed = float(value)
+                    return parsed if math.isfinite(parsed) and parsed > 0 else float(fallback)
+                except (TypeError, ValueError, OverflowError):
+                    return float(fallback)
+
+            support_wall = _positive_level(
+                options_data.get('support') if isinstance(options_data, dict) else None,
+                current_price * 0.997,
+            )
+            resistance_wall = _positive_level(
+                options_data.get('resistance') if isinstance(options_data, dict) else None,
+                current_price * 1.003,
+            )
+            max_pain = _positive_level(
+                options_data.get('max_pain') if isinstance(options_data, dict) else None,
+                current_price,
+            )
             
             # 3. Handle Direction
             if direction == 'CALL':
@@ -3311,8 +3486,13 @@ class Part2Zone:
             self._engine = None
 
     def analyze(self, data, context=None):
-        # ── Try real Part2 engine (16-brain AdvancedAnalysisSystem) ──────────────
-        if self._engine is not None and context and 'mtf_datasets' in context:
+        # The legacy Part2 engine consumes 1m/5m/15m jointly. Run that
+        # cross-frame computation once on the 1m row; invoking it from every
+        # native timeframe would duplicate identical evidence across groups.
+        active_timeframe = ((context or {}).get('timeframe')
+                            or getattr(data, 'attrs', {}).get('timeframe'))
+        if (active_timeframe == '1m' and self._engine is not None
+                and context and 'mtf_datasets' in context):
             try:
                 mtf = context['mtf_datasets']
                 df_1m = mtf.get('1m', data)
@@ -4112,58 +4292,34 @@ class Part12Confidence:
 
 
 class Part14OptionsChain:
-    """Institutional Positioning Analysis - Prefers Delta, Fallbacks to Deribit"""
-    def __init__(self, delta_client=None, asset='BTC'):
+    """Deterministic point-in-time options analysis; never lets a model vote."""
+    def __init__(self, delta_client=None, asset='BTC', backtest_mode=False):
         self.delta_client = delta_client
         self.asset = str(asset or 'BTC').upper().replace('USDT', '').replace('USD', '')
-        try:
-            from deribit_options_client import DeribitOptionsClient
-            # BUG FIX #3: Never hardcode credentials — load from env
-            client_id = os.getenv("DERIBIT_CLIENT_ID", "")
-            client_secret = os.getenv("DERIBIT_CLIENT_SECRET", "")
-            self.deribit = DeribitOptionsClient(currency=self.asset, client_id=client_id, client_secret=client_secret)
-        except ImportError:
-            self.deribit = None
-        except Exception:
-            self.deribit = None
+        self.backtest_mode = bool(backtest_mode)
+        self.deribit = None
+        if not self.backtest_mode and self.asset == 'BTC':
+            try:
+                from deribit_options_client import DeribitOptionsClient
+                # Credentials are environment-managed; Deribit remains BTC-only.
+                client_id = os.getenv("DERIBIT_CLIENT_ID", "")
+                client_secret = os.getenv("DERIBIT_CLIENT_SECRET", "")
+                self.deribit = DeribitOptionsClient(currency=self.asset, client_id=client_id, client_secret=client_secret)
+            except Exception:
+                self.deribit = None
 
-        # Ollama Whale Tracker Cooldown setup
-        self.last_ollama_time = 0
-        self.ollama_cooldown = 300  # 5 minutes
-        self.last_ollama_whale_tag = "WHALE_NEUTRAL"
-        self.last_ollama_insight = "Institutional options positioning tracking."
-
-    def _generate_ollama_options_prompt(self, telemetry: Dict, current_price: float) -> str:
-        prompt = f"""You are an Elite Institutional Options Analyst. You track Smart Money and Whale positioning in the crypto options market.
-
-Options Telemetry:
-- Exchange Source: {telemetry.get('exchange', 'Unknown')}
-- Current Price: ${current_price:.2f}
-- Put/Call Ratio (PCR): {telemetry.get('pcr', 'N/A')}
-- Max Pain Level: {telemetry.get('max_pain', 'N/A')}
-- Call Resistance Wall: {telemetry.get('resistance_wall', 'N/A')}
-- Put Support Wall: {telemetry.get('support_wall', 'N/A')}
-- Math Bias Score: {telemetry.get('bias_score', 0)}
-
-Task: Analyze if institutions (Whales) are accumulating long positions, setting up short hedges, or creating a retail trap (Bull Trap / Bear Trap).
-
-Respond with EXACTLY ONE of the following tags at the start of your response:
-- [WHALE_BULLISH] : Smart money is heavily buying calls / building support wall above current price.
-- [WHALE_BEARISH] : Smart money is buying puts / strong call wall capping price upside.
-- [RETAIL_TRAP] : High PCR divergence / Max Pain pin setup indicating a retail squeeze trap.
-
-Follow the tag with a 1-sentence options analyst insight.
-"""
-        return prompt
-
-    def analyze_options_with_ollama(self, telemetry: Dict, current_price: float) -> Tuple[str, str, int]:
-        """Compatibility name; return only the deterministic observed-chain signal."""
+    def analyze_options_deterministically(self, telemetry: Dict, current_price: float) -> Tuple[str, str, int]:
+        """Return only the deterministic observed-chain signal; no model vote."""
         signal = telemetry.get('signal', 0)
         try:
             signal = int(signal) if int(signal) in (-1, 0, 1) else 0
         except (TypeError, ValueError, OverflowError):
             signal = 0
-        return "MODEL_ADVISORY_DISABLED", "Options result is deterministic observed-chain math", signal
+        return "DETERMINISTIC_CHAIN_ONLY", "Options result uses validated provider observations; Laya is commentary-only", signal
+
+    def analyze_options_with_ollama(self, telemetry: Dict, current_price: float) -> Tuple[str, str, int]:
+        """Deprecated compatibility alias; never calls a model or adds a vote."""
+        return self.analyze_options_deterministically(telemetry, current_price)
 
     def analyze(self, data, context=None):
         """Unified selected-asset options analysis; BTC Deribit is never an alt substitute."""
@@ -4176,41 +4332,71 @@ Follow the tag with a 1-sentence options analyst insight.
                 return {"signal": 0, "thought": "No price data available", "telemetry": {"signal": 0}}
 
             current_price = float(data['close'].iloc[-1])
-            # Delta is asset-aware. Deribit is retained only for BTC and is
-            # never allowed to contaminate an altcoin decision.
-            delta_source = self.delta_client if self.delta_client and hasattr(self.delta_client, 'get_institutional_bias') else None
-            deribit_source = self.deribit if self.asset == 'BTC' else None
-            source = delta_source or deribit_source
-            if not source:
-                return {"signal": 0, "thought": f"Selected-asset options unavailable ({self.asset or 'unknown'})", "telemetry": {"signal": 0, "exchange": "None", "available": False, "asset": self.asset}}
-            
-            # Fetch specialized bias analysis
-            try:
-                if source == delta_source:
-                    bias_data = source.get_institutional_bias(self.asset)
-                else:
-                    bias_data = source.get_institutional_bias(current_price)
-            except Exception as e:
-                logging.warning(f"Options client API fetch warning: {e}")
-                bias_data = {'bias': 'NEUTRAL', 'score': 0, 'reasons': [str(e)]}
-            
-            # Additional detailed analysis if available (Deribit specific)
-            thoughts = []
-            if hasattr(source, 'analyze_full_market'):
-                try:
-                    market = source.analyze_full_market(current_price)
-                    if market and market.get('smart_money', {}).get('detected'):
-                        thoughts.append(f"🐋 {market['smart_money']['details']}")
-                except Exception:
-                    pass
-            
-            # Add basic bias to thoughts
-            thoughts.extend(bias_data.get('reasons', [])[:2])
+            # Historical mode consumes only recorded point-in-time provider
+            # observations; it must never touch current Delta/Deribit APIs.
+            if self.backtest_mode or bool((context or {}).get('is_backtest_mode')):
+                bias_data = (context or {}).get('historical_options_context', {})
+                if not isinstance(bias_data, dict) or not bias_data.get('available'):
+                    return {"signal": 0, "thought": "Historical options snapshot unavailable at decision time",
+                            "telemetry": {"signal": 0, "available": False, "asset": self.asset,
+                                           "source": "none", "not_ohlc_derived": True}}
+                source = None
+                source_name = str(bias_data.get('source') or 'recorded_options_snapshots')
+                thoughts = list(bias_data.get('reasons') or [])[:2]
+            else:
+                # Delta is asset-aware. Deribit is BTC-only and never substitutes
+                # its BTC chain for an altcoin decision.
+                delta_source = self.delta_client if self.delta_client and hasattr(self.delta_client, 'get_institutional_bias') else None
+                deribit_source = self.deribit if self.asset == 'BTC' else None
+                candidates = []
+                if delta_source is not None:
+                    candidates.append((delta_source, "Delta", self.asset))
+                if deribit_source is not None:
+                    # Deribit is an explicit BTC-only fallback; it may not
+                    # replace missing options for another selected asset.
+                    candidates.append((deribit_source, "Deribit", current_price))
+                source = None
+                source_name = "None"
+                bias_data = {}
+                source_failures = []
+                for candidate, candidate_name, query in candidates:
+                    try:
+                        candidate_data = candidate.get_institutional_bias(query)
+                    except Exception as e:
+                        source_failures.append(f"{candidate_name}: {type(e).__name__}")
+                        logging.warning("Options %s fetch failed: %s", candidate_name, type(e).__name__)
+                        continue
+                    if not isinstance(candidate_data, dict):
+                        source_failures.append(f"{candidate_name}: malformed response")
+                        continue
+                    validation = (candidate_data.get('raw_data') or {}).get('options_validation')
+                    candidate_available = bool(candidate_data.get('available', True))
+                    if isinstance(validation, dict):
+                        candidate_available = candidate_available and bool(validation.get('usable'))
+                    if not candidate_available:
+                        source_failures.append(f"{candidate_name}: unavailable or unusable chain")
+                        continue
+                    source, source_name, bias_data = candidate, candidate_name, candidate_data
+                    break
+                if source is None:
+                    reason = "; ".join(source_failures) or "no eligible provider configured"
+                    return {"signal": 0, "thought": f"Selected-asset options unavailable ({self.asset or 'unknown'}): {reason}",
+                            "telemetry": {"signal": 0, "exchange": "None", "available": False, "asset": self.asset,
+                                           "provider_failures": source_failures}}
+                thoughts = []
+                if hasattr(source, 'analyze_full_market'):
+                    try:
+                        market = source.analyze_full_market(current_price)
+                        if market and market.get('smart_money', {}).get('detected'):
+                            thoughts.append(f"🐋 {market['smart_money']['details']}")
+                    except Exception:
+                        pass
+                thoughts.extend(bias_data.get('reasons', [])[:2])
             
             math_signal = 1 if bias_data.get('bias') == 'BULLISH' else (-1 if bias_data.get('bias') == 'BEARISH' else 0)
             
             # Extract safe floats for telemetry
-            pcr_raw = bias_data.get('raw_data', {}).get('pcr')
+            pcr_raw = bias_data.get('pcr', bias_data.get('raw_data', {}).get('pcr'))
             pcr_float = float(pcr_raw) if pcr_raw is not None and str(pcr_raw).replace('.', '', 1).isdigit() else None
             
             max_pain_raw = bias_data.get('max_pain') or bias_data.get('raw_data', {}).get('max_pain')
@@ -4234,10 +4420,16 @@ Follow the tag with a 1-sentence options analyst insight.
             max_pain_float = _observed_price(max_pain_float)
             pcr_float = pcr_float if pcr_float is not None and math.isfinite(pcr_float) and pcr_float >= 0 else None
 
+            options_validation = bias_data.get('raw_data', {}).get('options_validation')
+            options_available = bool(bias_data.get('available', True))
+            if isinstance(options_validation, dict):
+                options_available = options_available and bool(options_validation.get('usable'))
             telemetry = {
-                "exchange": "Delta" if source == delta_source else "Deribit",
+                "exchange": source_name,
                 "asset": self.asset,
-                "available": True,
+                "available": options_available,
+                "historical": bool(bias_data.get('historical', False)),
+                "not_ohlc_derived": bool(bias_data.get('not_ohlc_derived', False)),
                 "bias_score": float(bias_data.get('score', 0)),
                 "pcr": pcr_float,
                 "signal": math_signal,
@@ -4251,7 +4443,7 @@ Follow the tag with a 1-sentence options analyst insight.
             }
 
             # Deterministic options math; optional model commentary cannot change signal.
-            whale_tag, insight, final_signal = self.analyze_options_with_ollama(telemetry, current_price)
+            whale_tag, insight, final_signal = self.analyze_options_deterministically(telemetry, current_price)
             telemetry['advisory_status'] = whale_tag
             telemetry['advisory_note'] = insight
 
@@ -4272,64 +4464,25 @@ def _call_ollama_local(prompt, model=None, timeout=30):
     return None, "Ollama retired; use isolated Laya advisory only"
 
 class DeepSeekV3Brain:
+    """Retired model surface; Laya is advisory-only and never casts a vote."""
     def __init__(self):
-        self.model_name = None  # Auto-detect installed Ollama model (or OLLAMA_MODEL env)
-        self.enabled = True  # FIX: Always enabled via Ollama
+        self.model_name = None
+        self.enabled = False
 
     def analyze_sentiment(self, data, market_context):
-        try:
-            volatility = market_context.get('volatility', 'unknown')
-            trend = market_context.get('trend', 'unknown')
-            mood = market_context.get('mood', 'unknown')
-            prompt = f"BTC sentiment: vol={volatility}, trend={trend}, mood={mood}. Score:-10to10,reason(10words)"
-            content, err = _call_ollama_local(prompt, model=self.model_name)
-            if err:
-                return 0, f"ollama-err:{err}"
-            score, reason = parse_score_from_text(content)
-            if score > 3: return 1, reason
-            if score < -3: return -1, reason
-            return 0, reason
-        except Exception as e:
-            logger.debug("DeepSeekV3 error: %s", e)
-            return 0, "error"
+        return 0, "unavailable: legacy Ollama/DeepSeek voting retired; Laya is commentary-only"
+
 
 class DeepSeekR1ReasoningBrain:
+    """Retired decision surface; deterministic code remains authoritative."""
     def __init__(self):
-        self.model_name = None  # Auto-detect installed Ollama model (or OLLAMA_MODEL env)
-        self.enabled = True  # FIX: Always enabled via Ollama
+        self.model_name = None
+        self.enabled = False
 
     def complex_reasoning(self, all_signals, market_data, context):
-        try:
-            # Build signal summary for AI
-            s = 0
-            for v in all_signals.get('traditional_signals', {}).values():
-                try:
-                    s += int(v)
-                except Exception: pass
-            
-            mood = context.get('mood', 'unknown')
-            vol = context.get('volatility', 0)
-            prompt = f"BTC sig_sum={s},mood={mood},vol={vol:.4f}. Reply: CALL/PUT/NO-TRADE,conf:1-10,reason(15words)"
-            content, err = _call_ollama_local(prompt, model=self.model_name, timeout=45)
-            if err:
-                # Fallback to math-only signal
-                signal = "CALL" if s>0 else ("PUT" if s<0 else "NO-TRADE")
-                return {"signal": signal, "confidence": 5, "reasoning": f"Ollama offline, math fallback (sum={s})", "key_factors": []}
-            low = (content or "").lower()
-            if "call" in low and "put" not in low:
-                sig = "CALL"
-            elif "put" in low and "call" not in low:
-                sig = "PUT"
-            else:
-                sig = "NO-TRADE"
-            import re
-            nums = re.findall(r"\d{1,2}", content or "")
-            conf = int(nums[0]) if nums else 5
-            conf = max(0, min(10, conf))
-            return {"signal": sig, "confidence": conf, "reasoning": (content or '')[:300], "key_factors": []}
-        except Exception as e:
-            logger.debug("DeepSeekR1 error: %s", e)
-            return {"signal": "NO-TRADE", "confidence": 0, "reasoning": "parse error"}
+        return {"signal": "NO-TRADE", "confidence": 0,
+                "reasoning": "unavailable: legacy Ollama/DeepSeek voting retired; Laya is commentary-only",
+                "key_factors": [], "available": False}
 
 class QuantumV5:
     """
@@ -5422,19 +5575,30 @@ class JarvisElite:
             self.delta_data = None
             self.delta_client = None
 
-        # Live analysis uses one bounded native-interval snapshot for the
-        # selected symbol.  The cache key includes symbol/source/timeframe;
-        # it never resamples or pads data and fails closed on a bad feed.
+        # Selected-symbol analysis reads strict Binance Spot candles; Delta stays
+        # the separate execution/options venue. No Bybit or Delta candle fallback
+        # is accepted by this cache. Per-frame lookback follows the interval
+        # profile, and each snapshot keeps the forming candle separate.
+        self.binance_data = None
+        if BINANCE_DATA_AVAILABLE:
+            try:
+                self.binance_data = _get_binance_data()
+            except Exception as _binance_error:
+                logger.warning("Binance public data client unavailable: %s", type(_binance_error).__name__)
         self.direct_candle_cache = None
         self._active_candle_snapshot = None
-        if self.delta_data is not None and DIRECT_CANDLE_CACHE_AVAILABLE:
+        if (self.binance_data is not None and DIRECT_CANDLE_CACHE_AVAILABLE
+                and BinanceSpotCandleClient is not None):
             try:
+                _history_limits = {tf: TIMEFRAME_HISTORY_CANDLES[tf] for tf in BINANCE_SPOT_TIMEFRAMES}
                 self.direct_candle_cache = DirectCandleCache(
-                    self.delta_data,
-                    ttl_seconds=float(os.getenv('JARVIS_CANDLE_REFRESH_SECONDS', '45')),
+                    BinanceSpotCandleClient(self.binance_data),
+                    ttl_seconds=float(os.getenv('JARVIS_CANDLE_REFRESH_SECONDS', '5')),
+                    timeframes=tuple(BINANCE_SPOT_TIMEFRAMES),
+                    history_limits=_history_limits,
                 )
             except Exception as _cache_error:
-                logger.warning("Direct candle cache unavailable: %s", _cache_error)
+                logger.warning("Strict Binance candle cache unavailable: %s", type(_cache_error).__name__)
 
         # Optional wiring: keep supplemental sources and utilities discoverable,
         # but do not start scanners, model calls, backtests, or another position
@@ -5442,7 +5606,6 @@ class JarvisElite:
         self.position_manager = None
         self.position_sizer = None
         self.coin_scanner = None
-        self.binance_data = None
         self.upstox_data = None
         self.specialist_pool = None
         self.specialist_pool_class = _SpecialistPool
@@ -5709,10 +5872,13 @@ class JarvisElite:
             'part11_fusion': Part11Fusion(),
             'part12_confidence': Part12Confidence(),
         }
-        # Options positioning needs a timestamp-matched historical chain. Never let
-        # a live/current chain masquerade as replay data or silently count as a vote.
-        if not self.is_backtest_mode:
-            self.parts['part14_options_chain'] = Part14OptionsChain(delta_client=self.delta_data)
+        # Options positioning uses live provider observations in live mode and
+        # timestamp-matched recorded observations in backtests. It never fetches
+        # a current chain during historical replay.
+        self.parts['part14_options_chain'] = Part14OptionsChain(
+            delta_client=None if self.is_backtest_mode else self.delta_data,
+            backtest_mode=self.is_backtest_mode,
+        )
         self.mtf_analyzer = DeepMTFAnalyzer(self.parts) # NEW: Deep MTF Analysis
         self.brains = {
             'neural_hud_brain': None,
@@ -5769,11 +5935,10 @@ class JarvisElite:
         return self.integration_sources.get(key)
     
     def _fetch_mtf_from_api(self, symbol=None):
-        """Return direct native live frames; never resample or substitute BTC.
+        """Return validated Binance Spot native frames or fail closed.
 
-        The compatibility branch is only for small unit fixtures that construct
-        ``JarvisElite`` with ``object.__new__`` and therefore bypass ``__init__``;
-        production instances always use ``DirectCandleCache`` below.
+        No raw-client compatibility path is allowed here: it would bypass source,
+        timeframe history, continuity, and forming-candle validation.
         """
         if self.is_backtest_mode:
             return {}
@@ -5783,27 +5948,19 @@ class JarvisElite:
             return {}
         direct_cache = getattr(self, 'direct_candle_cache', None)
         if direct_cache is None:
-            # Test doubles made with object.__new__ predate the cache wiring.
-            # Keep their symbol-routing assertion direct and native; do not
-            # resample, synthesize, or use a different symbol in this branch.
-            client = getattr(self, 'delta_client', None)
-            fetch = getattr(client, 'get_historical_candles', None)
-            if callable(fetch):
-                frames = {}
-                try:
-                    for timeframe in LIVE_TIMEFRAMES:
-                        rows = fetch(symbol=symbol, resolution=timeframe, limit=501)
-                        if rows:
-                            frames[timeframe] = pd.DataFrame(rows)
-                    return frames
-                except Exception as error:
-                    logger.warning('[MTF-API] Compatibility fixture fetch rejected: %s', error)
+            logger.warning('[MTF-API] Strict Binance Spot candle cache unavailable; refusing raw fallback')
             return {}
         try:
             snapshot = getattr(self, '_active_candle_snapshot', None)
-            if snapshot is None or snapshot.symbol != str(symbol).upper().replace('/', '').replace('-', '').replace('_', ''):
-                snapshot = self.direct_candle_cache.refresh(symbol)
+            _canonical = str(symbol).upper().replace('/', '').replace('-', '').replace('_', '')
+            if (snapshot is None or snapshot.symbol != _canonical
+                    or snapshot.identity != ('binance', 'spot', _canonical, _canonical)):
+                snapshot = self.direct_candle_cache.refresh(
+                    _canonical, venue='binance', market_type='spot', instrument_id=_canonical,
+                )
                 self._active_candle_snapshot = snapshot
+            if snapshot.identity != ('binance', 'spot', _canonical, _canonical):
+                raise CandleDataError('selected candle source/market identity mismatch')
             if set(snapshot.frames) != set(LIVE_TIMEFRAMES):
                 logger.warning('[MTF-API] Incomplete direct snapshot; refusing analysis')
                 return {}
@@ -5814,7 +5971,7 @@ class JarvisElite:
             logger.warning('[MTF-API] Direct native fetch rejected: %s', error)
             return {}
 
-    def analyze_trade_setup(self, data, mtf_context=None, candle_snapshot=None):
+    def analyze_trade_setup(self, data, mtf_context=None, candle_snapshot=None, native_mtf=None):
         """Analyze verified closed native candles; current candle stays metadata-only."""
         # Clear only display snapshots at cycle start: an early data-gate return
         # must not render yesterday's/previous-cycle Parts as current evidence.
@@ -5831,6 +5988,7 @@ class JarvisElite:
         self.latest_diagnostics_cycle_status = {
             'status': 'NOT RUN', 'reason': 'current-cycle analysis has not started',
         }
+        self._historical_options_bias = None
 
         def _record_diagnostics_cycle(status, reason):
             try:
@@ -5851,7 +6009,7 @@ class JarvisElite:
                 self.latest_timeframe_inputs = _build_timeframe_inputs(
                     frames,
                     snapshot=snapshot,
-                    timeframes=tuple(LIVE_TIMEFRAMES) or _DIAGNOSTIC_TIMEFRAMES,
+                    timeframes=tuple(frames.keys()) or _DIAGNOSTIC_TIMEFRAMES,
                     expected_symbol=getattr(self, 'active_symbol', None),
                     stale_intervals=stale_intervals,
                     fetch_ttl_seconds=fetch_ttl,
@@ -5873,6 +6031,21 @@ class JarvisElite:
                 except Exception:
                     _initial_frames = {}
                 _capture_diagnostics_inputs(_initial_frames, _initial_snapshot)
+                if not self.is_backtest_mode:
+                    _selected = str(getattr(self, 'active_symbol', '') or '').upper().replace('/', '').replace('-', '').replace('_', '')
+                    _expected_identity = ('binance', 'spot', _selected, _selected)
+                    if (not _selected or getattr(_initial_snapshot, 'identity', None) != _expected_identity
+                            or set(getattr(_initial_snapshot, 'frames', {})) != set(LIVE_TIMEFRAMES)):
+                        _record_diagnostics_cycle('BLOCKED', 'live snapshot provider, market, identity, or timeframe set mismatch')
+                        return self._get_no_trade_signal('WAIT/NO-DATA: Binance Spot snapshot identity/timeframe mismatch')
+                    _limits = getattr(getattr(self, 'direct_candle_cache', None), 'history_limits', {})
+                    for _tf, _frame in _initial_snapshot.frames.items():
+                        if (_frame.source != 'binance' or _frame.venue != 'binance'
+                                or _frame.market_type != 'spot' or _frame.instrument_id != _selected
+                                or len(_frame.closed) != int(_limits.get(_tf, TIMEFRAME_HISTORY_CANDLES.get(_tf, 0)))
+                                or _frame.current is None):
+                            _record_diagnostics_cycle('BLOCKED', f'live {_tf} Binance Spot frame incomplete or unverified')
+                            return self._get_no_trade_signal(f'WAIT/NO-DATA: invalid { _tf } Binance Spot frame')
             if candle_snapshot is not None:
                 self._active_candle_snapshot = candle_snapshot
                 if not self.is_backtest_mode:
@@ -5884,6 +6057,53 @@ class JarvisElite:
             elif not self.is_backtest_mode and self._active_candle_snapshot is None:
                 _record_diagnostics_cycle('UNAVAILABLE', 'no direct candle snapshot supplied for current cycle')
                 return self._get_no_trade_signal('WAIT/NO-DATA: no direct candle snapshot')
+
+            # Caller-supplied MTF frames may not bypass the canonical live snapshot.
+            # In live mode they must be byte-for-byte equivalent DataFrame values
+            # from that validated Binance Spot snapshot; in backtests only an
+            # explicit known interval set is accepted, with no future timestamps.
+            if native_mtf is not None:
+                allowed_backtest_sets = {frozenset(DEFAULT_STRATEGY_TIMEFRAMES), frozenset(LIVE_TIMEFRAMES)}
+                expected_keys = (set(LIVE_TIMEFRAMES) if not self.is_backtest_mode
+                                 else set(native_mtf) if isinstance(native_mtf, dict)
+                                 and frozenset(native_mtf) in allowed_backtest_sets else set())
+                if (not isinstance(native_mtf, dict) or not expected_keys
+                        or set(native_mtf) != expected_keys or '1m' not in native_mtf):
+                    _record_diagnostics_cycle('BLOCKED', 'supplied native MTF timeframe set invalid')
+                    return self._get_no_trade_signal('WAIT/NO-DATA: supplied native timeframe set invalid')
+                for _tf, _frame in native_mtf.items():
+                    if not isinstance(_frame, pd.DataFrame) or _frame.empty:
+                        _record_diagnostics_cycle('BLOCKED', f'supplied {_tf} frame is empty or invalid')
+                        return self._get_no_trade_signal(f'WAIT/NO-DATA: invalid supplied {_tf} frame')
+                    if not self.is_backtest_mode:
+                        _snap_frame = getattr(_initial_snapshot, 'frames', {}).get(_tf)
+                        if (_snap_frame is None or _frame.attrs.get('symbol') != _selected
+                                or _frame.attrs.get('timeframe') != _tf
+                                or not _frame.equals(_snap_frame.closed)):
+                            _record_diagnostics_cycle('BLOCKED', f'supplied {_tf} frame differs from validated snapshot')
+                            return self._get_no_trade_signal(f'WAIT/NO-DATA: unverified supplied {_tf} frame')
+                    else:
+                        try:
+                            if not isinstance(_frame.index, pd.DatetimeIndex) or _frame.index.tz is None:
+                                raise ValueError('native MTF frame requires a timezone-aware DatetimeIndex')
+                            _source_end = pd.Timestamp(data.index[-1])
+                            if not isinstance(data.index, pd.DatetimeIndex):
+                                raise ValueError('backtest source requires a DatetimeIndex')
+                            if _source_end.tzinfo is None:
+                                _source_end = _source_end.tz_localize('UTC')
+                            else:
+                                _source_end = _source_end.tz_convert('UTC')
+                            # Backtest decisions use the close of the latest
+                            # completed 1m bar. A higher-TF candle is admissible
+                            # only if its full interval had closed by that time;
+                            # checking only its open timestamp leaks future OHLCV.
+                            _decision_time = next_candle_open('1m', _source_end.timestamp())
+                            _frame_stamps = _frame.index.tz_convert('UTC')
+                            _frame_seconds = [float(_stamp.timestamp()) for _stamp in _frame_stamps]
+                            validate_closed_candle_timestamps(_tf, _frame_seconds, _decision_time)
+                        except Exception:
+                            _record_diagnostics_cycle('BLOCKED', f'supplied {_tf} frame includes unclosed or invalid backtest candles')
+                            return self._get_no_trade_signal(f'WAIT/NO-DATA: unclosed supplied {_tf} frame')
             # Auto-start Double-Brain AI Chain on first run
             # DISABLED for Performance: Prevents resource contention with Trading Judge
             # if not self.ai_chain_brain.is_running:
@@ -5908,7 +6128,7 @@ class JarvisElite:
                         or getattr(self, 'symbol', None)
                         or getattr(self, 'current_coin', None)
                     )
-                    _dv_result = _dv.validate_dataframe(data, source="delta", symbol=_active_sym)
+                    _dv_result = _dv.validate_dataframe(data, source="binance_spot", symbol=_active_sym)
                     if not _dv_result.ok:
                         logger.warning(
                             "🛡️ DATA-VALIDATOR GATE: %s — %s",
@@ -5922,38 +6142,68 @@ class JarvisElite:
                         return self._get_no_trade_signal(
                             f"WAIT/NO-DATA: {'; '.join(_dv_result.failures)}"
                         )
-                    # Cross-source: Delta vs Binance price divergence
-                    if self.binance_data is not None:
-                        try:
-                            _xs_base = getattr(self, 'active_base_asset', None) or 'BTC'
-                            _bn_price = self.binance_data.get_live_price(symbol=f"{_xs_base}USDT")
-                            if _bn_price and _bn_price > 0:
-                                _delta_price = float(data['close'].iloc[-1])
-                                _xs_result = _dv.cross_source_check(
-                                    _delta_price, _bn_price, "delta", "binance"
-                                )
-                                if not _xs_result.ok:
-                                    logger.warning(
-                                        "🛡️ DATA-VALIDATOR CROSS-SOURCE BLOCK: %s",
-                                        "; ".join(_xs_result.failures)
-                                    )
-                                    _record_diagnostics_cycle(
-                                        'BLOCKED',
-                                        f"cross-source validator failures={'; '.join(_xs_result.failures)}",
-                                    )
-                                    return self._get_no_trade_signal(
-                                        f"WAIT/NO-DATA: {'; '.join(_xs_result.failures)}"
-                                    )
-                        except Exception as _xs_err:
-                            logger.debug("Cross-source check skipped: %s", _xs_err)
                 except Exception as _dv_err:
-                    # FAIL-OPEN: validator crash must never block the brain
-                    logger.debug("Data validator skipped (error): %s", _dv_err)
+                    # The direct native cache has already established provider,
+                    # identity, continuity, and freshness. If the configured
+                    # secondary validator is present but crashes, fail closed.
+                    _record_diagnostics_cycle('BLOCKED', f'data validator failed: {type(_dv_err).__name__}')
+                    return self._get_no_trade_signal('WAIT/NO-DATA: data validator unavailable')
 
             # Get current price and context
             current_price = float(data['close'].iloc[-1])
             self.last_price = current_price  # Store for AI Chain global context
             self.market_context = self._get_market_context(data)
+            self.market_context['symbol'] = (getattr(self, 'active_symbol', None) or getattr(data, 'attrs', {}).get('symbol') or 'UNKNOWN')
+            self.market_context['selected_symbol'] = self.market_context['symbol']
+            # Every part, especially Part14, must know whether this call is a
+            # historical replay. Without this shared flag a live-constructed
+            # analyzer could query today's options during a backtest.
+            self.market_context['is_backtest_mode'] = bool(self.is_backtest_mode)
+            # Historical options are used only from recorded provider snapshots
+            # at or before this candle's close. No live chain or OHLC-derived
+            # synthetic options are permitted in backtest mode.
+            if self.is_backtest_mode:
+                snapshot_path = os.getenv(
+                    'JARVIS_OPTIONS_SNAPSHOT_PATH',
+                    os.path.join('.jarvis_state', 'options_snapshots.jsonl'),
+                ).strip()
+                try:
+                    index = getattr(data, 'index', None)
+                    if snapshot_path and index is not None and len(index) >= 2:
+                        stamps = pd.to_datetime(index[-min(20, len(index)):])
+                        if getattr(stamps, 'tz', None) is None:
+                            stamps = stamps.tz_localize('UTC')
+                        else:
+                            stamps = stamps.tz_convert('UTC')
+                        # This strategy entry point is explicitly the 1m
+                        # primary frame. Do not infer an interval from median
+                        # spacing, which can advance replay time across gaps.
+                        from binance_timeframes import next_candle_open, validate_closed_candle_timestamps
+                        stamp_seconds = [float(stamp.timestamp()) for stamp in stamps]
+                        _decision_epoch = next_candle_open('1m', stamp_seconds[-1])
+                        validate_closed_candle_timestamps('1m', stamp_seconds, _decision_epoch)
+                        decision_time = datetime.fromtimestamp(_decision_epoch, tz=timezone.utc)
+                        base_asset = str(getattr(self, 'active_base_asset', '') or self.market_context['symbol'])
+                        for quote in ('USDT', 'USD', 'USDC'):
+                            if base_asset.upper().endswith(quote):
+                                base_asset = base_asset[:-len(quote)]
+                                break
+                        from options_snapshot_store import replay_institutional_bias
+                        self._historical_options_bias = replay_institutional_bias(
+                            snapshot_path, base_asset, decision_time, max_age_seconds=600)
+                    else:
+                        self._historical_options_bias = {
+                            'available': False, 'bias': 'NEUTRAL', 'score': 0,
+                            'reason': 'no_recorded_point_in_time_options_archive',
+                            'source': 'none', 'not_ohlc_derived': True,
+                        }
+                except Exception as history_error:
+                    self._historical_options_bias = {
+                        'available': False, 'bias': 'NEUTRAL', 'score': 0,
+                        'reason': type(history_error).__name__, 'source': 'none',
+                        'not_ohlc_derived': True,
+                    }
+                self.market_context['historical_options_context'] = self._historical_options_bias
             
             # --- EXTERNAL ENGINE EXECUTION ---
             # FIX: Initialize ALL market_context keys upfront to prevent KeyError crashes
@@ -5981,7 +6231,9 @@ class JarvisElite:
                     # Live GPU/external engines consume the exact same direct
                     # native frames as Parts 1-12.  No resampling, truncation,
                     # live-price injection, or forming-candle mutation occurs.
-                    if self.is_backtest_mode:
+                    if isinstance(native_mtf, dict) and native_mtf:
+                        engine_tf_data = {str(tf): frame.copy(deep=True) for tf, frame in native_mtf.items()}
+                    elif self.is_backtest_mode:
                         engine_tf_data = {'1m': data}
                     else:
                         engine_tf_data = self._fetch_mtf_from_api(getattr(self, 'active_symbol', None))
@@ -6107,40 +6359,36 @@ class JarvisElite:
             # ---------------------------------
             
             # ============================================================
-            # MULTI-TIMEFRAME ANALYSIS: All Parts on ALL Timeframes (1m-4h)
-            # Reuse the shared direct snapshot for Parts 1-12 and external engines.
+            # MULTI-TIMEFRAME ANALYSIS: native frames supplied by the selected data path.
+            # Extra Binance Spot intervals are enabled only in the isolated analysis pipeline.
             # ============================================================
             
-            # Historical replay must rebuild every timeframe from the local
-            # pre-decision window on every step. Reusing a previous cache would make
-            # higher timeframes stale; fetching a feed would contaminate the replay.
-            if self.is_backtest_mode:
+            # A supplied mapping is already native, closed and caller-validated.
+            # Use it as-is (not as a resampling seed) for isolated analysis jobs.
+            if isinstance(native_mtf, dict) and native_mtf:
+                mtf_data = {str(tf): frame.copy(deep=True) for tf, frame in native_mtf.items()}
+                if '1m' not in mtf_data or any(not isinstance(frame, pd.DataFrame) or frame.empty for frame in mtf_data.values()):
+                    _record_diagnostics_cycle('UNAVAILABLE', 'native MTF input missing 1m or contains empty frame')
+                    return self._get_no_trade_signal('WAIT/NO-DATA: incomplete supplied native frames')
+                self._api_mtf_cache = mtf_data
+                self.market_context['mtf_datasets'] = mtf_data
+            # Historical replay never labels 1m-resampled bins as native
+            # Binance intervals. Full multi-interval backtests must supply
+            # point-in-time native_mtf frames explicitly; without them only the
+            # source 1m frame is analyzed and MTF confluence is unavailable.
+            elif self.is_backtest_mode:
                 if not isinstance(data.index, pd.DatetimeIndex):
                     data = data.copy()
-                    data.index = pd.to_datetime(data.index)
-                ohlcv_agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+                    data.index = pd.to_datetime(data.index, utc=True)
                 mtf_data = {'1m': data.copy()}
-                for tf_name, tf_rule in {
-                    '3m': '3min', '5m': '5min', '15m': '15min', '30m': '30min',
-                    '1h': '1h', '2h': '2h', '4h': '4h'
-                }.items():
-                    resampled = data.resample(tf_rule).agg(ohlcv_agg).dropna()
-                    # Keep every configured timeframe explicit.  A short replay
-                    # window must produce an invalid/missing Part 7 result and
-                    # block entries, rather than silently omitting that identity.
-                    mtf_data[tf_name] = resampled
-                
-                # OPTIMIZATION: Truncate to 500 rows to prevent massive slowdown in backtest
-                for k in list(mtf_data.keys()):
-                    if len(mtf_data[k]) > 500:
-                        mtf_data[k] = mtf_data[k].iloc[-500:]
-                        
+                self.market_context['native_mtf_backtest_status'] = {
+                    'available_timeframes': ['1m'],
+                    'missing_timeframes': [tf for tf in DEFAULT_STRATEGY_TIMEFRAMES if tf != '1m'],
+                    'status': 'incomplete_native_history',
+                }
                 self._api_mtf_cache = mtf_data
                 self.market_context['mtf_datasets'] = mtf_data
             else:
-                # Live mode is strict: the shared snapshot is refreshed by the
-                # live loop and reused here.  A direct-fetch failure blocks the
-                # cycle; there is no synthetic/resampled fallback or BTC swap.
                 mtf_data = self._fetch_mtf_from_api(getattr(self, 'active_symbol', None))
                 if set(mtf_data) != set(LIVE_TIMEFRAMES):
                     _record_diagnostics_cycle('UNAVAILABLE', f'incomplete native timeframe snapshot; received={sorted(mtf_data)}')
@@ -6152,6 +6400,24 @@ class JarvisElite:
                     self.market_context['current_candles'] = self._active_candle_snapshot.current_candles
                     self.market_context['current_candle_is_confirmed'] = False
 
+            # Synchronize every native live interval to the last completed 1m
+            # close. Faster candles (especially 1s) may otherwise contribute
+            # evidence newer than the decision reference. Keep the forming bars
+            # separately in snapshot.current_candles for live display only.
+            if not self.is_backtest_mode:
+                try:
+                    if set(mtf_data) != set(LIVE_TIMEFRAMES):
+                        raise ValueError('native live timeframe set is incomplete')
+                    mtf_data = synchronize_native_frames_to_1m_close(mtf_data)
+                    if set(mtf_data) != set(LIVE_TIMEFRAMES):
+                        raise ValueError('synchronized native timeframe set is incomplete')
+                    self._api_mtf_cache = mtf_data
+                    self.market_context['mtf_datasets'] = mtf_data
+                    self.market_context['decision_cutoff_source'] = 'latest_completed_1m_close'
+                except Exception as _alignment_error:
+                    _record_diagnostics_cycle('BLOCKED', f'native timeframe synchronization failed: {type(_alignment_error).__name__}')
+                    return self._get_no_trade_signal('WAIT/NO-DATA: native timeframes are not synchronized')
+
             # Capture only safe, bounded metadata from the exact closed frames
             # being analyzed. This is display-only and has no strategy inputs.
             _capture_diagnostics_inputs(
@@ -6161,17 +6427,15 @@ class JarvisElite:
 
             logger.info(f"📊 MTF Analysis: {len(mtf_data)} timeframes active: {list(mtf_data.keys())}")
             
-            # Timeframe weights (higher TF = higher weight for trend direction)
-            tf_weights = {
-                '1m': 1.0,   # Scalping - Entry timing
-                '3m': 1.5,   # Micro trend  
-                '5m': 2.0,   # Short-term trend
-                '15m': 3.0,  # Medium trend
-                '30m': 4.0,  # Strong trend
-                '1h': 5.0,   # Major trend
-                '2h': 6.0,   # Institutional trend
-                '4h': 7.0    # Long-term bias (STRONGEST)
-            }
+            # Diagnostic per-frame contributions divide each horizon weight
+            # across its correlated native intervals. The actual MTF veto below
+            # aggregates each correlation group once before applying its weight.
+            tf_weights = {}
+            for _group_name, _group_frames in TIMEFRAME_CORRELATION_GROUPS.items():
+                _available_group_frames = [tf for tf in _group_frames if tf in mtf_data]
+                if _available_group_frames:
+                    _per_frame_weight = TIMEFRAME_GROUP_WEIGHTS[_group_name] / len(_available_group_frames)
+                    tf_weights.update({tf: _per_frame_weight for tf in _available_group_frames})
             
             # Run ALL parts on ALL timeframes
             part_results = {}        # Final weighted results (1m base)
@@ -6192,27 +6456,28 @@ class JarvisElite:
                 for name, part in self.parts.items():
                     if name in ['part11_fusion', 'part12_confidence']:
                         continue
+                    if name == 'part14_options_chain' and tf_name != '1m':
+                        continue
                     
                     try:
-                        # 🎓 TEACHER FIX #1: Data Pollution (Pass-by-reference mutation bug)
-                        # Ensure each part receives a pristine, independent copy of the dataframe.
-                        # Part 7 also receives the selected symbol/timeframe identity so it
-                        # cannot silently analyze a BTC/default or mixed-symbol frame.
-                        part_context = self.market_context
-                        if name == 'part7_volatility':
-                            part_context = dict(self.market_context)
-                            part_context.update({
-                                'selected_symbol': getattr(self, 'active_symbol', None),
-                                'timeframe': tf_name,
-                                'is_backtest_mode': self.is_backtest_mode,
-                                'shared_candle_source': 'historical_replay' if self.is_backtest_mode else 'shared_exchange',
-                            })
-                            tf_data = tf_data.copy()
-                            tf_data.attrs = dict(getattr(tf_data, 'attrs', {}) or {})
-                            if getattr(self, 'active_symbol', None):
-                                tf_data.attrs['symbol'] = self.active_symbol
-                            tf_data.attrs['timeframe'] = tf_name
-                        res = part.analyze(tf_data, context=part_context)
+                        # Give each analyzer a pristine input frame and its own
+                        # context dictionary. Canonical MTF evidence in that
+                        # context is read-only; Parts must not mutate it.
+                        part_context = dict(self.market_context)
+                        part_context.update({
+                            'symbol': getattr(self, 'active_symbol', None),
+                            'selected_symbol': getattr(self, 'active_symbol', None),
+                            'timeframe': tf_name,
+                            'native_timeframe': tf_name,
+                            'is_backtest_mode': self.is_backtest_mode,
+                            'shared_candle_source': 'historical_replay' if self.is_backtest_mode else 'shared_exchange',
+                        })
+                        part_data = tf_data.copy(deep=True)
+                        part_data.attrs = dict(getattr(tf_data, 'attrs', {}) or {})
+                        if getattr(self, 'active_symbol', None):
+                            part_data.attrs['symbol'] = self.active_symbol
+                        part_data.attrs['timeframe'] = tf_name
+                        res = part.analyze(part_data, context=part_context)
                         if name in _DIAGNOSTIC_PART_KEYS:
                             try:
                                 tf_diagnostics[name] = (
@@ -6321,21 +6586,16 @@ class JarvisElite:
                 base_thought = str(base_result.get('thought', 'No thought')).strip()
                 
                 # HTF confluence / veto calculation across higher timeframes
-                htf_weighted_sum = 0.0
-                htf_total_weight = 0.0
+                htf_values = {}
                 for tf_name in mtf_data.keys():
                     if tf_name == primary_tf:
                         continue
                     tf_res = mtf_breakdown.get(tf_name, {}).get(name, {})
                     try:
-                        s = float(tf_res.get('signal', 0))
+                        htf_values[tf_name] = float(tf_res.get('signal', 0))
                     except (ValueError, TypeError):
-                        s = 0.0
-                    w = tf_weights.get(tf_name, 1.0)
-                    htf_weighted_sum += s * w
-                    htf_total_weight += w
-                
-                htf_avg = (htf_weighted_sum / htf_total_weight) if htf_total_weight > 0 else 0.0
+                        htf_values[tf_name] = 0.0
+                htf_avg, htf_groups = grouped_timeframe_consensus(htf_values)
                 
                 # ── RULE 1: PRIMARY TIMEFRAME (1m) INTEGRITY ──────────────────────
                 # If 1m is Neutral (0), the part MUST remain Neutral (0).
@@ -6354,12 +6614,8 @@ class JarvisElite:
                     else:
                         # 1m is valid and confirmed / not opposed by HTF
                         final_signal = base_sig
-                        tf_agree = sum(
-                            1 for tf in mtf_breakdown 
-                            if name in mtf_breakdown[tf] 
-                            and mtf_breakdown[tf][name].get('signal', 0) == final_signal
-                        )
-                        final_thought = f"{base_thought} | MTF: {tf_agree}/{len(mtf_data)} TFs agree"
+                        tf_agree = sum(1 for value in htf_groups.values() if value * final_signal > 0)
+                        final_thought = f"{base_thought} | MTF: {tf_agree}/{len(htf_groups)} independent horizon groups agree"
                 
                 tf_agree_cnt = sum(
                     1 for tf in mtf_breakdown 
@@ -6371,7 +6627,8 @@ class JarvisElite:
                     'signal': final_signal,
                     'thought': final_thought,
                     'weighted_avg': round(htf_avg, 3),
-                    'tf_agreement': tf_agree_cnt
+                    'tf_agreement': tf_agree_cnt,
+                    'mtf_horizon_groups': htf_groups
                 }
                 
                 if final_signal != 0:
@@ -6396,8 +6653,10 @@ class JarvisElite:
             self.latest_telemetry = full_telemetry
             
             # --- MACRO CONTEXT & OPTIONS PRE-FETCH ---
-            options_intel = None
-            intel_delta = None
+            options_intel = (self._historical_options_bias
+                             if self.is_backtest_mode and isinstance(self._historical_options_bias, dict)
+                             and self._historical_options_bias.get('available') else None)
+            intel_delta = options_intel
             intel_deribit = None
             
             # Fetch options/institutional intel for the locked asset.  Deribit
@@ -6477,6 +6736,16 @@ class JarvisElite:
             if neural_res: thoughts.insert(0, f"🧠 NEURAL: {ai_thought}")
             
             detailed_scores = {name: res['signal'] for name, res in part_results.items()}
+            if options_walls:
+                # Observed current/historical option levels are passed through to
+                # target logic; absent walls remain absent rather than fabricated.
+                detailed_scores['options_walls'] = dict(options_walls)
+            if isinstance(options_intel, dict):
+                detailed_scores['options_intel'] = {
+                    key: options_intel.get(key) for key in
+                    ('bias', 'score', 'pcr', 'max_pain', 'source', 'available', 'historical', 'not_ohlc_derived')
+                    if key in options_intel
+                }
             detailed_scores['thoughts'] = thoughts
             detailed_scores['neural_synthesis'] = neural_res
             detailed_scores['quantum_validation'] = (neural_res.get('quantum_data', {}) if neural_res else self.brains['quantum_v5'].simulate(data)) if hasattr(self, 'brains') and 'quantum_v5' in getattr(self, 'brains', {}) else {}
@@ -6484,23 +6753,38 @@ class JarvisElite:
             # Base score from confidence
             # FIXED: NO-TRADE should also show confidence % (how certain we are NOT to trade)
             score = confidence
+            if self.is_backtest_mode and isinstance(self._historical_options_bias, dict) and self._historical_options_bias.get('available'):
+                historical_bias = str(self._historical_options_bias.get('bias') or 'NEUTRAL').upper()
+                signal_bias = 'BULLISH' if logic_signal > 0 else 'BEARISH' if logic_signal < 0 else 'NEUTRAL'
+                adjustment = 4 if historical_bias == signal_bias and signal_bias != 'NEUTRAL' else -6 if historical_bias not in {'NEUTRAL', signal_bias} and signal_bias != 'NEUTRAL' else 0
+                if adjustment:
+                    score = max(0, min(100, score + adjustment))
+                detailed_scores['historical_options_adjustment'] = adjustment
+                detailed_scores['historical_options_source'] = self._historical_options_bias.get('source') or 'none'
+            elif self.is_backtest_mode:
+                detailed_scores['historical_options_adjustment'] = 0
+                detailed_scores['historical_options_status'] = 'unavailable_no_asof_snapshot'
             
-            # --- UNIVERSAL MTF CONFLUENCE BONUS (1m to 4h) ---
+            # --- UNIVERSAL MTF CONFLUENCE BONUS (grouped native horizons) ---
             if mtf_context:
                 # Direction from 1m logic
                 current_dir = logic_signal 
                 
                 confluence_score = 0
-                mtf_weights = {'3m': 2, '5m': 3, '15m': 5, '30m': 7, '1h': 10, '2h': 12, '4h': 15}
-                
+                mtf_values = {}
                 for tf, analysis in mtf_context.items():
-                    tf_dir = analysis.get('direction', 0)
-                    weight = mtf_weights.get(tf, 0)
-                    
-                    if tf_dir == current_dir and current_dir != 0:
-                        confluence_score += weight  # Cumulative bonus
-                    elif tf_dir == -current_dir and current_dir != 0:
-                        confluence_score -= (weight * 0.5)  # Light penalty for HTF conflict (allow 1m scalping)
+                    raw_direction = analysis.get('direction', 0) if isinstance(analysis, dict) else analysis
+                    try:
+                        mtf_values[str(tf)] = float(raw_direction)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                mtf_groups = grouped_timeframe_values(mtf_values, exclude=('1m',))
+                for group, group_value in mtf_groups.items():
+                    weight = TIMEFRAME_GROUP_WEIGHTS.get(group, 0)
+                    if group_value * current_dir > 0 and current_dir != 0:
+                        confluence_score += weight
+                    elif group_value * current_dir < 0 and current_dir != 0:
+                        confluence_score -= weight * 0.5
                 
                 if confluence_score != 0:
                     score = max(0, min(100, score + confluence_score))
@@ -6651,29 +6935,9 @@ class JarvisElite:
                         except (ValueError, TypeError):
                             pass
                             
-            # ---------------------------
-            # LAYA SYSTEM 1 SYNCHRONOUS INDICATOR
-            # Giving Laya the "Full Picture" before final decision
-            try:
-                from jarvis_laya_advisor import advise
-                full_snapshot = {
-                    'price': current_price,
-                    'detailed_scores': {k: str(v)[:500] for k, v in detailed_scores.items()},
-                    'mtf_matrix': supplementary.get('mtf_matrix', {}),
-                    'options_intel': options_intel,
-                    'supplementary': {k: str(v)[:200] for k, v in supplementary.items()}
-                }
-                laya_advisory = advise(full_snapshot, symbol='BTCUSDT', deterministic_decision='PENDING', enabled=True)
-                if laya_advisory.status == "ok" and laya_advisory.confidence is not None:
-                    laya_score = laya_advisory.confidence * 100
-                    old_score = score
-                    # Blend Laya's score (10% weight) with the math algo's score (90% weight)
-                    score = int(score * 0.9 + laya_score * 0.1)
-                    ai_thought += f" | 🤖 LAYA SYSTEM 1 ({old_score}→{score})"
-                    detailed_scores['laya_indicator_boost'] = score - old_score
-            except Exception as e:
-                logger.error(f"Laya Indicator error: {e}")
-                
+            # Laya is audit/display-only. Its output cannot change score,
+            # direction, confidence, targets, gates, or order inputs.
+
             # ---------------------------
             # Check trading conditions
             if not self.trade_manager.can_trade():
@@ -6848,8 +7112,98 @@ class JarvisElite:
             # direction and target values from this isolated run. The bridge
             # may later replace the Binance reference entry with a fresh Delta
             # executable quote; it never derives missing targets or sizes.
-            if native_mtf is not None and isinstance(getattr(self, 'latest_multicoin_analysis', None), dict):
+            _complete_live_native_set = (
+                not self.is_backtest_mode
+                and set(mtf_data) == set(LIVE_TIMEFRAMES)
+                and set(mtf_breakdown) == set(LIVE_TIMEFRAMES)
+            )
+            if native_mtf is not None or _complete_live_native_set:
+                _parts_by_tf = {}
+                _part_names = [
+                    ('part1_breakout', 'part1_breakout'), ('part2_zone', 'part2_zone'),
+                    ('part3_psychology', 'part3_psychology'), ('part4_volume', 'part4_volume'),
+                    ('part5_ml', 'part5_ml'), ('part6_trend', 'part6_trend'),
+                    ('part7_volatility', 'part7_volatility'), ('part8_structure', 'part8_structure'),
+                    ('part9_orderflow', 'part9_orderflow'), ('part10_candlestats', 'part10_candlestats'),
+                ]
+                for _tf, _results in mtf_breakdown.items():
+                    _frame_parts = {}
+                    for _key, _name in _part_names:
+                        _item = dict(_results.get(_name) or {'signal': 0, 'thought': 'unavailable'})
+                        # Identity is supplied by the exact native snapshot
+                        # boundary, not inferred from a model-generated label.
+                        _item.setdefault('symbol', getattr(self, 'active_symbol', None))
+                        _item.setdefault('timeframe', _tf)
+                        _frame_parts[_key] = _item
+                    _parts_by_tf[_tf] = _frame_parts
+                _strategy_dir = str((final_decision.get('trade_signal') or {}).get('direction') or 'NO_TRADE').upper()
+                _strategy_conf = normalize_confidence((final_decision.get('trade_signal') or {}).get('confidence_score'), default=0) or 0
+                self.latest_multicoin_analysis = {
+                    'parts_by_timeframe': _parts_by_tf,
+                    'once_per_symbol_parts': {
+                        'part11': dict(math_res) if isinstance(math_res, dict) else {'signal': math_signal},
+                        'part12': dict(math_conf_res) if isinstance(math_conf_res, dict) else {'confidence': math_confidence},
+                    },
+                    'part7_gate': dict(part7_gate),
+                    'central_strategy_decision': {
+                        'direction': {'CALL': 'BUY', 'PUT': 'SELL'}.get(_strategy_dir, 'NO_TRADE'),
+                        'confidence': int(_strategy_conf),
+                        'origin': 'deterministic_parts11_12',
+                    },
+                    'central_strategy_evidence': {
+                        'parts_by_timeframe': _parts_by_tf,
+                        'horizon_groups': {k: v.get('mtf_horizon_groups', {}) for k, v in part_results.items() if isinstance(v, dict)},
+                    },
+                    'central_strategy_approval': {'status': 'analysis_only_no_execution_authority'},
+                    'central_execution_plan': None,
+                    'execution_plan': None,
+                    'analysis_reference': None,
+                }
+
+            if (native_mtf is not None or _complete_live_native_set) and isinstance(getattr(self, 'latest_multicoin_analysis', None), dict):
                 _raw_signal = final_decision.get('trade_signal', {}) or {}
+                _legacy_dir = str(_raw_signal.get('direction') or 'NO_TRADE').upper()
+                _central = {'status': 'BLOCKED', 'approved': False, 'direction': 'NO_TRADE',
+                            'reasons': ['central MTF approval unavailable'], 'policy_version': 'unavailable'}
+                if _complete_live_native_set:
+                    try:
+                        from jarvis_strategy_approval import evaluate_mtf_central_strategy
+                        _central = evaluate_mtf_central_strategy(
+                            _parts_by_tf, part7_gate, confidence=score,
+                            minimum_confidence=self.scoring_matrix.minimum_trade_score,
+                            expected_symbol=(getattr(self, 'active_symbol', None)
+                                             or getattr(self, 'market_context', {}).get('symbol')),
+                        )
+                    except Exception as _central_error:
+                        _central = {
+                            'status': 'BLOCKED', 'approved': False, 'direction': 'NO_TRADE',
+                            'reasons': [f'central MTF approval error: {type(_central_error).__name__}'],
+                            'policy_version': 'unavailable',
+                        }
+                    self.latest_multicoin_analysis['central_strategy_approval'] = dict(_central)
+                    self.latest_multicoin_analysis['central_strategy_decision'] = {
+                        'direction': _central.get('direction', 'NO_TRADE'),
+                        'confidence': int(score) if isinstance(score, (int, float)) else 0,
+                        'origin': 'central_native_mtf_gate',
+                    }
+                    _central_call = {'BUY': 'CALL', 'SELL': 'PUT'}.get(
+                        str(_central.get('direction') or 'NO_TRADE').upper(), 'NO_TRADE')
+                    # Keep one canonical direction: the independent all-frame
+                    # evaluator must approve and agree with the existing
+                    # deterministic Part11/12 side. Otherwise every entry
+                    # consumer (paper or auto) receives NO_TRADE.
+                    if (not _central.get('approved') or _central_call != _legacy_dir
+                            or part7_gate.get('entry_blocked') is not False
+                            or part7_gate.get('risk_veto') is not False):
+                        _raw_signal['direction'] = 'NO_TRADE'
+                        _raw_signal['confidence_score'] = '0/100'
+                        _raw_signal['central_mtf_blocked'] = True
+                        final_decision['no_trade_reason'] = '; '.join(_central.get('reasons') or []) or 'central MTF direction/gate mismatch'
+                        self.latest_multicoin_analysis['central_strategy_decision']['direction'] = 'NO_TRADE'
+                    else:
+                        _raw_signal['direction'] = _central_call
+                        _raw_signal['central_mtf_approved'] = True
+                    final_decision['trade_signal'] = _raw_signal
                 _dir = str(_raw_signal.get('direction') or 'NO_TRADE').upper()
                 if score < self.scoring_matrix.minimum_trade_score or _dir not in {'CALL', 'PUT'}:
                     _dir = 'NO_TRADE'
@@ -7816,93 +8170,50 @@ class Jarvis4EngineSystem:
             Signal with TP/SL levels and Multi-TF confluence
         """
         if not self.multi_tf_engine:
-            logger.error("Multi-TF Engine not available. Using fallback trade mode.")
-            # Fallback to single TF analysis
-            from delta_api_wrapper import DeltaExchangeData
-            data_wrapper = DeltaExchangeData()
-            requested = str(symbol or '').upper().replace('-', '').replace('_', '')
-            if requested in {'BTC', 'ETH', 'SOL'}:
-                requested += 'USDT'
-            if not requested or requested == 'USDT':
-                logger.error('Multi-TF fallback blocked: missing requested symbol')
-                return None
-            data = data_wrapper.get_historical_candles(symbol=requested, resolution="1m", limit=100)
-            if data:
-                import pandas as pd
-                df = pd.DataFrame(data)
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    df[col] = pd.to_numeric(df[col])
-                self.jarvis.active_symbol = requested
-                return self.jarvis.analyze_trade_setup(df, symbol=requested)
+            # This legacy helper has no reviewed native-timeframe source. Do not
+            # silently switch from the canonical Binance Spot MTF feed to Delta
+            # candles or call analyze_trade_setup with an unsupported `symbol=`.
+            logger.error("Multi-TF Engine unavailable; refusing single-venue candle fallback")
+            if self.jarvis is not None and hasattr(self.jarvis, '_get_no_trade_signal'):
+                return self.jarvis._get_no_trade_signal(
+                    "WAIT/NO-DATA: native multi-timeframe engine unavailable")
             return None
         
         # Use Multi-TF Engine
         return self.multi_tf_engine.analyze(symbol=symbol, mode=mode)
 
     def _generate_sample_data(self):
-        """Fetch REAL historical data from Delta Exchange (FIXED: No more fake $100 data!)"""
-        try:
-            from delta_api_wrapper import DeltaExchangeData
-            logger.info("📡 [BACKTEST/TRAINING] Fetching REAL data from Delta Exchange...")
-            
-            delta = DeltaExchangeData()
-            # Fetch last 500 minutes of data for backtesting (real BTC ~$69k)
-            candles = delta.get_historical_candles(symbol="BTCUSDT", resolution="1m", limit=500)
-            
-            if candles and len(candles) > 0:
-                data = pd.DataFrame({
-                    'timestamp': [pd.to_datetime(c['time'], unit='s') for c in candles],
-                    'open': [float(c['open']) for c in candles],
-                    'high': [float(c['high']) for c in candles],
-                    'low': [float(c['low']) for c in candles],
-                    'close': [float(c['close']) for c in candles],
-                    'volume': [float(c.get('volume') or 0.0) for c in candles]
-                })
-                
-                logger.info(f"✅ [BACKTEST] Loaded {len(data)} REAL candles | BTC: ${data['close'].iloc[-1]:,.2f}")
-                return data
-            else:
-                logger.warning("⚠️ Delta returned no data for backtest. Using fallback.")
-                raise Exception("No Delta data")
-                
-        except Exception as e:
-            logger.error(f"❌ [BACKTEST] Real data fetch failed: {e}")
-            # Fallback: Try to at least use current real price
-            try:
-                from delta_api_wrapper import DeltaExchangeData
-                current_price = DeltaExchangeData().get_live_price("BTCUSDT")
-                if current_price > 1000:
-                    logger.info(f"🔄 [BACKTEST] Using baseline ${current_price:,.2f}")
-                    dates = pd.date_range(start='2024-01-01', periods=500, freq='1min')
-                    rng = np.random.default_rng(seed=42)  # BUG FIX #17: seed for reproducibility
-                    prices = [current_price * (1 + rng.normal(0, 0.0005)) for _ in range(500)]
-                    return pd.DataFrame({
-                        'timestamp': dates,
-                        'open': prices,
-                        'high': [p * 1.001 for p in prices],
-                        'low': [p * 0.999 for p in prices],
-                        'close': prices,
-                        'volume': np.random.randint(1000, 10000, 500)
-                    })
-            except Exception:
-                pass
-                
-            # Last resort: Generate synthetic data to allow system to start
-            logger.warning("⚠️ Using synthetic BTC data for backtest startup (Delta offline). Live trading will use real data.")
-            base_price = 87000.0  # Approximate BTC price
-            dates = pd.date_range(end=pd.Timestamp.now(), periods=500, freq='1min')
-            rng = np.random.default_rng(seed=42)
-            prices = [base_price]
-            for _ in range(499):
-                prices.append(prices[-1] * (1 + rng.normal(0, 0.0005)))
-            return pd.DataFrame({
-                'timestamp': dates,
-                'open': prices,
-                'high': [p * 1.001 for p in prices],
-                'low': [p * 0.999 for p in prices],
-                'close': prices,
-                'volume': rng.integers(1000, 10000, 500)
-            })
+        """Fetch real, closed Binance Spot 1m candles; never fabricate backtest bars."""
+        from binance_data import get_binance_data
+        from binance_timeframes import TIMEFRAME_HISTORY_CANDLES, candle_is_closed
+        import time as _time
+
+        symbol = 'BTCUSDT'
+        requested = TIMEFRAME_HISTORY_CANDLES['1m']
+        logger.info("[BACKTEST] Fetching %s closed Binance Spot 1m candles for %s", requested, symbol)
+        candles = get_binance_data().get_historical_candles(
+            symbol=symbol, resolution='1m', limit=requested + 1, allow_fallback=False,
+        )
+        now = _time.time()
+        closed = [row for row in candles if candle_is_closed('1m', row['time'], now)]
+        if len(closed) < requested:
+            raise RuntimeError(
+                f"Binance Spot history incomplete: need {requested} closed 1m bars, got {len(closed)}; "
+                "no synthetic or alternate-venue backtest fallback is permitted"
+            )
+        closed = closed[-requested:]
+        data = pd.DataFrame({
+            'timestamp': pd.to_datetime([row['time'] for row in closed], unit='s', utc=True),
+            'open': [float(row['open']) for row in closed],
+            'high': [float(row['high']) for row in closed],
+            'low': [float(row['low']) for row in closed],
+            'close': [float(row['close']) for row in closed],
+            'volume': [float(row['volume']) for row in closed],
+        })
+        data.attrs['symbol'] = symbol
+        data.attrs['source'] = 'binance_spot'
+        logger.info("[BACKTEST] Loaded %s closed Binance Spot candles for %s", len(data), symbol)
+        return data
 
 
     def _print_final_summary(self):

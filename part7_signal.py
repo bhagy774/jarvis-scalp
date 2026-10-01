@@ -13,12 +13,14 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 import pandas as pd
 
+from binance_timeframes import (
+    BINANCE_SPOT_TIMEFRAMES, TIMEFRAME_CORRELATION_GROUPS,
+    TIMEFRAME_GROUP_WEIGHTS, next_candle_open, stale_deadline,
+    validate_closed_candle_timestamps,
+    validate_interval,
+)
 
-DEFAULT_TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
-_INTERVAL_SECONDS = {
-    "1m": 60, "3m": 180, "5m": 300, "15m": 900,
-    "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400,
-}
+DEFAULT_TIMEFRAMES = BINANCE_SPOT_TIMEFRAMES
 _REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
 
 
@@ -85,7 +87,9 @@ def _validate_frame(data: Any, symbol: str, timeframe: str, context: Mapping[str
         return _blocked(symbol, timeframe, "symbol_mismatch", "Part7 data symbol identity missing", "invalid")
     if expected_symbol and frame_symbol and expected_symbol != frame_symbol:
         return _blocked(symbol, timeframe, "symbol_mismatch", f"Part7 data symbol mismatch: {frame_symbol} != {expected_symbol}", "invalid")
-    if timeframe not in _INTERVAL_SECONDS:
+    try:
+        validate_interval(timeframe)
+    except ValueError:
         return _blocked(symbol, timeframe, "invalid", f"Part7 unsupported timeframe: {timeframe}", "invalid")
     if len(data) < 30:
         return _blocked(symbol, timeframe, "invalid", f"Part7 data invalid: insufficient candles ({len(data)} < 30)", "invalid")
@@ -109,15 +113,28 @@ def _validate_frame(data: Any, symbol: str, timeframe: str, context: Mapping[str
         if not isinstance(data.index, pd.DatetimeIndex):
             return _blocked(symbol, timeframe, "invalid", "Part7 data timestamp index missing", "invalid")
         try:
-            last = data.index[-1]
-            if getattr(last, "tzinfo", None) is None:
-                last = last.tz_localize("UTC")
-            age = time.time() - float(last.timestamp())
-            max_age = _INTERVAL_SECONDS[timeframe] * 3
-            if age > max_age:
+            index = data.index
+            if index.tz is None:
+                index = index.tz_localize("UTC")
+            else:
+                index = index.tz_convert("UTC")
+            stamps = [float(stamp.timestamp()) for stamp in index]
+            now = time.time()
+            validate_closed_candle_timestamps(timeframe, stamps, now)
+            last_open = stamps[-1]
+            age = now - float(next_candle_open(timeframe, last_open))
+            # Apply the same calendar-aware freshness rule to every supported
+            # interval. Tiny bars get a 10s transport allowance so REST polling
+            # at the configured cadence does not make each 1s frame instantly stale.
+            bar_seconds = next_candle_open(timeframe, last_open) - last_open
+            freshness_intervals = max(3.0, 10.0 / bar_seconds) if bar_seconds > 0 else 3.0
+            stale = now > stale_deadline(timeframe, last_open, freshness_intervals)
+            if stale:
                 return _blocked(symbol, timeframe, "stale", f"Part7 data stale: closed {int(age)}s ago", "stale")
             if age < -5:
-                return _blocked(symbol, timeframe, "invalid", "Part7 data timestamp is in the future", "invalid")
+                return _blocked(symbol, timeframe, "invalid", "Part7 data timestamp is in the future or not closed", "invalid")
+        except ValueError as exc:
+            return _blocked(symbol, timeframe, "invalid", f"Part7 timestamp validation failed: {str(exc)[:120]}", "invalid")
         except Exception as exc:
             return _blocked(symbol, timeframe, "error", f"Part7 timestamp validation error: {type(exc).__name__}", "error")
     return None
@@ -173,17 +190,59 @@ def aggregate_results(
 ) -> Dict[str, Any]:
     """Aggregate explicit timeframe results into one entry gate."""
     required = tuple(required_timeframes or DEFAULT_TIMEFRAMES)
-    per_timeframe = {str(tf): dict(results.get(tf) or _blocked(symbol, str(tf), "invalid", "Part7 timeframe result missing", "missing")) for tf in required}
-    vetoes = [tf for tf, result in per_timeframe.items() if result.get("risk_veto") or result.get("status") == "veto"]
-    blocked_data = [tf for tf, result in per_timeframe.items() if result.get("status") in {"invalid", "stale", "error", "symbol_mismatch"} or result.get("data_status") in {"invalid", "stale", "error", "missing"}]
+    normalized_symbol = _symbol(symbol)
+    per_timeframe: dict[str, dict[str, Any]] = {}
+    for raw_tf in required:
+        tf = str(raw_tf)
+        raw = results.get(tf) if isinstance(results, Mapping) else None
+        if not isinstance(raw, Mapping):
+            per_timeframe[tf] = _blocked(symbol, tf, "invalid", "Part7 timeframe result missing or malformed", "missing")
+            continue
+        row = dict(raw)
+        if row.get("timeframe") != tf or _symbol(row.get("symbol")) != normalized_symbol:
+            per_timeframe[tf] = _blocked(symbol, tf, "symbol_mismatch", "Part7 timeframe result identity mismatch", "invalid")
+            continue
+        if (not isinstance(row.get("entry_blocked"), bool)
+                or not isinstance(row.get("risk_veto"), bool)
+                or row.get("data_status") != "valid"
+                or row.get("status") not in {"ok", "neutral", "veto"}):
+            per_timeframe[tf] = _blocked(symbol, tf, "invalid", "Part7 timeframe result is incomplete or not execution-valid", "invalid")
+            continue
+        per_timeframe[tf] = row
+    vetoes = [tf for tf, result in per_timeframe.items() if result.get("risk_veto") is True or result.get("status") == "veto"]
+    blocked_data = [tf for tf, result in per_timeframe.items()
+                    if result.get("status") not in {"ok", "neutral", "veto"}
+                    or result.get("data_status") != "valid"
+                    or not isinstance(result.get("entry_blocked"), bool)
+                    or not isinstance(result.get("risk_veto"), bool)
+                    or result.get("entry_blocked") is True]
     if vetoes:
         status, reason, entry_blocked = "veto", f"Part7 extreme volatility veto on {', '.join(vetoes)}", True
     elif blocked_data:
         status, reason, entry_blocked = "data_blocked", f"Part7 data blocked on {', '.join(blocked_data)}", True
     else:
         status, reason, entry_blocked = "ok", "Part7 timeframe data valid", False
-    weights = {tf: float(i + 1) for i, tf in enumerate(required)}
-    weighted = sum(float(per_timeframe[tf].get("signal", 0) or 0) * weights[tf] for tf in required)
+    # Reduce correlated resolutions to one horizon value before voting. A
+    # 1m/3m/5m cluster must not outvote an independent daily/weekly horizon just
+    # because it contains more interval labels.
+    groups = {}
+    required_set = set(required)
+    for group_name, frames in TIMEFRAME_CORRELATION_GROUPS.items():
+        observed = []
+        for tf in frames:
+            if tf not in required_set:
+                continue
+            try:
+                value = float(per_timeframe[tf].get("signal", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(value):
+                observed.append(value)
+        if observed:
+            groups[group_name] = sum(observed) / len(observed)
+    denominator = sum(TIMEFRAME_GROUP_WEIGHTS[name] for name in groups)
+    weighted = (sum(groups[name] * TIMEFRAME_GROUP_WEIGHTS[name] for name in groups) / denominator
+                if denominator else 0.0)
     signal = 1 if weighted > 0 else -1 if weighted < 0 else 0
     volatility_statuses = sorted({str(r.get("volatility_status", "unknown")) for r in per_timeframe.values()})
     return {

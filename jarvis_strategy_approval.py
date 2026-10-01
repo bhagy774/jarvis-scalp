@@ -14,6 +14,11 @@ import math
 import time
 from typing import Any, Mapping, Optional
 
+from binance_timeframes import (
+    BINANCE_SPOT_TIMEFRAMES, TIMEFRAME_CORRELATION_GROUPS,
+    TIMEFRAME_GROUP_WEIGHTS,
+)
+
 POLICY_VERSION = "jarvis-central-entry-v1"
 APPROVAL_SCHEMA = "jarvis-entry-approval-v1"
 DEFAULT_APPROVAL_TTL_SECONDS = 180.0
@@ -37,17 +42,14 @@ PART_WEIGHTS = {
 }
 ANCHORS = {"part6_trend", "part8_structure", "part9_orderflow"}
 INACTIVE_MARKERS = ("error", "offline", "fallback", "missing")
-REQUIRED_TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
-# Existing jarvis_FIXED.py native-timeframe weights. 1m remains a trigger-only
-# interval; it does not contribute to the SWING directional vote.
-TIMEFRAME_WEIGHTS = {
-    "1m": 1.0, "3m": 1.5, "5m": 2.0, "15m": 3.0,
-    "30m": 4.0, "1h": 5.0, "2h": 6.0, "4h": 7.0,
-}
-SCALP_DIRECTION_TIMEFRAMES = ("1m", "3m", "5m", "15m")
-SWING_DIRECTION_TIMEFRAMES = ("3m", "5m", "15m", "30m", "1h", "2h", "4h")
-SCALP_HIGHER_TIMEFRAME_GUARD = ("30m", "1h", "2h", "4h")
-CENTRAL_CONSENSUS_THRESHOLD = 0.65  # Existing Parts 1–11 consensus policy.
+REQUIRED_TIMEFRAMES = BINANCE_SPOT_TIMEFRAMES
+# Frames in each horizon bucket are averaged before the horizon receives one
+# vote, so adding correlated intervals cannot multiply their influence.
+SCALP_DIRECTION_GROUPS = ("fast", "short")
+SWING_DIRECTION_GROUPS = ("short", "session", "swing", "macro")
+SCALP_HIGHER_TIMEFRAME_GUARD_GROUPS = ("session", "swing", "macro")
+ENTRY_TRIGGER_TIMEFRAME = "1m"
+CENTRAL_CONSENSUS_THRESHOLD = 0.65  # Retained as the initial confluence threshold.
 
 
 def _direction(value: Any) -> str:
@@ -221,7 +223,7 @@ def evaluate_central_strategy(
         # A bare pair of booleans is not an execution-grade Part7 result. The
         # entry gate must be the complete aggregate from all native intervals,
         # with each frame explicitly valid for the same selected symbol.
-        required_timeframes = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+        required_timeframes = REQUIRED_TIMEFRAMES
         timeframe_results = part7_gate.get("timeframe_results")
         if (part7_gate.get("status") != "ok" or part7_gate.get("data_status") != "valid"
                 or part7_gate.get("timeframe") != "aggregate"
@@ -364,17 +366,19 @@ def evaluate_mtf_central_strategy(
 ) -> dict[str, Any]:
     """Select a deterministic SCALP/SWING candidate from complete native evidence.
 
-    Every native frame is independently evaluated with the existing Parts 1–11
-    quorum, 65% weighted consensus, Part 2 zone veto and anchor-dissent policy.
-    SWING direction is decided from 3m–4h evidence; 1m only times entry. SCALP
-    direction uses 1m–15m evidence and the existing 30m–4h group can veto a
-    strongly counter-trend entry. A neutral 1m is always pending, never approval.
+    All 16 native frames are independently evaluated with the existing Parts
+    1–11 quorum, Part 2 zone veto and anchor-dissent policy. Frames are then
+    averaged within five predeclared correlation horizons before 65% weighted
+    confluence is measured. SCALP uses fast+short horizons; SWING uses
+    short+session+swing+macro horizons; 1m remains a separate mandatory entry
+    trigger. Higher horizons may veto a counter-trend scalp. A neutral 1m is
+    always pending, never approval.
     """
     expected_clean = _clean_symbol(expected_symbol)
     if not expected_clean:
         return _result("BLOCKED", "NO_TRADE", None, ["Selected symbol is required for MTF approval"], {})
     if not isinstance(timeframe_parts, Mapping) or set(timeframe_parts) != set(REQUIRED_TIMEFRAMES):
-        return _result("BLOCKED", "NO_TRADE", None, ["Complete native 8-timeframe Part evidence is required"], {})
+        return _result("BLOCKED", "NO_TRADE", None, ["Complete native 16-timeframe Part evidence is required"], {})
     if not isinstance(part7_gate, Mapping):
         return _result("BLOCKED", "NO_TRADE", None, ["Part7 aggregate gate is missing"], {})
     aggregate_frames = part7_gate.get("timeframe_results")
@@ -435,22 +439,38 @@ def evaluate_mtf_central_strategy(
                            [f"Part7 {timeframe} evidence is missing, stale, blocked, or symbol-mismatched"], {})
         decisions[timeframe] = evaluate_central_strategy(parts, gate)
 
-    def group_vote(timeframes: tuple[str, ...]) -> dict[str, Any]:
-        total = sum(TIMEFRAME_WEIGHTS[tf] for tf in timeframes)
-        buy = sum(TIMEFRAME_WEIGHTS[tf] for tf in timeframes
-                  if decisions[tf].get("status") == "APPROVED" and decisions[tf].get("direction") == "BUY")
-        sell = sum(TIMEFRAME_WEIGHTS[tf] for tf in timeframes
-                   if decisions[tf].get("status") == "APPROVED" and decisions[tf].get("direction") == "SELL")
-        direction = "BUY" if buy / total >= CENTRAL_CONSENSUS_THRESHOLD else (
-            "SELL" if sell / total >= CENTRAL_CONSENSUS_THRESHOLD else "NO_TRADE")
-        return {"timeframes": list(timeframes), "buy_weight": round(buy, 4),
-                "sell_weight": round(sell, 4), "total_weight": round(total, 4),
-                "buy_ratio": round(buy / total, 6), "sell_ratio": round(sell / total, 6),
-                "direction": direction}
+    def group_vote(group_names: tuple[str, ...]) -> dict[str, Any]:
+        timeframes = tuple(tf for name in group_names for tf in TIMEFRAME_CORRELATION_GROUPS[name])
+        horizon_values: dict[str, float] = {}
+        for name in group_names:
+            members = TIMEFRAME_CORRELATION_GROUPS[name]
+            values = []
+            for timeframe in members:
+                decision = decisions[timeframe]
+                value = (1.0 if decision.get("status") == "APPROVED" and decision.get("direction") == "BUY"
+                         else -1.0 if decision.get("status") == "APPROVED" and decision.get("direction") == "SELL"
+                         else 0.0)
+                values.append(value)
+            if values:
+                horizon_values[name] = sum(values) / len(values)
+        total = sum(TIMEFRAME_GROUP_WEIGHTS[name] for name in group_names)
+        buy = sum(TIMEFRAME_GROUP_WEIGHTS[name] * max(horizon_values.get(name, 0.0), 0.0)
+                  for name in group_names)
+        sell = sum(TIMEFRAME_GROUP_WEIGHTS[name] * max(-horizon_values.get(name, 0.0), 0.0)
+                   for name in group_names)
+        buy_ratio = buy / total if total else 0.0
+        sell_ratio = sell / total if total else 0.0
+        direction = "BUY" if buy_ratio >= CENTRAL_CONSENSUS_THRESHOLD else (
+            "SELL" if sell_ratio >= CENTRAL_CONSENSUS_THRESHOLD else "NO_TRADE")
+        return {"groups": list(group_names), "timeframes": list(timeframes),
+                "horizon_values": {key: round(value, 6) for key, value in horizon_values.items()},
+                "buy_weight": round(buy, 4), "sell_weight": round(sell, 4),
+                "total_weight": round(total, 4), "buy_ratio": round(buy_ratio, 6),
+                "sell_ratio": round(sell_ratio, 6), "direction": direction}
 
-    swing = group_vote(SWING_DIRECTION_TIMEFRAMES)
-    scalp = group_vote(SCALP_DIRECTION_TIMEFRAMES)
-    guard = group_vote(SCALP_HIGHER_TIMEFRAME_GUARD)
+    swing = group_vote(SWING_DIRECTION_GROUPS)
+    scalp = group_vote(SCALP_DIRECTION_GROUPS)
+    guard = group_vote(SCALP_HIGHER_TIMEFRAME_GUARD_GROUPS)
     frame_summary = {
         tf: {"status": decisions[tf].get("status"), "direction": decisions[tf].get("direction"),
              "reasons": list(decisions[tf].get("reasons") or [])}
@@ -468,16 +488,24 @@ def evaluate_mtf_central_strategy(
 
     # A zone or anchor veto in the selected directional group remains a veto;
     # it is not diluted by otherwise-aligned frames.
-    selected_group = SWING_DIRECTION_TIMEFRAMES if mode == "SWING" else SCALP_DIRECTION_TIMEFRAMES
-    critical_reasons = [reason for tf in selected_group for reason in decisions[tf].get("reasons", [])
+    selected_groups = SWING_DIRECTION_GROUPS if mode == "SWING" else SCALP_DIRECTION_GROUPS
+    selected_timeframes = tuple(tf for name in selected_groups for tf in TIMEFRAME_CORRELATION_GROUPS[name])
+    critical_reasons = [reason for tf in selected_timeframes for reason in decisions[tf].get("reasons", [])
                         if "zone veto" in str(reason).lower() or "anchor-dissent veto" in str(reason).lower()]
     if critical_reasons:
         result = _result("BLOCKED", "NO_TRADE", None, critical_reasons, diagnostic)
         result.update({"trade_mode": mode, "setup_direction": candidate, "entry_trigger": "BLOCKED"})
         return result
+    trigger = decisions[ENTRY_TRIGGER_TIMEFRAME]
+    if trigger.get("status") != "APPROVED" or trigger.get("direction") != candidate:
+        result = _result("BLOCKED", "NO_TRADE", None,
+                         [f"1m entry trigger does not confirm {candidate}"], diagnostic)
+        result.update({"trade_mode": mode, "setup_direction": candidate,
+                       "entry_trigger": "1m_PENDING" if trigger.get("status") != "APPROVED" else "1m_CONFLICT"})
+        return result
     if mode == "SCALP" and guard["direction"] in {"BUY", "SELL"} and guard["direction"] != candidate:
         result = _result("BLOCKED", "NO_TRADE", None,
-                         [f"SCALP {candidate} vetoed by 30m–4h {guard['direction']} confluence"], diagnostic)
+                         [f"SCALP {candidate} vetoed by higher-timeframe {guard['direction']} confluence"], diagnostic)
         result.update({"trade_mode": mode, "setup_direction": candidate, "entry_trigger": "HTF_VETO"})
         return result
 

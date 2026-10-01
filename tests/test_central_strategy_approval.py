@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from part7_signal import analyze_timeframe
+from binance_timeframes import BINANCE_SPOT_TIMEFRAMES
 from jarvis_strategy_approval import (
     build_execution_plan, evaluate_central_strategy, make_entry_approval,
     validate_entry_approval, validate_execution_plan,
@@ -49,7 +50,7 @@ def bullish_parts(symbol="BTCUSDT"):
 def timeframe_parts(symbol="BTCUSDT", *, low_only=True):
     """Complete exact-frame evidence for an approved, deterministic SCALP."""
     rows = {}
-    for timeframe in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"):
+    for timeframe in BINANCE_SPOT_TIMEFRAMES:
         bullish = not low_only or timeframe in {"1m", "3m", "5m", "15m"}
         row = {}
         for name, item in bullish_parts(symbol).items():
@@ -77,7 +78,7 @@ def clear_gate(symbol=None):
         "timeframe_results": {
             tf: {"symbol": symbol, "timeframe": tf, "status": "neutral",
                  "data_status": "valid", "entry_blocked": False, "risk_veto": False}
-            for tf in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+            for tf in BINANCE_SPOT_TIMEFRAMES
         },
     }
 

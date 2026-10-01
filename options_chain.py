@@ -121,8 +121,10 @@ def normalize_contract(raw: Mapping[str, Any], underlying: str, venue: str,
         return None, "missing_or_invalid_strike"
     if expiry is None:
         return None, "missing_or_invalid_expiry"
-    if expiry < as_of.date():
-        return None, "expired_contract"
+    if expiry <= as_of.date():
+        # Contract timestamps expose dates but not a reliable settlement instant.
+        # Exclude same-day contracts in both live chain scoring and historical replay.
+        return None, "expired_or_same_day_expiry_unverified"
 
     greeks_raw = raw.get("greeks") if isinstance(raw.get("greeks"), Mapping) else {}
     values: dict[str, float | None] = {}
@@ -347,8 +349,10 @@ def build_provider_chain(underlying: str, venue: str, pages: list[Any],
         if previous is None or (contract.get("observed_at") or "") >= (previous.get("observed_at") or ""):
             by_symbol[contract["symbol"]] = contract
     contracts = sorted(by_symbol.values(), key=lambda c: (c["expiry"], c["strike"], c["type"], c["symbol"]))
-    # Expired rows are expected on some listing endpoints; they are counted, not used.
+    # Expired and same-day rows are expected on listing endpoints; they are
+    # counted and excluded consistently because only an expiry date is known.
     expired_rows = rejected.pop("expired_contract", 0)
+    same_day_rows = rejected.pop("expired_or_same_day_expiry_unverified", 0)
     identity_valid = not any(k in rejected for k in ("underlying_identity_mismatch", "missing_contract_identity"))
     schema_valid = schema_valid and not bool(rejected)
 
@@ -402,6 +406,7 @@ def build_provider_chain(underlying: str, venue: str, pages: list[Any],
         "normalized_contract_count": len(contracts),
         "rejected_rows": dict(rejected),
         "expired_rows_excluded": expired_rows,
+        "same_day_expiry_rows_excluded": same_day_rows,
         "provider_error": provider_error,
     }
     return {

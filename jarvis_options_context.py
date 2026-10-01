@@ -74,7 +74,7 @@ def _valid_bias(raw: Any, asset: str) -> OptionsContext | None:
         return None
     if any(str(reason).strip().lower() == "no data" for reason in reasons):
         return None
-    coverage = raw.get("raw_data", {}).get("expiry_coverage") if isinstance(raw.get("raw_data"), dict) else None
+    coverage = (raw_data.get("expiry_coverage") or raw_data.get("coverage"))
     return OptionsContext(
         selected_asset=asset,
         source_asset=asset,
@@ -140,7 +140,8 @@ def resolve_options_context(delta_client: Any, selected_symbol: str) -> OptionsC
     return OptionsContext(
         selected_asset=asset, source_asset=asset, role="asset_primary", available=True,
         bias=primary.bias, strength=primary.strength, pcr=primary.pcr,
-        reason=primary.reason, validation=primary.validation, macro_contexts=macros,
+        reason=primary.reason, expiry_coverage=primary.expiry_coverage,
+        validation=primary.validation, macro_contexts=macros,
     )
 
 
