@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from datetime import datetime, timezone
+from functools import wraps
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -550,3 +552,44 @@ def clear_caches() -> None:
     with _LOCK:
         _ARTIFACT_CACHE.clear()
         _PREDICTION_CACHE.clear()
+
+
+def part_advisory_entry(part_id: str, *, data_parameter: str = "data",
+                        context_parameter: str = "context",
+                        evidence_context_key: Optional[str] = None):
+    """Attach diagnostic advisory metadata after the deterministic Part returns.
+
+    The wrapped analyzer remains the sole source of its original result. Missing,
+    stale, invalid, or failed neural artifacts are surfaced as unavailable; no
+    advisory value can rewrite deterministic signal/confidence fields.
+    """
+    def decorate(function):
+        signature = inspect.signature(function)
+
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            result = function(*args, **kwargs)
+            if not isinstance(result, dict):
+                return result
+            output = dict(result)
+            try:
+                bound = signature.bind_partial(*args, **kwargs)
+                bound.apply_defaults()
+                data = bound.arguments.get(data_parameter)
+                context = bound.arguments.get(context_parameter)
+                if not isinstance(context, Mapping):
+                    context = {}
+                advisory_data = (context.get(evidence_context_key)
+                                 if evidence_context_key else data)
+                output["neural_advisory"] = predict_advisory(
+                    advisory_data, part_id, context
+                )
+            except Exception:
+                output["neural_advisory"] = {
+                    "status": "unavailable",
+                    "reason": "advisory_inference_error",
+                }
+            return output
+
+        return wrapped
+    return decorate
