@@ -19,6 +19,8 @@ import time
 import sys
 from typing import List, Dict, Optional
 
+from binance_timeframes import BINANCE_SPOT_TIMEFRAMES, history_limit, validate_interval
+
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -49,8 +51,10 @@ BYBIT_BASE_URL = "https://api.bybit.com"
 
 # Bybit interval map (Binance format -> Bybit format)
 BYBIT_INTERVAL_MAP = {
+    # Only native Bybit linear intervals with exact duration equivalence.
     "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
-    "1h": "60", "2h": "120", "4h": "240", "1d": "D",
+    "1h": "60", "2h": "120", "4h": "240", "6h": "360",
+    "12h": "720", "1d": "D", "1w": "W", "1M": "M",
 }
 
 # Optional: set BINANCE_PROXY env var to route via proxy
@@ -58,17 +62,7 @@ BYBIT_INTERVAL_MAP = {
 _PROXY = os.environ.get("BINANCE_PROXY", "").strip()
 
 # Map Jarvis resolution names → Binance interval names
-RESOLUTION_MAP = {
-    "1m":  "1m",
-    "3m":  "3m",
-    "5m":  "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1h":  "1h",
-    "2h":  "2h",
-    "4h":  "4h",
-    "1d":  "1d",
-}
+RESOLUTION_MAP = {interval: interval for interval in BINANCE_SPOT_TIMEFRAMES}
 
 
 class BinanceData:
@@ -200,7 +194,10 @@ class BinanceData:
     def _bybit_get_candles(self, symbol: str, resolution: str, limit: int) -> List[Dict]:
         """Fetch OHLCV candles from Bybit (fallback when Binance is geo-blocked)."""
         sym = symbol.upper().replace("USD", "USDT") if "USDT" not in symbol.upper() else symbol.upper()
-        interval = BYBIT_INTERVAL_MAP.get(resolution, "1")
+        interval = BYBIT_INTERVAL_MAP.get(resolution)
+        if interval is None:
+            logger.warning("[BYBIT FALLBACK] Unsupported native interval %s; refusing substitute interval", resolution)
+            return []
         try:
             resp = self.session.get(
                 f"{BYBIT_BASE_URL}/v5/market/kline",
@@ -301,52 +298,108 @@ class BinanceData:
         self,
         symbol: str = "BTCUSDT",
         resolution: str = "1m",
-        limit: int = 500
+        limit: int = 500,
+        *,
+        allow_fallback: bool = True,
     ) -> List[Dict]:
-        """
-        Fetch OHLCV candles from Binance.
-        Returns list of dicts with keys: time, open, high, low, close, volume
-        Compatible with Delta Exchange candle format used by Jarvis.
-        """
-        sym = symbol.upper().replace("USD", "USDT") if "USDT" not in symbol.upper() else symbol.upper()
-        interval = RESOLUTION_MAP.get(resolution, resolution)
-        limit = min(limit, 1000)  # Binance max per request = 1000
+        """Fetch validated native Binance Spot OHLCV rows, paging up to ``limit``.
 
+        Binance permits at most 1,000 klines per request. Requests are paged
+        backward from the latest bar so large short-timeframe windows retain the
+        freshest observations. Callers that require Spot provenance must set
+        ``allow_fallback=False``; this prevents Bybit perpetual data being
+        mistaken for Binance Spot.
+        """
+        validate_interval(resolution)
+        if isinstance(limit, bool) or int(limit) != limit or int(limit) <= 0:
+            raise ValueError("candle limit must be a positive integer")
+        requested = int(limit)
+        sym = symbol.upper().replace("USD", "USDT") if "USDT" not in symbol.upper() else symbol.upper()
+        interval = RESOLUTION_MAP[resolution]
         self.last_candle_source = None
+        candles_by_open = {}
+        end_time = None
+        remaining = requested
         try:
-            resp = self._get("/api/v3/klines",
-                             params={"symbol": sym, "interval": interval, "limit": limit},
-                             timeout=10)
-            if resp is not None and resp.status_code == 200:
+            while remaining > 0:
+                page_limit = min(remaining, 1000)
+                params = {"symbol": sym, "interval": interval, "limit": page_limit}
+                if end_time is not None:
+                    params["endTime"] = end_time
+                resp = self._get("/api/v3/klines", params=params, timeout=10)
+                if resp is None or resp.status_code != 200:
+                    if resp is not None:
+                        logger.warning("[BINANCE CANDLES] HTTP %s: %s", resp.status_code, resp.text[:100])
+                    break
                 raw = resp.json()
-                candles = []
+                if not isinstance(raw, list) or not raw:
+                    break
+                page_rows = []
                 for k in raw:
-                    candles.append({
-                        "time":   int(k[0]) // 1000,   # ms → seconds
-                        "open":   float(k[1]),
-                        "high":   float(k[2]),
-                        "low":    float(k[3]),
-                        "close":  float(k[4]),
-                        "volume": float(k[5]),
-                    })
+                    if not isinstance(k, (list, tuple)) or len(k) < 6:
+                        raise ValueError("malformed Binance kline row")
+                    row = {"time": int(k[0]) // 1000, "open": float(k[1]),
+                           "high": float(k[2]), "low": float(k[3]),
+                           "close": float(k[4]), "volume": float(k[5])}
+                    if not all(__import__("math").isfinite(row[key]) for key in ("open", "high", "low", "close", "volume")):
+                        raise ValueError("non-finite Binance kline value")
+                    page_rows.append(row)
+                page_rows.sort(key=lambda row: row["time"])
+                if not page_rows:
+                    break
+                before = len(candles_by_open)
+                for row in page_rows:
+                    candles_by_open[row["time"]] = row
+                if len(candles_by_open) == before:
+                    raise ValueError("Binance kline pagination made no progress")
+                remaining = max(0, requested - len(candles_by_open))
+                if remaining == 0 or len(page_rows) < page_limit:
+                    break
+                oldest_ms = min(row["time"] for row in page_rows) * 1000
+                end_time = oldest_ms - 1
+            candles = [candles_by_open[key] for key in sorted(candles_by_open)][-requested:]
+            if len(candles) == requested:
                 self.last_candle_source = "binance"
                 self._last_source = "binance_spot"
                 self._last_market_semantics = "spot"
                 for candle in candles:
-                    candle["source"] = self._last_source
-                    candle["market_semantics"] = self._last_market_semantics
-                logger.info("[BINANCE] %s %s: %s candles fetched (spot)", sym, interval, len(candles))
+                    candle["source"] = "binance_spot"
+                    candle["market_semantics"] = "spot"
+                logger.info("[BINANCE] %s %s: %s/%s candles fetched (spot)", sym, interval, len(candles), requested)
                 return candles
-            elif resp is not None:
-                logger.warning(f"[BINANCE CANDLES] HTTP {resp.status_code}: {resp.text[:100]}")
         except Exception as e:
-            logger.warning(f"[BINANCE CANDLES] Error: {e}")
+            logger.warning("[BINANCE CANDLES] Error: %s", type(e).__name__)
+        if not allow_fallback:
+            return []
 
-        # Binance fully blocked — try Bybit.  Keep provenance explicit so a
-        # same-symbol fallback cannot masquerade as the primary source.
-        candles = self._bybit_get_candles(symbol, resolution, limit)
+        # Legacy generic callers may use Bybit as an explicit last resort.
+        # Strict Binance Spot consumers must always disable this fallback.
+        fallback_limit = min(requested, 1000)
+        candles = self._bybit_get_candles(symbol, resolution, fallback_limit)
         self.last_candle_source = "bybit" if candles else None
         return candles
+
+    def get_historical_candles_with_metadata(
+        self, *, symbol: str, resolution: str, limit: int
+    ) -> Dict[str, object]:
+        """Return candle rows with response-local, row-verified provenance.
+
+        Strict consumers use this result instead of reading mutable client-wide
+        ``last_candle_source`` after a request, which can race with other threads.
+        """
+        candles = self.get_historical_candles(
+            symbol=symbol, resolution=resolution, limit=limit, allow_fallback=False
+        )
+        verified = bool(candles) and all(
+            row.get("source") == "binance_spot" and row.get("market_semantics") == "spot"
+            for row in candles if isinstance(row, dict)
+        ) and all(isinstance(row, dict) for row in candles)
+        return {
+            "candles": candles if verified else [],
+            "source": "binance" if verified else "unavailable",
+            "market_type": "spot" if verified else "unavailable",
+            "symbol": symbol,
+        }
 
     # ─────────────────────────────────────────────
     # 3. BID / ASK PRICE (for Part 12)
@@ -388,20 +441,41 @@ class BinanceData:
         self,
         symbol: str = "BTCUSDT",
         timeframes: Optional[List[str]] = None,
-        limit: int = 500
+        limit: Optional[int] = None,
     ) -> Dict[str, List[Dict]]:
+        """Fetch complete native Binance Spot history for the requested frames.
+
+        By default this uses every native Spot interval and the reviewed
+        timeframe-specific closed-history profile. Supplying ``limit`` retains
+        an explicit same-count override for compatibility. The low-level method
+        returns raw provider rows (including any forming row); live decisions
+        must use ``DirectCandleCache`` to separate and validate forming candles.
+        A missing/short frame raises instead of silently returning a partial MTF
+        bundle. No Bybit/Delta substitution is allowed in this MTF helper.
         """
-        Fetch candles for multiple timeframes at once.
-        Returns: { "1m": [...], "5m": [...], "1h": [...], ... }
-        """
-        if timeframes is None:
-            timeframes = ["1m", "5m", "15m", "1h", "4h"]
+        selected = list(BINANCE_SPOT_TIMEFRAMES if timeframes is None else timeframes)
+        if not selected or len(set(selected)) != len(selected):
+            raise ValueError("timeframes must be a non-empty unique sequence")
 
         result = {}
-        for tf in timeframes:
-            candles = self.get_historical_candles(symbol, tf, limit)
-            if candles:
-                result[tf] = candles
+        for tf in selected:
+            validate_interval(tf)
+            if limit is None:
+                closed_history = history_limit(tf)
+            else:
+                if isinstance(limit, bool) or int(limit) != limit or int(limit) <= 0:
+                    raise ValueError("candle limit must be a positive integer")
+                closed_history = int(limit)
+            # Raw Klines may include the still-forming latest bar. Request one
+            # extra row so callers can retain `closed_history` completed bars
+            # while keeping the current candle separate.
+            requested = closed_history + 1
+            candles = self.get_historical_candles(
+                symbol, tf, requested, allow_fallback=False
+            )
+            if len(candles) != requested:
+                raise RuntimeError(f"incomplete native Binance Spot history for {tf}: {len(candles)}/{requested} rows (need {closed_history} closed plus current)")
+            result[tf] = candles
         return result
 
     # ─────────────────────────────────────────────

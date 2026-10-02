@@ -9,13 +9,14 @@ import pandas as pd
 
 from jarvis_dashboard import render_dashboard
 from part7_signal import DEFAULT_TIMEFRAMES, aggregate_results, analyze_timeframe
+from binance_timeframes import candle_open_time
 
 
 SYMBOL = "ETHUSDT"
 
 
-def candles(*, timestamp=None, extreme=False, symbol=SYMBOL, rows=60):
-    """Build deterministic offline native-candle fixtures."""
+def candles(*, timestamp=None, timeframe="1m", extreme=False, symbol=SYMBOL, rows=60):
+    """Build deterministic offline fixtures on exact native Binance boundaries."""
     close = np.full(rows, 100.0)
     high = close + 0.2
     low = close - 0.2
@@ -27,8 +28,18 @@ def candles(*, timestamp=None, extreme=False, symbol=SYMBOL, rows=60):
         "close": close.copy(), "volume": np.full(rows, 1000.0),
     })
     if timestamp is None:
-        timestamp = pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=2)
-    frame.index = pd.date_range(end=timestamp, periods=rows, freq="min", tz="UTC")
+        now = pd.Timestamp.now(tz="UTC").timestamp()
+        current_open = candle_open_time(timeframe, now)
+        last_closed = candle_open_time(timeframe, current_open - 1)
+    else:
+        stamp = pd.Timestamp(timestamp)
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize("UTC")
+        last_closed = candle_open_time(timeframe, stamp.timestamp())
+    opens = [int(last_closed)]
+    for _ in range(rows - 1):
+        opens.append(candle_open_time(timeframe, opens[-1] - 1))
+    frame.index = pd.to_datetime(list(reversed(opens)), unit="s", utc=True)
     frame.attrs["symbol"] = symbol
     return frame
 
@@ -40,13 +51,13 @@ class Part7SignalContracts(unittest.TestCase):
 
     def test_routes_each_configured_native_timeframe_with_identity(self):
         for timeframe in DEFAULT_TIMEFRAMES:
-            result = analyze_timeframe(candles(), symbol=SYMBOL,
+            result = analyze_timeframe(candles(timeframe=timeframe), symbol=SYMBOL,
                                        timeframe=timeframe,
                                        context=self.live_context(timeframe))
             self.assertEqual(result["symbol"], SYMBOL)
             self.assertEqual(result["timeframe"], timeframe)
             self.assertEqual(result["signal_identity"], f"part7:{SYMBOL}:{timeframe}")
-            self.assertEqual(result["computation_backend"], "pandas_cpu")
+            self.assertEqual(result["computation_backend"], "stdlib_cpu")
             self.assertEqual(result["accelerator"], "cpu")
 
     def test_wrong_or_missing_symbol_identity_blocks(self):
@@ -95,7 +106,8 @@ class Part7SignalContracts(unittest.TestCase):
                                   timeframe="1m", context=self.live_context())
         self.assertEqual(veto["status"], "veto")
         self.assertTrue(veto["risk_veto"])
-        bullish = {"signal": 1, "status": "ok", "data_status": "valid",
+        bullish = {"signal": 1, "symbol": SYMBOL, "timeframe": "3m",
+                   "status": "ok", "data_status": "valid",
                    "volatility_status": "expanding", "entry_blocked": False,
                    "risk_veto": False}
         aggregate = aggregate_results({"1m": veto, "3m": bullish}, symbol=SYMBOL,
@@ -117,7 +129,8 @@ class Part7SignalContracts(unittest.TestCase):
                 raise RuntimeError("fixture failure")
 
         frame = ExplodingFrame(candles())
-        with patch("part7_signal._validate_frame", return_value=None):
+        with patch("part7_signal._validate_frame", return_value=None), \
+                patch("quantitative_math.part_signal", side_effect=RuntimeError("fixture failure")):
             result = analyze_timeframe(frame, symbol=SYMBOL, timeframe="1m",
                                        context=self.live_context())
         self.assertEqual(result["status"], "error")

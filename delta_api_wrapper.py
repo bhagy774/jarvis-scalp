@@ -104,7 +104,7 @@ def _validate_jarvis_broker_entry_authorization(
             return False, "Jarvis central entry scope is incomplete"
         if (not isinstance(timeframe_evidence, dict)
                 or set(timeframe_evidence) != set(REQUIRED_TIMEFRAMES)):
-            return False, "Complete native 8-timeframe Jarvis evidence is required"
+            return False, "Complete native 16-timeframe Jarvis evidence is required"
         from jarvis_strategy_approval import _clean_symbol
         expected_clean = _clean_symbol(analysis_symbol)
         for timeframe in REQUIRED_TIMEFRAMES:
@@ -217,6 +217,7 @@ class DeltaExchangeData:
         })
         self._cache = {}
         self._options_chain_cache = {}
+        self._options_snapshot_last_capture = {}
 
         # ── HYBRID: Use Binance for price+candles (more accurate, no API key needed) ──
         try:
@@ -1329,7 +1330,7 @@ class DeltaExchangeData:
         cached = getattr(self, "_options_chain_cache", {}).get(asset)
         if cached and time.monotonic() - cached[0] <= 15:
             return copy.deepcopy(cached[1])
-        retrieved = datetime.now(timezone.utc)
+        request_started = datetime.now(timezone.utc)
         if not re.fullmatch(r"[A-Z0-9]{2,12}", asset):
             return combine_provider_chains("", {})
         pages: list[list[dict]] = []
@@ -1369,7 +1370,9 @@ class DeltaExchangeData:
             cursor = next_cursor
         else:
             provider_error = "pagination_page_limit_reached"
+        delta_retrieved = datetime.now(timezone.utc)
         pagination = {
+            "request_started_at": request_started.isoformat(),
             "complete": terminated,
             "truncated": bool(provider_error == "pagination_page_limit_reached" or (marker_seen and not terminated)),
             "marker_seen": marker_seen,
@@ -1379,7 +1382,7 @@ class DeltaExchangeData:
             "cursor_used": cursor is not None,
         }
         delta_chain = build_provider_chain(
-            asset, "Delta", pages, pagination, retrieved_at=retrieved,
+            asset, "Delta", pages, pagination, retrieved_at=delta_retrieved,
             provider_error=provider_error,
         )
         delta_chain["status"] = "ok" if delta_chain["validation"]["usable"] else ("provider_error" if provider_error else "incomplete_or_unverified")
@@ -1395,12 +1398,41 @@ class DeltaExchangeData:
                     "validation": {"usable": False, "complete": False, "reasons": ["provider_request_failed"], "error_type": type(exc).__name__},
                 }
         chain = combine_provider_chains(asset, providers)
-        snapshot_path = os.environ.get("JARVIS_OPTIONS_SNAPSHOT_PATH", "")
-        if snapshot_path:
-            written = append_snapshot(snapshot_path, chain, captured_at=retrieved)
-            chain["snapshot_persistence"] = {"enabled": True, "written": bool(written), "schema": "jarvis.options.snapshot.v1"}
+        # Historical option observations cannot be reconstructed from OHLC.
+        # Start a bounded local archive by default; deployments should override
+        # this with a persistent volume path. Capture at a conservative cadence
+        # because full option chains can be large.
+        snapshot_path = os.environ.get(
+            "JARVIS_OPTIONS_SNAPSHOT_PATH",
+            os.path.join(".jarvis_state", "options_snapshots.jsonl"),
+        ).strip()
+        try:
+            capture_interval = max(60.0, float(os.environ.get("JARVIS_OPTIONS_SNAPSHOT_INTERVAL_SECONDS", "300")))
+        except (TypeError, ValueError, OverflowError):
+            capture_interval = 300.0
+        try:
+            snapshot_max_bytes = max(1024, int(os.environ.get("JARVIS_OPTIONS_SNAPSHOT_MAX_BYTES", "134217728")))
+        except (TypeError, ValueError, OverflowError):
+            snapshot_max_bytes = 134217728
+        capture_completed = datetime.now(timezone.utc)
+        now_mono = time.monotonic()
+        last_capture = self._options_snapshot_last_capture.get(asset, 0.0)
+        if snapshot_path and now_mono - last_capture >= capture_interval:
+            written = append_snapshot(snapshot_path, chain, captured_at=capture_completed)
+            self._options_snapshot_last_capture[asset] = now_mono
+            chain["snapshot_persistence"] = {
+                "enabled": True, "written": bool(written),
+                "schema": "jarvis.options.snapshot.v1",
+                "sample_interval_seconds": int(capture_interval),
+                "max_bytes_per_generation": snapshot_max_bytes,
+            }
+        elif snapshot_path:
+            chain["snapshot_persistence"] = {
+                "enabled": True, "written": False, "reason": "sampling_interval_not_elapsed",
+                "sample_interval_seconds": int(capture_interval),
+            }
         else:
-            chain["snapshot_persistence"] = {"enabled": False, "reason": "JARVIS_OPTIONS_SNAPSHOT_PATH_not_set"}
+            chain["snapshot_persistence"] = {"enabled": False, "reason": "JARVIS_OPTIONS_SNAPSHOT_PATH_empty"}
         self._options_chain_cache[asset] = (time.monotonic(), copy.deepcopy(chain))
         return chain
 
@@ -1487,15 +1519,25 @@ class DeltaExchangeData:
     # 4. OPTIONS EXECUTION & MANAGEMENT (NEW)
     # ==========================================
 
-    def get_nearest_expiries(self, underlying: str = "BTC") -> List[str]:
-        """Get sorted list of available option expiry dates"""
+    def _usable_options_contracts(self, underlying: str) -> List[Dict]:
+        """Return contracts from one complete, fresh, validated provider only."""
         chain = self.get_options_chain(underlying)
-        expiries = set()
-        for opt in chain.get("calls", []) + chain.get("puts", []):
-            exp = opt.get("expiry")
-            if exp and exp != "PERPETUAL":
-                expiries.add(exp)
-        return sorted(list(expiries))
+        providers = chain.get("providers", {}) if isinstance(chain, dict) else {}
+        for name in ("Delta", "Binance Options"):
+            provider = providers.get(name) if isinstance(providers, dict) else None
+            validation = provider.get("validation", {}) if isinstance(provider, dict) else {}
+            contracts = provider.get("contracts", []) if isinstance(provider, dict) else []
+            if validation.get("usable") is True and isinstance(contracts, list):
+                return [row for row in contracts if isinstance(row, dict)]
+        return []
+
+    def get_nearest_expiries(self, underlying: str = "BTC") -> List[str]:
+        """List future expiries from the selected validated provider chain."""
+        expiries = {
+            str(opt.get("expiry")) for opt in self._usable_options_contracts(underlying)
+            if opt.get("expiry") and opt.get("expiry") != "PERPETUAL"
+        }
+        return sorted(expiries)
 
     def get_option_positions(self) -> List[Dict]:
         """Fetch all currently open option positions"""
@@ -1515,27 +1557,35 @@ class DeltaExchangeData:
         return self.place_order(option_symbol, side, size, order_type="market")
 
     def get_option_by_criteria(self, underlying: str, option_type: str, target_strike: float, expiry_preference: str = "nearest") -> Optional[Dict]:
-        """Find best matching option contract"""
-        chain = self.get_options_chain(underlying)
-        key = "puts" if option_type.upper() == "PUT" else "calls"
-        options = chain.get(key, [])
-        
+        """Select from the nearest requested expiry in one usable provider chain.
+
+        This is a discovery helper, not execution authorization: callers still
+        need fresh quotes, product metadata, liquidity checks, and risk approval.
+        """
+        kind = str(option_type or "").strip().upper()
+        if kind not in {"CALL", "PUT"}:
+            return None
+        try:
+            strike = float(target_strike)
+            if not math.isfinite(strike) or strike <= 0:
+                return None
+        except (TypeError, ValueError, OverflowError):
+            return None
+        options = [row for row in self._usable_options_contracts(underlying)
+                   if row.get("type") == kind.lower()]
         if not options:
             return None
-            
-        # Filter by expiry if needed
-        if expiry_preference != "nearest":
-            options = [o for o in options if o.get("expiry") == expiry_preference]
-            
+        if expiry_preference == "nearest":
+            expiries = sorted({str(row.get("expiry")) for row in options if row.get("expiry")})
+            if not expiries:
+                return None
+            selected_expiry = expiries[0]
+        else:
+            selected_expiry = str(expiry_preference or "")
+        options = [row for row in options if str(row.get("expiry")) == selected_expiry]
         if not options:
             return None
-            
-        # Find exact strike or closest
-        exact = next((o for o in options if o.get("strike") == target_strike), None)
-        if exact:
-            return exact
-            
-        return min(options, key=lambda x: abs(x.get("strike", 0) - target_strike))
+        return min(options, key=lambda row: abs(float(row.get("strike")) - strike))
 
     # ==========================================
     # 5. ORDER EXECUTION & RISK MANAGEMENT (PHASE 3)

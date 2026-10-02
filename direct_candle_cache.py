@@ -1,11 +1,11 @@
 """Direct native-interval candle snapshots for live Jarvis analysis.
 
-This module deliberately does not resample, pad, or fabricate candles.  A live
-snapshot contains exactly 500 completed candles and one separate forming
-candle. After warm-up, refresh requests a short native delta, merges only
-contiguous updates, rejects revisions to previously closed bars, and falls back
-to a full 501-row fetch when continuity is uncertain. Consumers must use
-``closed`` for indicators; ``current`` is unconfirmed metadata only.
+This module deliberately does not resample, pad, or fabricate candles. A live
+snapshot contains a configured, timeframe-specific number of completed native
+candles and one separate forming candle. After warm-up, refresh requests a short
+native delta, merges only contiguous updates, rejects revisions to previously
+closed bars, and falls back to a full window when continuity is uncertain.
+Consumers must use ``closed`` for indicators; ``current`` is unconfirmed metadata.
 """
 from __future__ import annotations
 
@@ -18,12 +18,23 @@ from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
 
 import pandas as pd
 
-LIVE_TIMEFRAMES: Tuple[str, ...] = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+from binance_timeframes import (
+    BINANCE_SPOT_TIMEFRAMES, DEFAULT_STRATEGY_TIMEFRAMES,
+    TIMEFRAME_HISTORY_CANDLES, candle_is_closed, history_limit, is_aligned_open,
+    candle_open_time, next_candle_open, validate_interval,
+)
+
+# All provider-native Binance Spot intervals are part of the live MTF snapshot.
+# Backtests may explicitly retain the smaller legacy strategy set when only
+# 1m source history is available; the live path must not silently do that.
+LIVE_TIMEFRAMES: Tuple[str, ...] = BINANCE_SPOT_TIMEFRAMES
 INTERVAL_SECONDS: Mapping[str, int] = {
-    "1m": 60, "3m": 180, "5m": 300, "15m": 900,
+    "1s": 1, "1m": 60, "3m": 180, "5m": 300, "15m": 900,
     "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400,
+    "6h": 21600, "8h": 28800, "12h": 43200, "1d": 86400,
+    "3d": 259200, "1w": 604800,
 }
-REQUIRED_CLOSED_CANDLES = 500
+REQUIRED_CLOSED_CANDLES = 500  # compatibility default; configured per frame below
 FETCH_CANDLES = REQUIRED_CLOSED_CANDLES + 1
 
 
@@ -117,8 +128,21 @@ class DirectCandleCache:
         stale_intervals: float = 2.0,
         max_concurrent_fetches: int = 1,
         max_cached_identities: int = 64,
+        timeframes: Tuple[str, ...] = LIVE_TIMEFRAMES,
+        history_limits: Optional[Mapping[str, int]] = None,
     ) -> None:
         self.client = client
+        self.timeframes = tuple(timeframes)
+        if not self.timeframes or len(set(self.timeframes)) != len(self.timeframes):
+            raise CandleDataError("timeframes must be a non-empty unique sequence")
+        try:
+            for _tf in self.timeframes:
+                validate_interval(_tf)
+            # Use the reviewed per-timeframe profile unless a caller explicitly
+            # overrides individual frames. Unspecified entries keep their profile.
+            self.history_limits = {tf: history_limit(tf, history_limits) for tf in self.timeframes}
+        except ValueError as exc:
+            raise CandleDataError(str(exc)) from exc
         self.clock = clock
         self.ttl_seconds = float(ttl_seconds)
         self.stale_intervals = float(stale_intervals)
@@ -231,16 +255,21 @@ class DirectCandleCache:
         venue: str = "unknown",
         market_type: str = "unknown",
         instrument_id: str = "",
+        required_closed_candles: Optional[int] = None,
     ) -> CandleFrame:
-        if timeframe not in INTERVAL_SECONDS:
-            raise CandleDataError(f"unsupported native timeframe: {timeframe}")
+        try:
+            validate_interval(timeframe)
+        except ValueError as exc:
+            raise CandleDataError(str(exc)) from exc
+        required_closed = int(self.history_limits.get(timeframe, REQUIRED_CLOSED_CANDLES) if required_closed_candles is None else required_closed_candles)
+        if required_closed < 20:
+            raise CandleDataError(f"{timeframe}: closed-candle history must be at least 20")
         if self._canonical_symbol(instrument) != self._canonical_symbol(symbol):
             raise CandleDataError(f"{timeframe}: instrument mismatch ({instrument!r} != {symbol!r})")
         source = source or "unknown"
         rows = list(candles)
-        if len(rows) < FETCH_CANDLES:
-            raise CandleDataError(f"{timeframe}: need {FETCH_CANDLES} rows, got {len(rows)}")
-        interval = INTERVAL_SECONDS[timeframe]
+        if len(rows) < required_closed + 1:
+            raise CandleDataError(f"{timeframe}: need at least {required_closed + 1} rows, got {len(rows)}")
         normalized = []
         seen = set()
         for row in rows:
@@ -249,15 +278,23 @@ class DirectCandleCache:
             raw_time = self._row_value(row, "time")
             try:
                 ts = float(raw_time)
-                # Accept ms timestamps, but keep all downstream times in seconds.
+                # Accept millisecond provider timestamps only when they denote
+                # an exact whole-second candle open. Never truncate malformed
+                # fractional-second opens into a valid aligned timestamp.
                 if ts > 10_000_000_000:
                     ts /= 1000.0
+                if not math.isfinite(ts) or not ts.is_integer():
+                    raise ValueError("candle open timestamp must be an exact whole second")
                 ts = int(ts)
                 values = {field: float(self._row_value(row, field)) for field in ("open", "high", "low", "close", "volume")}
             except (TypeError, ValueError, OverflowError) as exc:
-                raise CandleDataError(f"{timeframe}: non-numeric candle") from exc
+                raise CandleDataError(f"{timeframe}: invalid numeric candle ({exc})") from exc
             if ts <= 0 or any(not math.isfinite(v) for v in values.values()):
                 raise CandleDataError(f"{timeframe}: invalid numeric candle")
+            if not is_aligned_open(timeframe, ts):
+                raise CandleDataError(f"{timeframe}: candle open is not aligned to native interval")
+            if any(values[name] <= 0 for name in ("open", "high", "low", "close")) or values["volume"] < 0:
+                raise CandleDataError(f"{timeframe}: non-positive price or negative volume")
             if ts in seen:
                 raise CandleDataError(f"{timeframe}: duplicate timestamp {ts}")
             if ts > now + 2:
@@ -267,28 +304,36 @@ class DirectCandleCache:
             seen.add(ts)
             normalized.append({"time": ts, **values})
         normalized.sort(key=lambda row: row["time"])
-        closed_rows = [row for row in normalized if row["time"] + interval <= now]
-        forming_rows = [row for row in normalized if row["time"] <= now < row["time"] + interval]
+        closed_rows = [row for row in normalized if candle_is_closed(timeframe, row["time"], now)]
+        forming_rows = [row for row in normalized if row["time"] <= now < next_candle_open(timeframe, row["time"])]
         if len(forming_rows) != 1:
             raise CandleDataError(f"{timeframe}: expected one current forming candle, got {len(forming_rows)}")
         current = forming_rows[0]
         prior_closed = [row for row in closed_rows if row["time"] < current["time"]]
-        if len(prior_closed) < REQUIRED_CLOSED_CANDLES:
-            raise CandleDataError(f"{timeframe}: need {REQUIRED_CLOSED_CANDLES} closed candles, got {len(prior_closed)}")
-        prior_closed = prior_closed[-REQUIRED_CLOSED_CANDLES:]
+        if len(prior_closed) < required_closed:
+            raise CandleDataError(f"{timeframe}: need {required_closed} closed candles, got {len(prior_closed)}")
+        prior_closed = prior_closed[-required_closed:]
         expected = prior_closed[0]["time"]
         for row in prior_closed:
             if row["time"] != expected:
                 raise CandleDataError(f"{timeframe}: missing/non-contiguous closed candle at {expected}")
-            expected += interval
+            expected = next_candle_open(timeframe, expected)
         if current["time"] != expected:
             raise CandleDataError(f"{timeframe}: current candle is not after the closed window")
         # A forming row must be fresh, not a stale exchange response.
-        if now - current["time"] >= interval:
+        if candle_is_closed(timeframe, current["time"], now):
             raise CandleDataError(f"{timeframe}: current candle is stale")
         frame = pd.DataFrame(prior_closed, columns=["time", "open", "high", "low", "close", "volume"])
         frame.index = pd.to_datetime(frame.pop("time"), unit="s", utc=True)
         frame.index.name = "timestamp"
+        frame.attrs.update({
+            "symbol": self._canonical_symbol(symbol),
+            "timeframe": timeframe,
+            "source": source,
+            "venue": venue,
+            "market_type": market_type,
+            "instrument_id": instrument_id or symbol,
+        })
         return CandleFrame(
             symbol=symbol, source=source, timeframe=timeframe, closed=frame,
             current=current, fetched_at=now, venue=venue,
@@ -308,6 +353,7 @@ class DirectCandleCache:
         venue: str,
         market_type: str,
         instrument_id: str,
+        required_closed_candles: int = REQUIRED_CLOSED_CANDLES,
     ) -> CandleFrame:
         """Merge a short native update into the bounded rolling frame.
 
@@ -337,6 +383,8 @@ class DirectCandleCache:
                 ts = float(raw_time)
                 if ts > 10_000_000_000:
                     ts /= 1000.0
+                if not math.isfinite(ts) or not ts.is_integer():
+                    raise ValueError("candle open timestamp must be an exact whole second")
                 ts = int(ts)
                 values = {field: float(self._row_value(row, field)) for field in ("open", "high", "low", "close", "volume")}
             except (TypeError, ValueError, OverflowError) as exc:
@@ -351,11 +399,36 @@ class DirectCandleCache:
                 continue
             merged[ts] = {"time": ts, **values}
         combined = [merged[ts] for ts in sorted(merged)]
-        combined = combined[-FETCH_CANDLES:]
+        combined = combined[-(required_closed_candles + 1):]
         return self._normalize(
             symbol, timeframe, combined, source, instrument, now,
             venue=venue, market_type=market_type, instrument_id=instrument_id,
+            required_closed_candles=required_closed_candles,
         )
+
+    def _incremental_request_limit(self, timeframe: str, previous: CandleFrame, now: float) -> int:
+        """Fetch enough recent native bars to bridge elapsed time without gaps.
+
+        The previous forming bar may have closed since the last refresh. A fixed
+        three-row delta silently loses 1s bars whenever polling is slower than
+        a few seconds; size the delta from native bar boundaries instead.
+        """
+        max_rows = self.history_limits[timeframe] + 1
+        try:
+            previous_open = int((previous.current or {})["time"])
+            current_open = candle_open_time(timeframe, now)
+            cursor = previous_open
+            steps = 0
+            while cursor < current_open and steps < max_rows:
+                cursor = next_candle_open(timeframe, cursor)
+                steps += 1
+            if cursor != current_open:
+                return max_rows
+            # Two extra bars cover the previous forming bar and the new current
+            # bar; a minimum of three also handles same-bar refreshes safely.
+            return min(max_rows, max(3, steps + 2))
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            return max_rows
 
     def refresh(
         self,
@@ -375,10 +448,12 @@ class DirectCandleCache:
             if not force and cached and now - cached.fetched_at < self.ttl_seconds:
                 return cached
             frames: Dict[str, CandleFrame] = {}
-            for timeframe in LIVE_TIMEFRAMES:
+            for timeframe in self.timeframes:
+                request_limit = self.history_limits[timeframe] + 1
                 with self._lock:
                     previous = self._cache.get((identity, timeframe))
-                request_limit = 3 if previous is not None else FETCH_CANDLES
+                if previous is not None:
+                    request_limit = self._incremental_request_limit(timeframe, previous, now)
                 candles, source, instrument = self._fetch(symbol_key, timeframe, request_limit)
                 # Validate freshness at the time each response arrives rather
                 # than anchoring all eight sequential requests to cycle start.
@@ -387,7 +462,7 @@ class DirectCandleCache:
                     frame = self._normalize(
                         symbol_key, timeframe, candles, source, instrument, frame_now,
                         venue=venue_key, market_type=market_key,
-                        instrument_id=instrument_key,
+                        instrument_id=instrument_key, required_closed_candles=self.history_limits[timeframe],
                     )
                 else:
                     rows = list(candles)
@@ -396,7 +471,7 @@ class DirectCandleCache:
                             previous, rows, symbol=symbol_key, timeframe=timeframe,
                             source=source, instrument=instrument, now=frame_now,
                             venue=venue_key, market_type=market_key,
-                            instrument_id=instrument_key,
+                            instrument_id=instrument_key, required_closed_candles=self.history_limits[timeframe],
                         )
                     except CandleDataError as incremental_error:
                         if "previously closed candle revision" in str(incremental_error):
@@ -404,7 +479,7 @@ class DirectCandleCache:
                         # A long pause, source switch, malformed/short delta, or
                         # detected gap gets one bounded full-window recovery.
                         full_rows, full_source, full_instrument = self._fetch(
-                            symbol_key, timeframe, FETCH_CANDLES
+                            symbol_key, timeframe, self.history_limits[timeframe] + 1
                         )
                         full_now = float(self.clock())
                         if full_source == previous.source:
@@ -412,13 +487,14 @@ class DirectCandleCache:
                                 previous, full_rows, symbol=symbol_key, timeframe=timeframe,
                                 source=full_source, instrument=full_instrument, now=full_now,
                                 venue=venue_key, market_type=market_key,
-                                instrument_id=instrument_key,
+                                instrument_id=instrument_key, required_closed_candles=self.history_limits[timeframe],
                             )
                         else:
                             frame = self._normalize(
                                 symbol_key, timeframe, full_rows, full_source,
                                 full_instrument, full_now, venue=venue_key,
                                 market_type=market_key, instrument_id=instrument_key,
+                                required_closed_candles=self.history_limits[timeframe],
                             )
                 with self._lock:
                     # One current provider frame per request identity/timeframe;
