@@ -88,6 +88,7 @@ def jarvis_broker_authorization(*, entry=100.1, stop=98.0, target=105.0,
         snapshot_version=snapshot, analysis_timestamp=issued,
         confidence=confidence, execution_plan=plan,
     )
+    approval["trade_mode"] = "SCALP"
     return {
         "central_approval": approval, "part_results": evidence,
         "timeframe_parts": timeframe_parts, "parts_by_timeframe": timeframe_parts,
@@ -222,6 +223,7 @@ def set_live_flags(monkeypatch):
                  "DELTA_USE_MAINNET", "DELTA_ORDER_EXECUTION_ENABLED"):
         monkeypatch.setenv(name, "1")
     monkeypatch.setenv("JARVIS_KILL_SWITCH", "0")
+    monkeypatch.setenv("JARVIS_MAX_RISK_USDT", "100.0")
 
 
 def test_real_pagination_parser_requires_terminal_cursor_and_rejects_repeats():

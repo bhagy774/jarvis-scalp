@@ -38,12 +38,6 @@ try:
 except ImportError:
     resource = None
 
-# Import Ollama Local AI Integration
-# Retired model interface. Trade logic must not import or probe Ollama.
-OLLAMA_INTEGRATION_AVAILABLE = False
-
-def call_ollama(*args, **kwargs):
-    return None, "Ollama retired; Laya commentary is isolated"
 
 
 # Optional CuPy fallback
@@ -63,6 +57,17 @@ except (ImportError, OSError):
     TORCH_AVAILABLE = False
     
     class DummyTensor:
+        def __pow__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data ** (other._data if isinstance(other, DummyTensor) else other))
+        def __rpow__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor((other._data if isinstance(other, DummyTensor) else other) ** self._data)
+        def __add__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data + (other._data if isinstance(other, DummyTensor) else other))
+        def __radd__(self, other): return self.__add__(other)
+        def __sub__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data - (other._data if isinstance(other, DummyTensor) else other))
+        def __rsub__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor((other._data if isinstance(other, DummyTensor) else other) - self._data)
+        def __mul__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data * (other._data if isinstance(other, DummyTensor) else other))
+        def __rmul__(self, other): return self.__mul__(other)
+        def __truediv__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data / (other._data if isinstance(other, DummyTensor) else other))
+        def __rtruediv__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor((other._data if isinstance(other, DummyTensor) else other) / self._data)
+
         def __init__(self, data=0.0, *args, **kwargs):
             if isinstance(data, (list, tuple, np.ndarray)):
                 self._data = np.array(data, dtype=np.float32)
@@ -103,6 +108,7 @@ except (ImportError, OSError):
         def __add__(self, other): return DummyTensor(self._data + (other._data if isinstance(other, DummyTensor) else other))
         def __sub__(self, other): return DummyTensor(self._data - (other._data if isinstance(other, DummyTensor) else other))
         def __mul__(self, other): return DummyTensor(self._data * (other._data if isinstance(other, DummyTensor) else other))
+        def __pow__(self, other): return DummyTensor(self._data ** (other._data if isinstance(other, DummyTensor) else other))
         def __truediv__(self, other): return DummyTensor(self._data / (other._data if isinstance(other, DummyTensor) else 1e-8))
         def __gt__(self, other): return bool(self.item() > (other.item() if isinstance(other, DummyTensor) else other))
         def __lt__(self, other): return bool(self.item() < (other.item() if isinstance(other, DummyTensor) else other))

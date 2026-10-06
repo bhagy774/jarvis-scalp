@@ -10,7 +10,7 @@ if sys.platform == "win32":
 JARVIS Market Oracle — Multi-Timeframe AI Market Map
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Every 5 minutes, gathers ALL market data sources (Binance, Deribit, Delta,
-Parts 1-12 opinions, Ollama Multi-AI Board) and queries Gemini 3.6 Flash
+Parts 1-12 opinions, Local AI Board) and queries Gemini 3.6 Flash
 to generate a comprehensive time-by-time Market Map forecast.
 
 Layers:
@@ -18,7 +18,7 @@ Layers:
                        Deribit (Max Pain, PCR, Gamma Walls, Greeks, IV)
                        Delta Exchange (Options Chain, Expiries)
                        Parts 1-12 (Live signals & thoughts)
-  2. AI Analysis     : Ollama Multi-AI Board (Parallel DeepSeek + Qwen + Mistral)
+  2. AI Analysis     : Local AI Board (Parallel DeepSeek + Qwen + Mistral)
   3. Gemini Oracle   : gemini-3.6-flash Multi-Timeframe Market Map JSON
   4. Auto-Trade Gate : Direct integration with OracleTradeGate (Gate 0.5)
   5. Output          : Console Market Map, CognitiveBus ORACLE_FORECAST, Web HUD, Telegram
@@ -384,8 +384,8 @@ class JarvisMarketOracle:
             try:
                 d_chain = self._delta.get_options_chain("BTC") or {}
                 data["delta"] = {
-                    "total_oi": round(d_chain.get("total_oi", 0.0), 2),
-                    "pcr": round(d_chain.get("pcr", 0.0), 3),
+                "total_oi": round(float(d_chain.get("total_oi") or 0.0), 2),
+                "pcr": round(float(d_chain.get("pcr") or 0.0), 3),
                     "calls_count": len(d_chain.get("calls", [])),
                     "puts_count": len(d_chain.get("puts", [])),
                 }
@@ -456,17 +456,17 @@ class JarvisMarketOracle:
     #  LAYER 2: OLLAMA MULTI-AI BOARD (PARALLEL)
     # ──────────────────────────────────────────────────────────
 
-    def _run_ollama_board(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _run_ai_board(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
         """Retired multi-model vote; leave a neutral, non-confirming board."""
         return {"status": "unavailable", "analyst": "Model committee retired",
                 "validator": "Model committee retired", "risk_officer": "Model committee retired",
                 "chairman": "CONSENSUS_WAIT", "verdict": "WAIT", "confidence": 0}
 
-    def _call_gemini_oracle(self, market_data: Dict[str, Any], ollama_board: Dict[str, Any]) -> Dict[str, Any]:
+    def _call_gemini_oracle(self, market_data: Dict[str, Any], ai_board: Dict[str, Any]) -> Dict[str, Any]:
         """Compatibility shim: derive from observed data; no model forecast."""
-        return self._generate_local_forecast(market_data, ollama_board)
+        return self._generate_local_forecast(market_data, ai_board)
 
-    def _build_gemini_prompt(self, market_data: Dict[str, Any], ollama_board: Dict[str, Any]) -> str:
+    def _build_gemini_prompt(self, market_data: Dict[str, Any], ai_board: Dict[str, Any]) -> str:
         """Construct the prompt matching the exact user specification."""
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
         candles = market_data.get("candles", {})
@@ -516,10 +516,10 @@ Liquidation Zones:    Longs at ${liq_longs:,}, Shorts at ${liq_shorts:,}
 {parts_text}
 
 === OLLAMA BOARD DECISION ===
-Analyst:   {ollama_board.get('analyst', 'N/A')}
-Validator: {ollama_board.get('validator', 'N/A')}
-Risk:      {ollama_board.get('risk_officer', 'N/A')}
-Chairman:  {ollama_board.get('chairman', 'N/A')}
+Analyst:   {ai_board.get('analyst', 'N/A')}
+Validator: {ai_board.get('validator', 'N/A')}
+Risk:      {ai_board.get('risk_officer', 'N/A')}
+Chairman:  {ai_board.get('chairman', 'N/A')}
 
 Provide JSON market forecast for ALL timeframes matching the requested schema.
 """
@@ -546,11 +546,11 @@ Provide JSON market forecast for ALL timeframes matching the requested schema.
 
 
 
-    def _call_ollama_oracle(self, market_data: Dict[str, Any], ollama_board: Dict[str, Any]) -> Dict[str, Any]:
+    def _call_ai_oracle(self, market_data: Dict[str, Any], ai_board: Dict[str, Any]) -> Dict[str, Any]:
         """Observed-market local synthesizer; never use model or cached model result."""
-        return self._generate_local_forecast(market_data, ollama_board)
+        return self._generate_local_forecast(market_data, ai_board)
 
-    def _generate_local_forecast(self, market_data: Dict[str, Any], ollama_board: Dict[str, Any]) -> Dict[str, Any]:
+    def _generate_local_forecast(self, market_data: Dict[str, Any], ai_board: Dict[str, Any]) -> Dict[str, Any]:
         """Unvalidated deterministic heuristic; only observed BTC data may produce a map."""
         # Incomplete, invalid, or unobserved sources cannot manufacture a CALL/PUT.
         import math
@@ -656,10 +656,10 @@ Provide JSON market forecast for ALL timeframes matching the requested schema.
         data = self._collect_data()
 
         logger.info("[Oracle] Model committee retired; deriving from observed data only...")
-        board = self._run_ollama_board(data)
+        board = self._run_ai_board(data)
 
         logger.info("[Oracle] Building deterministic local market map...")
-        forecast = self._call_ollama_oracle(data, board)
+        forecast = self._call_ai_oracle(data, board)
 
         # Store spot & raw meta in forecast for display
         # This service currently collects BTC-only derivatives context. Keep

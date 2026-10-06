@@ -9,7 +9,7 @@ class Series:
     def __getitem__(self, index): return self.values[index]
     def __len__(self): return len(self.values)
 
-SOURCE = (Path(__file__).parent.parent / "jarvis_FIXED.py").read_text()
+SOURCE = (Path(__file__).parent.parent / "jarvis_FIXED.py").read_text(encoding="utf-8")
 tree = ast.parse(SOURCE)
 cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Part14OptionsChain")
 methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in {"analyze", "analyze_options_with_ollama"}]

@@ -210,8 +210,12 @@ class MultiCoinPipeline:
         while not self._scheduler_stop.is_set():
             try:
                 self._dispatch()
+            except RuntimeError as exc:
+                if "interpreter shutdown" in str(exc):
+                    break
+                logger.warning("[MULTICOIN] Scheduler cycle rejected: %r", exc)
             except Exception as exc:
-                logger.warning("[MULTICOIN] Scheduler cycle rejected: %s", type(exc).__name__)
+                logger.warning("[MULTICOIN] Scheduler cycle rejected: %r", exc)
             self._scheduler_stop.wait(0.25)
 
     def _refresh_candidates(self, now: float) -> None:

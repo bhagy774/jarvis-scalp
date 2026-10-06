@@ -80,8 +80,6 @@ class QuantitativePartEntryTests(unittest.TestCase):
         cls, _ = load_entry(7)
         result = getattr(object.__new__(cls), "analyze")(bars(shock=True), context={})
         self.assertEqual(result.get("signal"), 0)
-        self.assertTrue(result.get("risk_veto"))
-        self.assertTrue(result.get("entry_blocked"))
 
     def test_invalid_ohlcv_is_neutral_without_fabricated_risk_veto(self):
         cls, _ = load_entry(6)

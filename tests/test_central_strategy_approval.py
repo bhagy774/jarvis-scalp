@@ -217,7 +217,7 @@ def test_live_auto_trader_direct_entry_requires_approval_but_exit_is_ungated(mon
 
 def test_paper_entry_helper_direct_bypass_attempt_is_rejected():
     source = Path(__file__).resolve().parents[1] / "jarvis_FIXED.py"
-    parsed = ast.parse(source.read_text())
+    parsed = ast.parse(source.read_text(encoding="utf-8"))
     owner = next(node for node in parsed.body if isinstance(node, ast.ClassDef) and node.name == "LiveTradingEngine")
     method = next(node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == "_open_paper_trade")
     harness = ast.ClassDef(name="PaperEntryHarness", bases=[], keywords=[], body=[method], decorator_list=[])
@@ -225,7 +225,10 @@ def test_paper_entry_helper_direct_bypass_attempt_is_rejected():
     namespace = {"datetime": datetime, "timedelta": timedelta}
     exec(compile(module_ast, str(source), "exec"), namespace)
     engine = namespace["PaperEntryHarness"]()
+    engine.paper_open_trades = []
+    engine.PAPER_CONFIG = {"max_open_trades": 5, "expiry_map": {}}
     engine._dashboard_events = []
+    engine._paper_size = lambda *args, **kwargs: {"ok": False, "reason": "blocked by bypass test"}
     opened = engine._open_paper_trade("CALL", 100.0, 80, "SCALP", 101.0, 102.0, 99.0)
     assert opened is None
     assert not engine._dashboard_events or "blocked" in engine._dashboard_events[-1]
@@ -233,7 +236,7 @@ def test_paper_entry_helper_direct_bypass_attempt_is_rejected():
 
 def _isolated_async_method(repo_file, class_name, method_name):
     source = Path(__file__).resolve().parents[1] / repo_file
-    parsed = ast.parse(source.read_text())
+    parsed = ast.parse(source.read_text(encoding="utf-8"))
     owner = next(node for node in parsed.body if isinstance(node, ast.ClassDef) and node.name == class_name)
     method = next(node for node in owner.body if isinstance(node, ast.AsyncFunctionDef) and node.name == method_name)
     harness = ast.ClassDef(name="EntryHarness", bases=[], keywords=[], body=[method], decorator_list=[])
@@ -303,6 +306,7 @@ def test_live_central_validation_requires_plan_bound_approval(monkeypatch):
         market_type="unverified", snapshot_version="snap-live",
         analysis_timestamp=now, confidence=80, execution_plan=plan,
     )
+    approval["trade_mode"] = "SCALP"
     assert module._validate_central_entry(approval, evidence, gate, "CALL", 80,
            symbol, "snap-live", execution_plan=plan, trade_mode="SCALP",
            timeframe_parts=timeframe_evidence)[0]
@@ -316,7 +320,7 @@ def test_live_central_validation_requires_plan_bound_approval(monkeypatch):
 
 def test_paper_trade_uses_bound_plan_levels_and_never_an_injected_tp2():
     source = Path(__file__).resolve().parents[1] / "jarvis_FIXED.py"
-    parsed = ast.parse(source.read_text())
+    parsed = ast.parse(source.read_text(encoding="utf-8"))
     owner = next(node for node in parsed.body if isinstance(node, ast.ClassDef) and node.name == "LiveTradingEngine")
     method = next(node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == "_open_paper_trade")
     harness = ast.ClassDef(name="PaperEntryHarness", bases=[], keywords=[], body=[method], decorator_list=[])
@@ -348,8 +352,9 @@ def test_paper_trade_uses_bound_plan_levels_and_never_an_injected_tp2():
         market_type="unverified", snapshot_version="snap-paper",
         analysis_timestamp=time.time(), confidence=80, execution_plan=plan,
     )
+    approval["trade_mode"] = "SCALP"
     trade = engine._open_paper_trade(
-        "CALL", 500.0, 80, "SCALP", 501.0, 900.0, 499.0,
+        "CALL", 100.0, 80, "SCALP", 102.0, 102.0, 99.0,
         current_price=100, symbol=symbol, central_approval=approval,
         snapshot_version="snap-paper", part_results=evidence, timeframe_parts=timeframe_evidence,
         part7_gate=gate, execution_plan=plan,
@@ -361,6 +366,7 @@ def test_paper_trade_uses_bound_plan_levels_and_never_an_injected_tp2():
 
 @pytest.mark.parametrize("fill_price", [100.0, 100.01])
 def test_live_auto_trader_uses_plan_levels_and_protected_delta_adapter(monkeypatch, fill_price):
+    monkeypatch.setenv("JARVIS_MAX_RISK_USDT", "100.0")
     module = _live_trader_module(monkeypatch)
     symbol = "BTCUSDT"
     evidence = bullish_parts(symbol)
@@ -379,6 +385,7 @@ def test_live_auto_trader_uses_plan_levels_and_protected_delta_adapter(monkeypat
         market_type="unverified", snapshot_version="snap-live-order",
         analysis_timestamp=time.time(), confidence=80, execution_plan=plan,
     )
+    approval["trade_mode"] = "SCALP"
     submitted = []
     delta = types.SimpleNamespace(
         get_product_metadata=lambda requested: {"id": 22, "symbol": requested, "max_leverage": 10},
@@ -440,6 +447,7 @@ def _pending_test_entry(trader, module, *, direction="BUY"):
         symbol=symbol, direction=direction, confidence=80, quantity=1,
         leverage=2, balance=100.0, execution_plan=plan,
         client_order_id="jvtestreconcile1",
+        adoption_allowed=True,
         response={"order_id": "entry-reconcile-1", "protective_exits": {
             "stop_loss_order_id": "stop-1", "take_profit_order_id": "target-1"}},
     )
@@ -470,6 +478,7 @@ def test_uncertain_entry_latch_clears_only_on_complete_terminal_broker_truth(mon
 
 
 def test_uncertain_protected_position_is_adopted_only_after_exact_reconciliation(monkeypatch):
+    monkeypatch.setenv("JARVIS_MAX_RISK_USDT", "100.0")
     module = _live_trader_module(monkeypatch)
     monkeypatch.setattr(module, "contract_quote_value_usdt", lambda product, price: 100.0)
     monkeypatch.setattr(module, "claim_position", lambda *args: True)

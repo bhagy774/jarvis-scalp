@@ -45,6 +45,28 @@ if sys.platform == "win32":
 logger = logging.getLogger("JarvisAutoTrader")
 
 
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class TradeRequest:
+    """Encapsulates parameters for a single trade placement request."""
+    direction: str
+    confidence: float
+    price: float
+    trade_type: str
+    hedge_plan: Dict = field(default_factory=lambda: {"do_hedge": False})
+    symbol: str = "BTCUSDT"
+    central_approval: Any = None
+    part_results: Any = None
+    part7_gate: Any = None
+    snapshot_version: Any = None
+    execution_plan: Any = None
+    timeframe_parts: Any = None
+
+
+
 def _same_exact_price(left, right):
     """Require exact plan-price equality until a slippage policy is configured."""
     try:
@@ -551,11 +573,31 @@ class JarvisAutoTrader:
     #  GATE 3: TRADE EXECUTION
     # ──────────────────────────────────────────────────────────────
 
-    def _place_trade(self, direction, confidence, price,
-                     trade_type, hedge_plan, symbol: str = "BTCUSDT", *,
+    def _place_trade(self, direction, confidence=None, price=None,
+                     trade_type=None, hedge_plan=None, symbol: str = "BTCUSDT", *,
                      central_approval=None, part_results=None, part7_gate=None,
                      snapshot_version=None, execution_plan=None, timeframe_parts=None) -> Dict:
-        """Execute a new entry only with fresh Jarvis central approval."""
+        """Execute a new entry only with fresh Jarvis central approval.
+
+        Accepts either a TradeRequest object as the first argument, or the
+        individual keyword arguments for backward compatibility.
+        """
+        # Support TradeRequest dataclass as first argument
+        if isinstance(direction, TradeRequest):
+            req = direction
+            direction = req.direction
+            confidence = req.confidence
+            price = req.price
+            trade_type = req.trade_type
+            hedge_plan = req.hedge_plan
+            symbol = req.symbol
+            central_approval = req.central_approval
+            part_results = req.part_results
+            part7_gate = req.part7_gate
+            snapshot_version = req.snapshot_version
+            execution_plan = req.execution_plan
+            timeframe_parts = req.timeframe_parts
+
         symbol = str(symbol or "").upper().replace("-", "").replace("_", "").strip()
         if not symbol:
             return {"success": False, "reason": "Execution symbol is missing"}

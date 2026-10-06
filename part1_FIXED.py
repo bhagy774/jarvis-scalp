@@ -14,6 +14,17 @@ except (ImportError, OSError):
     TORCH_AVAILABLE = False
     # Dummy torch for compatibility
     class DummyTensor:
+        def __pow__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data ** (other._data if isinstance(other, DummyTensor) else other))
+        def __rpow__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor((other._data if isinstance(other, DummyTensor) else other) ** self._data)
+        def __add__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data + (other._data if isinstance(other, DummyTensor) else other))
+        def __radd__(self, other): return self.__add__(other)
+        def __sub__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data - (other._data if isinstance(other, DummyTensor) else other))
+        def __rsub__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor((other._data if isinstance(other, DummyTensor) else other) - self._data)
+        def __mul__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data * (other._data if isinstance(other, DummyTensor) else other))
+        def __rmul__(self, other): return self.__mul__(other)
+        def __truediv__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data / (other._data if isinstance(other, DummyTensor) else other))
+        def __rtruediv__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor((other._data if isinstance(other, DummyTensor) else other) / self._data)
+
         def __init__(self, data=0.0, *args, **kwargs):
             if isinstance(data, (list, tuple, np.ndarray)):
                 self._data = [float(x) for x in data]
@@ -207,12 +218,6 @@ except (ImportError, OSError):
     nn = torch.nn
     F = torch.F
 
-# Import Ollama Local AI Integration
-# Retired model interface. Trade logic must not import or probe Ollama.
-OLLAMA_INTEGRATION_AVAILABLE = False
-
-def call_ollama(*args, **kwargs):
-    return None, "Ollama retired; Laya commentary is isolated"
 
 
 def _safe_std(tensor):
@@ -374,10 +379,11 @@ class TrendBrain:
             c1 = closes[-1].item() if hasattr(closes[-1], 'item') else float(closes[-1])
             momentum = (c1 - c0) / (c0 + 1e-8)
             
-            h_curr = highs[1:].numpy() if hasattr(highs[1:], 'numpy') else np.array(highs[1:].tolist())
-            h_prev = highs[:-1].numpy() if hasattr(highs[:-1], 'numpy') else np.array(highs[:-1].tolist())
-            l_curr = lows[1:].numpy() if hasattr(lows[1:], 'numpy') else np.array(lows[1:].tolist())
-            l_prev = lows[:-1].numpy() if hasattr(lows[:-1], 'numpy') else np.array(lows[:-1].tolist())
+            # FIX: Must call .cpu() before .numpy() on CUDA tensors (GPU fix)
+            h_curr = highs[1:].cpu().numpy() if hasattr(highs[1:], 'numpy') else np.array(highs[1:].tolist())
+            h_prev = highs[:-1].cpu().numpy() if hasattr(highs[:-1], 'numpy') else np.array(highs[:-1].tolist())
+            l_curr = lows[1:].cpu().numpy() if hasattr(lows[1:], 'numpy') else np.array(lows[1:].tolist())
+            l_prev = lows[:-1].cpu().numpy() if hasattr(lows[:-1], 'numpy') else np.array(lows[:-1].tolist())
 
             higher_highs = np.sum(h_curr > h_prev) / len(h_prev)
             higher_lows = np.sum(l_curr > l_prev) / len(l_prev)
@@ -442,6 +448,8 @@ class VolatilityBrain:
             
             # Combine traditional std dev with forecasted variance
             avg_volatility = (weighted_atr * 0.7) + (close_volatility * 0.3)
+            # FIX: thresholds below are fractions of price -> normalize absolute $ volatility
+            avg_volatility = avg_volatility / (abs(_safe_mean(closes)) + 1e-8)
             
             if avg_volatility > 0.002:
                 regime = 'HIGH'
@@ -636,14 +644,14 @@ class RegimeBrain:
             trend_direction = trend_data.get('trend_direction', 0)
             volatility_regime = volatility_data.get('volatility_regime', 'UNKNOWN')
             
-            if trend_strength > 0.7:
+            if trend_strength > 0.35:
                 if trend_direction == 1:
                     regime_type = 'STRONG_BULL'
                     support_score = 0.9
                 else:
                     regime_type = 'STRONG_BEAR'
                     support_score = -0.9
-            elif trend_strength > 0.4:
+            elif trend_strength > 0.15:
                 if trend_direction == 1:
                     regime_type = 'BULL'
                     support_score = 0.7
@@ -986,8 +994,18 @@ class MiniV3Brain:
         
     def analyze_mini_v3(self, market_data):
         try:
+            real_pressure = 0.0
+            if 'real_orderbook' in market_data:
+                ob = market_data['real_orderbook']
+                bids = ob.get('bids', [])
+                asks = ob.get('asks', [])
+                bid_vol = sum(float(b[1]) for b in bids)
+                ask_vol = sum(float(a[1]) for a in asks)
+                total = bid_vol + ask_vol + 1e-8
+                real_pressure = (bid_vol - ask_vol) / total
+
             if 'price_action' not in market_data or len(market_data['price_action']) < 2:
-                return {'microstructure_score': 0, 'wick_imbalance': 0, 'tick_momentum': 0, 'pressure_detection': 0, 'support_score': 0}
+                return {'microstructure_score': 0, 'wick_imbalance': 0, 'tick_momentum': real_pressure, 'pressure_detection': abs(real_pressure), 'support_score': abs(real_pressure)}
                 
             recent_candles = market_data['price_action'][-5:]
             
@@ -1014,9 +1032,14 @@ class MiniV3Brain:
             avg_wick_imbalance = float(np.mean(wick_imbalances)) if wick_imbalances else 0.0
             avg_tick_pressure = float(np.mean(tick_pressures)) if tick_pressures else 0.0
             
+            # Combine real pressure with candle pressure
+            final_tick_momentum = avg_tick_pressure
+            if real_pressure != 0.0:
+                final_tick_momentum = (avg_tick_pressure + real_pressure) / 2.0
+            
             microstructure_score = 1.0 - abs(avg_wick_imbalance) * 0.5
             wick_imbalance = avg_wick_imbalance
-            tick_momentum = avg_tick_pressure
+            tick_momentum = final_tick_momentum
             pressure_detection = abs(tick_momentum)
             
             support_score = microstructure_score * (1.0 + tick_momentum) * 0.5
@@ -1061,6 +1084,13 @@ class SmartBreakoutAI:
             self._process_live_ticks(live_ticks)
         if live_candles:
             self._process_live_candles(live_candles)
+
+    def analyze_master_consensus(self, m5, h1, tf_dict=None):
+        """Unified 29-Brain Consensus Engine integration directly inside Part 1."""
+        from mode_engine import ModeEngine
+        if not hasattr(self, '_mode_engine'):
+            self._mode_engine = ModeEngine()
+        return self._mode_engine.master_evaluate(m5, h1, tf_dict=tf_dict)
             
     def _process_live_ticks(self, ticks):
         pass
@@ -1156,14 +1186,14 @@ class SmartBreakoutAI:
             broken_level = None
             breakout_strength = 0.0
             
-            # Simulated LSTM/Transformer sequence forecasting
-            closes = torch.tensor([c['close'] for c in market_data['price_action'][-15:]], dtype=torch.float32)
-            c_mean = torch.mean(closes)
-            c_std = torch.std(closes) + 1e-8
+            # Simulated sequence forecasting using numpy
+            closes = np.array([c['close'] for c in market_data['price_action'][-15:]], dtype=np.float32)
+            c_mean = np.mean(closes)
+            c_std = np.std(closes) + 1e-8
             normalized_closes = (closes - c_mean) / c_std
 
             # Simple mathematically computed non-linear breakout score
-            momentum_score = float(torch.tanh(normalized_closes[-1] - normalized_closes[-2]).item())
+            momentum_score = float(np.tanh(normalized_closes[-1] - normalized_closes[-2]))
 
             for resistance in resistance_levels:
                 if current_high > resistance and current_close > resistance:
@@ -1219,6 +1249,58 @@ class SmartBreakoutAI:
             current_candle = market_data['price_action'][-1]
             current_close = current_candle['close']
             
+            if len(market_data['price_action']) >= 6:
+                window_size = min(5, len(market_data['price_action']) - 1)
+                recent_candles = market_data['price_action'][-(window_size+1):-1]
+                
+                if breakout_direction == -1:
+                    # Bearish breakdown: Check for Bullish Trap in recent candles
+                    highest_high = max(c['high'] for c in recent_candles)
+                    
+                    pierced_resistance = False
+                    if levels_data and levels_data.get('resistance'):
+                        for r in levels_data['resistance']:
+                            if highest_high > r:
+                                pierced_resistance = True
+                                break
+                                
+                    if not pierced_resistance:
+                        older_highs = [c['high'] for c in market_data['price_action'][-26:-(window_size+1)]]
+                        if older_highs and highest_high >= max(older_highs):
+                            pierced_resistance = True
+                            
+                    if pierced_resistance:
+                        # Find the base of the recent rally
+                        lowest_recent_body = min(min(c['open'], c['close']) for c in recent_candles)
+                        dump_size = (current_candle['open'] - current_candle['close']) / current_candle['open']
+                        
+                        if dump_size > 0.002 and current_candle['close'] < lowest_recent_body:
+                            return {'fakeout_detected': True, 'fakeout_probability': 1.0, 'reversal_signals': 1.0}
+                            
+                elif breakout_direction == 1:
+                    # Bullish breakout: Check for Bearish Trap in recent candles
+                    lowest_low = min(c['low'] for c in recent_candles)
+                    
+                    pierced_support = False
+                    if levels_data and levels_data.get('support'):
+                        for s in levels_data['support']:
+                            if lowest_low < s:
+                                pierced_support = True
+                                break
+                                
+                    if not pierced_support:
+                        older_lows = [c['low'] for c in market_data['price_action'][-26:-(window_size+1)]]
+                        if older_lows and lowest_low <= min(older_lows):
+                            pierced_support = True
+                            
+                    if pierced_support:
+                        # Find the top of the recent dump
+                        highest_recent_body = max(max(c['open'], c['close']) for c in recent_candles)
+                        pump_size = (current_candle['close'] - current_candle['open']) / current_candle['open']
+                        
+                        if pump_size > 0.002 and current_candle['close'] > highest_recent_body:
+                            return {'fakeout_detected': True, 'fakeout_probability': 1.0, 'reversal_signals': 1.0}
+
             if breakout_direction == 1 and broken_level is not None:
                 next_resistance = None
                 for level in levels_data.get('resistance', []):
@@ -1333,10 +1415,11 @@ class SmartBreakoutAI:
             acceleration_medium = price_change_medium - price_change_long
             acceleration = acceleration_short * 0.7 + acceleration_medium * 0.3
             
-            h_curr = highs[1:].numpy() if hasattr(highs[1:], 'numpy') else np.array(highs[1:].tolist())
-            h_prev = highs[:-1].numpy() if hasattr(highs[:-1], 'numpy') else np.array(highs[:-1].tolist())
-            l_curr = lows[1:].numpy() if hasattr(lows[1:], 'numpy') else np.array(lows[1:].tolist())
-            l_prev = lows[:-1].numpy() if hasattr(lows[:-1], 'numpy') else np.array(lows[:-1].tolist())
+            # FIX: Must call .cpu() before .numpy() on CUDA tensors (GPU fix)
+            h_curr = highs[1:].cpu().numpy() if hasattr(highs[1:], 'numpy') else np.array(highs[1:].tolist())
+            h_prev = highs[:-1].cpu().numpy() if hasattr(highs[:-1], 'numpy') else np.array(highs[:-1].tolist())
+            l_curr = lows[1:].cpu().numpy() if hasattr(lows[1:], 'numpy') else np.array(lows[1:].tolist())
+            l_prev = lows[:-1].cpu().numpy() if hasattr(lows[:-1], 'numpy') else np.array(lows[:-1].tolist())
 
             higher_highs = np.sum(h_curr > h_prev)
             higher_lows = np.sum(l_curr > l_prev)
@@ -1362,6 +1445,27 @@ class SmartBreakoutAI:
             
     def detect_orderflow(self, market_data):
         try:
+            # Use real orderbook depth if passed from live context
+            if 'real_orderbook' in market_data:
+                ob = market_data['real_orderbook']
+                bids = ob.get('bids', [])
+                asks = ob.get('asks', [])
+                bid_vol = sum(float(b[1]) for b in bids)
+                ask_vol = sum(float(a[1]) for a in asks)
+                
+                delta_positive = bid_vol > ask_vol
+                total_vol = bid_vol + ask_vol + 1e-8
+                net_delta = bid_vol - ask_vol
+                pressure_strength = min(abs(net_delta) / total_vol * 5.0, 1.0)
+                
+                return {
+                    'delta_positive': delta_positive,
+                    'pressure_strength': pressure_strength,
+                    'absorption_detected': pressure_strength > 0.8,
+                    'exhaustion_signals': 0,
+                    'cumulative_delta': net_delta
+                }
+
             if 'order_flow' not in market_data:
                 return {'delta_positive': False, 'pressure_strength': 0, 'absorption_detected': False, 'exhaustion_signals': 0, 'cumulative_delta': 0}
                 
@@ -1537,9 +1641,130 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
 
     @part_advisory_entry("part1_breakout", data_parameter="advisory_data", context_parameter="context")
     def analyze(self, market_data, context=None, advisory_data=None):
-        """Task-specific OHLCV evidence. The analyzer decorator still adds only its own advisory."""
-        import quantitative_math as qm
-        return qm.part_signal("1", market_data)
+        try:
+            if context:
+                if 'real_orderbook' in context:
+                    market_data['real_orderbook'] = context['real_orderbook']
+                if 'real_funding' in context:
+                    market_data['real_funding'] = context['real_funding']
+                    
+            levels_data = self.detect_smart_levels(market_data)
+            liquidity_data = self.detect_liquidity(market_data, levels_data)
+            breakout_data = self.detect_breakout(market_data, levels_data)
+            fakeout_data = self.detect_fakeout(market_data, breakout_data, levels_data)
+            pullback_data = self.detect_pullback(market_data, breakout_data, levels_data)
+            momentum_data = self.detect_momentum(market_data)
+            orderflow_data = self.detect_orderflow(market_data)
+            ml_data = self.detect_ml_features(market_data)
+            regime_data = self.detect_regime(market_data)
+            
+            trend_brain_data = self.apply_trend_brain(market_data)
+            volatility_brain_data = self.apply_volatility_brain(market_data)
+            strength_brain_data = self.apply_strength_brain(market_data, breakout_data, momentum_data)
+            risk_brain_data = self.apply_risk_brain(market_data, volatility_brain_data, trend_brain_data)
+            reversal_brain_data = self.apply_reversal_brain(market_data, trend_brain_data, strength_brain_data)
+            regime_brain_data = self.apply_regime_brain(market_data, trend_brain_data, volatility_brain_data)
+            
+            all_brain_data = {
+                'trend': trend_brain_data,
+                'volatility': volatility_brain_data,
+                'strength': strength_brain_data,
+                'risk': risk_brain_data,
+                'reversal': reversal_brain_data,
+                'regime': regime_brain_data
+            }
+            
+            deepseek_brain_data = self.apply_deepseek_brain(market_data, all_brain_data)
+            evolution_brain_data = self.apply_evolution_brain(market_data, self.signal_history)
+            memory_brain_data = self.apply_memory_brain(market_data, trend_brain_data.get('trend_direction', 0))
+            self_heal_brain_data = self.apply_self_heal_brain(market_data, self.system_metrics)
+            mini_r1_brain_data = self.apply_mini_r1_brain(market_data, breakout_data, fakeout_data)
+            mini_v3_brain_data = self.apply_mini_v3_brain(market_data)
+            
+            all_brain_support = {
+                "trend": trend_brain_data,
+                "volatility": volatility_brain_data,
+                "strength": strength_brain_data,
+                "risk": risk_brain_data,
+                "reversal": reversal_brain_data,
+                "regime": regime_brain_data,
+                "deepseek": deepseek_brain_data,
+                "evolution": evolution_brain_data,
+                "memory": memory_brain_data,
+                "self_heal": self_heal_brain_data,
+                "mini_r1": mini_r1_brain_data,
+                "mini_v3": mini_v3_brain_data
+            }
+            
+            meta_fusion_brain_data = self.apply_meta_fusion_brain(all_brain_support)
+            all_brain_support["meta_fusion"] = meta_fusion_brain_data
+            
+            cloud_r1_data = self.call_deepseek_r1({
+                'market_data': market_data,
+                'breakout_data': breakout_data,
+                'brain_support': all_brain_support
+            })
+            
+            cloud_v3_data = self.call_deepseek_v3({
+                'market_data': market_data,
+                'ml_data': ml_data,
+                'orderflow_data': orderflow_data
+            })
+            
+            # Initial algorithmic signal generation
+            signal, confidence = self._generate_signal(
+                breakout_data, fakeout_data, pullback_data, momentum_data,
+                orderflow_data, regime_data, all_brain_support,
+                cloud_r1_data, cloud_v3_data, liquidity_data,
+                ollama_signal=0
+            )
+            
+            temp_result = {
+                "signal": signal,
+                "breakout": breakout_data,
+                "fakeout": fakeout_data,
+                "pullback": pullback_data,
+                "momentum": momentum_data,
+                "levels": levels_data,
+                "liquidity": liquidity_data,
+                "orderflow": orderflow_data,
+                "ml": ml_data,
+                "regime": regime_data,
+                "brain_support": all_brain_support,
+                "confidence": confidence
+            }
+
+            # Model text cannot cast a vote. Preserve only mathematical signal.
+            ollama_reasoning = "Legacy model disabled; experimental Laya is audit-only"
+            ollama_signal = 0
+
+            result = {
+                "signal": signal,
+                "breakout": breakout_data,
+                "fakeout": fakeout_data,
+                "pullback": pullback_data,
+                "momentum": momentum_data,
+                "levels": levels_data,
+                "liquidity": liquidity_data,
+                "orderflow": orderflow_data,
+                "ml": ml_data,
+                "regime": regime_data,
+                "brain_support": all_brain_support,
+                "confidence": confidence,
+                "ollama_reasoning": ollama_reasoning,
+                "ollama_signal": ollama_signal
+            }
+            
+            self.signal_history.append(result)
+            # Publish to CognitiveBus for Watcher AI monitoring
+            if hasattr(self, 'bus') and self.bus:
+                direction_str = 'BULLISH' if signal > 0 else 'BEARISH' if signal < 0 else 'NEUTRAL'
+                msg = f"Breakout Analysis: {direction_str} (Signal: {signal}, Confidence: {confidence:.2f}). Regime: {regime_data.get('regime', 'unknown')}"
+                self.bus.publish('THOUGHTS', 'Part1_Breakout', msg)
+            return result
+            
+        except Exception as e:
+            return self._get_error_response()
             
     def _generate_signal(self, breakout_data, fakeout_data, pullback_data, momentum_data,
                         orderflow_data, regime_data, brain_support, cloud_r1_data, cloud_v3_data, liquidity_data,

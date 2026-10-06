@@ -114,10 +114,10 @@ class JarvisQuantitativeRuntimeTests(unittest.TestCase):
                     self.assertLessEqual(tp2,tp1); self.assertGreaterEqual(tp2,98.50)
         self.assertIsNone(obj.calculate_targets(data[:10],"CALL",100.0))
         # The active stop path no longer uses a rolling ATR estimator.
-        tree=ast.parse((ROOT/"jarvis_FIXED.py").read_text())
+        tree=ast.parse((ROOT/"jarvis_FIXED.py").read_text(encoding="utf-8"))
         cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=="ScalpingEngine")
         method=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=="calculate_targets")
-        code=ast.get_source_segment((ROOT/"jarvis_FIXED.py").read_text(),method)
+        code=ast.get_source_segment((ROOT/"jarvis_FIXED.py").read_text(encoding="utf-8"),method)
         self.assertNotIn("rolling(",code)
         self.assertNotIn("ATR",code)
 

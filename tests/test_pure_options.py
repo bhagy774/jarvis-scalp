@@ -4,7 +4,7 @@ import os
 import unittest
 from pathlib import Path
 
-SOURCE = (Path(__file__).parent.parent / "jarvis_FIXED.py").read_text()
+SOURCE = (Path(__file__).parent.parent / "jarvis_FIXED.py").read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
 cls = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == "Part14OptionsChain")
 method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "analyze_options_with_ollama")

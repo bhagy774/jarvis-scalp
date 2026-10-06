@@ -104,7 +104,7 @@ class CognitiveBus:
     Central nervous system for Jarvis.
     - Pub/Sub routing between AI agents.
     - Self-Diagnostic HEALTH monitoring.
-    - Ollama-powered error analysis when available.
+    - AI-powered error analysis when available.
     """
     
     def __init__(self):
@@ -190,7 +190,7 @@ class CognitiveBus:
         """Return last N Doctor health reports. Used by HUD and Gemini advisor."""
         return list(self._doctor_reports)[-n:]
 
-    def report_error(self, part_name: str, error: Exception, context: str = "", try_ollama: bool = True):
+    def report_error(self, part_name: str, error: Exception, context: str = "", try_ai: bool = False):
         """
         Call this inside any part's except block.
         Automatically:
@@ -222,7 +222,7 @@ class CognitiveBus:
         # Try Ollama diagnosis in background (non-blocking)
         if False:  # Retired model diagnosis; do not spawn a thread.
             threading.Thread(
-                target=self._ollama_diagnose,
+                target=self._ai_diagnose,
                 args=(part_name, type(error).__name__, str(error), context, severity),
                 daemon=True
             ).start()
@@ -241,7 +241,7 @@ class CognitiveBus:
         self.health_monitor.record_ok(part_name)
         self.logger.log('HEALTH', part_name, f"[RECOVERED] {part_name} is working again. Context: {context}")
         
-    def _ollama_diagnose(self, part_name: str, error_type: str, error_msg: str,
+    def _ai_diagnose(self, part_name: str, error_type: str, error_msg: str,
                          context: str, severity: str):
         """Retired model diagnosis. Structured local HEALTH event is sufficient."""
         return None

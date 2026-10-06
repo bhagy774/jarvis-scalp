@@ -32,14 +32,37 @@ def _predict_with_laya(snapshot: dict[str, Any]) -> Any:
     # Upstream NandhaKishorM/laya: Router.predict(state, questions), answers[id].choice.
     # Checkpoint loading is lazy; invoke only from a bounded daemon worker.
     from laya import Router
-    questions = {"suggestion": {"type": "choice", "instructions": "Experimental non-authoritative market commentary only: which label best describes this setup?", "criteria": {"BUY": "bullish setup", "SELL": "bearish setup", "NO_TRADE": "unclear, risky, or insufficient evidence"}}}
+    questions = {
+        "suggestion": {
+            "type": "choice",
+            "instructions": (
+                "You are reviewing a crypto futures trade setup for decision support only. "
+                "Based on the snapshot: parts agreement, timeframe alignment, options walls, "
+                "and volatility — which label best describes this setup?"
+            ),
+            "criteria": {
+                "BUY":      "Bullish setup: majority of analysis parts agree to go long, "
+                            "HTF timeframes show uptrend, options walls support price above entry.",
+                "SELL":     "Bearish setup: majority of analysis parts agree to go short, "
+                            "HTF timeframes show downtrend, price near resistance wall.",
+                "NO_TRADE": "Unclear or conflicting setup: parts are split, low confidence, "
+                            "extreme volatility, or insufficient evidence to enter a trade.",
+            },
+        }
+    }
     result = Router().predict(snapshot, questions)
     answer = result.get("answers", {}).get("suggestion", {})
-    return {"suggestion": answer.get("choice"), "confidence": answer.get("confidence"), "rationale": "General-purpose Laya; not market-trained or validated."}
+    # Use answer_confidence (probability of chosen class) — the raw 'confidence'
+    # field is uncalibrated in current checkpoints (RuntimeWarning from router).
+    answer_conf = answer.get("answer_confidence") or answer.get("confidence")
+    return {"suggestion": answer.get("choice"), "confidence": answer_conf,
+            "rationale": "Laya non-autoregressive advisory (general model, not crypto-trained)."}
 
 
 def _enabled() -> bool:
-    return os.getenv("JARVIS_LAYA_ADVISORY", "false").strip().lower() in {"1", "true", "yes", "on"}
+    # Enabled by default when laya package is present; set JARVIS_LAYA_ADVISORY=false to disable.
+    env = os.getenv("JARVIS_LAYA_ADVISORY", "true").strip().lower()
+    return env not in {"0", "false", "no", "off"}
 
 
 def advise(snapshot: dict[str, Any], *, symbol: str, deterministic_decision: str, predictor: Optional[Callable] = None, enabled: Optional[bool] = None) -> Advisory:
@@ -49,9 +72,13 @@ def advise(snapshot: dict[str, Any], *, symbol: str, deterministic_decision: str
         enabled = _enabled()
     if not enabled:
         return Advisory("disabled", symbol, deterministic)
-    if (not isinstance(snapshot, dict) or symbol == "UNKNOWN"
-            or str(snapshot.get("symbol", "")).upper() != symbol):
-        return Advisory("invalid", symbol, deterministic, rationale="missing or mismatched symbol snapshot")
+    # Allow snapshots that either have a matching symbol field OR no symbol field at all
+    # (Jarvis holistic engine passes snapshots that may not include a top-level symbol key)
+    snap_symbol = str(snapshot.get("symbol", "")).upper()
+    if not isinstance(snapshot, dict) or symbol == "UNKNOWN":
+        return Advisory("invalid", symbol, deterministic, rationale="missing snapshot or unknown symbol")
+    if snap_symbol and snap_symbol != symbol:
+        return Advisory("invalid", symbol, deterministic, rationale="mismatched symbol snapshot")
     try:
         result = (predictor or _predict_with_laya)(snapshot)
     except (ImportError, ModuleNotFoundError) as exc:

@@ -21,3 +21,7 @@ class SpecialistPool:
         return {"approved": False, "final_verdict": "NO_TRADE",
                 "chairman_summary": "Model committee retired; no confirmation",
                 "approve_votes": 0, "opinions": opinions}
+
+    def shutdown(self) -> None:
+        """No-op: pool has no live resources to release."""
+        pass

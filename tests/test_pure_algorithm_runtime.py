@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-SOURCE = (Path(__file__).parent.parent / "jarvis_FIXED.py").read_text()
+SOURCE = (Path(__file__).parent.parent / "jarvis_FIXED.py").read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
 mode = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "_pure_algorithm_mode")
 jarvis = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == "JarvisElite")

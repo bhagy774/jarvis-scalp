@@ -57,8 +57,7 @@ class AIHedgeAdvisor:
     def __init__(self):
         self.chat_history: List[Dict] = []
         self.max_history_pairs = 10
-        self.ollama_url = OLLAMA_BASE_URL
-        self.model = OLLAMA_MODEL
+                self.model = OLLAMA_MODEL
         self._call_count = 0
         logger.info(f"[HEDGE-AI] Initialized -- model={self.model} memory={self.max_history_pairs} trades")
 
@@ -116,9 +115,7 @@ class AIHedgeAdvisor:
         )
         return report
 
-    def _call_ollama_chat(self) -> Optional[str]:
-        return None
-
+    
     def _parse_hedge_decision(self, raw: Optional[str], current_price: float) -> Dict:
         if not raw:
             return self._fallback_decision("NO_TRADE", 0, current_price, 0)

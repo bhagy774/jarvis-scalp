@@ -11,6 +11,17 @@ except (ImportError, OSError):
     TORCH_AVAILABLE = False
     import numpy as np
     class DummyTensor:
+        def __pow__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data ** (other._data if isinstance(other, DummyTensor) else other))
+        def __rpow__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor((other._data if isinstance(other, DummyTensor) else other) ** self._data)
+        def __add__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data + (other._data if isinstance(other, DummyTensor) else other))
+        def __radd__(self, other): return self.__add__(other)
+        def __sub__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data - (other._data if isinstance(other, DummyTensor) else other))
+        def __rsub__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor((other._data if isinstance(other, DummyTensor) else other) - self._data)
+        def __mul__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data * (other._data if isinstance(other, DummyTensor) else other))
+        def __rmul__(self, other): return self.__mul__(other)
+        def __truediv__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor(self._data / (other._data if isinstance(other, DummyTensor) else other))
+        def __rtruediv__(self, other): return DummyTensor() if not hasattr(self, '_data') else DummyTensor((other._data if isinstance(other, DummyTensor) else other) / self._data)
+
         def __init__(self, data=0, *args, **kwargs):
             if isinstance(data, (list, tuple, np.ndarray)):
                 self.arr = np.array(data, dtype=np.float32)
@@ -188,12 +199,6 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-# Import Ollama Local AI Integration
-# Retired model interface. Trade logic must not import or probe Ollama.
-OLLAMA_INTEGRATION_AVAILABLE = False
-
-def call_ollama(*args, **kwargs):
-    return None, "Ollama retired; Laya commentary is isolated"
 
 
 

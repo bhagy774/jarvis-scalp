@@ -210,7 +210,7 @@ def test_feature_flag_defaults_off_and_runtime_wiring_is_shadow_only():
     assert multicoin_analysis_enabled("0") is False
     assert multicoin_analysis_enabled("false") is False
     assert multicoin_analysis_enabled("1") is True
-    source = Path(__file__).parents[1].joinpath("jarvis_FIXED.py").read_text()
+    source = Path(__file__).parents[1].joinpath("jarvis_FIXED.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     live = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "LiveTradingEngine")
     methods = {node.name: node for node in live.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}

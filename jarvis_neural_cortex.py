@@ -14,7 +14,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL", "deepseek-r1:14b")
+LAYA_MODEL    = os.environ.get("LAYA_MODEL", "deepseek-r1:14b")
 
 
 class JarvisNeuralCortex:
@@ -69,8 +69,7 @@ class JarvisNeuralCortex:
     def __init__(self):
         self.chat_history: List[Dict] = []
         self.max_history_pairs = 20
-        self.ollama_url = OLLAMA_BASE_URL
-        self.model = OLLAMA_MODEL
+        self.model = LAYA_MODEL
         self._last_result: Optional[Dict] = None
         self._call_count = 0
         self._error_count = 0
@@ -170,12 +169,33 @@ class JarvisNeuralCortex:
         return report.strip()
 
     # -------------------------------------------------------------------------
-    # OLLAMA CHAT API (With Memory)
+    # LAYA AI INTEGRATION (Replaces Ollama)
     # -------------------------------------------------------------------------
 
-    def _call_ollama_chat(self) -> Optional[str]:
-        """Compatibility shim; never contact a model service."""
-        return None
+    def _call_laya_advisor(self, snapshot: Dict) -> Optional[Dict]:
+        """Calls Laya AI for decision support instead of Ollama."""
+        try:
+            from jarvis_laya_advisor import advise
+            # Convert neural cortex snapshot to Laya snapshot format
+            laya_snap = {
+                'symbol': 'BTCUSDT',
+                'price': snapshot.get('price', 0),
+                'direction': snapshot.get('fusion_direction', 'NO_TRADE'),
+                'confidence': snapshot.get('math_conf', 0),
+                'parts_summary': snapshot.get('parts', {})
+            }
+            res = advise(laya_snap, symbol='BTCUSDT', deterministic_decision=snapshot.get('fusion_direction', 'NO_TRADE'), enabled=True)
+            if res.status == 'ok' and res.suggestion:
+                return {
+                    'signal': res.suggestion.upper(),
+                    'confidence': int((res.confidence or 0.5) * 100),
+                    'rationale': res.rationale or 'Laya Neural Cortex Advisory',
+                    'risk': 'MEDIUM'
+                }
+            return None
+        except Exception as e:
+            self.logger.debug(f"[LAYA] Cortex error: {e}")
+            return None
 
     def _parse_decision(self, raw: Optional[str], part_results: Dict) -> Dict:
         if not raw:
@@ -273,7 +293,7 @@ class JarvisNeuralCortex:
             math_sig  = fusion.get('signal', 0)
             math_conf = conf_part.get('confidence', 10)
             signal    = 'CALL' if math_sig > 0 else ('PUT' if math_sig < 0 else 'NO_TRADE')
-            source    = ("Ollama offline — using math vote fallback."
+            source    = ("AI offline — using math vote fallback."
                          if not ai_online else
                          "AI response could not be parsed — using math vote fallback.")
             return {'signal': signal, 'bias': signal.replace('_', '-'), 'confidence': math_conf,

@@ -413,6 +413,7 @@ def test_protected_broker_authorization_binds_plan_and_broker_levels(monkeypatch
     }
     args = {"symbol": "ETHUSDT", "side": "buy", "product_id": 22,
             "size": 1, "stop_loss": 99.2, "take_profit": 102, "leverage": 2}
+    monkeypatch.setenv("JARVIS_MAX_RISK_USDT", "10.0")
     assert wrapper._validate_jarvis_broker_entry_authorization(auth, **args)[0]
     mutated = {**auth, "broker_plan": {**auth["broker_plan"], "stop_loss": 98}}
     rejected, reason = wrapper._validate_jarvis_broker_entry_authorization(
