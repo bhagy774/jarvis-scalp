@@ -2911,6 +2911,14 @@ class LiveTradingEngine:
                         result = self._apply_options_confirmation(result, symbol)
                         direction, confidence, entry_price, tp1, tp2, sl, expiry = \
                             self._print_live_signal(result, current_price, symbol=symbol, df=df)
+                        # Record Parts 1-12 outputs + this coin's 15m candle features
+                        # (once per closed 15m bar) for offline XGBoost training.
+                        # Advisory data only; never affects the decision.
+                        try:
+                            from jarvis_part_snapshot import get_recorder
+                            get_recorder().record(symbol, result, snapshot, direction, confidence)
+                        except Exception:
+                            pass
 
                         # 1M ENTRY CONFIRMATION GATE: HTF decision valid,
                         # pan 1m candle confirm na kare to aa cycle ma entry skip.
