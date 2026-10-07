@@ -18,6 +18,7 @@ def delta_row(symbol, kind, strike):
 def client_with_responses(responses):
     client = DeltaExchangeData.__new__(DeltaExchangeData)
     client._options_chain_cache = {}
+    client._options_snapshot_last_capture = {}
     client._binance_options = None
     calls = []
     def fake_request(method, endpoint, params):

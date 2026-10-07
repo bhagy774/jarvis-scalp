@@ -43,7 +43,7 @@ class Part7QuantitativeSignalTests(unittest.TestCase):
         adapter = namespace["Part7Volatility"]()
         frame = pd.DataFrame(make_bars(shock=True))
         frame.attrs["symbol"] = "BTCUSDT"
-        frame.index = pd.date_range(end=pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=60),
+        frame.index = pd.date_range(end=pd.Timestamp.now(tz="UTC").floor("min") - pd.Timedelta(seconds=60),
                                     periods=len(frame), freq="min")
         result = adapter.analyze(frame, context={"selected_symbol": "BTCUSDT", "symbol": "BTCUSDT", "timeframe": "1m"})
         self.assertEqual(result["status"], "veto")

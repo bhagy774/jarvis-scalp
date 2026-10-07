@@ -1,3 +1,4 @@
+from jarvis_decision import DecisionContext
 import pytest
 from jarvis_decision import (
     normalize_confidence,
@@ -99,7 +100,7 @@ def test_opinion_direction():
 
 def test_build_final_decision_basic_buy():
     signal = {"direction": "BUY", "confidence": 85, "entry_price": 100}
-    decision = build_final_decision(signal, symbol="BTC")
+    decision = build_final_decision(signal, DecisionContext(symbol="BTC"))
 
     assert decision["direction"] == "BUY"
     assert decision["execution_direction"] == "CALL"
@@ -113,7 +114,7 @@ def test_build_final_decision_basic_buy():
 
 def test_build_final_decision_no_confidence():
     signal = {"direction": "BUY"}
-    decision = build_final_decision(signal, symbol="BTC")
+    decision = build_final_decision(signal, DecisionContext(symbol="BTC"))
 
     assert decision["direction"] == "NO_TRADE"
     assert decision["confidence"] is None
@@ -124,7 +125,7 @@ def test_build_final_decision_no_confidence():
 def test_build_final_decision_conflict():
     signal = {"direction": "BUY", "confidence": 85}
     opinions = [{"direction": "BUY"}, {"direction": "SELL"}]
-    decision = build_final_decision(signal, symbol="BTC", opinions=opinions)
+    decision = build_final_decision(signal, DecisionContext(symbol="BTC", opinions=opinions))
 
     assert decision["direction"] == "NO_TRADE"
     assert decision["status"] == "CONFLICT"
@@ -135,18 +136,13 @@ def test_build_final_decision_options_context():
     signal = {"direction": "BUY", "confidence": 85}
 
     # Require options but none provided
-    decision1 = build_final_decision(signal, symbol="BTC", require_options=True)
+    decision1 = build_final_decision(signal, DecisionContext(symbol="BTC", require_options=True))
     assert decision1["direction"] == "NO_TRADE"
     assert decision1["execution_allowed"] is False
     assert "Required selected-asset options context unavailable or non-primary" in decision1["reasons"]
 
     # Require options and provided
-    decision2 = build_final_decision(
-        signal,
-        symbol="BTC",
-        require_options=True,
-        options_context={"available": True, "role": "asset_primary"}
-    )
+    decision2 = build_final_decision(signal, DecisionContext(symbol="BTC", require_options=True, options_context={"available": True, "role": "asset_primary"}))
     assert decision2["direction"] == "BUY"
     assert decision2["execution_allowed"] is True
     assert decision2["options_context"] == {"available": True, "role": "asset_primary"}
@@ -154,12 +150,7 @@ def test_build_final_decision_options_context():
 def test_build_final_decision_gate_and_blocking():
     signal = {"direction": "BUY", "confidence": 85}
 
-    decision = build_final_decision(
-        signal,
-        symbol="BTC",
-        gate_reason="Market Closed",
-        blocking_reasons=["High volatility"]
-    )
+    decision = build_final_decision(signal, DecisionContext(symbol="BTC", gate_reason="Market Closed", blocking_reasons=["High volatility"]))
 
     assert decision["direction"] == "NO_TRADE"
     assert decision["execution_allowed"] is False
@@ -169,7 +160,7 @@ def test_build_final_decision_gate_and_blocking():
 def test_build_final_decision_plan_overrides():
     signal = {"direction": "BUY", "confidence": 85, "entry_price": 100, "take_profit_1": 110}
     plan = {"entry": 105, "tp1": 115}
-    decision = build_final_decision(signal, symbol="BTC", plan=plan)
+    decision = build_final_decision(signal, DecisionContext(symbol="BTC", plan=plan))
 
     assert decision["entry"] == 105
     assert decision["tp1"] == 115

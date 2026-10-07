@@ -1,3 +1,4 @@
+from jarvis_scenario_simulator import ScenarioConfig
 import os
 import pytest
 import pandas as pd
@@ -66,19 +67,19 @@ def test_scenario_normal_move():
 
 def test_scenario_slippage_spike():
     # risk <= 0
-    ok, msg = _scenario_slippage_spike("CALL", 100, 100, 110, 0, 0)
+    ok, msg = _scenario_slippage_spike(100, 100, 110, 0, 0)
     assert not ok
     assert "Risk distance zero" in msg
 
     # RR < 0.5
     # entry=100, sl=99, tp=100.1, fee=10, slippage=50 => cost = 100*(10+150)/10000 = 1.6
     # reward = 0.1 - 1.6 = -1.5, risk = 1 + 1.6 = 2.6 -> RR < 0
-    ok, msg = _scenario_slippage_spike("CALL", 100, 99, 100.1, 10, 50)
+    ok, msg = _scenario_slippage_spike(100, 99, 100.1, 10, 50)
     assert not ok
     assert "cost profit khai jashe" in msg
 
     # RR >= 0.5
-    ok, msg = _scenario_slippage_spike("CALL", 100, 90, 120, 10, 5)
+    ok, msg = _scenario_slippage_spike(100, 90, 120, 10, 5)
     assert ok
 
 def test_scenario_wick_hunt():
@@ -160,7 +161,7 @@ def test_scenario_volume_drop():
 
 def test_run_scenarios():
     # Insufficient inputs (fail-open)
-    res = run_scenarios(None, 0, 0, 0, None)
+    res = run_scenarios(ScenarioConfig(None, 0, 0, 0, None))
     assert res["action"] == "pass"
     assert res["passed"] == 0
 
@@ -172,7 +173,7 @@ def test_run_scenarios():
         })
     df = pd.DataFrame(data)
 
-    res = run_scenarios("CALL", 100, 90, 110, df)
+    res = run_scenarios(ScenarioConfig("CALL", 100, 90, 110, df))
     assert res["action"] == "pass"
     assert res["passed"] == 5
 
@@ -183,6 +184,6 @@ def test_run_scenarios():
     data[-1] = {"open": 100, "close": 100, "high": 100.1, "low": 100.0, "volume": 10}
     df_veto = pd.DataFrame(data)
 
-    res2 = run_scenarios("CALL", 100, 90, 200, df_veto)
+    res2 = run_scenarios(ScenarioConfig("CALL", 100, 90, 200, df_veto))
     assert res2["action"] == "veto"
     assert res2["passed"] < 3

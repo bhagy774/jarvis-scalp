@@ -95,7 +95,7 @@ def test_cognitive_bus():
     assert reports[0]['payload'] == "report content"
 
     # Test report_error
-    bus.report_error("TestPart", Exception("Test error"), context="test context", try_ollama=False)
+    bus.report_error("TestPart", Exception("Test error"), context="test context")
     health = bus.get_system_health()
     assert health["TestPart"].startswith("WARNING (1 errors)")
 

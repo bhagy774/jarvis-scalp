@@ -1,3 +1,4 @@
+from central_entry_fixture import entry_evidence
 """Offline production-module behavior checks; no network, model inference or orders."""
 import os
 import unittest
@@ -50,17 +51,17 @@ class MigrationIntegration(unittest.TestCase):
         oracle = JarvisMarketOracle.__new__(JarvisMarketOracle)
         oracle._gemini_client = Mock()
         no_data = {'btc_spot': 0, 'deribit': {}, 'microstructure': {}}
-        board = oracle._run_ollama_board(no_data)
+        board = oracle._run_ai_board(no_data)
         self.assertEqual(board['verdict'], 'WAIT')
-        for method in (oracle._call_ollama_oracle, oracle._call_gemini_oracle):
+        for method in (oracle._call_ai_oracle, oracle._call_gemini_oracle):
             self.assertEqual(method(no_data, board)['trade_suggestion'], 'WAIT')
         oracle._gemini_client.models.generate_content.assert_not_called()
         observed = {'btc_spot': 100., 'deribit': {'pcr': .70, 'max_pain': 105.},
                     'microstructure': {'imbalance_pct': 2.}}
-        fc = oracle._call_ollama_oracle(observed, board)
+        fc = oracle._call_ai_oracle(observed, board)
         self.assertEqual(fc['model_used'], 'local_synthesizer')
         self.assertIn(fc['trade_suggestion'], ('CALL', 'PUT', 'WAIT'))
-        self.assertEqual(oracle._call_ollama_oracle({'btc_spot': 100., 'deribit': {},
+        self.assertEqual(oracle._call_ai_oracle({'btc_spot': 100., 'deribit': {},
                                                      'microstructure': {}}, board)['trade_suggestion'], 'WAIT')
 
     def test_oracle_gate_rejects_model_and_stale_maps(self):
@@ -101,8 +102,7 @@ class MigrationIntegration(unittest.TestCase):
              patch('jarvis_live_trader._get_sizer', return_value=None):
             # Direct private caller cannot slip a model-selected leg into even
             # a paper position. No order or exchange mutation is permitted.
-            result = trader._place_trade('CALL', 90, 100., 'SCALP',
-                                         {'do_hedge': True, 'strike': 105, 'option_type': 'PUT'}, 'BTCUSDT')
+            result = trader._place_trade('CALL', 90, 100., entry_evidence('BTCUSDT', 'CALL', 90, 100.)[1], {'do_hedge': True, 'strike': 105, 'option_type': 'PUT'}, 'BTCUSDT', **entry_evidence('BTCUSDT', 'CALL', 90, 100.)[0])
         self.assertTrue(result['success'])
         self.assertIsNone(result['hedge'])
         self.assertEqual(delta.order_calls, [])

@@ -53,12 +53,17 @@ class AuditRegressionTests(unittest.TestCase):
         self.assertFalse(macro["execution_allowed"])
 
     def test_mtf_fetch_uses_selected_symbol(self):
+        import time
+        from direct_candle_cache import DirectCandleCache
+        from native_candle_fixture import native_times
         class Delta:
             def __init__(self):
                 self.symbols = []
-            def get_historical_candles(self, symbol, resolution, limit):
+            def get_historical_candles_with_metadata(self, symbol, resolution, limit):
                 self.symbols.append(symbol)
-                return [{"time": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}]
+                return {"source": "binance", "symbol": symbol, "candles": [
+                    {"time": ts, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}
+                    for ts in native_times(resolution, time.time(), limit)]}
         try:
             import jarvis_FIXED
         except ModuleNotFoundError as exc:
@@ -66,6 +71,7 @@ class AuditRegressionTests(unittest.TestCase):
         engine = object.__new__(jarvis_FIXED.JarvisElite)
         engine.is_backtest_mode = False
         engine.delta_client = Delta()
+        engine.direct_candle_cache = DirectCandleCache(engine.delta_client)
         data = engine._fetch_mtf_from_api("ETHUSDT")
         self.assertTrue(data)
         self.assertEqual(set(engine.delta_client.symbols), {"ETHUSDT"})

@@ -1,3 +1,4 @@
+from central_entry_fixture import entry_evidence
 import os
 import unittest
 from io import StringIO
@@ -28,6 +29,10 @@ class VenueStub:
         self.leverage_calls.append((symbol, leverage))
         return self.leverage_ok
 
+    def place_protected_order(self, **kwargs):
+        assert self.set_leverage(kwargs["symbol"], kwargs["leverage"]) is False
+        return {"status": "REJECTED", "authoritative": True, "reason": "Leverage rejected"}
+
     def place_order(self, *args, **kwargs):
         self.order_calls.append((args, kwargs))
         return {"success": True, "order_id": "unexpected"}
@@ -56,9 +61,10 @@ class AutoRiskDashboardTests(unittest.TestCase):
             direction="CALL",
             confidence=90,
             price=100.0,
-            trade_type="SCALP",
+            trade_type=entry_evidence("BTCUSDT", "CALL", 90, 100.0)[1],
             hedge_plan={"do_hedge": False},
-            symbol="BTCUSDT"
+            symbol="BTCUSDT",
+            **entry_evidence("BTCUSDT", "CALL", 90, 100.0)[0]
         )
         result = trader._place_trade(req)
         self.assertFalse(result["success"])
@@ -75,12 +81,14 @@ class AutoRiskDashboardTests(unittest.TestCase):
             direction="CALL",
             confidence=90,
             price=100.0,
-            trade_type="SCALP",
+            trade_type=entry_evidence("BTCUSDT", "CALL", 90, 100.0)[1],
             hedge_plan={"do_hedge": False},
-            symbol="BTCUSDT"
+            symbol="BTCUSDT",
+            **entry_evidence("BTCUSDT", "CALL", 90, 100.0)[0]
         )
         result = trader._place_trade(req)
         self.assertFalse(result["success"])
+        self.assertEqual(result["reason"], "Leverage rejected")
         self.assertEqual(len(venue.leverage_calls), 1)
         self.assertEqual(venue.order_calls, [])
 

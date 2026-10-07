@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from native_candle_fixture import native_times, TIMEFRAME_HISTORY_CANDLES
 from direct_candle_cache import DirectCandleCache, FETCH_CANDLES, LIVE_TIMEFRAMES
 from jarvis_delta_execution import DeltaExecutionAdapter, build_delta_candidate
 from jarvis_multicoin_execution import CandidateRejected
@@ -38,11 +39,8 @@ class OfflineBinanceCandles:
         self.last_candle_source = "binance"
 
     def get_historical_candles_with_metadata(self, *, symbol, resolution, limit):
-        step = STEPS[resolution]
-        forming = int(NOW // step) * step
-        start = forming - (limit - 1) * step
         rows = []
-        for timestamp in range(start, forming + step, step):
+        for timestamp in native_times(resolution, NOW, limit):
             close = 100.0 + (timestamp % 1_000_000) * 1e-6
             rows.append({"time": timestamp, "open": close - 0.01, "high": close + 0.10,
                          "low": close - 0.10, "close": close, "volume": 10.0})

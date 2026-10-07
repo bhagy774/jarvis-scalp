@@ -23,7 +23,11 @@ def test_enabled_path_uses_rust_or_logs_explicit_fallback(monkeypatch, caplog):
     except ImportError:
         assert "jarvis_rust is unavailable" in caplog.text
     else:
-        assert "jarvis_rust is unavailable" not in caplog.text
+        import jarvis_rust
+        if callable(getattr(jarvis_rust, "calculate_sma", None)):
+            assert "jarvis_rust is unavailable" not in caplog.text
+        else:
+            assert "jarvis_rust is unavailable" in caplog.text
     monkeypatch.setenv("JARVIS_RUST_MATH", "0")
     importlib.reload(integration)
 

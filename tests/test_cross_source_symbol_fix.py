@@ -13,11 +13,12 @@ def test_cross_source_uses_active_base_asset():
     src = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), 'jarvis_FIXED.py'), encoding='utf-8').read()
     assert 'active_base_asset' in src, "brain must track active_base_asset"
-    assert 'get_live_price(symbol=f"{_xs_base}USDT")' in src, (
-        "cross-source check must fetch the selected coin's Binance price")
-    # Old buggy call must be gone from the cross-source block
-    assert 'self.binance_data.get_live_price()' not in src, (
-        "default BTCUSDT cross-source call must be removed")
+    # Raw cross-source fallback was retired in favor of exact Spot cache identity.
+    assert "snapshot.identity != ('binance', 'spot', _canonical, _canonical)" in src
+    assert "_canonical = str(symbol).upper()" in src
+    assert "_fetch_mtf_from_api(getattr(self, 'active_symbol', None))" in src
+    assert 'self.binance_data.get_live_price()' not in src
+
 
 
 def test_loop_sets_active_symbol_on_brain():

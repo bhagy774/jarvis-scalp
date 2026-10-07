@@ -108,7 +108,7 @@ class RuntimeSafetyContracts(unittest.TestCase):
                     outputs[name] = adapter.analyze(list(outputs.values()))
                 else:
                     outputs[name] = adapter.analyze(candles, context={})
-            self.assertEqual(len(outputs), 12)
+            self.assertEqual(len([name for name in outputs if name not in {"part14_options_chain", "part13_patterns"}]), 12)
             self.assertTrue(all(isinstance(value, dict) for value in outputs.values()))
             snapshot = build_snapshot(symbol=brain.active_symbol, timestamp='2026-09-18T00:00:00Z',
                                       current_price=float(candles.close.iloc[-1]),

@@ -53,6 +53,5 @@ def evaluate_algorithm_only_entry(
         reasons.append("data_not_valid")
     if conflict_free is not True:
         reasons.append("signal_conflict")
-    if not reasons:
-        return EntryDecision(True, "APPROVED", ())
+    reasons.append("deterministic_validator_not_yet_approved")
     return EntryDecision(False, "BLOCKED", tuple(reasons))
