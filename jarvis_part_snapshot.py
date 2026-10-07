@@ -70,8 +70,8 @@ def flatten_result(obj: Any, prefix: str = "", out: Optional[Dict[str, float]] =
     return out
 
 
-def candle_features(frame_closed) -> Dict[str, float]:
-    """Shared 15m candle features from jarvis_xgb_meta (same code as the gate)."""
+def candle_features(frame_closed, tf: str = "15m") -> Dict[str, float]:
+    """Candle features of ONE timeframe (same code as the gate: no train/live skew)."""
     try:
         import numpy as np
         from jarvis_xgb_meta import FEATURE_NAMES, feature_matrix
@@ -79,10 +79,30 @@ def candle_features(frame_closed) -> Dict[str, float]:
         if X is None:
             return {}
         row = X[-1]
-        return {f"c15.{n}": float(v) for n, v in zip(FEATURE_NAMES, row)
+        return {f"tf{tf}.{n}": float(v) for n, v in zip(FEATURE_NAMES, row)
                 if n != "direction" and np.isfinite(v)}
     except Exception:
         return {}
+
+
+def all_timeframe_features(snapshot) -> Dict[str, float]:
+    """Candle features for EVERY timeframe frame of this coin's snapshot (closed bars only).
+    Timeframes with too little history are simply absent (never fabricated)."""
+    out: Dict[str, float] = {}
+    frames = getattr(snapshot, "frames", None) or {}
+    for tf, fr in frames.items():
+        closed = getattr(fr, "closed", None)
+        if closed is not None:
+            out.update(candle_features(closed, str(tf)))
+    return out
+
+
+def build_feature_row(result: Any, snapshot: Any) -> Dict[str, float]:
+    """Single feature dict used by BOTH the recorder and the live advisor."""
+    feats = all_timeframe_features(snapshot)
+    feats.update(flatten_result(
+        {k: v for k, v in (result or {}).items() if k != "candle_snapshot"}))
+    return feats
 
 
 class PartSnapshotRecorder:
@@ -115,7 +135,7 @@ class PartSnapshotRecorder:
                 "v": SCHEMA_VERSION, "ts": time.time(), "symbol": sym, "bar_ts": bar_ts,
                 "close": float(closed[cols["close"]].iloc[-1]),
                 "raw_direction": str(direction), "confidence": _num(confidence),
-                "candle": candle_features(closed), "parts": parts,
+                "candle": all_timeframe_features(snapshot), "parts": parts,
             }
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.path, "a") as fh:
