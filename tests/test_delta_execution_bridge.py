@@ -55,7 +55,7 @@ def valid_part7_gate(symbol):
         "timeframe_results": {
             tf: {"symbol": symbol, "timeframe": tf, "status": "neutral",
                  "data_status": "valid", "entry_blocked": False, "risk_veto": False}
-            for tf in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+            for tf in REQUIRED_TIMEFRAMES
         },
     }
 
@@ -218,8 +218,10 @@ def test_valid_eth_bridge_sizes_from_delta_metadata_quote_and_risk_engine():
 def test_mapping_quote_product_freshness_and_missing_data_all_fail_closed():
     fake = FakeDelta()
     zone_veto = analysis()
-    zone_veto["parts_by_timeframe"]["3m"]["part2"]["signal"] = -1
-    zone_veto["parts_by_timeframe"]["3m"]["part2"]["thought"] = "resistance zone"
+    # Frames are vote-averaged by horizon group, so a real zone veto must hold across frames.
+    for _tf in REQUIRED_TIMEFRAMES:
+        zone_veto["parts_by_timeframe"][_tf]["part2"]["signal"] = -1
+        zone_veto["parts_by_timeframe"][_tf]["part2"]["thought"] = "resistance zone"
     bad_results = [
         zone_veto,
         analysis(parts_by_timeframe=None),

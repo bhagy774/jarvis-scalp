@@ -1148,13 +1148,16 @@ class JarvisAutoTrader:
                 sig = result.get("trade_signal", {})
                 selected_symbol = str(pos.get("symbol", "")).upper()
                 selected_ctx = (result.get("market_context", {}) or {}).get("options_context", {})
+                from jarvis_decision import DecisionContext, build_final_decision
                 reversal_decision = build_final_decision(
                     sig,
-                    symbol=selected_symbol,
-                    price=position_price,
-                    opinions=result.get("decision_opinions", []) or [],
-                    options_context=selected_ctx,
-                    require_options=bool(self.is_enabled),
+                    DecisionContext(
+                        symbol=selected_symbol,
+                        price=position_price,
+                        opinions=result.get("decision_opinions", []) or [],
+                        options_context=selected_ctx,
+                        require_options=bool(self.is_enabled),
+                    ),
                 )
                 if not reversal_decision.get("execution_allowed"):
                     logger.info("[REVERSAL] blocked by canonical decision: %s", reversal_decision.get("reasons"))

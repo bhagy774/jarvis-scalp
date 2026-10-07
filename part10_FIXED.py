@@ -452,6 +452,10 @@ class DeepSeekValidator:
 
 # ==================== OLLAMA LOCAL AI TRADE VALIDATOR (THE JUDGE) ====================
 
+# Model judges are retired; validator stays disabled (fail closed).
+OLLAMA_INTEGRATION_AVAILABLE = False
+
+
 class OllamaLocalValidator:
     """100% Offline Local AI Trade Validator (The Judge) using Ollama"""
     

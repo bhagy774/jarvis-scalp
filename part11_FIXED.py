@@ -1183,14 +1183,19 @@ class SignalFusionEngineGPU:
 
     @part_advisory_entry("part11_fusion", data_parameter="results_by_timeframe", context_parameter="context", evidence_context_key="neural_advisory_evidence")
     def analyze_multi_timeframe(self, results_by_timeframe: Dict[str, Any], context=None) -> Dict[str, Any]:
-        """Fuse each native frame independently, then summarize all eight frames.
+        """Fuse each native frame independently, then summarize all native frames.
 
         This remains Parts 1–10 evidence, not execution authority. Every row is
         passed through the existing Part 11 engine with its canonical part names.
         """
-        timeframes = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
-        tf_weights = {"1m": 1.0, "3m": 1.5, "5m": 2.0, "15m": 3.0,
-                      "30m": 4.0, "1h": 5.0, "2h": 6.0, "4h": 7.0}
+        # Same native frame set as the central MTF strategy. Each correlation
+        # group shares one horizon weight so correlated frames do not multiply it.
+        from binance_timeframes import (
+            BINANCE_SPOT_TIMEFRAMES as timeframes,
+            TIMEFRAME_CORRELATION_GROUPS, TIMEFRAME_GROUP_WEIGHTS,
+        )
+        tf_weights = {tf: TIMEFRAME_GROUP_WEIGHTS[g] / len(members)
+                      for g, members in TIMEFRAME_CORRELATION_GROUPS.items() for tf in members}
         if not isinstance(results_by_timeframe, dict) or set(results_by_timeframe) != set(timeframes):
             return {"signal": 0, "thought": "Part11 MTF evidence incomplete",
                     "data_status": "error", "timeframe_coverage": []}

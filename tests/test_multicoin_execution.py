@@ -38,7 +38,7 @@ def part7_gate(symbol):
         "timeframe_results": {
             tf: {"symbol": symbol, "timeframe": tf, "status": "neutral",
                  "data_status": "valid", "entry_blocked": False, "risk_veto": False}
-            for tf in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+            for tf in REQUIRED_TIMEFRAMES
         },
     }
 
@@ -132,10 +132,12 @@ def test_candidate_contract_requires_all_explicit_fields_and_asset_policy():
     contract_candidate = candidate_from_analysis(analysis(plan=contract_plan), policy_registry=POLICIES, now=NOW)
     assert contract_candidate.notional == 1000.0 and contract_candidate.risk_notional == 20.0
     zone_veto = analysis()
-    zone_veto["parts_by_timeframe"]["3m"]["part2_zone"].update({
-        "signal": -1, "thought": "resistance zone", "symbol": "BTCUSDT",
-        "timeframe": "3m", "native_timeframe": "3m",
-    })
+    # Frames are vote-averaged by horizon group, so a real zone veto must hold across frames.
+    for _tf in REQUIRED_TIMEFRAMES:
+        zone_veto["parts_by_timeframe"][_tf]["part2_zone"].update({
+            "signal": -1, "thought": "resistance zone", "symbol": "BTCUSDT",
+            "timeframe": _tf, "native_timeframe": _tf,
+        })
     wrong_frame = analysis()
     wrong_frame["parts_by_timeframe"]["4h"]["part6_trend"]["symbol"] = "ETHUSDT"
     for bad_result, policies in [
