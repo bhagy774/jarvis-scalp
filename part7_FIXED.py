@@ -398,7 +398,8 @@ class VolatilityEngineGPU:
         """
         try:
             if data is None or not isinstance(data, pd.DataFrame) or len(data) < 30:
-                return {"signal": 0, "confidence": 5.0, "thought": "Part7 Vol: Insufficient data (<30)"}
+                return {"signal": 0, "confidence": 5.0, "thought": "Part7 Vol: Insufficient data (<30)",
+                        "telemetry": {"status": "insufficient_or_invalid_ohlcv"}}
 
             # ── Check regime override from context ────────────────────────
             if context:
@@ -408,7 +409,9 @@ class VolatilityEngineGPU:
                         "signal": 0,
                         "confidence": 5.0,
                         "thought": f"Part7 Vol: High Volatility Regime ({regime}) — No trade veto",
-                        "telemetry": {"regime": regime}
+                        "entry_blocked": True,
+                        "risk_veto": True,
+                        "telemetry": {"regime": regime, "entry_blocked": True, "risk_veto": True}
                     }
 
             recent = data.tail(50).copy()
@@ -417,7 +420,8 @@ class VolatilityEngineGPU:
             lows   = recent['low'].astype(float)
 
             if len(closes) < 20:
-                return {"signal": 0, "confidence": 5.0, "thought": "Part7 Vol: Insufficient closes"}
+                return {"signal": 0, "confidence": 5.0, "thought": "Part7 Vol: Insufficient closes",
+                        "telemetry": {"status": "insufficient_or_invalid_ohlcv"}}
 
             current_close = float(closes.iloc[-1])
 
@@ -438,7 +442,10 @@ class VolatilityEngineGPU:
                     "signal": 0,
                     "confidence": 5.0,
                     "thought": f"Part7 Vol: HMM High Volatility State Detected (P={emission_prob_high:.2f}) — Risk Veto",
-                    "telemetry": {"regime": hmm_state, "emission_prob": emission_prob_high}
+                    "entry_blocked": True,
+                    "risk_veto": True,
+                    "telemetry": {"regime": hmm_state, "emission_prob": emission_prob_high,
+                                  "entry_blocked": True, "risk_veto": True}
                 }
 
             # 1. Bollinger Bands (20-period SMA, 2.0 std)
@@ -485,7 +492,9 @@ class VolatilityEngineGPU:
                     "signal": 0,
                     "confidence": 5.0,
                     "thought": f"Part7 Vol: Extreme Volatility Spike ({vol_ratio:.1f}x, ATR={norm_atr*100:.2f}%) — Risk Veto",
-                    "telemetry": telemetry
+                    "entry_blocked": True,
+                    "risk_veto": True,
+                    "telemetry": {**telemetry, "entry_blocked": True, "risk_veto": True}
                 }
 
             # 7. Squeeze Compression Coiling (Pre-Breakout Consolidation)
@@ -530,7 +539,7 @@ class VolatilityEngineGPU:
                 "signal": 0,
                 "confidence": 5.0,
                 "thought": f"Part7 Vol: Neutral (error: {e})",
-                "telemetry": {}
+                "telemetry": {"status": "analysis_error", "error": str(e)}
             }
 
 @dataclass
