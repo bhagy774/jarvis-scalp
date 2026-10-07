@@ -2911,6 +2911,29 @@ class LiveTradingEngine:
                         result = self._apply_options_confirmation(result, symbol)
                         direction, confidence, entry_price, tp1, tp2, sl, expiry = \
                             self._print_live_signal(result, current_price, symbol=symbol, df=df)
+                        # Record Parts 1-12 outputs + this coin's 15m candle features
+                        # (once per closed 15m bar) for offline XGBoost training.
+                        # Advisory data only; never affects the decision.
+                        try:
+                            from jarvis_part_snapshot import get_recorder
+                            get_recorder().record(symbol, result, snapshot, direction, confidence)
+                        except Exception:
+                            pass
+                        # XGBoost trade-mode advisor (NO_TRADE/SCALP/SWING) from all Part outputs
+                        # + every timeframe of this coin. Advisory: shadow logs only; veto only
+                        # with a validated model and JARVIS_XGB_ADVISOR=veto. Never creates/sizes.
+                        self.last_xgb_mode = None
+                        try:
+                            from jarvis_part_snapshot import build_feature_row
+                            from jarvis_xgb_mode import get_advisor
+                            self.last_xgb_mode = get_advisor().advise(
+                                symbol, build_feature_row(result, snapshot), direction)
+                            if self.last_xgb_mode.get('veto') and direction in ('CALL', 'PUT'):
+                                self._dashboard_events.append(
+                                    f"XGB mode veto {direction}: advice={self.last_xgb_mode.get('advice')}")
+                                direction = 'NO_TRADE'
+                        except Exception:
+                            pass
 
                         # 1M ENTRY CONFIRMATION GATE: HTF decision valid,
                         # pan 1m candle confirm na kare to aa cycle ma entry skip.
