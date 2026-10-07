@@ -155,6 +155,66 @@ def xgb_brain(name: str, method: str):
     return deco
 
 
+def _features_any(result) -> Dict[str, float]:
+    """Features from heterogeneous brain outputs (dict / list of dicts / number). Read-only."""
+    if isinstance(result, dict):
+        return extract_features(result)
+    if isinstance(result, (bool, np.bool_)):
+        return {"value": float(bool(result))}
+    if isinstance(result, (int, float, np.integer, np.floating)):
+        f = float(result)
+        return {"value": f} if math.isfinite(f) else {}
+    if isinstance(result, (list, tuple)):
+        feats = {"count": float(len(result))}
+        dicts = [extract_features(r) for r in result if isinstance(r, dict)]
+        keys = sorted({k for d in dicts for k in d})
+        for k in keys:
+            vals = [d[k] for d in dicts if k in d]
+            if vals:
+                feats["mean_" + k] = float(np.mean(vals))
+        return feats
+    return {}
+
+
+def xgb_shadow(name: str, method: str):
+    """SIDE-CHANNEL shadow hook for Part 2/3 brains whose return type must NOT change
+    (str / float / list / internal-state dict / broker order dict).
+    The original return value is passed through UNTOUCHED (same object, nothing added).
+    Confidence is stored on the instance: brain.last_xgb = {'confidence': p, 'active': bool}.
+    Never raises, never changes decisions."""
+    def deco(cls):
+        orig = getattr(cls, method)
+
+        def wrapped(self, *a, **k):
+            result = orig(self, *a, **k)
+            try:
+                state = getattr(self, "_xgb_state", None)
+                if state is None:
+                    state = BrainXGB(name)
+                    self._xgb_state = state
+                feats = _features_any(result)
+                state.last_features = feats
+                conf, active = state.predict(feats) if feats else (NEUTRAL, False)
+                self.last_xgb = {"confidence": conf, "active": active}
+            except Exception:
+                self.last_xgb = {"confidence": NEUTRAL, "active": False}
+            return result
+        wrapped.__name__ = orig.__name__
+        wrapped.__doc__ = orig.__doc__
+        setattr(cls, method, wrapped)
+
+        def record_outcome(self, outcome: int, features: Optional[dict] = None):
+            state = getattr(self, "_xgb_state", None)
+            if state is None:
+                state = BrainXGB(name)
+                self._xgb_state = state
+            return state.record_outcome(features, outcome)
+        cls.record_outcome = record_outcome
+        cls._xgb_name = name
+        return cls
+    return deco
+
+
 def load_outcomes(name: str):
     path = os.path.join(BUFFER_DIR, f"{name}.jsonl")
     rows = []

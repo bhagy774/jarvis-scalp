@@ -336,6 +336,9 @@ class CandlePsychologyMasterGPU:
             return {}
 
 
+from brain_xgb import xgb_shadow
+
+@xgb_shadow('zone_detector', 'detect_0_5_zone_signals')
 class ZonePointFiveDetectorGPU:
     def __init__(self, master=None):
         self.master = master
@@ -373,6 +376,7 @@ except Exception:
 
 # ==================== GPU-OPTIMIZED INSTITUTIONAL TRADING ENGINE ====================
 
+@xgb_shadow('inst_trading', 'generate_live_signals')
 class InstitutionalTradingEngineGPU:
     def __init__(self, master_system=None):
         self.master = master_system
@@ -1182,6 +1186,7 @@ CURRENT STATE:
 
 # ==================== GPU-OPTIMIZED INSTITUTIONAL RISK MANAGEMENT ENGINE ====================
 
+@xgb_shadow('inst_risk', 'calculate_institutional_position_size')
 class InstitutionalRiskManagementEngineGPU:
     def __init__(self, trading_engine):
         self.trading_engine = trading_engine
@@ -1366,6 +1371,7 @@ CURRENT EXPOSURE:
 
 # ==================== INSTITUTIONAL TRADE EXECUTION ENGINE ====================
 
+@xgb_shadow('inst_execution', '_prepare_trade_order')
 class InstitutionalTradeExecutionEngine:
     def __init__(self, trading_engine):
         self.trading_engine = trading_engine
