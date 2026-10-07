@@ -1,14 +1,12 @@
 """
 JARVIS SYSTEM 2: XGBOOST TABULAR ALPHA & META-LABELING ENGINE (v3.4.1)
 =======================================================================
-Implements Marcos López de Prado's Triple-Barrier Meta-Labeling across
-a 48-dimensional continuous quantitative feature store.
+Implements a legacy 48-dimensional quantitative feature store and optional
+XGBoost inference. Model provenance is reported; predictions are not claimed
+as out-of-sample calibrated without independent validation.
 
-Computes:
-1. P(Win >= 1.5R) out-of-sample calibrated probability.
-2. Fractional Kelly Criterion position sizing: f* = lambda * ((p*b - q)/b)
-3. Dynamic Expected Return and Scalp vs Swing Regime Classification.
-4. Fail-closed gate: Requires P(Win) >= 0.68 for trade authorization.
+Computes a model score, an illustrative Kelly-style sizing value, and a
+regime classification. This module does not itself grant trading authority.
 """
 from __future__ import annotations
 
@@ -67,34 +65,44 @@ assert len(FEATURE_NAMES) == 48, f"Feature store must contain exactly 48 feature
 
 class JarvisXGBoostEngine:
     """
-    Tier-1 Quantitative Tabular Alpha & Meta-Labeling Engine.
-    Evaluates 48 continuous features using an out-of-sample gradient boosting tree.
+    Legacy 48-feature tabular scoring engine with optional local XGBoost inference.
+    The inference score is not considered calibrated or validation-approved here.
     """
 
-    def __init__(self, model_path: Optional[str] = None):
+    def __init__(self, model_path: Optional[str] = None, allow_bootstrap: bool = True):
         self.model: Optional[xgb.Booster] = None
         self.feature_names = FEATURE_NAMES
         self.model_path = model_path or os.path.join(os.path.dirname(__file__), "models", "jarvis_xgboost_btc_eth.json")
+        self.allow_bootstrap = bool(allow_bootstrap)
+        # is_bootstrapped is retained for legacy callers; provenance below states
+        # whether the available model came from synthetic or candle data.
         self.is_bootstrapped = False
+        self.model_source: Optional[str] = None
+        self.training_status = "unavailable"
+        self.approved_for_advisory = False
         self._load_or_initialize()
 
     def _load_or_initialize(self):
-        """Load pre-trained model if available on disk."""
+        """Load a local artifact, optionally falling back to synthetic priors."""
         if os.path.exists(self.model_path):
             try:
-                self.model = xgb.Booster()
-                self.model.load_model(self.model_path)
+                candidate = xgb.Booster()
+                candidate.load_model(self.model_path)
+                self.model = candidate
                 self.is_bootstrapped = True
-                logger.info("Loaded pre-trained XGBoost model from %s", self.model_path)
+                self.model_source = "local_model_artifact"
+                self.training_status = "artifact_loaded_unvalidated"
+                self.approved_for_advisory = False
+                logger.info("Loaded local XGBoost model artifact from %s", self.model_path)
                 return
             except Exception as e:
-                logger.warning("Failed to load existing XGBoost model: %s; re-initializing", e)
+                logger.warning("Failed to load existing XGBoost model: %s", e)
 
-        # Initialize with baseline institutional trees
-        self._create_bootstrap_baseline()
+        if self.allow_bootstrap:
+            self._create_bootstrap_baseline()
 
     def _create_bootstrap_baseline(self):
-        """Create initial calibrated baseline model using synthetic institutional priors."""
+        """Fit a synthetic-prior demonstration model (uncalibrated; not validation)."""
         np.random.seed(42)
         n_samples = 2000
         # Synthetic feature distribution with realistic correlations
@@ -117,13 +125,11 @@ class JarvisXGBoostEngine:
         }
         self.model = xgb.train(params, dtrain, num_boost_round=60)
         self.is_bootstrapped = True
-
-        # Save to disk
-        try:
-            os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-            self.model.save_model(self.model_path)
-        except Exception:
-            pass
+        self.model_source = "synthetic_priors"
+        self.training_status = "synthetic_prior_fit_uncalibrated"
+        self.approved_for_advisory = False
+        # Synthetic demonstrations are intentionally never persisted as if they
+        # were a reusable/pretrained artifact.
 
     def bootstrap_from_candles(self, df_5m: pd.DataFrame, symbol: str = "BTCUSDT") -> bool:
         """
@@ -192,7 +198,10 @@ class JarvisXGBoostEngine:
             }
             self.model = xgb.train(params, dtrain, num_boost_round=80)
             self.is_bootstrapped = True
-            logger.info("Successfully bootstrapped XGBoost on %s historical candles for %s", len(rows), symbol)
+            self.model_source = "historical_candles"
+            self.training_status = "historical_candle_fit_unvalidated"
+            self.approved_for_advisory = False
+            logger.info("Fit XGBoost on %s historical candles for %s (not validation-gated)", len(rows), symbol)
             try:
                 self.model.save_model(self.model_path)
             except Exception:
@@ -238,137 +247,344 @@ class JarvisXGBoostEngine:
         # Microstructure body/range
         feat[28] = abs(close[-1] - close[-2]) / max(high[-1] - low[-1], 1e-6)
         
-        # Default baseline fill for remaining features
-        feat[30] = 0.70  # Default consensus
-        feat[33] = 0.50  # Max pain distance neutral
-        feat[35] = 0.75  # PCR baseline
+        # Unsupported consensus/options features remain zero placeholders in
+        # this legacy candle-only bootstrap projection; they are not observed
+        # measurements and the resulting fit is explicitly unvalidated.
         
         return np.clip(feat, -5.0, 5.0)
 
+    @staticmethod
+    def _mapping(value: Any) -> Dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _lookup(mapping: Dict[str, Any], paths: List[str]) -> Tuple[Any, Optional[str]]:
+        """Return the first explicitly supplied mapping value and its dotted path."""
+        for path in paths:
+            current: Any = mapping
+            for key in path.split("."):
+                if not isinstance(current, dict) or key not in current:
+                    current = None
+                    break
+                current = current[key]
+            if current is not None:
+                return current, path
+        return None, None
+
+    @classmethod
+    def _part_lookup(cls, part: Dict[str, Any], names: List[str]) -> Tuple[Any, Optional[str]]:
+        paths = []
+        for name in names:
+            paths.extend((name, "telemetry." + name))
+        return cls._lookup(part, paths)
+
+    def extract_feature_report(self, snapshot: Dict[str, Any], parts_results: Dict[str, Any], options_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Return legacy 48-feature values with explicit provenance and missingness.
+
+        Values retain the legacy schema and [-10, 10] clipping. Missing or
+        malformed fields are represented as zero *only for vector compatibility*
+        and listed in ``missing_features``; callers must not treat those zeros as
+        observed measurements. ``feature_sources`` is position-aligned with the
+        feature vector. A directional signal is used only in legacy slots that
+        already defined that signal fallback.
+        """
+        snapshot = self._mapping(snapshot)
+        parts_results = self._mapping(parts_results)
+        options_data = self._mapping(options_data)
+        values: List[float] = [0.0] * len(FEATURE_NAMES)
+        sources: List[Optional[str]] = [None] * len(FEATURE_NAMES)
+        missing: List[str] = []
+        used: List[str] = []
+        provided: List[str] = []
+        participation: Dict[str, str] = {}
+
+        # Names are ordered aliases; signal fallbacks are limited to the five
+        # legacy schema positions that already defined them (P1, P4, P6, P8, P9).
+        part_specs = [
+            ("part1_breakout", ("part1_breakout", "part1", "p1"), [(["breakout_intensity"], ["signal"]), (["squeeze_ratio"], []), (["wick_ratio"], [])]),
+            ("part2_zone", ("part2_zone", "part2", "p2"), [(["demand_distance_pct"], []), (["supply_distance_pct"], []), (["retest_count"], [])]),
+            ("part3_psychology", ("part3_psychology", "part3", "p3"), [(["funding_rate_zscore"], []), (["retail_long_skew"], []), (["liquidation_gravity"], [])]),
+            ("part4_volume", ("part4_volume", "part4", "p4"), [(["cvd_slope"], ["signal"]), (["relative_volume"], []), (["bid_ask_imbalance"], [])]),
+            ("part5_ml", ("part5_ml", "part5", "p5"), [(["drift_zscore"], []), (["trend_tstat"], []), (["kalman_error"], [])]),
+            ("part6_trend", ("part6_trend", "part6", "p6"), [(["ema_alignment"], ["signal"]), (["adx_15m"], []), (["adx_1h"], [])]),
+            # Part 7's norm_atr_pct is emitted in the same percent units.
+            ("part7_volatility", ("part7_volatility", "part7", "p7"), [(["atr_pct", "norm_atr_pct"], []), (["parkinson_vol"], []), (["choppiness_index"], [])]),
+            ("part8_structure", ("part8_structure", "part8", "p8"), [(["bos_choch"], ["signal"]), (["fvg_distance_pct"], []), (["order_block_status"], [])]),
+            ("part9_orderflow", ("part9_orderflow", "part9", "p9"), [(["footprint_imbalance"], ["signal"]), (["iceberg_flag"], []), (["delta_depth"], [])]),
+            ("part10_candlestats", ("part10_candlestats", "part10", "p10"), [(["wick_asymmetry"], []), (["body_ratio", "body_fraction"], []), (["consecutive_bars"], [])]),
+            # Part 11 quorum_ratio counts active evidence; consensus_ratio is
+            # accepted as its legacy alias, not interpreted as confidence.
+            ("part11_fusion", ("part11_fusion", "part11", "p11"), [(["quorum", "quorum_ratio", "consensus_ratio"], []), (["dispersion", "dispersion_variance", "vote_dispersion", "signal_dispersion"], [])]),
+            # Only an explicit historical accuracy weight is accepted. Part 12's
+            # confidence/correctness score is not historical accuracy.
+            ("part12_confidence", ("part12_confidence", "part12", "p12"), [(["accuracy_weight", "historical_accuracy_weight"], [])]),
+        ]
+
+        part_roots: Dict[str, Dict[str, Any]] = {}
+        part_names: Dict[str, str] = {}
+        for canonical, aliases, _ in part_specs:
+            raw, actual_key = self._lookup(parts_results, list(aliases))
+            root = self._mapping(raw)
+            part_roots[canonical] = root
+            part_names[canonical] = actual_key or canonical
+            present = bool(root)
+            participation[canonical] = "present" if present else "missing"
+            if present:
+                provided.append(canonical)
+
+        def assign(index: int, canonical: str, fields: List[str], fallback: List[str] = ()) -> None:
+            root = part_roots[canonical]
+            raw, field_path = self._part_lookup(root, fields)
+            if field_path is None and fallback:
+                raw, field_path = self._part_lookup(root, fallback)
+            if field_path is not None:
+                try:
+                    number = float(raw)
+                    if not math.isfinite(number):
+                        raise ValueError("non_finite")
+                    values[index] = max(-10.0, min(10.0, number))
+                    prefix = part_names[canonical]
+                    sources[index] = prefix + "." + field_path
+                    if canonical not in used:
+                        used.append(canonical)
+                    return
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            missing.append(FEATURE_NAMES[index])
+
+        index = 0
+        for canonical, _, groups in part_specs:
+            for fields, fallback in groups:
+                assign(index, canonical, fields, fallback)
+                index += 1
+
+        # Preserve two legacy telemetry fallbacks, with their original units:
+        # funding-rate z-score and order-book imbalance percent / 100.
+        aux = self._mapping(snapshot.get("auxiliary_telemetry"))
+        aux_funding, aux_funding_path = self._lookup(aux, ["funding_rate.funding_rate_zscore"])
+        if sources[6] is None and aux_funding_path is not None:
+            try:
+                number = float(aux_funding)
+                if math.isfinite(number):
+                    values[6] = max(-10.0, min(10.0, number))
+                    sources[6] = "snapshot.auxiliary_telemetry." + aux_funding_path
+                    missing.remove(FEATURE_NAMES[6])
+            except (TypeError, ValueError, OverflowError):
+                pass
+        aux_imbalance, aux_imbalance_path = self._lookup(aux, ["order_book.imbalance_pct"])
+        if sources[11] is None and aux_imbalance_path is not None:
+            try:
+                number = float(aux_imbalance) / 100.0
+                if math.isfinite(number):
+                    values[11] = max(-10.0, min(10.0, number))
+                    sources[11] = "snapshot.auxiliary_telemetry." + aux_imbalance_path + " / 100"
+                    missing.remove(FEATURE_NAMES[11])
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+        # Options: prefer an explicit telemetry envelope, then explicit top-level
+        # values. Similar names are mapped only where their stated semantics agree.
+        opt_specs = [
+            (["max_pain_distance_pct"],), (["max_pain_velocity_24h"],),
+            (["pcr", "pcr_volume"],), (["pcr_oi"],), (["pcr_velocity_7d"],),
+            (["net_dealer_gex"],), (["call_wall_distance_pct", "resistance_distance_pct"],),
+            (["put_wall_distance_pct", "support_distance_pct"],), (["atm_iv"],),
+            (["iv_rv_spread"],), (["expected_move_24h_pct"],), (["gamma_flip_distance_pct"],),
+        ]
+        opt_telem = self._mapping(options_data.get("telemetry"))
+        for offset, (aliases,) in enumerate(opt_specs, start=33):
+            raw, path = self._lookup(opt_telem, aliases)
+            prefix = "options_data.telemetry"
+            if path is None:
+                raw, path = self._lookup(options_data, aliases)
+                prefix = "options_data"
+            if path is not None:
+                try:
+                    number = float(raw)
+                    if math.isfinite(number):
+                        values[offset] = max(-10.0, min(10.0, number))
+                        sources[offset] = prefix + "." + path
+                        continue
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            missing.append(FEATURE_NAMES[offset])
+
+        # Cross-asset values are used only when explicitly present in snapshot.
+        for offset, aliases in ((45, ["eth_btc_momentum"]), (46, ["btc_dominance_trend"]), (47, ["session_liquidity"])):
+            raw, path = self._lookup(snapshot, aliases)
+            if path is not None:
+                try:
+                    number = float(raw)
+                    if math.isfinite(number):
+                        values[offset] = max(-10.0, min(10.0, number))
+                        sources[offset] = "snapshot." + path
+                        continue
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            missing.append(FEATURE_NAMES[offset])
+
+        # Snapshot values contain compatibility zeros for missing slots; the
+        # report remains authoritative about whether each value was observed.
+        return {
+            "features": values,
+            "feature_names": list(FEATURE_NAMES),
+            "feature_sources": sources,
+            "missing_features": missing,
+            "parts_used": used,
+            "parts_provided": provided,
+            "parts_participation": participation,
+        }
+
     def extract_48_features(self, snapshot: Dict[str, Any], parts_results: Dict[str, Any], options_data: Dict[str, Any]) -> np.ndarray:
-        """
-        Assembles the comprehensive 48-feature store vector from active parts and options.
-        """
-        vec = np.zeros(48, dtype=np.float32)
+        """Legacy vector API, delegated to the auditable feature report."""
+        report = self.extract_feature_report(snapshot, parts_results, options_data)
+        return np.asarray(report["features"], dtype=np.float32)
+
+    def _model_metadata(self) -> Dict[str, Any]:
+        return {
+            "model_source": self.model_source,
+            "training_status": self.training_status,
+            "approved_for_advisory": bool(self.approved_for_advisory),
+            "calibration_status": "not_established",
+        }
+
+    @staticmethod
+    def _unavailable(reason: str, **extra: Any) -> Dict[str, Any]:
+        return {"available": False, "approved": False, "reason": reason, **extra}
+
+    def _model_schema_error(self) -> Optional[str]:
+        """Fail closed unless the loaded booster declares the exact 48 names/order."""
         try:
-            # 1. Breakout (P1)
-            p1 = parts_results.get("part1_breakout", {})
-            vec[0] = float(p1.get("breakout_intensity", p1.get("signal", 0)))
-            vec[1] = float(p1.get("squeeze_ratio", 1.0))
-            vec[2] = float(p1.get("wick_ratio", 0.0))
+            feature_count = int(self.model.num_features())
+        except Exception:
+            return "model_schema_unverifiable"
+        if feature_count != len(self.feature_names):
+            return "model_feature_count_mismatch"
+        try:
+            model_names = self.model.feature_names
+        except Exception:
+            model_names = None
+        if not isinstance(model_names, (list, tuple)):
+            return "model_feature_names_unavailable"
+        if list(model_names) != list(self.feature_names):
+            return "model_feature_names_mismatch"
+        return None
 
-            # 2. Zones (P2)
-            p2 = parts_results.get("part2_zone", {})
-            vec[3] = float(p2.get("demand_distance_pct", 1.5))
-            vec[4] = float(p2.get("supply_distance_pct", 1.5))
-            vec[5] = float(p2.get("retest_count", 0))
+    def evaluate_parts(self, snapshot: Dict[str, Any], parts_results: Dict[str, Any], options_data: Dict[str, Any], direction: str = "BUY") -> Dict[str, Any]:
+        """Run inference only when every legacy model input is genuinely present.
 
-            # 3. Psychology (P3)
-            p3 = parts_results.get("part3_psychology", {})
-            aux = snapshot.get("auxiliary_telemetry", {}) if isinstance(snapshot, dict) else {}
-            fr_val = p3.get("funding_rate_zscore")
-            if fr_val is None:
-                fr_val = aux.get("funding_rate", {}).get("funding_rate_zscore", 0.0)
-            vec[6] = float(fr_val or 0.0)
-            vec[7] = float(p3.get("retail_long_skew", 0.5))
-            vec[8] = float(p3.get("liquidation_gravity", 0.0))
-
-            # 4. Volume (P4)
-            p4 = parts_results.get("part4_volume", {})
-            vec[9] = float(p4.get("cvd_slope", p4.get("signal", 0)))
-            vec[10] = float(p4.get("relative_volume", 1.0))
-            imb_val = p4.get("bid_ask_imbalance")
-            if imb_val is None:
-                imb_val = float(aux.get("order_book", {}).get("imbalance_pct", 0.0) or 0.0) / 100.0
-            vec[11] = float(imb_val or 0.0)
-
-            # 5. Statistical ML (P5)
-            p5 = parts_results.get("part5_ml", {})
-            vec[12] = float(p5.get("drift_zscore", 0.0))
-            vec[13] = float(p5.get("trend_tstat", 0.0))
-            vec[14] = float(p5.get("kalman_error", 0.0))
-
-            # 6. Trend (P6)
-            p6 = parts_results.get("part6_trend", {})
-            vec[15] = float(p6.get("ema_alignment", p6.get("signal", 0)))
-            vec[16] = float(p6.get("adx_15m", 25.0))
-            vec[17] = float(p6.get("adx_1h", 25.0))
-
-            # 7. Volatility (P7)
-            p7 = parts_results.get("part7_volatility", {})
-            vec[18] = float(p7.get("atr_pct", 0.8))
-            vec[19] = float(p7.get("parkinson_vol", 1.0))
-            vec[20] = float(p7.get("choppiness_index", 50.0))
-
-            # 8. Structure (P8)
-            p8 = parts_results.get("part8_structure", {})
-            vec[21] = float(p8.get("bos_choch", p8.get("signal", 0)))
-            vec[22] = float(p8.get("fvg_distance_pct", 0.0))
-            vec[23] = float(p8.get("order_block_status", 0.0))
-
-            # 9. Orderflow (P9)
-            p9 = parts_results.get("part9_orderflow", {})
-            vec[24] = float(p9.get("footprint_imbalance", p9.get("signal", 0)))
-            vec[25] = float(p9.get("iceberg_flag", 0.0))
-            vec[26] = float(p9.get("delta_depth", 0.0))
-
-            # 10. Microstructure (P10)
-            p10 = parts_results.get("part10_candlestats", {})
-            vec[27] = float(p10.get("wick_asymmetry", 0.0))
-            vec[28] = float(p10.get("body_ratio", 0.6))
-            vec[29] = float(p10.get("consecutive_bars", 1.0))
-
-            # 11 & 12. Consensus
-            p11 = parts_results.get("part11_fusion", {})
-            p12 = parts_results.get("part12_confidence", {})
-            vec[30] = float(p11.get("quorum", 0.70))
-            vec[31] = float(p11.get("dispersion", 0.10))
-            vec[32] = float(p12.get("accuracy_weight", 0.85))
-
-            # 14. 3D Options
-            opt_telem = options_data.get("telemetry", options_data)
-            vec[33] = float(opt_telem.get("max_pain_distance_pct", 0.0) or 0.0)
-            vec[34] = float(opt_telem.get("max_pain_velocity_24h", 0.0) or 0.0)
-            vec[35] = float(opt_telem.get("pcr", 0.75) or 0.75)
-            vec[36] = float(opt_telem.get("pcr_oi", 0.80) or 0.80)
-            vec[37] = float(opt_telem.get("pcr_velocity_7d", 0.0) or 0.0)
-            vec[38] = float(opt_telem.get("net_dealer_gex", 0.0) or 0.0)
-            vec[39] = float(opt_telem.get("resistance_distance_pct", 2.0) or 2.0)
-            vec[40] = float(opt_telem.get("support_distance_pct", 2.0) or 2.0)
-            vec[41] = float(opt_telem.get("atm_iv", 55.0) or 55.0)
-            vec[42] = float(opt_telem.get("iv_rv_spread", 0.0) or 0.0)
-            vec[43] = float(opt_telem.get("expected_move_24h_pct", 2.5) or 2.5)
-            vec[44] = float(opt_telem.get("gamma_flip_distance_pct", 0.0) or 0.0)
-
-            # Macro / Cross-Asset
-            vec[45] = float(snapshot.get("eth_btc_momentum", 0.0) or 0.0)
-            vec[46] = float(snapshot.get("btc_dominance_trend", 0.0) or 0.0)
-            vec[47] = float(snapshot.get("session_liquidity", 1.0) or 1.0)
-
-        except Exception as e:
-            logger.warning("Feature extraction partial fallback: %s", e)
-
-        return np.clip(np.nan_to_num(vec, nan=0.0, posinf=5.0, neginf=-5.0), -10.0, 10.0)
+        The vector API remains zero-filled for compatibility, but this bridge
+        refuses inference on incomplete feature reports to avoid treating those
+        compatibility zeros as observations.
+        """
+        report = self.extract_feature_report(snapshot, parts_results, options_data)
+        metadata = self._model_metadata()
+        if report["missing_features"]:
+            return self._unavailable(
+                "missing_required_features",
+                feature_report=report,
+                inference=None,
+                model_metadata=metadata,
+            )
+        if self.model is None:
+            # Do not retry into synthetic initialization here. In particular,
+            # allow_bootstrap=False is a strict no-training/no-save mode.
+            return self._unavailable(
+                "model_unavailable",
+                feature_report=report,
+                inference=None,
+                model_metadata=metadata,
+            )
+        if self.model_source == "synthetic_priors" or self.training_status == "synthetic_prior_fit_uncalibrated":
+            return self._unavailable(
+                "synthetic_model_not_advisory",
+                feature_report=report,
+                inference=None,
+                model_metadata=metadata,
+            )
+        schema_error = self._model_schema_error()
+        if schema_error:
+            return self._unavailable(
+                schema_error,
+                feature_report=report,
+                inference=None,
+                model_metadata=metadata,
+            )
+        try:
+            inference = self.evaluate(np.asarray(report["features"], dtype=np.float32), direction)
+        except Exception as exc:
+            return self._unavailable(
+                "inference_exception",
+                feature_report=report,
+                inference=None,
+                inference_error=f"{type(exc).__name__}: {exc}",
+                model_metadata=metadata,
+            )
+        if not inference.get("available", False):
+            return self._unavailable(
+                str(inference.get("reason", "inference_unavailable")),
+                feature_report=report,
+                inference=inference,
+                inference_error=inference.get("inference_error"),
+                model_metadata=metadata,
+            )
+        result = {
+            **inference,
+            "available": True,
+            "approved": bool(inference.get("approved", False)),
+            "reason": "evaluated",
+            "feature_report": report,
+            "inference": inference,
+            "model_metadata": metadata,
+        }
+        return result
 
     def evaluate(self, features_48: np.ndarray, direction: str = "BUY") -> Dict[str, Any]:
-        """
-        Inference call: Returns win probability, Kelly sizing, continuous expected return,
-        and gate approval status.
-        """
+        """Return the legacy score/gate fields plus truthful model provenance."""
         if self.model is None:
             self._load_or_initialize()
+        if self.model is None:
+            return self._unavailable("model_unavailable", **self._model_metadata())
 
-        feat = features_48.reshape(1, -1).astype(np.float32)
-        dmatrix = xgb.DMatrix(feat, feature_names=self.feature_names)
+        try:
+            feat = np.asarray(features_48, dtype=np.float32).reshape(1, -1)
+        except (TypeError, ValueError, OverflowError):
+            return self._unavailable("invalid_feature_array", **self._model_metadata())
+        if feat.shape[1] != len(self.feature_names):
+            return self._unavailable("invalid_feature_count", **self._model_metadata())
+        if not np.isfinite(feat).all():
+            return self._unavailable("non_finite_features", **self._model_metadata())
+        schema_error = self._model_schema_error()
+        if schema_error:
+            return self._unavailable(schema_error, **self._model_metadata())
+        try:
+            dmatrix = xgb.DMatrix(feat, feature_names=self.feature_names)
+            prediction = self.model.predict(dmatrix)
+            predictions = np.asarray(prediction, dtype=np.float64).reshape(-1)
+        except Exception as exc:
+            return self._unavailable(
+                "inference_exception",
+                inference_error=f"{type(exc).__name__}: {exc}",
+                **self._model_metadata(),
+            )
+        if predictions.size != 1:
+            return self._unavailable("invalid_prediction_count", **self._model_metadata())
+        raw_prob = float(predictions[0])
+        if not math.isfinite(raw_prob) or not 0.0 <= raw_prob <= 1.0:
+            return self._unavailable("invalid_prediction_probability", **self._model_metadata())
         
-        # Raw probability from logistic booster
-        raw_prob = float(self.model.predict(dmatrix)[0])
-        
-        # Directional scaling: if direction is SELL, invert directional features
-        if direction.upper() in ("SELL", "SHORT", "PUT"):
-            win_prob = raw_prob if raw_prob > 0.50 else (1.0 - raw_prob)
-        else:
+        # Raw model score. It is not presented as calibrated out-of-sample probability.
+        # This module's candle labels describe an upward/long outcome. A SELL
+        # must use the opposite class score, never max(p, 1-p), which could
+        # approve a short on strongly bullish evidence. This is still an
+        # uncalibrated classification score, not a proven short-barrier win rate.
+        normalized_direction = str(direction).upper()
+        if normalized_direction in ("SELL", "SHORT", "PUT"):
+            win_prob = 1.0 - raw_prob
+        elif normalized_direction in ("BUY", "LONG", "CALL"):
             win_prob = raw_prob
+        else:
+            return self._unavailable("invalid_trade_direction", **self._model_metadata())
 
         # Fractional Kelly Criterion calculation
         b = MIN_REWARD_TO_RISK
@@ -393,6 +609,7 @@ class JarvisXGBoostEngine:
         approved = bool(win_prob >= MIN_WIN_PROBABILITY and regime != "CHOP_AVOID")
 
         return {
+            "available": True,
             "win_probability": round(win_prob, 4),
             "win_probability_pct": f"{win_prob * 100:.1f}%",
             "kelly_fraction": round(kelly_sized, 4),
@@ -401,7 +618,8 @@ class JarvisXGBoostEngine:
             "approved": approved,
             "min_threshold": MIN_WIN_PROBABILITY,
             "latency_ms": 1.5,
-            "features_evaluated": len(self.feature_names)
+            "features_evaluated": len(self.feature_names),
+            **self._model_metadata(),
         }
 
 

@@ -6,6 +6,7 @@ aiohttp
 websockets
 websocket-client
 scikit-learn
+xgboost>=2.0,<4.0
 python-dotenv
 
 psutil

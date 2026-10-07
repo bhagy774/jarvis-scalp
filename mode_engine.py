@@ -1,10 +1,12 @@
-"""
-UNIVERSAL 29-BRAIN DECISION ENGINE  -  Omni-Timeframe Loop & Universal Consensus
-================================================================================
-EVERY SINGLE ONE OF THE 29 BRAINS in Part 1 (13 Brains) and Part 2 (16 Brains)
-evaluates EVERY SINGLE TIMEFRAME (1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d) provided by the API!
+"""Omni-timeframe decision engine with explicit Parts 1–12 integration.
 
-No timeframe is skipped, no brain is restricted, and all TFs are processed uniformly!
+Part 1's 13 and Part 2's 16 brains retain their existing votes. Parts 4–10
+add seven independent engine votes (36 total). Part 3 retains its institutional
+super-vote. Part 11 confirms direction; Part 12 gates confidence. The separate
+Part 5 institutional override remains subordinate to risk/model gates.
+
+Each provided nonempty frame is analyzed. XGBoost consumes actual named Part
+results, with missing features reported rather than fabricated. No orders here.
 """
 import time as _real_time
 import numpy as np
@@ -62,7 +64,23 @@ class ModeEngine:
     SWING_CONSENSUS_THRESHOLD = 5
     SCALP_CONSENSUS_THRESHOLD = 6
 
-    def __init__(self):
+    def __init__(self, *, enable_extended_parts=True, require_xgboost=True,
+                 min_part12_confidence=65.0, part_bridge=None, xgboost_engine=None):
+        self.enable_extended_parts = bool(enable_extended_parts)
+        self.require_xgboost = bool(require_xgboost)
+        self.min_part12_confidence = float(min_part12_confidence)
+        if not np.isfinite(self.min_part12_confidence) or not 0 <= self.min_part12_confidence <= 100:
+            raise ValueError('Part 12 confidence threshold must be 0–100')
+        self.xgboost_engine = xgboost_engine
+        self.last_xgboost_report = {'available': False, 'approved': False, 'reason': 'not_evaluated'}
+        if self.enable_extended_parts:
+            from mode_part_bridge import PartEngineBridge
+            self.part_bridge = part_bridge if part_bridge is not None else PartEngineBridge()
+            # Retain the old approximate quorum fraction for 36 independent votes.
+            self.SWING_CONSENSUS_THRESHOLD = 7  # ceil(5 * 36 / 29)
+            self.SCALP_CONSENSUS_THRESHOLD = 8  # ceil(6 * 36 / 29)
+        else:
+            self.part_bridge = None
         with _Silent():
             self.p2_system = p2.AdvancedAnalysisSystem()
             self.p2_brains = self.p2_system.brains
@@ -117,11 +135,13 @@ class ModeEngine:
             if self.p3_institutional:
                 self.p3_institutional.bus = bus
 
-    def evaluate_all_brains(self, tf_dict):
+    def evaluate_all_brains(self, tf_dict, context=None):
         """
         Omni-Timeframe Loop:
         EVERY SINGLE ONE of the 29 Brains evaluates ALL available timeframes (1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d).
         """
+        if self.part_bridge is not None:
+            self.part_bridge.reset()
         available_tfs = {}
         for k, v in tf_dict.items():
             if v is not None and not v.empty:
@@ -216,6 +236,51 @@ class ModeEngine:
             add_tf_sig("P2_InstitutionalFlow", *eval_p2_tf(lambda: (b2["institutional_flow"].analyze_institutional_flow(df), b2["institutional_flow"].get_institutional_signals(price, psy))[1]))
             add_tf_sig("P2_SignalFusion", *eval_p2_tf(lambda: b2["signal_fusion"].fuse_signals([], price, {})))
 
+            # Parts 4–12 use the same native OHLCV frame, not aggregate vote
+            # counts disguised as candle input. Parts 11/12 get named results.
+            if self.part_bridge is not None:
+                from mode_part_bridge import VOTE_NAMES, direction
+                meta_score = float(mf_res.get('support_score', 0.0))
+                p1_dir = 1 if meta_score > 0.1 and t_res['trend_direction'] == 1 else -1 if meta_score > 0.1 else 0
+                zone_dir = brain_tf_signals['P2_ZonePointFiveDetector'][tf_name][0]
+                seed = {
+                    'part1_breakout': {'signal': p1_dir, 'thought': 'ModeEngine Part 1 MetaFusion summary',
+                                       'source': 'P1_MetaFusion', 'raw_result': mf_res},
+                    'part2_zone': {'signal': 1 if zone_dir == 'BUY' else -1 if zone_dir == 'SELL' else 0,
+                                   'thought': 'ModeEngine Part 2 native zone signal', 'source': 'P2_ZonePointFiveDetector'},
+                    'part3_psychology': {'signal': 0, 'thought': 'institutional engine unavailable',
+                                        'source': 'Part3_Institutional', 'runtime_status': 'unavailable'},
+                }
+                frame_context = dict(context or {})
+                if self.p3_institutional is not None:
+                    try:
+                        p3_frame = self.p3_institutional.generate_mtf_signals({tf_name: df})
+                        consensus = float(p3_frame.get('mtf_consensus', 0.0))
+                        if not np.isfinite(consensus):
+                            raise ValueError('non-finite institutional consensus')
+                        components = p3_frame.get('components', {})
+                        if isinstance(components, dict):
+                            external_components = frame_context.get('institutional_components', {})
+                            if not isinstance(external_components, dict):
+                                external_components = {}
+                            frame_context['institutional_components'] = {
+                                **external_components, **components,
+                                # A supplied neutral regime must not erase a
+                                # native PANIC/VOLATILE observation, or vice versa.
+                                'regime': f"{components.get('regime', '')} {external_components.get('regime', '')}".strip(),
+                            }
+                        seed['part3_psychology'] = {
+                            'signal': 1 if consensus >= 0.25 else -1 if consensus <= -0.25 else 0,
+                            'thought': 'ModeEngine Part 3 institutional frame consensus',
+                            'source': 'Part3_Institutional', 'raw_result': p3_frame,
+                        }
+                    except Exception as error:
+                        seed['part3_psychology']['error'] = f'{type(error).__name__}: {error}'
+                frame_results = self.part_bridge.evaluate_frame(tf_name, df, seed, context=frame_context)
+                for key, vote_name in VOTE_NAMES.items():
+                    result = frame_results[key]
+                    add_tf_sig(vote_name, direction(result.get('signal')), float(result.get('confidence', 0)))
+
         # Synthesize final vote per brain across ALL timeframes
         final_brain_votes = {}
         high_tfs = {"1h", "4h", "1d", "60m", "240m"}
@@ -275,7 +340,76 @@ class ModeEngine:
         rr = tp_pct / max(sl_pct, 1e-8)
         return round(sl, 2), round(tp, 2), round(rr, 2)
 
-    def master_evaluate(self, m5, h1, tf_dict=None):
+    @staticmethod
+    def _prepare_inputs(m5, h1, tf_dict):
+        required = ['open', 'high', 'low', 'close', 'volume']
+        def validate(frame, name):
+            if frame is None:
+                return None
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                raise ValueError(f'{name}: empty or non-DataFrame input')
+            if not set(required).issubset(frame.columns):
+                raise ValueError(f'{name}: missing OHLCV columns')
+            normalized = frame.copy(deep=True)
+            try:
+                normalized[required] = normalized[required].astype(float)
+                values = normalized[required].to_numpy()
+            except (ValueError, TypeError) as error:
+                raise ValueError(f'{name}: nonnumeric OHLCV') from error
+            if not np.isfinite(values).all() or (values[:, :4] <= 0).any() or (values[:, 4] < 0).any():
+                raise ValueError(f'{name}: nonfinite/nonpositive prices or invalid volume')
+            if (normalized['high'] < normalized[['open', 'close', 'low']].max(axis=1)).any() or (normalized['low'] > normalized[['open', 'close', 'high']].min(axis=1)).any():
+                raise ValueError(f'{name}: invalid candle geometry')
+            return normalized
+        m5 = validate(m5, 'm5')
+        h1 = validate(h1, 'h1')
+        if tf_dict is None:
+            tf_dict = {'5min': m5, '1h': h1}
+        if not isinstance(tf_dict, dict):
+            raise ValueError('timeframes must be a dictionary')
+        frames = {str(tf): validate(df, str(tf)) for tf, df in tf_dict.items() if df is not None}
+        if not frames:
+            raise ValueError('no usable OHLCV timeframes')
+        # The provided timeframe map is the decision evidence source of truth.
+        # Resolve execution anchors from it before using optional legacy args.
+        m5 = next((frames[tf] for tf in ('5m', '5min', '1m', '3m') if tf in frames), m5)
+        h1 = next((frames[tf] for tf in ('1h', '60m', '4h', '240m', '1d') if tf in frames), h1)
+        return m5, h1, frames
+
+    def master_evaluate(self, m5, h1, tf_dict=None, *, snapshot=None, options_data=None):
+        """Evaluate Parts 1–12 and attach auditable frame/model diagnostics.
+
+        Extended mode defaults to fail-closed when real XGBoost inference is
+        unavailable. Set require_xgboost=False explicitly for algorithm-only
+        operation. This class never submits an order.
+        """
+        self.last_xgboost_report = {'available': False, 'approved': False, 'reason': 'no_candidate'}
+        self._evaluation_snapshot = dict(snapshot or {})
+        self._evaluation_options = dict(options_data or {})
+        self._candidate_mode = None
+        if self.part_bridge is not None:
+            self.part_bridge.reset()
+        try:
+            m5, h1, tf_dict = self._prepare_inputs(m5, h1, tf_dict)
+        except ValueError as error:
+            result = {'action': 'HOLD', 'trade_type': None, 'direction': None,
+                      'entry': None, 'sl': None, 'tp': None, 'rr': None,
+                      'total_brains_voted': 0, 'timeframes_evaluated': [],
+                      'all_brain_votes': {}, 'vote_tally': {}, 'reason': f'INVALID_MARKET_DATA: {error}'}
+            self.last_xgboost_report = {'available': False, 'approved': False, 'reason': 'invalid_market_data'}
+        else:
+            result = self._master_evaluate(m5, h1, tf_dict)
+        result['extended_parts_enabled'] = self.enable_extended_parts
+        result['consensus_thresholds'] = {'SWING': self.SWING_CONSENSUS_THRESHOLD,
+                                          'SCALP': self.SCALP_CONSENSUS_THRESHOLD}
+        result['xgboost_report'] = self.last_xgboost_report
+        if self.part_bridge is not None:
+            report = self.part_bridge.report(result.get('trade_type') or getattr(self, '_candidate_mode', None))
+            result['part_engine_report'] = report
+            result['part12_confidence'] = report['selected_part_results'].get('part12_confidence', {}).get('confidence')
+        return result
+
+    def _master_evaluate(self, m5, h1, tf_dict=None):
         """
         Universal Master Evaluator:
         Tallies votes from ALL 29 BRAINS evaluated across ALL API TIMEFRAMES (1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d).
@@ -283,8 +417,12 @@ class ModeEngine:
         if tf_dict is None:
             tf_dict = {"5min": m5, "1h": h1}
             
-        price = m5['close'].iloc[-1] if m5 is not None else 0
-        votes = self.evaluate_all_brains(tf_dict)
+        self._candidate_mode = None
+        entry_frame = m5 if m5 is not None else h1
+        if entry_frame is None:
+            entry_frame = next(iter(tf_dict.values()))
+        price = float(entry_frame['close'].iloc[-1])
+        votes = self.evaluate_all_brains(tf_dict, context=self._evaluation_snapshot)
 
         tally = {
             ("SWING", "BUY"): 0,
@@ -372,8 +510,51 @@ class ModeEngine:
                 }
         # --- END VETO ---
 
+        self._candidate_mode = winning_mode
+        # Native Part 11 and 12 are confirmations, not extra copies of the
+        # same evidence in the vote denominator. Part 7 risk outranks the
+        # legacy Part 5 override as well.
+        def extended_hold(reason):
+            return {'action': 'HOLD', 'trade_type': None, 'direction': None,
+                    'entry': price, 'sl': None, 'tp': None, 'rr': None,
+                    'total_brains_voted': len(votes), 'timeframes_evaluated': list(tf_dict),
+                    'all_brain_votes': votes, 'vote_tally': tally, 'reason': reason}
+
+        if winning_dir and (m5 if winning_mode == 'SCALP' else h1) is None:
+            return extended_hold('MISSING_EXECUTION_TIMEFRAME')
+
+        if winning_dir and self.part_bridge is not None:
+            gate_reason = self.part_bridge.gate(winning_mode, winning_dir, self.min_part12_confidence)
+            if gate_reason:
+                self.last_xgboost_report = {'available': False, 'approved': False,
+                                            'reason': 'deterministic_part_gate_blocked'}
+                return extended_hold(gate_reason)
+            try:
+                if self.xgboost_engine is None:
+                    from jarvis_xgboost_engine import JarvisXGBoostEngine
+                    # Never authorize trades with a synthetic on-the-fly model.
+                    self.xgboost_engine = JarvisXGBoostEngine(allow_bootstrap=False)
+                report = self.part_bridge.report(winning_mode)
+                self.last_xgboost_report = self.xgboost_engine.evaluate_parts(
+                    self._evaluation_snapshot, report['selected_part_results'],
+                    self._evaluation_options, direction=winning_dir)
+                if not isinstance(self.last_xgboost_report, dict):
+                    raise ValueError('XGBoost report must be a dictionary')
+            except Exception as error:
+                self.last_xgboost_report = {'available': False, 'approved': False,
+                    'reason': 'inference_error', 'error': f'{type(error).__name__}: {error}'}
+            if type(self.last_xgboost_report.get('available')) is not bool or type(self.last_xgboost_report.get('approved')) is not bool:
+                self.last_xgboost_report = {'available': False, 'approved': False, 'reason': 'invalid_model_report'}
+            if not self.last_xgboost_report.get('available'):
+                if self.require_xgboost:
+                    return extended_hold('XGBOOST_UNAVAILABLE: ' + str(self.last_xgboost_report.get('reason', 'unknown')))
+            elif not self.last_xgboost_report.get('approved'):
+                return extended_hold('XGBOOST_PARTS_VETO')
+
+        # Legacy 5-feature model was trained on 29-vote counts. Do NOT feed
+        # 36-vote counts to it; keep it only in explicit legacy operation.
         # --- XGBOOST CONTINUOUS META-LEARNING VETO ---
-        if winning_dir:
+        if winning_dir and self.part_bridge is None:
             try:
                 import os
                 import pandas as pd
@@ -428,7 +609,7 @@ class ModeEngine:
                 "timeframes_evaluated": list(tf_dict.keys()),
                 "all_brain_votes": votes,
                 "vote_tally": tally,
-                "reason": "NO_29_BRAIN_CONSENSUS"
+                "reason": f"NO_{len(votes)}_BRAIN_CONSENSUS"
             }
 
         sl, tp, rr = self.calculate_dynamic_sl_tp(m5 if winning_mode == "SCALP" else h1, price, winning_dir, winning_mode)
@@ -445,7 +626,7 @@ class ModeEngine:
             "timeframes_evaluated": list(tf_dict.keys()),
             "all_brain_votes": votes,
             "vote_tally": tally,
-            "reason": f"ALL_29_BRAIN_CONSENSUS_{winning_mode}_{winning_dir}"
+            "reason": f"ALL_{len(votes)}_BRAIN_CONSENSUS_{winning_mode}_{winning_dir}"
         }
 
         # Let the internal brains know the final verdict via the Cognitive Bus
