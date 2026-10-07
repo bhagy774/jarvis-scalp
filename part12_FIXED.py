@@ -1525,6 +1525,13 @@ def setup_linux_trading_environment():
 
 # ==================== GPU-OPTIMIZED PART-12: CONFIDENCE ENGINE ====================
 
+try:
+    from brain_xgb import xgb_shadow
+except Exception:  # xgboost helper missing -> no-op, engine unchanged
+    def xgb_shadow(name, method):
+        return lambda cls: cls
+
+@xgb_shadow('p12_confidence_engine', 'analyze')
 class ConfidenceEngineGPU:
     """
     INSTITUTIONAL QUANTITATIVE CONFIDENCE ENGINE (PART 12)

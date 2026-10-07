@@ -288,6 +288,13 @@ class GPUMemoryManager:
 
 # ==================== GPU-ACCELERATED ML PREDICTION ENGINE ====================
 
+try:
+    from brain_xgb import xgb_shadow
+except Exception:  # xgboost helper missing -> no-op, engine unchanged
+    def xgb_shadow(name, method):
+        return lambda cls: cls
+
+@xgb_shadow('p5_ml_engine', 'analyze')
 class MLEngineGPU:
     """
     JARVIS PART 5 - GPU-ACCELERATED MACHINE LEARNING PREDICTION ENGINE
