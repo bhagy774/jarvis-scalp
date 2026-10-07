@@ -1442,6 +1442,7 @@ class LiveTradingEngine:
         """Publish one state snapshot; signal/reason/plan/risk never use separate blocks."""
         try:
             result = self.last_jarvis_result or {}
+            _decision = getattr(self, "last_decision", None)
             signal = self._dashboard_signal or result.get('trade_signal', {}) or {}
             plan = dict(self._dashboard_plan or {})
             if action:
@@ -1507,6 +1508,33 @@ class LiveTradingEngine:
     #  PAPER TRADE MANAGEMENT
     # ═══════════════════════════════════════════════════════════════
     
+    def _xgb_meta_gate(self, direction, snapshot, symbol):
+        """XGBoost win-probability gate on the selected coin's own native 15m candles.
+
+        Veto-only and fail-neutral: unavailable/unvalidated models, missing 15m
+        frame or any error leave ``direction`` unchanged. Default mode is
+        ``shadow`` (log only); ``JARVIS_XGB_MODE=veto`` lets a VALIDATED
+        per-symbol model block an entry. It never changes direction or size.
+        """
+        try:
+            from jarvis_xgb_meta import get_gate
+            frame = None if snapshot is None else getattr(snapshot, 'frames', {}).get('15m')
+            closed = None if frame is None else frame.closed
+            verdict = get_gate().evaluate(closed, direction, symbol)
+            self.last_xgb_meta = verdict
+            if verdict.get('veto'):
+                try:
+                    self._dashboard_events.append(
+                        f"XGB veto {direction}: p={verdict.get('probability')} < {verdict.get('threshold')}")
+                except Exception:
+                    pass
+                logger.info('[XGB] VETO %s %s p=%s thr=%s', symbol, direction,
+                            verdict.get('probability'), verdict.get('threshold'))
+                return 'NO_TRADE'
+        except Exception as exc:  # advisory layer must never break or authorize trading
+            logger.debug('[XGB] gate unavailable (%s)', type(exc).__name__)
+        return direction
+
     def _presim_gate(self, direction, confidence, entry_price, result=None, df=None, current_price=None, symbol='BTCUSDT'):
         """Run the pre-trade simulator and fail closed on safety uncertainty.
 
@@ -2915,6 +2943,10 @@ class LiveTradingEngine:
                             )
                             if direction not in ('CALL', 'PUT'):
                                 direction = 'NO_TRADE'
+                        # XGBoost meta-gate: advisory, can only VETO an entry that
+                        # the deterministic path already produced (never create/size).
+                        if direction in ('CALL', 'PUT'):
+                            direction = self._xgb_meta_gate(direction, snapshot, symbol)
                         _options_ctx = (result.get('market_context', {}) or {}).get('options_context', {})
                         _opinions = list(result.get('decision_opinions', []) or [])
                         _live_execution_enabled = bool(
