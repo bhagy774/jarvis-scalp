@@ -57,7 +57,7 @@ class AIHedgeAdvisor:
     def __init__(self):
         self.chat_history: List[Dict] = []
         self.max_history_pairs = 10
-                self.model = OLLAMA_MODEL
+        self.model = OLLAMA_MODEL
         self._call_count = 0
         logger.info(f"[HEDGE-AI] Initialized -- model={self.model} memory={self.max_history_pairs} trades")
 

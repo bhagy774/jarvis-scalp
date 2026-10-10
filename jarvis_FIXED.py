@@ -1442,6 +1442,7 @@ class LiveTradingEngine:
         """Publish one state snapshot; signal/reason/plan/risk never use separate blocks."""
         try:
             result = self.last_jarvis_result or {}
+            _decision = getattr(self, "last_decision", None)
             signal = self._dashboard_signal or result.get('trade_signal', {}) or {}
             plan = dict(self._dashboard_plan or {})
             if action:

@@ -53,7 +53,7 @@ def jarvis_broker_authorization(*, entry=100.1, stop=98.0, target=105.0,
         "timeframe_results": {
             tf: {"symbol": symbol, "timeframe": tf, "status": "neutral",
                  "data_status": "valid", "entry_blocked": False, "risk_veto": False}
-            for tf in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
+            for tf in REQUIRED_TIMEFRAMES
         },
     }
     timeframe_parts = {}

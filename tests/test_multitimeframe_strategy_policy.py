@@ -2,7 +2,8 @@ import time
 
 from jarvis_strategy_approval import (
     REQUIRED_TIMEFRAMES,
-    TIMEFRAME_WEIGHTS,
+    TIMEFRAME_CORRELATION_GROUPS,
+    TIMEFRAME_GROUP_WEIGHTS,
     build_execution_plan,
     evaluate_mtf_central_strategy,
     make_entry_approval,
@@ -118,7 +119,8 @@ def test_all_eight_frames_and_complete_parts_are_required():
     assert set(evidence) == set(REQUIRED_TIMEFRAMES)
     for timeframe in REQUIRED_TIMEFRAMES:
         assert set(PARTS).issubset(evidence[timeframe])
-    assert TIMEFRAME_WEIGHTS["1m"] < TIMEFRAME_WEIGHTS["4h"]
+    group_of = {tf: g for g, tfs in TIMEFRAME_CORRELATION_GROUPS.items() for tf in tfs}
+    assert TIMEFRAME_GROUP_WEIGHTS[group_of["1m"]] < TIMEFRAME_GROUP_WEIGHTS[group_of["4h"]]
 
     missing_frame = dict(evidence)
     missing_frame.pop("4h")
