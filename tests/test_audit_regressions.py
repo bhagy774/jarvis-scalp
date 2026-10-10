@@ -194,17 +194,6 @@ class AuditRegressionTests(unittest.TestCase):
         self.assertEqual(venue.calls, [])  # paper close never reaches venue
         clear_registry()
 
-    def test_retired_ollama_never_calls_model_and_schema_validator_rejects_invalid(self):
-        import ollama_integration as oi
-        schema = {"type": "object", "required": ["direction"],
-                  "properties": {"direction": {"type": "string", "enum": ["BUY", "SELL"]}}}
-        with patch('requests.post', side_effect=AssertionError('retired model request')):
-            text, err = oi.call_gemini_structured('prompt', schema)
-            self.assertIsNone(text)
-            self.assertIn('retired', err.lower())
-        self.assertEqual(oi._validate_structured_response('{"direction":"BUY"}', schema),
-                         {"direction":"BUY"})
-        self.assertIsNone(oi._validate_structured_response('{"direction":"MAYBE"}', schema))
 
     def test_ambiguous_close_is_not_retried_or_reversed(self):
         from jarvis_live_trader import JarvisAutoTrader

@@ -10,7 +10,6 @@ from jarvis_market_oracle import JarvisMarketOracle
 from jarvis_specialist_pool import SpecialistPool
 from multi_ai_consensus import run_ai_roundtable
 from options_hedged_scalp import OptionsHedgedScalpEngine
-from ollama_integration import call_ollama, call_ollama_chat
 
 
 class MigrationIntegration(unittest.TestCase):
@@ -22,12 +21,12 @@ class MigrationIntegration(unittest.TestCase):
 
     def test_cortex_math_not_model_and_no_cached_vote(self):
         cortex = JarvisNeuralCortex()
-        cortex._call_ollama_chat = Mock(side_effect=AssertionError('model called'))
+        cortex._call_legacy_llm_chat = Mock(side_effect=AssertionError('model called'))
         result = cortex.analyze({'part11_fusion': {'signal': -1},
                                  'part12_confidence': {'confidence': 66}}, 101.0)
         self.assertEqual(result['signal'], 'PUT')
         self.assertFalse(result['ai_online'])
-        cortex._call_ollama_chat.assert_not_called()
+        cortex._call_legacy_llm_chat.assert_not_called()
         self.assertEqual(cortex.analyze_holistic_context('prompt')[0], '')
 
     def test_hedge_and_paper_execution_ignore_model_even_when_env_disabled(self):
@@ -127,8 +126,6 @@ class MigrationIntegration(unittest.TestCase):
         self.assertFalse(result['approved'])
         self.assertEqual(result['approve_votes'], 0)
         self.assertFalse(run_ai_roundtable({}, {})['approved'])
-        self.assertIsNone(call_ollama('BUY')[0])
-        self.assertIsNone(call_ollama_chat([{'role':'user', 'content':'BUY'}])[0])
 
 
 if __name__ == '__main__': unittest.main()

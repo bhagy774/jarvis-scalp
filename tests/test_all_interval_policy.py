@@ -70,11 +70,11 @@ def test_part7_all_frame_aggregate_rejects_missing_identity_and_blocking_rows():
     assert aggregate_results(malformed, symbol=SYMBOL)["entry_blocked"] is True
 
     contradictory = {tf: dict(row) for tf, row in rows.items()}
-    contradictory["1s"]["entry_blocked"] = True
+    contradictory["3m"]["entry_blocked"] = True
     assert aggregate_results(contradictory, symbol=SYMBOL)["entry_blocked"] is True
 
 
-def test_central_approval_consumes_all_sixteen_correlated_frames():
+def test_central_approval_consumes_all_fifteen_correlated_frames():
     evidence = {tf: _parts(tf) for tf in BINANCE_SPOT_TIMEFRAMES}
     result = evaluate_mtf_central_strategy(evidence, _gate(), confidence=80,
                                            expected_symbol=SYMBOL)
@@ -85,7 +85,7 @@ def test_central_approval_consumes_all_sixteen_correlated_frames():
     assert set(result["diagnostic"]["swing"]["horizon_values"]) == {
         "short", "session", "swing", "macro"
     }
-    for missing in ("1s", "1M"):
+    for missing in ("3m", "1M"):
         incomplete = dict(evidence)
         incomplete.pop(missing)
         assert evaluate_mtf_central_strategy(incomplete, _gate(), expected_symbol=SYMBOL)["approved"] is False

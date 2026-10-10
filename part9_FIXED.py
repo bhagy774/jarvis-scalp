@@ -860,11 +860,11 @@ class GPUAIAdaptiveLearningEngine:
         # Integration with trading system
         self.trade_callbacks = []
         
-        # Ollama Strategy Optimization Cooldown setup
-        self.last_ollama_time = 0
-        self.ollama_cooldown = 300  # 5 minutes
-        self.last_ollama_recommendation = "MAINTAIN_WEIGHTS"
-        self.last_ollama_insight = "Strategy weights optimal for current market conditions."
+        # LegacyLLM Strategy Optimization Cooldown setup
+        self.last_legacy_llm_time = 0
+        self.legacy_llm_cooldown = 300  # 5 minutes
+        self.last_legacy_llm_recommendation = "MAINTAIN_WEIGHTS"
+        self.last_legacy_llm_insight = "Strategy weights optimal for current market conditions."
         
         print("ACCELERATED GPU AI Learning Engine Initialized - Linux Optimized")
     
@@ -1018,8 +1018,8 @@ class GPUAIAdaptiveLearningEngine:
         except Exception as e:
             print(f"WARNING Performance metrics recording warning: {e}")
     
-    def _generate_ollama_learning_prompt(self, learning_summary: Dict) -> str:
-        """Generate Ollama prompt for Chief Strategy Officer Strategy Weight Optimization"""
+    def _generate_legacy_llm_learning_prompt(self, learning_summary: Dict) -> str:
+        """Generate LegacyLLM prompt for Chief Strategy Officer Strategy Weight Optimization"""
         summary_str = json.dumps(learning_summary, default=str)
 
         prompt = f"""You are a Chief Strategy Officer AI for an elite quantitative trading firm. Your job is to review the recent performance of our algorithmic trading strategies and recommend real-time strategy weight adjustments.
@@ -1037,7 +1037,7 @@ Follow the tag with a 1-2 sentence Chief Strategy Officer executive recommendati
 """
         return prompt
 
-    def validate_strategy_weights_with_ollama(self, learning_summary: Dict) -> Tuple[str, str]:
+    def validate_strategy_weights_with_legacy_llm(self, learning_summary: Dict) -> Tuple[str, str]:
         """No model-generated adaptive weight recommendation or cached vote."""
         return "UNAVAILABLE", "Model strategy recommendation unavailable"
 
@@ -1046,7 +1046,7 @@ Follow the tag with a 1-2 sentence Chief Strategy Officer executive recommendati
         try:
             current_metrics = self.performance_metrics[-1] if self.performance_metrics else {}
             summary = self._get_learning_summary()
-            rec, insight = self.validate_strategy_weights_with_ollama(summary)
+            rec, insight = self.validate_strategy_weights_with_legacy_llm(summary)
 
             analysis = {
                 'system_status': {
@@ -1057,14 +1057,14 @@ Follow the tag with a 1-2 sentence Chief Strategy Officer executive recommendati
                 },
                 'performance_metrics': current_metrics,
                 'summary': summary,
-                'ollama_strategy_recommendation': rec,
-                'ollama_insight': insight
+                'legacy_llm_strategy_recommendation': rec,
+                'legacy_llm_insight': insight
             }
             
             # Publish to CognitiveBus for Watcher AI monitoring
             if hasattr(self, 'trading_system') and hasattr(self.trading_system, 'bus') and self.trading_system.bus:
                 running = analysis.get('system_status', {}).get('is_running', False)
-                rec = str(analysis.get('ollama_strategy_recommendation', 'N/A'))[:60]
+                rec = str(analysis.get('legacy_llm_strategy_recommendation', 'N/A'))[:60]
                 msg = f"Adaptive Learning: Status={'RUNNING' if running else 'IDLE'}. Strategy Recommendation: {rec}"
                 self.trading_system.bus.publish('THOUGHTS', 'Part9_Adaptive', msg)
             return analysis

@@ -79,7 +79,7 @@ parts_data = [
      "Pattern Recognition: Bullish Engulfing + EMA Cross detected. BULLISH. Confidence = 77.0%"),
 
     ("Part11_Confidence",
-     "Confidence Engine: Final Score = 88.0%. VALID | Ollama Adj: +5"),
+     "Confidence Engine: Final Score = 88.0%. VALID | LegacyLLM Adj: +5"),
 ]
 
 health_events = [
@@ -135,7 +135,7 @@ head("STEP 4 — Watcher Packet sent to 3 Specialist AIs (PARALLEL)")
 
 MOCK_APPROVE = "[APPROVE] Bullish structure confirmed. Strong setup."
 
-with patch("jarvis_specialist_pool.call_ollama") as mock_call:
+with patch("jarvis_specialist_pool.call_legacy_llm") as mock_call:
     mock_call.return_value = (MOCK_APPROVE, None)
 
     from jarvis_specialist_pool import SpecialistPool
@@ -157,7 +157,7 @@ with patch("jarvis_specialist_pool.call_ollama") as mock_call:
     assert "risk_officer" in opinions
     assert all("[APPROVE]" in v for v in opinions.values())
     ok("All 3 Specialists responded in PARALLEL")
-    ok(f"Time taken: {t_elapsed:.2f}s (vs ~270s sequential — {270/max(t_elapsed,0.01):.0f}x faster with real Ollama)")
+    ok(f"Time taken: {t_elapsed:.2f}s (vs ~270s sequential — {270/max(t_elapsed,0.01):.0f}x faster with real LegacyLLM)")
 
     # ══════════════════════════════════════════════════════
     # CHAIRMAN — Final synthesis
@@ -228,4 +228,4 @@ print(f"""
 """)
 
 print(f"{B}{G}  ALL STEPS PASS — Complete Pipeline Working!{X}")
-print(f"{B}{G}  Ollama start karo ne `run_jarvis_live.ps1` chalavo — LIVE ready!{X}\n")
+print(f"{B}{G}  LegacyLLM start karo ne `run_jarvis_live.ps1` chalavo — LIVE ready!{X}\n")

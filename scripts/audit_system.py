@@ -243,7 +243,6 @@ class Audit:
             self.evidence("fusion-final-veto", [r"build_final_decision|blocking_reasons|gate_reason|SafetyRiskBrain|execution_allowed"], ["jarvis_FIXED.py", "jarvis_decision.py", "oracle_trade_gate.py"])
             self.evidence("risk-contract-lots", [r"calculate_trade_size|MAX_LEVERAGE_CAP|contract_value|enforce_entry_lots|lot_size"], ["jarvis_FIXED.py", "jarvis_risk.py", "jarvis_lot_limits.py", "jarvis_live_trader.py"])
             self.evidence("execution-close-reconciliation", [r"place.*order|create_order|reduce_only|close|reconcile|paper_trad"], ["jarvis_FIXED.py", "jarvis_live_trader.py", "jarvis_close_coordinator.py", "jarvis_position_manager.py"])
-            self.evidence("ollama-error-boundary", [r"ollama|validate_decision|snapshot_usable|timeout|except"], ["jarvis_FIXED.py", "jarvis_ollama_context.py", "ollama_integration.py"])
         # Static token presence is explicitly not a safety proof.
         self.add("static-proof-boundary", "PASS", "info",
                  "Static evidence is reported as wiring evidence only; token presence is not safety proof")
@@ -350,9 +349,9 @@ release_close('BTCUSDT','p', force=True)
 """)
         else:
             self.add("close-idempotency-ownership", "SKIPPED", "high", "Ownership/close helpers absent", category="environment")
-        if "jarvis_ollama_context.py" in self.sources:
-            self.probe("ollama-error-boundary", """
-from jarvis_ollama_context import validate_decision, snapshot_usable, build_snapshot
+        if "jarvis_legacy_llm_context.py" in self.sources:
+            self.probe("legacy_llm-error-boundary", """
+from jarvis_legacy_llm_context import validate_decision, snapshot_usable, build_snapshot
 assert validate_decision(None)[0] is None
 assert validate_decision({'direction':'BUY', 'confidence':'not-a-score'})[0] is None
 valid, err = validate_decision({'decision':'WAIT', 'confidence':0, 'rationale':'no trade', 'plan':{}})
@@ -365,7 +364,7 @@ mismatch = build_snapshot(symbol='BTCUSDT', timestamp=None, current_price=100, m
 assert snapshot_usable(mismatch)[0] is False
 """, severity="medium")
         else:
-            self.add("ollama-error-boundary", "SKIPPED", "medium", "Ollama context helper absent", category="environment")
+            self.add("legacy_llm-error-boundary", "SKIPPED", "medium", "LegacyLLM context helper absent", category="environment")
         rust = self.root / "jarvis_rust"
         if rust.exists() and (rust / "Cargo.toml").exists():
             self.add("rust-optional-parity", "SKIPPED", "medium",

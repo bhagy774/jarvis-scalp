@@ -8,7 +8,7 @@ Every 60 seconds:
   1. 12 Parts health check (import check + CognitiveBus staleness)
   2. Log file scan (ERROR / CRITICAL lines)
   3. System resources (RAM / CPU / disk via psutil)
-  4. Dependency check (Ollama server, Delta API)
+  4. Dependency check (LegacyLLM server, Delta API)
   5. If problem found -> Gemini diagnosis -> auto-apply safe fix
   6. Telegram CRITICAL alerts
   7. Print Doctor Report to console
@@ -282,7 +282,7 @@ class DoctorMonitor:
     # ── LAYER 4: Dependency Check ──────────────────────────────────
     def _check_dependencies(self) -> List[DoctorIssue]:
         issues = []
-        # Ollama retired; dependency is not required by the deterministic runtime.
+        # LegacyLLM retired; dependency is not required by the deterministic runtime.
 
         # Delta API
         try:

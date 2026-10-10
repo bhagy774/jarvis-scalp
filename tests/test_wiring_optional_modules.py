@@ -73,7 +73,7 @@ def test_brain_imports_cleanly_with_wired_modules_present(tmp_path):
 
 
 def test_brain_initializes_optional_wiring_without_network(tmp_path):
-    # All HTTP paths are blocked before importing the brain, including local Ollama.
+    # All HTTP paths are blocked before importing the brain, including local LegacyLLM.
     script = '''\
 import requests
 from requests.sessions import Session
@@ -105,7 +105,6 @@ if jarvis.bus:
     ("binance_data", "BINANCE_DATA_AVAILABLE"),
     ("upstox_data", "UPSTOX_DATA_AVAILABLE"),
     ("jarvis_backtester", "BACKTESTER_AVAILABLE"),
-    ("kie_gpt6_client", "KIE_GPT6_AVAILABLE"),
 ])
 def test_brain_fails_safe_when_each_optional_module_is_missing(tmp_path, module_name, availability_flag):
     # A fresh child process prevents import caches from hiding missing-module behavior.

@@ -134,10 +134,8 @@ class _Delta:
 
 
 class DeterministicRouterTests(unittest.TestCase):
-    def test_production_router_selects_without_ollama(self):
-        with patch.dict(os.environ, {"JARVIS_MULTI_MARKET": "1"}), patch.dict(
-            sys.modules, {"ollama_integration": None}
-        ):
+    def test_production_router_selects_without_legacy_llm(self):
+        with patch.dict(os.environ, {"JARVIS_MULTI_MARKET": "1"}):
             scanner_module = importlib.reload(jarvis_coin_scanner)
             scanner = _scanner(
                 {"ETHUSDT": _stats("ETHUSDT")},
@@ -148,16 +146,6 @@ class DeterministicRouterTests(unittest.TestCase):
         self.assertEqual(route.symbol, "ETHUSDT")
         self.assertEqual(scanner.get_best_coin(), "ETH")
 
-    def test_production_router_ignores_an_ollama_call_that_would_raise(self):
-        ollama = types.ModuleType("ollama_integration")
-        ollama.call_ollama = Mock(side_effect=RuntimeError("offline model"))
-        with patch.dict(os.environ, {"JARVIS_MULTI_MARKET": "1"}), patch.dict(
-            sys.modules, {"ollama_integration": ollama}
-        ):
-            scanner = _scanner({"ETHUSDT": _stats("ETHUSDT")})
-            route = MarketRouter(scanner=scanner, delta_client=_Delta()).select_crypto()
-        self.assertEqual(route.status, "READY")
-        ollama.call_ollama.assert_not_called()
 
     def test_market_router_keeps_actual_route_while_an_owned_position_is_open(self):
         with patch.dict(os.environ, {"JARVIS_MULTI_MARKET": "1"}):

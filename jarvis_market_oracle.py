@@ -49,7 +49,7 @@ ORACLE_ENABLED          = os.environ.get("ORACLE_ENABLED", "true").lower() == "t
 ORACLE_HARD_GATE        = os.environ.get("ORACLE_HARD_GATE", "true").lower() == "true"
 ORACLE_TELEGRAM_ALERTS  = os.environ.get("ORACLE_TELEGRAM_ALERTS", "false").lower() == "true"
 
-# Ollama Models for Board
+# LegacyLLM Models for Board
 MODEL_ANALYST   = os.environ.get("MODEL_ANALYST", "deepseek-r1:14b")
 MODEL_VALIDATOR = os.environ.get("MODEL_VALIDATOR", "qwen2.5:14b")
 MODEL_RISK      = os.environ.get("MODEL_RISK", "mistral-nemo:12b")
@@ -135,7 +135,7 @@ JSON Schema format:
 class JarvisMarketOracle:
     """
     JARVIS Market Oracle service.
-    Collects all market data -> Ollama Committee -> Gemini 3.6 Flash -> Market Map JSON.
+    Collects all market data -> LegacyLLM Committee -> Gemini 3.6 Flash -> Market Map JSON.
     Publishes to CognitiveBus, saves to disk, powers Gate 0.5 in live trader.
     """
 
@@ -453,7 +453,7 @@ class JarvisMarketOracle:
         return opinions
 
     # ──────────────────────────────────────────────────────────
-    #  LAYER 2: OLLAMA MULTI-AI BOARD (PARALLEL)
+    #  LAYER 2: LEGACY_LLM MULTI-AI BOARD (PARALLEL)
     # ──────────────────────────────────────────────────────────
 
     def _run_ai_board(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -515,7 +515,7 @@ Liquidation Zones:    Longs at ${liq_longs:,}, Shorts at ${liq_shorts:,}
 === PARTS AI OPINIONS (12 systems) ===
 {parts_text}
 
-=== OLLAMA BOARD DECISION ===
+=== LEGACY_LLM BOARD DECISION ===
 Analyst:   {ai_board.get('analyst', 'N/A')}
 Validator: {ai_board.get('validator', 'N/A')}
 Risk:      {ai_board.get('risk_officer', 'N/A')}

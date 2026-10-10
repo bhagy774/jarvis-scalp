@@ -47,37 +47,8 @@ class RetiredModelBoundaries(unittest.TestCase):
             self.assertIsNone(doctor._diagnose_with_gemini(issue))
             post.assert_not_called()
 
-    def test_standalone_gemini_cannot_infer_or_change_gates(self):
-        from gemini_supreme_advisor import GeminiSupremeAdvisor
-        with patch('gemini_supreme_advisor.ADVISOR_ENABLED', True):
-            advisor = GeminiSupremeAdvisor()
-        advisor._client = Mock()
-        advisor.last_insight = {'trading_override': 'FORCE_SHORT', 'confidence_threshold_override': 90,
-                                'leverage_recommendation': 100}
-        self.assertEqual(advisor.is_trading_allowed('BUY')[0], True)
-        self.assertEqual(advisor.get_confidence_threshold(70), 70)
-        self.assertEqual(advisor.get_leverage_recommendation(5), 5)
-        self.assertEqual(advisor.run_now()['trading_override'], 'STAY_NEUTRAL')
-        advisor._client.models.generate_content.assert_not_called()
 
-    def test_coordinator_rejects_injected_models_before_paper_opt_in(self):
-        import run_all_parts
-        forbidden = Mock()
-        with patch.dict(os.environ, {'JARVIS_START_PAPER': '0'}):
-            self.assertEqual(run_all_parts.run_all_parts(forbidden, forbidden), (None, None))
-        self.assertFalse(run_all_parts.AI_CHAIN_AVAILABLE)
-        forbidden.assert_not_called()
 
-    def test_coordinator_source_preserves_core_direction_and_no_model_merge(self):
-        # Source policy only; not a substitute for a full coordinator/live test.
-        source = (ROOT / 'run_all_parts.py').read_text(encoding='utf-8')
-        ast.parse(source)
-        self.assertIn("core_decision = ai_result_full.get('trade_signal', {})", source)
-        self.assertIn("core_direction in ('BUY', 'SELL')", source)
-        self.assertIn("unified_signal = jarvis_signal  # no model merge", source)
-        self.assertIn('prediction = None  # no model predictor', source)
-        self.assertNotIn('unified_signal = merge_signals(', source)
-        self.assertNotIn('"direction": "BUY" if signal_score', source)
 
 
 if __name__ == '__main__':

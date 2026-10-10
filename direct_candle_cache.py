@@ -29,7 +29,7 @@ from binance_timeframes import (
 # 1m source history is available; the live path must not silently do that.
 LIVE_TIMEFRAMES: Tuple[str, ...] = BINANCE_SPOT_TIMEFRAMES
 INTERVAL_SECONDS: Mapping[str, int] = {
-    "1s": 1, "1m": 60, "3m": 180, "5m": 300, "15m": 900,
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900,
     "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400,
     "6h": 21600, "8h": 28800, "12h": 43200, "1d": 86400,
     "3d": 259200, "1w": 604800,
@@ -410,7 +410,7 @@ class DirectCandleCache:
         """Fetch enough recent native bars to bridge elapsed time without gaps.
 
         The previous forming bar may have closed since the last refresh. A fixed
-        three-row delta silently loses 1s bars whenever polling is slower than
+        three-row delta silently loses short bars whenever polling is slower than
         a few seconds; size the delta from native bar boundaries instead.
         """
         max_rows = self.history_limits[timeframe] + 1

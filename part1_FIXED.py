@@ -1599,8 +1599,8 @@ class SmartBreakoutAI:
     def apply_mini_v3_brain(self, market_data):
         return self.mini_v3_brain.analyze_mini_v3(market_data)
         
-    def _generate_ollama_prompt(self, market_data: dict, result_data: dict) -> str:
-        """Format clean prompt for Ollama Local AI Reasoning"""
+    def _generate_legacy_llm_prompt(self, market_data: dict, result_data: dict) -> str:
+        """Format clean prompt for LegacyLLM Local AI Reasoning"""
         try:
             price_action = market_data.get('price_action', [])
             current_price = price_action[-1]['close'] if price_action else 0.0
@@ -1716,7 +1716,7 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
                 breakout_data, fakeout_data, pullback_data, momentum_data,
                 orderflow_data, regime_data, all_brain_support,
                 cloud_r1_data, cloud_v3_data, liquidity_data,
-                ollama_signal=0
+                legacy_llm_signal=0
             )
             
             temp_result = {
@@ -1735,8 +1735,8 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
             }
 
             # Model text cannot cast a vote. Preserve only mathematical signal.
-            ollama_reasoning = "Legacy model disabled; experimental Laya is audit-only"
-            ollama_signal = 0
+            legacy_llm_reasoning = "Legacy model disabled; experimental Laya is audit-only"
+            legacy_llm_signal = 0
 
             result = {
                 "signal": signal,
@@ -1751,8 +1751,8 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
                 "regime": regime_data,
                 "brain_support": all_brain_support,
                 "confidence": confidence,
-                "ollama_reasoning": ollama_reasoning,
-                "ollama_signal": ollama_signal
+                "legacy_llm_reasoning": legacy_llm_reasoning,
+                "legacy_llm_signal": legacy_llm_signal
             }
             
             self.signal_history.append(result)
@@ -1768,7 +1768,7 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
             
     def _generate_signal(self, breakout_data, fakeout_data, pullback_data, momentum_data,
                         orderflow_data, regime_data, brain_support, cloud_r1_data, cloud_v3_data, liquidity_data,
-                        ollama_signal=0):
+                        legacy_llm_signal=0):
         try:
             breakout_detected = bool(breakout_data.get('breakout_detected', False))
             breakout_direction = int(breakout_data.get('direction', 0))
@@ -1843,6 +1843,6 @@ Provide a 1-2 sentence analysis, then end your response with your decision stric
                 "mini_v3": {'microstructure_score': 0, 'wick_imbalance': 0, 'tick_momentum': 0, 'pressure_detection': 0, 'support_score': 0}
             },
             "confidence": 0,
-            "ollama_reasoning": "Error response fallback",
-            "ollama_signal": 0
+            "legacy_llm_reasoning": "Error response fallback",
+            "legacy_llm_signal": 0
         }

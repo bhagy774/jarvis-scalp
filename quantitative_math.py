@@ -435,7 +435,7 @@ def part_signal(part: str, data: Any) -> Dict[str, Any]:
         velz = f["kalman"]["velocity_z"]
         # This is a statistical evidence score, not learned ML or a probability.
         tele.update({"kalman_velocity_z": velz, "break_shift_bic_gain": cp["bic_gain"], "break_shift_z": cp["shift_z"]})
-        if abs(velz) >= 1.5 and abs(trend) >= 1.5 and cp["bic_gain"] >= 2.0:
+        if abs(velz) >= 1.5 and abs(trend) >= 1.5 and cp["bic_gain"] > 0.0:
             sig = 1 if velz > 0 else -1
             conf, text = min(75.0, 55.0 + min(abs(velz), 3.0) * 4.0 + min(cp["bic_gain"], 4.0) * 2.0), "state-space velocity plus penalized return-mean-shift evidence"
     elif part == "6":
@@ -450,7 +450,8 @@ def part_signal(part: str, data: Any) -> Dict[str, Any]:
         vs = f["volatility_state"]
         tele.update(vs)
         tail = max(abs(f["tail_return_q05"]), abs(f["tail_return_q95"]))
-        if (f["range_scale_pct"] >= 0.015 or
+        if (f["range_scale_pct"] >= 0.05 or
+                (f["range_scale_pct"] >= 0.015 and vs["short_long_ratio"] >= 2.0) or
                 vs["high_state_posterior"] >= 0.90 and
                 (vs["short_long_ratio"] >= 2.5 or tail >= 4.0 * f["return_scale"])): 
             sig, conf, text = 0, 5.0, "high-volatility-state risk veto (model-conditional posterior plus realized-tail evidence)"
@@ -491,7 +492,7 @@ def part_signal(part: str, data: Any) -> Dict[str, Any]:
         tele["sequential_direction"] = seq
         g = f["candle"]
         tele.update({"body_fraction": g["body_fraction"], "close_location": g["close_location"]})
-        if seq.get("available") and abs(seq["next_up_frequency"] - 0.5) >= 0.25 and g["body_fraction"] >= 0.65 and abs(g["close_location"]) >= 0.5:
+        if seq.get("available") and abs(seq["next_up_frequency"] - 0.5) >= 0.10 and g["body_fraction"] >= 0.65 and abs(g["close_location"]) >= 0.5:
             sig = 1 if seq["next_up_frequency"] > 0.5 else -1
             conf, text = 55.0 + min(20.0, abs(seq["next_up_frequency"] - 0.5) * 40.0), "smoothed sequential return-sign frequency with current candle geometry"
     elif part in ("11", "12"):

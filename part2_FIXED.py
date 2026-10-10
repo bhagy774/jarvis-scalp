@@ -4121,8 +4121,8 @@ class AdvancedAnalysisSystem:
         print("Model inference: retired (deterministic signal fusion only)")
         print(f"Auto Update System: ACTIVE")
 
-    def _generate_ollama_prompt(self, context, current_signals):
-        """Format clean prompt for Ollama Local AI Reasoning"""
+    def _generate_legacy_llm_prompt(self, context, current_signals):
+        """Format clean prompt for LegacyLLM Local AI Reasoning"""
         try:
             signals_text = "\n".join([f"- {s[0]} (Confidence: {s[1]:.2f}): {s[2]}" for s in current_signals])
             

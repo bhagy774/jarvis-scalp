@@ -100,14 +100,14 @@ def test_swing_pending_until_1m_trigger_then_approves_and_opposite_blocks():
 
 def test_scalp_mode_is_distinct_and_countertrend_higher_frames_veto_it():
     # A low-frame setup is SCALP only when the higher swing group is not aligned.
-    low_only = evidence_by_timeframe(overrides={"30m": 0, "1h": 0, "2h": 0, "4h": 0})
+    low_only = evidence_by_timeframe(overrides={tf: 0 for tf in ("30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M")})
     scalp = evaluate_mtf_central_strategy(low_only, aggregate_gate(), confidence=80, expected_symbol=SYMBOL)
     assert scalp["approved"] is True
     assert scalp["trade_mode"] == "SCALP"
 
     # The upper guard is countertrend, but is not large enough to independently
     # establish the broader 3m–4h SWING direction; it therefore vetoes SCALP.
-    countertrend = evidence_by_timeframe(overrides={"30m": -1, "1h": 0, "2h": -1, "4h": -1})
+    countertrend = evidence_by_timeframe(overrides={**{tf: -1 for tf in ("30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d")}, "3d": 0, "1w": 0, "1M": 0})
     blocked = evaluate_mtf_central_strategy(countertrend, aggregate_gate(), confidence=80, expected_symbol=SYMBOL)
     assert blocked["approved"] is False
     assert blocked["trade_mode"] == "SCALP"

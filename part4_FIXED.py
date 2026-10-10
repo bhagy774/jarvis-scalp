@@ -4,7 +4,7 @@ from neural_advisory import part_advisory_entry
 # JARVIS PART 4 - INSTITUTIONAL BACKTESTING & TRADE ANALYTICS ENGINE (GPU-OPTIMIZED & FIXED)
 # Fully hardened against hidden bugs, PyTorch 2.x incompatibilities, Windows platform limits,
 # GPUOptimizedDeque iterable errors, argmax bool crashes, and missing resource module errors.
-# Includes Ollama Local AI Backtest Insight Generation.
+# Includes LegacyLLM Local AI Backtest Insight Generation.
 # ==============================================================================
 
 import sys
@@ -939,10 +939,10 @@ class TradeAnalysisEngine:
         }
 
 
-# ==================== REPORT GENERATOR WITH OLLAMA LOCAL AI ====================
+# ==================== REPORT GENERATOR WITH LEGACY_LLM LOCAL AI ====================
 
 class ReportGeneratorGPU:
-    """GPU-accelerated professional report generation with Local Ollama AI Backtest Insights"""
+    """GPU-accelerated professional report generation with Local LegacyLLM AI Backtest Insights"""
     
     def __init__(self):
         self.template_cache = {}
@@ -952,7 +952,7 @@ class ReportGeneratorGPU:
             None, self._generate_report_sync, analytics_data
         )
 
-    def _generate_ollama_executive_insight(self, analytics_data: Dict) -> str:
+    def _generate_legacy_llm_executive_insight(self, analytics_data: Dict) -> str:
         """Retired backtest prose; never imply model review or deployment approval."""
         return "Model review unavailable; use observed backtest metrics only."
 
@@ -969,8 +969,8 @@ class ReportGeneratorGPU:
                 }
             }
             
-            # Inject Ollama AI Executive Insight
-            report['advisory_note'] = self._generate_ollama_executive_insight(report)
+            # Inject LegacyLLM AI Executive Insight
+            report['advisory_note'] = self._generate_legacy_llm_executive_insight(report)
             return report
         except Exception as e:
             logging.error(f"Report generation error: {e}")

@@ -49,10 +49,10 @@ def get_active_config() -> Dict[str, Any]:
 TRADING_CONFIG: Dict[str, Any] = get_active_config()
 
 
-# ── AI PROVIDER ENVIRONMENT VARIABLES (all safe defaults = local Ollama only) ──
-# OLLAMA_BASE_URL            Local Ollama server URL. Default: http://localhost:11434
+# ── AI PROVIDER ENVIRONMENT VARIABLES (all safe defaults = local LegacyLLM only) ──
+# LEGACY_LLM_BASE_URL            Local LegacyLLM server URL. Default: http://localhost:11434
 # JARVIS_ENABLE_GEMINI       "1" to opt in to the external Gemini Supreme Advisor
-#                            (also requires GEMINI_API_KEY). Default: off (Ollama-only).
+#                            (also requires GEMINI_API_KEY). Default: off (LegacyLLM-only).
 # JARVIS_ENABLE_EXTERNAL_AI  "1" to opt in to external AI clients (e.g. KIE GPT-6).
 #                            Default: off — external clients return a "disabled" result
 #                            and never make a network call.
@@ -61,7 +61,7 @@ TRADING_CONFIG: Dict[str, Any] = get_active_config()
 #                            (completeness, price sanity, staleness, cross-source).
 #                            Default: on.
 AI_ENV_DEFAULTS: Dict[str, str] = {
-    "OLLAMA_BASE_URL": "http://localhost:11434",
+    "LEGACY_LLM_BASE_URL": "http://localhost:11434",
     "JARVIS_ENABLE_GEMINI": "0",
     "JARVIS_ENABLE_EXTERNAL_AI": "0",
     "JARVIS_WATCHDOG": "1",

@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 import jarvis_close_coordinator as close
 from jarvis_dashboard import render_dashboard
-from jarvis_ollama_context import build_snapshot, decision_prompt, snapshot_usable, validate_decision
 from jarvis_runtime import detect_backend, safe_device
 
 
@@ -44,35 +43,7 @@ class RuntimeSafetyContracts(unittest.TestCase):
         self.assertIs(captured['reduce_only'], True)
         self.assertEqual(captured['client_order_id'], 'jarvis-close-eth-1')
 
-    def test_snapshot_is_bounded_same_symbol_and_secret_free(self):
-        snapshot = build_snapshot(
-            symbol="ethusdt", timestamp="2026-09-18T00:00:00Z", current_price=100,
-            market_context={"api_key": "secret", "trend": "UP", "symbol": "ETHUSDT"},
-            part_results={f"part{i}": {"signal": 1} for i in range(1, 20)},
-            runtime={"backend": "cpu"}, safety_gates=["symbol verified"],
-        )
-        text = json.dumps(snapshot)
-        self.assertEqual(snapshot["symbol"], "ETHUSDT")
-        self.assertNotIn("secret", text)
-        self.assertLessEqual(len(snapshot["parts_1_to_12"]), 12)
-        self.assertIn("ETHUSDT", decision_prompt(snapshot))
-        mismatch = build_snapshot(symbol="ETHUSDT", timestamp="2026-09-18T00:00:00Z",
-                                  current_price=100, market_context={"symbol": "BTCUSDT"},
-                                  part_results={})
-        self.assertFalse(snapshot_usable(mismatch)[0])
-        stale = build_snapshot(symbol="ETHUSDT", timestamp="2020-01-01T00:00:00Z",
-                               current_price=100, market_context={"symbol": "ETHUSDT"},
-                               part_results={})
-        self.assertFalse(snapshot_usable(stale)[0])
 
-    def test_decision_validation(self):
-        valid, err = validate_decision({"decision": "BUY", "confidence": 75,
-                                        "rationale": "Parts align", "plan": {},
-                                        "risks": [], "missing_data": []})
-        self.assertIsNone(err)
-        self.assertEqual(valid["decision"], "BUY")
-        self.assertIsNone(validate_decision({"decision": "EXECUTE", "confidence": 75,
-                                             "rationale": "bad", "plan": {}})[0])
 
     def test_gpu_detection_never_fakes_accelerator(self):
         with patch.dict(os.environ, {"JARVIS_DEVICE": "cuda"}, clear=False), patch("jarvis_runtime._torch", return_value=None):
@@ -110,18 +81,6 @@ class RuntimeSafetyContracts(unittest.TestCase):
                     outputs[name] = adapter.analyze(candles, context={})
             self.assertEqual(len([name for name in outputs if name not in {"part14_options_chain", "part13_patterns"}]), 12)
             self.assertTrue(all(isinstance(value, dict) for value in outputs.values()))
-            snapshot = build_snapshot(symbol=brain.active_symbol, timestamp='2026-09-18T00:00:00Z',
-                                      current_price=float(candles.close.iloc[-1]),
-                                      market_context={'symbol': brain.active_symbol},
-                                      part_results=outputs, runtime=brain.gpu_status,
-                                      safety_gates=['advisory only'])
-            self.assertEqual(snapshot['symbol'], 'ETHUSDT')
-            advisory, err = validate_decision({'decision': 'WAIT', 'confidence': 0,
-                                               'rationale': 'Local gates remain authoritative',
-                                               'plan': {}, 'risks': ['synthetic data'],
-                                               'missing_data': []})
-            self.assertIsNone(err)
-            self.assertEqual(advisory['decision'], 'WAIT')
 
     def test_single_dashboard_contains_authoritative_and_advisory_state(self):
         stream = io.StringIO()

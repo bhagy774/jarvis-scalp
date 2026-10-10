@@ -5,7 +5,7 @@ pd = pytest.importorskip("pandas")
 from binance_timeframes import BINANCE_SPOT_TIMEFRAMES, TIMEFRAME_HISTORY_CANDLES, candle_open_time, next_candle_open
 from direct_candle_cache import DirectCandleCache, CandleDataError, LIVE_TIMEFRAMES
 
-WIDTH = {"1s": 1, "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800, "12h": 43200, "1d": 86400, "3d": 259200, "1w": 604800}
+WIDTH = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800, "12h": 43200, "1d": 86400, "3d": 259200, "1w": 604800}
 class FakeClock:
     def __init__(self, value): self.value = float(value)
     def __call__(self): return self.value
@@ -37,7 +37,7 @@ def test_all_16_native_intervals_use_variable_history_and_separate_forming_bar()
     clock = FakeClock(1_727_503_200); client = FakeClient(clock)
     snap = DirectCandleCache(client, clock=clock).refresh("ETHUSDT", venue="binance", market_type="spot")
     assert tuple(snap.frames) == BINANCE_SPOT_TIMEFRAMES == LIVE_TIMEFRAMES
-    assert len(client.calls) == 16
+    assert len(client.calls) == 15
     for tf, frame in snap.frames.items():
         assert len(frame.closed) == TIMEFRAME_HISTORY_CANDLES[tf]
         assert client.calls[list(LIVE_TIMEFRAMES).index(tf)][2] == TIMEFRAME_HISTORY_CANDLES[tf] + 1
@@ -51,15 +51,12 @@ def test_calendar_month_week_and_minute_month_token_are_distinct():
     assert next_candle_open("1M", candle_open_time("1M", stamp)) == datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp()
 
 
-def test_incremental_poll_bridges_every_missed_one_second_candle():
+def test_one_second_frames_are_never_requested():
     clock = FakeClock(1_727_503_200); client = FakeClient(clock)
-    cache = DirectCandleCache(client, clock=clock, ttl_seconds=5, timeframes=("1s", "1m"))
-    first = cache.refresh("ETHUSDT", venue="binance", market_type="spot")
-    clock.advance(6); second = cache.refresh("ETHUSDT", venue="binance", market_type="spot")
-    calls = [row for row in client.calls if row[1] == "1s"]
-    assert calls[1][2] >= 8
-    assert len(second.frames["1s"].closed) == TIMEFRAME_HISTORY_CANDLES["1s"]
-    assert second.frames["1s"].closed.index[-1] > first.frames["1s"].closed.index[-1]
+    cache = DirectCandleCache(client, clock=clock, ttl_seconds=5)
+    snap = cache.refresh("ETHUSDT", venue="binance", market_type="spot")
+    assert "1s" not in snap.frames
+    assert all(row[1] != "1s" for row in client.calls)
 
 
 def test_refresh_reuses_fresh_snapshot_then_refreshes_after_ttl():

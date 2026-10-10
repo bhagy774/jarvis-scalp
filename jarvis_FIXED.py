@@ -19,7 +19,7 @@ import requests
 import subprocess
 
 # --- ZERO LAG PURE ALGO MODE ---
-# Set to "True" to completely bypass all LLM/Ollama network calls during live trading
+# Set to "True" to completely bypass all LLM/LegacyLLM network calls during live trading
 os.environ.setdefault("JARVIS_PURE_ALGO", "true")
 # -------------------------------
 def _pure_algorithm_mode():
@@ -33,7 +33,7 @@ from jarvis_dashboard import UnifiedDashboard
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
 from jarvis_decision import normalize_confidence, confidence_text, build_final_decision
 from jarvis_runtime import detect_backend, torch_device
-# Legacy Ollama context removed; deterministic gates are authoritative.
+# Legacy LegacyLLM context removed; deterministic gates are authoritative.
 pro_display = ProfessionalSignalDisplay()
 import warnings
 from collections import deque, defaultdict
@@ -237,13 +237,6 @@ try:
 except Exception:
     _JarvisFullBacktester = None
     BACKTESTER_AVAILABLE = False
-try:
-    from kie_gpt6_client import KieGPT6Client as _KieGPT6Client
-    KIE_GPT6_AVAILABLE = True
-except Exception:
-    _KieGPT6Client = None
-    KIE_GPT6_AVAILABLE = False
-
 # Import JARVIS Self-Healing Doctor
 try:
     from jarvis_doctor import init_doctor as _init_doctor, get_doctor as _get_doctor
@@ -255,15 +248,7 @@ except ImportError as _de:
     print(f"[JARVIS CORE] ⚠️  JarvisDoctor not loaded: {_de}")
 
 
-# Import Ollama Local AI Integration
-try:
-    raise ImportError("Ollama integration retired")
-    OLLAMA_INTEGRATION_AVAILABLE = False
-except ImportError:
-    OLLAMA_INTEGRATION_AVAILABLE = False
-    runtime_metadata = lambda: {"available": False, "reason": "integration unavailable"}
-    def call_ollama(prompt, model=None, timeout=120):
-        return None, "ollama_integration module not found"
+runtime_metadata = lambda: {"available": False, "reason": "integration unavailable"}
 
 # FIX: Set EXTERNAL_ENGINES_AVAILABLE BEFORE imports to avoid circular dependency
 EXTERNAL_ENGINES_AVAILABLE = False
@@ -484,11 +469,7 @@ TRADING_SESSIONS = {
     'ny_close': {'start': 16, 'end': 20, 'quality': 'MEDIUM'}
 }
 
-# Retired compatibility API. No model call is made by generic helpers.
-OLLAMA_ENABLED = False
-call_ollama = lambda *a, **k: (None, "Ollama retired")
-call_ollama_chat = lambda *a, **k: (None, "Ollama retired")
-analyze_trade_signal = lambda *a, **k: (None, "Ollama retired")
+
 
 def call_ai_for_analysis(prompt, timeout=30):
     return None, "Model analysis retired; Laya is audit-only"
@@ -1064,7 +1045,7 @@ class DeltaWebSocketClient:
         
     def start(self):
         """Start WebSocket listener in a separate thread"""
-        pass # DISABLED: Using Unified Delta Hybrid Client in run_all_parts.py
+        pass # DISABLED: Using Unified Delta Hybrid Client in the live path
         # self.is_running = True
         # self.thread = threading.Thread(target=self._run_loop, daemon=True)
         # self.thread.start()
@@ -1291,7 +1272,7 @@ class LiveTradingEngine:
             try:
                 # The optional scanner uses the same full native interval set
                 # and history profile as the selected-asset path. Keep its
-                # default candidate budget conservative: 16 intervals are a
+                # default candidate budget conservative: 15 intervals are a
                 # much heavier REST workload than the former 8-frame runner.
                 _multi_timeframes = tuple(BINANCE_SPOT_TIMEFRAMES)
                 _multi_history = {tf: TIMEFRAME_HISTORY_CANDLES[tf] for tf in _multi_timeframes}
@@ -1469,7 +1450,7 @@ class LiveTradingEngine:
                 'gpu': getattr(self.jarvis, 'gpu_status', {'backend': 'unknown'}),
                 'readiness': dict(getattr(self, 'readiness', {'status': 'UNKNOWN'})),
                 'native_engines': getattr(self.jarvis, 'native_engine_status', {}),
-                'ai_suggestion': getattr(self.jarvis, 'last_ollama_decision', {'decision': 'unavailable'}),
+                'ai_suggestion': getattr(self.jarvis, 'last_legacy_llm_decision', {'decision': 'unavailable'}),
                 'part7': part7,
             }
             reasons = (result.get('intelligence_board', []) or [])[:3]
@@ -2475,7 +2456,7 @@ class LiveTradingEngine:
             owner._active_candle_snapshot = snapshot
             native_frames = {tf: frame.copy(deep=True) for tf, frame in native_frames.items()}
             # Use a single point-in-time cut for this analysis-only replay.
-            # In particular, 1s candles can close after the latest 1m candle;
+            # In particular, faster candles can close after the latest 1m candle;
             # passing their newer values beside that 1m reference would leak
             # future information into a supposedly synchronized MTF result.
             if '1m' not in native_frames or native_frames['1m'].empty:
@@ -3124,7 +3105,7 @@ class LiveTradingEngine:
                     traceback.print_exc()
                     # Report main loop error to Cognitive Bus
                     if hasattr(self.jarvis, 'bus') and self.jarvis.bus:
-                        self.jarvis.bus.report_error('JarvisElite_LiveLoop', e, context='main _live_loop cycle', try_ollama=False)
+                        self.jarvis.bus.report_error('JarvisElite_LiveLoop', e, context='main _live_loop cycle', try_legacy_llm=False)
                     time.sleep(30)
             self.is_running = False
             if self.readiness.get('status') not in {'STOPPING', 'STOPPED'}:
@@ -4342,10 +4323,6 @@ class Part14OptionsChain:
             signal = 0
         return "DETERMINISTIC_CHAIN_ONLY", "Options result uses validated provider observations; Laya is commentary-only", signal
 
-    def analyze_options_with_ollama(self, telemetry: Dict, current_price: float) -> Tuple[str, str, int]:
-        """Deprecated compatibility alias; never calls a model or adds a vote."""
-        return self.analyze_options_deterministically(telemetry, current_price)
-
     def analyze(self, data, context=None):
         """Unified selected-asset options analysis; BTC Deribit is never an alt substitute."""
         try:
@@ -4483,11 +4460,6 @@ class Part14OptionsChain:
             logging.error(f"Part14OptionsChain analyze error: {e}")
             return {"signal": 0, "thought": "Institutional error", "telemetry": {"error": str(e), "signal": 0}}
 
-# FIX #6: Properly calling local Ollama (GPU) instead of Gemini cloud
-def _call_ollama_local(prompt, model=None, timeout=30):
-    """Legacy compatibility shim: Ollama routing is retired; never make a request."""
-    return None, "Ollama retired; use isolated Laya advisory only"
-
 class DeepSeekV3Brain:
     """Retired model surface; Laya is advisory-only and never casts a vote."""
     def __init__(self):
@@ -4495,7 +4467,7 @@ class DeepSeekV3Brain:
         self.enabled = False
 
     def analyze_sentiment(self, data, market_context):
-        return 0, "unavailable: legacy Ollama/DeepSeek voting retired; Laya is commentary-only"
+        return 0, "unavailable: legacy LegacyLLM/DeepSeek voting retired; Laya is commentary-only"
 
 
 class DeepSeekR1ReasoningBrain:
@@ -4506,7 +4478,7 @@ class DeepSeekR1ReasoningBrain:
 
     def complex_reasoning(self, all_signals, market_data, context):
         return {"signal": "NO-TRADE", "confidence": 0,
-                "reasoning": "unavailable: legacy Ollama/DeepSeek voting retired; Laya is commentary-only",
+                "reasoning": "unavailable: legacy LegacyLLM/DeepSeek voting retired; Laya is commentary-only",
                 "key_factors": [], "available": False}
 
 class QuantumV5:
@@ -5546,8 +5518,8 @@ class JarvisElite:
         self.runtime = detect_backend()
         self.device = torch_device(self.runtime)
         self.gpu_status = self.runtime.to_dict()
-        self.last_ollama_decision = {"decision": "WAIT", "confidence": 0, "rationale": "not queried"}
-        self.last_ollama_snapshot = None
+        self.last_legacy_llm_decision = {"decision": "WAIT", "confidence": 0, "rationale": "not queried"}
+        self.last_legacy_llm_snapshot = None
         self.scoring_matrix = TradeScoringMatrix()
         self.trade_manager = TradeManager()
         self.expiry_optimizer = TradeOptimizer()
@@ -5635,7 +5607,6 @@ class JarvisElite:
         self.specialist_pool = None
         self.specialist_pool_class = _SpecialistPool
         self.backtester_class = _JarvisFullBacktester
-        self.kie_gpt6_client_class = _KieGPT6Client
         self.integration_sources = {}
         if self.delta_data is not None:
             try:
@@ -5672,13 +5643,12 @@ class JarvisElite:
             "upstox_data": self.upstox_data,
             "specialist_pool": self.specialist_pool_class,
             "backtester": self.backtester_class,
-            "kie_gpt6": self.kie_gpt6_client_class,
         }
         if self.bus:
             try:
                 self.bus.publish("THOUGHTS", "JarvisIntegrations", {
                     "available": sorted(name for name, value in self.integration_sources.items() if value is not None),
-                    "on_demand_only": ["coin_scanner", "specialist_pool", "backtester", "kie_gpt6"],
+                    "on_demand_only": ["coin_scanner", "specialist_pool", "backtester"],
                 })
             except Exception:
                 pass
@@ -5877,7 +5847,7 @@ class JarvisElite:
         _optional_wiring_complete = all((SIZER_AVAILABLE, POSITION_MANAGER_AVAILABLE,
                                           COIN_SCANNER_AVAILABLE, SPECIALIST_POOL_AVAILABLE,
                                           BINANCE_DATA_AVAILABLE, UPSTOX_DATA_AVAILABLE,
-                                          BACKTESTER_AVAILABLE, KIE_GPT6_AVAILABLE))
+                                          BACKTESTER_AVAILABLE))
         if _optional_wiring_complete:
             _part2_zone = Part2Zone()
         else:
@@ -5955,8 +5925,6 @@ class JarvisElite:
             return self.specialist_pool
         if key == "backtester" and self.backtester_class:
             return self.backtester_class(**kwargs)
-        if key in {"kie_gpt6", "kie"} and self.kie_gpt6_client_class:
-            return self.kie_gpt6_client_class(**kwargs)
         return self.integration_sources.get(key)
     
     def _fetch_mtf_from_api(self, symbol=None):
@@ -6425,7 +6393,7 @@ class JarvisElite:
                     self.market_context['current_candle_is_confirmed'] = False
 
             # Synchronize every native live interval to the last completed 1m
-            # close. Faster candles (especially 1s) may otherwise contribute
+            # close. Faster candles may otherwise contribute
             # evidence newer than the decision reference. Keep the forming bars
             # separately in snapshot.current_candles for live display only.
             if not self.is_backtest_mode:
@@ -6590,6 +6558,75 @@ class JarvisElite:
                     'entry_blocked': True, 'risk_veto': False, 'data_status': 'error',
                     'computation_backend': 'pandas_cpu', 'timeframe_results': part7_by_timeframe,
                 }
+            # JARVIS owns the final entry decision.  Part 7 is advisory: its
+            # volatility vetoes are reported, but only invalid/missing data or a
+            # veto on the entry timeframe(s) may block a new entry.
+            try:
+                _p7 = self.latest_part7 if isinstance(self.latest_part7, dict) else {}
+                _rows = _p7.get('timeframe_results') or {}
+                _hard = [tf for tf, r in _rows.items()
+                         if not isinstance(r, dict)
+                         or r.get('data_status') != 'valid'
+                         or r.get('status') not in ('ok', 'neutral', 'veto')]
+                _vetoed = list(_p7.get('veto_timeframes') or [])
+                _entry_tfs = ('15m',)
+                _entry_veto = [tf for tf in _vetoed if tf in _entry_tfs]
+                _p7['advisory_veto_timeframes'] = _vetoed
+                _p7['jarvis_hard_data_blocks'] = _hard
+                _p7['jarvis_entry_veto_timeframes'] = _entry_veto
+                if _hard:
+                    _p7['entry_blocked'] = True
+                    _p7['reason'] = 'Part7 data invalid on ' + ', '.join(_hard)
+                elif _entry_veto:
+                    _p7['entry_blocked'] = True
+                    _p7['reason'] = 'JARVIS: extreme volatility on entry timeframe ' + ', '.join(_entry_veto)
+                else:
+                    # Advisory-only: keep the originals under advisory_* keys and
+                    # present a clean, execution-valid aggregate to the approval layer.
+                    _new_rows = {}
+                    for _tf, _r in _rows.items():
+                        _r2 = dict(_r)
+                        if _r2.get('risk_veto') or _r2.get('entry_blocked') or _r2.get('status') == 'veto':
+                            _r2['advisory_risk_veto'] = bool(_r2.get('risk_veto'))
+                            _r2['advisory_status'] = _r2.get('status')
+                            _r2['risk_veto'] = False
+                            _r2['entry_blocked'] = False
+                            if _r2.get('status') == 'veto':
+                                _r2['status'] = 'neutral'
+                        _new_rows[_tf] = _r2
+                    _p7['timeframe_results'] = _new_rows
+                    _p7['status'] = 'ok'
+                    _p7['data_status'] = 'valid'
+                    _p7['risk_veto'] = False
+                    _p7['veto_timeframes'] = []
+                    _p7['blocked_timeframes'] = []
+                    _p7['entry_blocked'] = False
+                    for _tf, _d in list(mtf_breakdown.items()):
+                        _pv = _d.get('part7_volatility') if isinstance(_d, dict) else None
+                        if isinstance(_pv, dict) and (_pv.get('risk_veto') or _pv.get('entry_blocked') or _pv.get('status') == 'veto'):
+                            _pv = dict(_pv)
+                            _pv['advisory_status'] = _pv.get('status')
+                            _pv['advisory_risk_veto'] = bool(_pv.get('risk_veto'))
+                            _pv['risk_veto'] = False
+                            _pv['entry_blocked'] = False
+                            _pv['status'] = 'neutral'
+                            _d['part7_volatility'] = _pv
+                    for _tf, _d in list(mtf_diagnostics.items()):
+                        _pv = _d.get('part7_volatility') if isinstance(_d, dict) else None
+                        if isinstance(_pv, dict) and (_pv.get('risk_veto') or _pv.get('entry_blocked') or _pv.get('status') == 'veto'):
+                            _pv = dict(_pv)
+                            _pv['advisory_status'] = _pv.get('status')
+                            _pv['advisory_risk_veto'] = bool(_pv.get('risk_veto'))
+                            _pv['risk_veto'] = False
+                            _pv['entry_blocked'] = False
+                            _pv['status'] = 'neutral'
+                            _d['part7_volatility'] = _pv
+                    _p7['reason'] = ('Part7 advisory only (higher-timeframe vol noted: '
+                                     + ', '.join(_vetoed) + ')') if _vetoed else 'Part7 data valid'
+                self.latest_part7 = _p7
+            except Exception as _p7_exc:
+                self.latest_part7 = {**(self.latest_part7 or {}), 'entry_blocked': True,
+                                     'reason': 'Part7 policy error: %r' % (_p7_exc,)}
             self.latest_part7_cycle_display = dict(self.latest_part7)
 
             # Build final part_results with MTF confirmation & veto protection
@@ -7386,100 +7423,6 @@ class JarvisElite:
                 return session
         return 'OVERNIGHT'
         
-    def _generate_ollama_ceo_prompt(self, score: float, detailed_scores: Dict, telemetry: Dict = None, data=None) -> str:
-        """Generate a bounded Ollama prompt from one same-symbol system snapshot."""
-        thoughts = detailed_scores.get('thoughts', [])
-        try:
-            current_price = float(data['close'].iloc[-1]) if data is not None and len(data) else None
-        except Exception:
-            current_price = None
-        self.last_ollama_snapshot = build_snapshot(
-            symbol=getattr(self, 'active_symbol', os.getenv('JARVIS_DEFAULT_SYMBOL', 'UNKNOWN')),
-            timestamp=(self.market_context or {}).get('timestamp'),
-            current_price=current_price,
-            market_context=getattr(self, 'market_context', {}),
-            part_results=getattr(self, 'latest_part_results', {}),
-            fusion=detailed_scores.get('fusion_mtf'),
-            confidence=score,
-            mtf=detailed_scores.get('mtf_matrix'),
-            options=detailed_scores.get('options_walls'),
-            risk=getattr(self, 'gpu_status', {}),
-            position_state=getattr(self, 'position_manager', None).__dict__ if getattr(self, 'position_manager', None) else None,
-            order_state={'live_execution_enabled': os.getenv('DELTA_ORDER_EXECUTION_ENABLED', 'false').lower() == 'true'},
-            runtime={'local': getattr(self, 'gpu_status', {}), 'ollama_remote': runtime_metadata()},
-            safety_gates=detailed_scores.get('safety_gates', []),
-        )
-        # The bounded schema is the canonical prompt. Do not append legacy
-        # free-form telemetry or hidden instructions that could reintroduce
-        # mixed symbols, secrets, or uncontrolled context volume.
-        return decision_prompt(self.last_ollama_snapshot)
-        mtf_matrix = detailed_scores.get('mtf_matrix', {})
-        walls = detailed_scores.get('options_walls', {})
-
-        # ── Inject only asset-compatible Oracle context into CEO telemetry ──
-        # The current Oracle publishes a BTC-only market map.  It must not be
-        # presented as ETH/SOL evidence or used to approve an altcoin trade.
-        selected_symbol = str(getattr(self, 'active_symbol', '') or '').upper().replace('-', '').replace('_', '')
-        selected_base = selected_symbol[:-4] if selected_symbol.endswith('USDT') else (selected_symbol[:-3] if selected_symbol.endswith('USD') else selected_symbol)
-        oracle_summary = "Oracle: unavailable for selected asset"
-        if selected_base == "BTC":
-            try:
-                oracle_data = None
-                if hasattr(self, 'jarvis') and hasattr(self.jarvis, 'market_oracle') and self.jarvis.market_oracle:
-                    oracle_data = self.jarvis.market_oracle.get_latest_forecast()
-                elif MARKET_ORACLE_AVAILABLE and _get_market_oracle:
-                    o = _get_market_oracle()
-                    if o:
-                        oracle_data = o.get_latest_forecast()
-                if isinstance(oracle_data, dict) and oracle_data and oracle_data.get("model_used") != "startup_default":
-                    sugg      = oracle_data.get("trade_suggestion", "WAIT")
-                    conf      = oracle_data.get("confidence", 0)
-                    d5m       = oracle_data.get("5min", {}).get("direction", "?")
-                    d30m      = oracle_data.get("30min", {}).get("direction", "?")
-                    hold      = oracle_data.get("hold_minutes", "?")
-                    gem_sum   = oracle_data.get("gemini_summary", "")[:120]
-                    oracle_summary = (
-                        f"Oracle(BTC macro only) -> Suggestion:{sugg} | Confidence:{conf}% | "
-                        f"5m:{d5m} / 30m:{d30m} | Hold:{hold}min | \\\"{gem_sum}\\\""
-                    )
-            except Exception:
-                pass
-        elif selected_base:
-            oracle_summary = f"Oracle: BTC macro map unavailable for selected asset {selected_base} (advisory excluded)"
-
-        prompt = f"""You are the Supreme Commander AI (CEO) of an elite multi-agent quantitative trading system.
-
-Executive Voting Matrix & Telemetry:
-- Overall System Pulse Score: {score}/100
-- Market Oracle (BTC macro scope only; excluded for non-BTC execution): {oracle_summary}
-- Multi-Timeframe Matrix: {json.dumps(mtf_matrix, default=str)}
-- Sub-Agent Insights: {json.dumps(thoughts[:6], default=str)}
-- Options Walls (Smart Money): {json.dumps(walls, default=str)}
-
-CRITICAL INSTRUCTION — Oracle Integration:
-- Selected asset: {selected_base or 'unknown'}. BTC Oracle context is unavailable and advisory-only for any non-BTC route.
-- If Oracle Confidence >= 60% and Oracle Suggestion aligns with sub-agent majority: STRONGLY favor [CEO_VERDICT: EXECUTE].
-- If Oracle says WAIT or is unavailable: treat as neutral (do NOT auto-STANDBY for this reason alone).
-- If Oracle direction contradicts the sub-agent majority with >= 60% confidence: issue [CEO_VERDICT: STANDBY].
-- A conflicting Oracle + conflicting sub-agents = [CEO_VERDICT: ABORT].
-
-Task: Review the complete telemetry above. You hold supreme executive authority over trade execution.
-- If Oracle + sub-agents are in alignment and risk is clean: issue [CEO_VERDICT: EXECUTE].
-- If Oracle is WAIT or sub-agents are mildly conflicting: issue [CEO_VERDICT: STANDBY].
-- If Oracle + sub-agents show severe divergence or trap signals: issue [CEO_VERDICT: ABORT].
-
-Respond with EXACTLY ONE of the following tags at the beginning of your response:
-- [CEO_VERDICT: EXECUTE]
-- [CEO_VERDICT: STANDBY]
-- [CEO_VERDICT: ABORT]
-
-Follow the tag with a 1-sentence CEO executive directive.
-"""
-        # Keep the legacy executive framing for compatibility, but append the
-        # bounded schema as the sole source of detailed context.
-        prompt += "\n\nBOUNDED SYSTEM SNAPSHOT (no secrets; safety rules remain authoritative):\n"
-        prompt += json.dumps(self.last_ollama_snapshot, separators=(',', ':'), default=str)
-        return prompt
 
 
     def _get_deepseek_validation(self, data, score, detailed_scores, telemetry=None):
@@ -7488,7 +7431,7 @@ Follow the tag with a 1-sentence CEO executive directive.
             return {'approved': True, 'reason': 'PURE ALGO BYPASS (Auto-Approved)', 'verdict': 'EXECUTE'}
         """Retired compatibility hook; model output is never an entry gate."""
         result = {'approved': False, 'reason': 'Retired legacy model gate unavailable; unsupported callers must reject', 'verdict': 'NO_TRADE'}
-        self.last_ollama_decision = {'decision': 'UNAVAILABLE', 'confidence': 0, 'rationale': result['reason']}
+        self.last_legacy_llm_decision = {'decision': 'UNAVAILABLE', 'confidence': 0, 'rationale': result['reason']}
         return result
 
     def _create_deepseek_prompt(self, data, score, detailed_scores, telemetry=None):
@@ -7840,7 +7783,7 @@ Follow the tag with a 1-sentence CEO executive directive.
 
     def _live_mode_with_deepseek(self, data):
         """DEPRECATED: Only called from process_data() which is itself dead code.
-        The active validation path is _get_deepseek_validation() using Ollama phi3.5."""
+        The active validation path is _get_deepseek_validation() using LegacyLLM phi3.5."""
         import warnings
         warnings.warn("_live_mode_with_deepseek() is dead code.", DeprecationWarning, stacklevel=2)
         try:

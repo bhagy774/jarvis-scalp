@@ -29,7 +29,7 @@ real_messages = [
     ('Part3_Institutional', 'Institutional MTF Analysis: BULLISH (Consensus: 0.55). Dominant Regime: trending'),
     ('Part5_Fusion',        'Fusion Engine (MTF): Consensus = 0.32, Direction = CALL, Confidence = 74.2%'),
     ('Part8_Pattern',       'Pattern Recognition: Strong BEARISH setup detected. Score: 0.68'),
-    ('Part11_Confidence',   'Confidence Engine: Final Score = 82.5%. VALID | Ollama Adj: +3'),
+    ('Part11_Confidence',   'Confidence Engine: Final Score = 82.5%. VALID | LegacyLLM Adj: +3'),
 ]
 
 print()

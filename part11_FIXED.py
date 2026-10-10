@@ -296,11 +296,11 @@ class GPUUnifiedConfidenceEngine:
         self.is_active = True
         self.executor = ThreadPoolExecutor(max_workers=4)  # i5 4-core optimized
         
-        # Ollama Confidence Analyst Cooldown setup
-        self.last_ollama_time = 0
-        self.ollama_cooldown = 30  # seconds
-        self.last_ollama_adjustment = 0
-        self.last_ollama_insight = "Mathematical confidence verified by AI Risk Analyst."
+        # LegacyLLM Confidence Analyst Cooldown setup
+        self.last_legacy_llm_time = 0
+        self.legacy_llm_cooldown = 30  # seconds
+        self.last_legacy_llm_adjustment = 0
+        self.last_legacy_llm_insight = "Mathematical confidence verified by AI Risk Analyst."
 
         # Initialize GPU tensors
         self._initialize_confidence_tensors()
@@ -347,17 +347,17 @@ class GPUUnifiedConfidenceEngine:
             # Apply final adjustments
             final_confidence = await self._apply_final_adjustments_gpu(fused_scores, signal_data)
             
-            # Apply Ollama AI Chief Risk Analyst Confidence Adjustment
-            final_confidence, ollama_adj, ollama_insight = self.adjust_confidence_with_ollama(final_confidence, signal_data)
+            # Apply LegacyLLM AI Chief Risk Analyst Confidence Adjustment
+            final_confidence, legacy_llm_adj, legacy_llm_insight = self.adjust_confidence_with_legacy_llm(final_confidence, signal_data)
 
             # Validate signal
             validation_result = await self._validate_signal_gpu(final_confidence, signal_data)
             
             if hasattr(self, 'bus') and self.bus:
-                msg = f"Confidence Engine: Final Score = {final_confidence:.1f}%. {validation_result} | Model adj unavailable: {ollama_adj:+d}"
+                msg = f"Confidence Engine: Final Score = {final_confidence:.1f}%. {validation_result} | Model adj unavailable: {legacy_llm_adj:+d}"
                 self.bus.publish('THOUGHTS', 'Part11_Confidence', msg)
                 
-            return final_confidence, f"{validation_result} | Model adj unavailable: {ollama_adj:+d}"
+            return final_confidence, f"{validation_result} | Model adj unavailable: {legacy_llm_adj:+d}"
             
         except Exception as e:
             if hasattr(self, 'bus') and self.bus:
@@ -793,8 +793,8 @@ class GPUUnifiedConfidenceEngine:
             print(f"ERROR Signal validation error: {e}")
             return "Signal validation failed"
 
-    def _generate_ollama_confidence_prompt(self, raw_confidence: float, signal_data: Dict) -> str:
-        """Generate Ollama prompt for Chief Risk & Confidence Analyst score adjustment"""
+    def _generate_legacy_llm_confidence_prompt(self, raw_confidence: float, signal_data: Dict) -> str:
+        """Generate LegacyLLM prompt for Chief Risk & Confidence Analyst score adjustment"""
         breakdown = {k: signal_data[k] for k in self.scoring_weights.keys() if k in signal_data}
         b_str = json.dumps(breakdown, default=str)
 
@@ -814,7 +814,7 @@ Follow the tag with a 1-sentence risk analyst justification.
 """
         return prompt
 
-    def adjust_confidence_with_ollama(self, raw_confidence: float, signal_data: Dict) -> Tuple[float, int, str]:
+    def adjust_confidence_with_legacy_llm(self, raw_confidence: float, signal_data: Dict) -> Tuple[float, int, str]:
         """Legacy hook: no stale adjustment and no model-derived confidence."""
         return raw_confidence, 0, "Model adjustment unavailable; mathematical score unchanged"
     
@@ -894,8 +894,8 @@ Follow the tag with a 1-sentence risk analyst justification.
                         'average_confidence': np.mean([p['confidence'] for p in performances])
                     }
             
-            analysis['ollama_confidence_adjustment'] = self.last_ollama_adjustment
-            analysis['ollama_insight'] = self.last_ollama_insight
+            analysis['legacy_llm_confidence_adjustment'] = self.last_legacy_llm_adjustment
+            analysis['legacy_llm_insight'] = self.last_legacy_llm_insight
 
             return analysis
             

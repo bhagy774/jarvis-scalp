@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-JARVIS FIXED Integration Test (No Ollama)
+JARVIS FIXED Integration Test (No LegacyLLM)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Tests: jarvis_FIXED.py calls multi_ai_consensus correctly
 and the new parallel pipeline is wired in properly.
@@ -48,7 +48,7 @@ section("TEST A: jarvis_FIXED.py -> Pipeline Integration")
 
 # Verify the import path exists as expected by jarvis_FIXED.py (line 1535)
 try:
-    with patch("jarvis_specialist_pool.call_ollama") as mock_call:
+    with patch("jarvis_specialist_pool.call_legacy_llm") as mock_call:
         mock_call.return_value = ("[CONSENSUS_EXECUTE] Strong setup.", None)
 
         from multi_ai_consensus import run_ai_roundtable, _specialist_pool
@@ -58,7 +58,7 @@ except Exception as e:
 
 # Simulate the EXACT call jarvis_FIXED.py makes (lines 1538-1546)
 try:
-    with patch("jarvis_specialist_pool.call_ollama") as mock_call:
+    with patch("jarvis_specialist_pool.call_legacy_llm") as mock_call:
         mock_call.return_value = ("[CONSENSUS_EXECUTE] Buy confirmed.", None)
 
         # This mirrors the EXACT market_context dict jarvis_FIXED.py builds
@@ -87,7 +87,7 @@ except Exception as e:
 
 # Verify result fields jarvis_FIXED.py reads (line 1547-1549)
 try:
-    with patch("jarvis_specialist_pool.call_ollama") as mock_call:
+    with patch("jarvis_specialist_pool.call_legacy_llm") as mock_call:
         mock_call.return_value = ("[CONSENSUS_EXECUTE] Confirmed.", None)
 
         consensus = run_ai_roundtable(
@@ -113,7 +113,7 @@ except Exception as e:
 section("TEST B: Background Thread (daemon=True) like jarvis_FIXED.py line 1553-1554")
 
 try:
-    with patch("jarvis_specialist_pool.call_ollama") as mock_call:
+    with patch("jarvis_specialist_pool.call_legacy_llm") as mock_call:
         mock_call.return_value = ("[CONSENSUS_EXECUTE] Go!", None)
 
         bg_result = {}
@@ -157,7 +157,7 @@ section("TEST C: Cycle Throttle (jarvis_FIXED.py line 1532: cycle % 5)")
 try:
     call_counts = [0]
 
-    with patch("jarvis_specialist_pool.call_ollama") as mock_call:
+    with patch("jarvis_specialist_pool.call_legacy_llm") as mock_call:
         mock_call.return_value = ("[CONSENSUS_EXECUTE] ok", None)
 
         total_cycles = 20
@@ -183,8 +183,8 @@ except Exception as e:
 section("TEST D: Error Safety (jarvis_FIXED.py line 1550: except Exception as ce)")
 
 try:
-    with patch("jarvis_specialist_pool.call_ollama") as mock_call:
-        # Simulate Ollama being down or erroring
+    with patch("jarvis_specialist_pool.call_legacy_llm") as mock_call:
+        # Simulate LegacyLLM being down or erroring
         mock_call.return_value = (None, "Connection refused")
 
         error_caught = []
@@ -196,7 +196,7 @@ try:
                     market_context={"symbol": "BTC/USDT", "current_price": 0, "trend": "NEUTRAL", "volatility": "HIGH"},
                     signal_data={"direction": "NO-TRADE", "confidence": 0}
                 )
-                # Even with Ollama down, function should return a valid dict (not crash)
+                # Even with LegacyLLM down, function should return a valid dict (not crash)
                 if result:
                     error_caught.append("result_returned")
             except Exception as ce:
@@ -207,7 +207,7 @@ try:
         t.start()
         t.join(timeout=8)
 
-        ok(f"Ollama-down scenario: outcome='{error_caught[0] if error_caught else 'timeout'}'")
+        ok(f"LegacyLLM-down scenario: outcome='{error_caught[0] if error_caught else 'timeout'}'")
         ok("jarvis_FIXED.py will safely log debug and continue — no crash")
 except Exception as e:
     fail("Error safety check", e)

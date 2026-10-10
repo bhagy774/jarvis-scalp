@@ -14,7 +14,7 @@ Real message format from parts:
   Part3:  "Institutional MTF Analysis: BULLISH (Consensus: 0.55). Dominant Regime: trending"
   Part5:  "Fusion Engine (MTF): Consensus = 0.32, Direction = CALL, Confidence = 74.2%"
   Part8:  "Pattern Recognition: ... BEARISH ..."
-  Part11: "Confidence Engine: Final Score = 82.5%. VALID | Ollama Adj: +3"
+  Part11: "Confidence Engine: Final Score = 82.5%. VALID | LegacyLLM Adj: +3"
 """
 
 import re

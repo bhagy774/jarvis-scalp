@@ -13,13 +13,13 @@ except ImportError:
     pass
 
 logger = logging.getLogger(__name__)
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+LEGACY_LLM_BASE_URL = os.environ.get("LEGACY_LLM_BASE_URL", "http://localhost:11434")
 LAYA_MODEL    = os.environ.get("LAYA_MODEL", "deepseek-r1:14b")
 
 
 class JarvisNeuralCortex:
     """
-    Single AI brain: all 12 GPU parts -> ONE Ollama chat call -> CALL/PUT/NO_TRADE
+    Single AI brain: all 12 GPU parts -> ONE LegacyLLM chat call -> CALL/PUT/NO_TRADE
     Uses rolling 20-message history for market memory.
 
     Backward-compatible with old ai_chain_brain API.
@@ -169,11 +169,11 @@ class JarvisNeuralCortex:
         return report.strip()
 
     # -------------------------------------------------------------------------
-    # LAYA AI INTEGRATION (Replaces Ollama)
+    # LAYA AI INTEGRATION (Replaces LegacyLLM)
     # -------------------------------------------------------------------------
 
     def _call_laya_advisor(self, snapshot: Dict) -> Optional[Dict]:
-        """Calls Laya AI for decision support instead of Ollama."""
+        """Calls Laya AI for decision support instead of LegacyLLM."""
         try:
             from jarvis_laya_advisor import advise
             # Convert neural cortex snapshot to Laya snapshot format

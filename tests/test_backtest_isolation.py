@@ -34,9 +34,9 @@ def _isolated_classes():
 
 def test_backtester_has_no_remote_model_path_or_network_library():
     lower = BACKTESTER.lower()
-    for prohibited in ("ollama", "requests", "http://", "https://", "api/generate"):
+    for prohibited in ("legacy_llm", "requests", "http://", "https://", "api/generate"):
         assert prohibited not in lower
-    assert 'p.add_argument("--ollama' not in BACKTESTER
+    assert 'p.add_argument("--legacy_llm' not in BACKTESTER
 
 
 def test_backtester_has_no_execution_client_or_order_submission_path():

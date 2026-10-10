@@ -330,11 +330,11 @@ class EnhancedGPUPatternRecognitionEngine:
         self.is_running = True
         self.executor = ThreadPoolExecutor(max_workers=4)  # i5 4-core optimized
         
-        # Ollama Pattern Technical Analysis Validation Cooldown setup
-        self.last_ollama_time = 0
-        self.ollama_cooldown = 30  # seconds
-        self.last_ollama_validation = "CONFIRM_PATTERN"
-        self.last_ollama_insight = "Geometric patterns validated against volume context."
+        # LegacyLLM Pattern Technical Analysis Validation Cooldown setup
+        self.last_legacy_llm_time = 0
+        self.legacy_llm_cooldown = 30  # seconds
+        self.last_legacy_llm_validation = "CONFIRM_PATTERN"
+        self.last_legacy_llm_insight = "Geometric patterns validated against volume context."
 
         # Initialize enhanced GPU pattern templates
         self._initialize_enhanced_pattern_templates_gpu()
@@ -1023,8 +1023,8 @@ class EnhancedGPUPatternRecognitionEngine:
                 fused[name] = data
         return fused
 
-    def _generate_ollama_pattern_prompt(self, market_context: Dict, detected_patterns: Dict) -> str:
-        """Generate Ollama prompt for chart pattern technical analysis validation"""
+    def _generate_legacy_llm_pattern_prompt(self, market_context: Dict, detected_patterns: Dict) -> str:
+        """Generate LegacyLLM prompt for chart pattern technical analysis validation"""
         pats_str = json.dumps(detected_patterns, default=str)
         ctx_str = json.dumps(market_context, default=str)
 
@@ -1044,7 +1044,7 @@ Follow the tag with a 1-2 sentence institutional technical analysis validation.
 """
         return prompt
 
-    def validate_patterns_with_ollama(self, market_context: Dict, detected_patterns: Dict) -> Tuple[str, str]:
+    def validate_patterns_with_legacy_llm(self, market_context: Dict, detected_patterns: Dict) -> Tuple[str, str]:
         """Legacy compatibility: model pattern verdicts cannot change a signal."""
         return "UNAVAILABLE", "Pattern advisory unavailable; deterministic patterns unchanged"
     
@@ -1324,9 +1324,9 @@ Follow the tag with a 1-2 sentence institutional technical analysis validation.
                 }
 
             context = self._get_current_market_context()
-            vote, insight = self.validate_patterns_with_ollama(context, analysis.get('detected_patterns', {}))
-            analysis['ollama_pattern_validation'] = vote
-            analysis['ollama_insight'] = insight
+            vote, insight = self.validate_patterns_with_legacy_llm(context, analysis.get('detected_patterns', {}))
+            analysis['legacy_llm_pattern_validation'] = vote
+            analysis['legacy_llm_insight'] = insight
             
             return analysis
             
@@ -1339,13 +1339,13 @@ Follow the tag with a 1-2 sentence institutional technical analysis validation.
         try:
             signals = list(self.pattern_signals)
             context = self._get_current_market_context()
-            vote, insight = self.validate_patterns_with_ollama(context, self.detected_patterns_gpu)
+            vote, insight = self.validate_patterns_with_legacy_llm(context, self.detected_patterns_gpu)
 
             annotated_signals = []
             for s in signals:
                 s_copy = dict(s)
-                s_copy['ollama_pattern_validation'] = vote
-                s_copy['ollama_insight'] = insight
+                s_copy['legacy_llm_pattern_validation'] = vote
+                s_copy['legacy_llm_insight'] = insight
                 # Model commentary cannot boost or penalize mathematical confidence.
                 annotated_signals.append(s_copy)
 

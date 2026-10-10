@@ -8,7 +8,7 @@ scores the existing candidate set: Volume(25) + Momentum(25) + RSI(20)
 The 24h quote-volume floor, fresh same-symbol ticker, bid/ask spread cap,
 and 15 fresh contiguous closed 5m candles are eligibility gates.  Ranking is
 score descending, then spread ascending, quote volume descending, and base
-symbol ascending. No Ollama/model is consulted for market selection.
+symbol ascending. No LegacyLLM/model is consulted for market selection.
 Coin switch ONLY when NO position is open. If no candidate passes the data-quality/volume filter, the result is empty and
 must be blocked by the market router; BTC is never silently substituted.
 """

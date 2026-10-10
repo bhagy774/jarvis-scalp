@@ -43,7 +43,7 @@ def test_get_historical_candles_success():
     assert bd.get_last_source()["source"] == "binance_spot"
 
 def test_all_native_interval_tokens_are_supported_distinctly():
-    assert set(binance_data.RESOLUTION_MAP) == {"1s", "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"}
+    assert set(binance_data.RESOLUTION_MAP) == {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"}
     assert binance_data.RESOLUTION_MAP["1m"] != binance_data.RESOLUTION_MAP["1M"]
 
 def test_historical_fetch_pages_over_binance_per_request_limit():
@@ -85,7 +85,7 @@ def test_mtf_helper_rejects_partial_native_history():
     bd = BinanceData()
     with patch.object(bd, "get_historical_candles", return_value=[]):
         with pytest.raises(RuntimeError, match="incomplete native Binance Spot history"):
-            bd.fetch_mtf_candles(timeframes=["1s"], limit=20)
+            bd.fetch_mtf_candles(timeframes=["1m"], limit=20)
 
 
 def test_get_bid_ask():

@@ -13,7 +13,7 @@ import time
 from typing import Mapping
 
 BINANCE_SPOT_TIMEFRAMES = (
-    "1s", "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h",
+    "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h",
     "6h", "8h", "12h", "1d", "3d", "1w", "1M",
 )
 
@@ -24,13 +24,13 @@ DEFAULT_STRATEGY_TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h")
 # Short frames receive deeper intraday warm-up; very long frames avoid asking
 # Binance for decades of monthly/weekly history.
 TIMEFRAME_HISTORY_CANDLES: Mapping[str, int] = {
-    "1s": 3600, "1m": 2000, "3m": 1500, "5m": 1000, "15m": 750,
+    "1m": 2000, "3m": 1500, "5m": 1000, "15m": 750,
     "30m": 500, "1h": 500, "2h": 500, "4h": 500, "6h": 365,
     "8h": 365, "12h": 365, "1d": 365, "3d": 180, "1w": 104, "1M": 60,
 }
 
 _FIXED_SECONDS: Mapping[str, int] = {
-    "1s": 1, "1m": 60, "3m": 180, "5m": 300, "15m": 900,
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900,
     "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400,
     "6h": 21600, "8h": 28800, "12h": 43200, "1d": 86400,
     "3d": 259200, "1w": 604800,
@@ -54,7 +54,9 @@ def candle_open_time(timeframe: str, timestamp: float) -> int:
         monday = midnight.timestamp() - dt.weekday() * 86400
         return int(monday)
     width = _FIXED_SECONDS[timeframe]
-    return ts - (ts % width)
+    # Binance 3d bars are anchored one day after the epoch (verified live: open % 259200 == 86400).
+    anchor = 86400 if timeframe == '3d' else 0
+    return ts - ((ts - anchor) % width)
 
 def is_aligned_open(timeframe: str, open_time: float) -> bool:
     """Whether a timestamp is exactly on the provider's native bar boundary."""
@@ -123,7 +125,7 @@ def validate_closed_candle_timestamps(timeframe: str, open_times: list[float], d
 # Nearby resolutions are correlated; summarize each bucket once before using
 # them as multi-timeframe confluence evidence.
 TIMEFRAME_CORRELATION_GROUPS = {
-    "fast": ("1s", "1m", "3m"),
+    "fast": ("1m", "3m"),
     "short": ("5m", "15m"),
     "session": ("30m", "1h", "2h"),
     "swing": ("4h", "6h", "8h", "12h"),
@@ -136,7 +138,7 @@ def synchronize_native_frames_to_1m_close(
 ) -> dict[str, object]:
     """Truncate native frames to the latest fully closed 1m decision instant.
 
-    This prevents faster frames (notably 1s) from contributing bars that close
+    This prevents faster frames (sub-minute frames are not used) from contributing bars that close
     after the reference 1m candle. Inputs are copied and must have timezone-aware
     DatetimeIndex values; insufficient history, a future/forming 1m reference,
     or malformed frames fail closed. ``as_of`` exists for deterministic tests.
