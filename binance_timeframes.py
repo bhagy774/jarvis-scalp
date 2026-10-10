@@ -54,7 +54,9 @@ def candle_open_time(timeframe: str, timestamp: float) -> int:
         monday = midnight.timestamp() - dt.weekday() * 86400
         return int(monday)
     width = _FIXED_SECONDS[timeframe]
-    return ts - (ts % width)
+    # Binance 3d bars are anchored one day after the epoch (verified live: open % 259200 == 86400).
+    anchor = 86400 if timeframe == '3d' else 0
+    return ts - ((ts - anchor) % width)
 
 def is_aligned_open(timeframe: str, open_time: float) -> bool:
     """Whether a timestamp is exactly on the provider's native bar boundary."""

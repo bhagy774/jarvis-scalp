@@ -83,3 +83,11 @@ def test_timestamp_validation_rejects_duplicate_unaligned_and_gapped_bars():
         validate_closed_candle_timestamps("1h", [start + 60], decision)
     with pytest.raises(ValueError, match="gap"):
         validate_closed_candle_timestamps("1h", [start, start + 7200], decision)
+
+
+def test_3d_open_matches_binance_native_anchor():
+    # Real Binance BTCUSDT 3d bar opens: 2026-10-08 00:00Z = 1791417600
+    from binance_timeframes import candle_open_time, is_aligned_open
+    assert is_aligned_open('3d', 1791417600)
+    assert candle_open_time('3d', 1791417600 + 100000) == 1791417600
+    assert not is_aligned_open('3d', 1791417600 + 86400)
