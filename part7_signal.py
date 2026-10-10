@@ -125,7 +125,7 @@ def _validate_frame(data: Any, symbol: str, timeframe: str, context: Mapping[str
             age = now - float(next_candle_open(timeframe, last_open))
             # Apply the same calendar-aware freshness rule to every supported
             # interval. Tiny bars get a 10s transport allowance so REST polling
-            # at the configured cadence does not make each 1s frame instantly stale.
+            # at the configured cadence does not make each short frame instantly stale.
             bar_seconds = next_candle_open(timeframe, last_open) - last_open
             freshness_intervals = max(3.0, 10.0 / bar_seconds) if bar_seconds > 0 else 3.0
             stale = now > stale_deadline(timeframe, last_open, freshness_intervals)

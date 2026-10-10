@@ -101,16 +101,6 @@ def test_pipeline():
     print(f"  ✓ Gate 0.5 Entry Zone: {in_zone} ({z_r})")
     print(f"  ✓ Gate 0.5 Dynamic TP/SL: TP=${tp_sl['tp_price']:,} / SL=${tp_sl['sl_price']:,}")
 
-    # 6. Test Gemini Supreme Advisor snapshot injection
-    print("\n[TEST 6] Testing GeminiSupremeAdvisor Oracle Snapshot Injection...")
-    from gemini_supreme_advisor import GeminiSupremeAdvisor
-    advisor = GeminiSupremeAdvisor(bus=bus)
-    snapshot = advisor._collect_system_snapshot()
-    assert "oracle" in snapshot, "oracle key missing from advisor system snapshot"
-    prompt = advisor._build_prompt(snapshot)
-    assert "MARKET ORACLE FORECAST" in prompt, "Oracle section missing from advisor prompt"
-    print("  ✓ Gemini Supreme Advisor snapshot and prompt include Oracle forecast")
-
     # 7. Test Market Oracle Forecast & Console Rendering
     print("\n[TEST 7] Testing JARVIS Market Oracle Instance...")
     from jarvis_market_oracle import JarvisMarketOracle

@@ -77,7 +77,7 @@ def _same_exact_price(left, right):
 
 
 def _validate_central_entry(approval, part_results, part7_gate, direction, confidence, symbol, snapshot_version, execution_plan=None, trade_mode=None, timeframe_parts=None):
-    """Recompute Jarvis native 16-frame policy and validate the scoped plan."""
+    """Recompute Jarvis native 15-frame policy and validate the scoped plan."""
     try:
         from jarvis_strategy_approval import evaluate_mtf_central_strategy, validate_entry_approval, validate_execution_plan
         expected = "BUY" if str(direction).upper() in ("CALL", "BUY") else "SELL" if str(direction).upper() in ("PUT", "SELL") else "NO_TRADE"

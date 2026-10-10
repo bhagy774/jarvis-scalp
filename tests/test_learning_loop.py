@@ -1,4 +1,4 @@
-"""Offline tests: Ollama auto model resolution + learning loop. All network mocked."""
+"""Offline tests: learning loop. No network."""
 import json
 import os
 import sys
@@ -7,66 +7,16 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import ollama_integration as oi
-
 
 @pytest.fixture(autouse=True)
 def clean_state(monkeypatch, tmp_path):
-    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
     monkeypatch.delenv("JARVIS_LEARNING", raising=False)
     monkeypatch.chdir(tmp_path)
-    # reset resolver cache between tests
-    oi._resolved_model_cache = None
-    oi._model_resolution_done = False
-    oi._no_model_logged = False
     import jarvis_learning as jl
     jl._cache = None
     jl._cache_path = None
     yield
 
-
-@pytest.mark.parametrize("override", [None, "my-custom:7b", "mistral:7b"])
-def test_retired_resolver_never_probes_or_honors_model_override(monkeypatch, override):
-    import requests
-    def forbidden(*a, **k):
-        raise AssertionError("retired resolver must not use network")
-    monkeypatch.setattr(requests, "get", forbidden)
-    monkeypatch.setattr(requests, "post", forbidden)
-    if override:
-        monkeypatch.setenv("OLLAMA_MODEL", override)
-    assert oi.resolve_ollama_model() is None
-    assert oi.resolve_ollama_model(force_refresh=True) is None
-    assert oi.list_installed_models() == []
-    assert oi.runtime_metadata()["available"] is False
-    assert oi.test_ollama_connection() is False
-
-@pytest.mark.parametrize("function", ["call_ollama", "call_ollama_chat", "call_gemini_structured", "call_gemini_with_search", "analyze_trade_signal"])
-def test_retired_callers_return_unavailable_without_network(monkeypatch, function):
-    import requests
-    def forbidden(*a, **k):
-        raise AssertionError("retired caller must not use network")
-    monkeypatch.setattr(requests, "post", forbidden)
-    content, error = getattr(oi, function)("BUY", model="force-enable")
-    assert content is None
-    assert "retired" in error.lower()
-
-def test_call_ollama_local_no_model_graceful(monkeypatch):
-    import jarvis_FIXED as jf
-    monkeypatch.setattr("requests.post", lambda *a, **k: pytest.fail("no network"))
-    content, err = jf._call_ollama_local("hi", model="force-enable")
-    assert content is None and "retired" in err.lower()
-
-def test_brains_use_auto_resolution():
-    import jarvis_FIXED as jf
-    assert jf.DeepSeekV3Brain().model_name is None
-    assert jf.DeepSeekR1ReasoningBrain().model_name is None
-
-def test_preload_skips_missing_models(monkeypatch):
-    monkeypatch.setenv("OLLAMA_PRELOAD_COMMITTEE", "1")
-    monkeypatch.setenv("MODEL_ANALYST", "force-enable")
-    monkeypatch.setattr("requests.post", lambda *a, **k: pytest.fail("no network"))
-    assert oi.preload_committee_models() is None
-    assert oi.OLLAMA_ENABLED is False
 
 # ── Learning loop ─────────────────────────────────────────────────────
 

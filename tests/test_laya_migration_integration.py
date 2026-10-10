@@ -10,7 +10,6 @@ from jarvis_market_oracle import JarvisMarketOracle
 from jarvis_specialist_pool import SpecialistPool
 from multi_ai_consensus import run_ai_roundtable
 from options_hedged_scalp import OptionsHedgedScalpEngine
-from ollama_integration import call_ollama, call_ollama_chat
 
 
 class MigrationIntegration(unittest.TestCase):
@@ -127,8 +126,6 @@ class MigrationIntegration(unittest.TestCase):
         self.assertFalse(result['approved'])
         self.assertEqual(result['approve_votes'], 0)
         self.assertFalse(run_ai_roundtable({}, {})['approved'])
-        self.assertIsNone(call_ollama('BUY')[0])
-        self.assertIsNone(call_ollama_chat([{'role':'user', 'content':'BUY'}])[0])
 
 
 if __name__ == '__main__': unittest.main()

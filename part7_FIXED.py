@@ -565,7 +565,7 @@ class EnhancedGPULiveDataEngine:
         self.candle_buffers_gpu: Dict[str, Dict] = {}
         
         # Multi-timeframe candle storage
-        self.timeframes: List[str] = ['1s', '5s', '1m', '5m', '15m']
+        self.timeframes: List[str] = ['5s', '1m', '5m', '15m']
         self._initialize_candle_buffers()
         
         # Real-time feature tensors
@@ -608,7 +608,6 @@ class EnhancedGPULiveDataEngine:
     def _initialize_candle_buffers(self):
         """Initialize GPU-optimized candle buffers for all timeframes"""
         buffer_sizes = {
-            '1s': 3600,   # 1 hour of 1-second data
             '5s': 4320,   # 6 hours of 5-second data  
             '1m': 1440,   # 1 day of 1-minute data
             '5m': 864,    # 3 days of 5-minute data
@@ -867,7 +866,6 @@ class EnhancedGPULiveDataEngine:
         last_timestamp = buffer['timestamp'][buffer['pointer']].item() / 1000
         
         timeframe_seconds = {
-            '1s': 1,
             '5s': 5,
             '1m': 60,
             '5m': 300,
@@ -1239,11 +1237,11 @@ class EnhancedGPULiveDataEngine:
                 }
             }
             
-            # Add current price from 1-second data
-            candle_1s = self.get_candle_data('1s', 1)
-            if candle_1s:
-                market_state['current_price'] = float(candle_1s['close'][-1])
-                market_state['current_volume'] = float(candle_1s['volume'][-1])
+            # Add current price from 5-second data (1-second frames are not used)
+            candle_5s = self.get_candle_data('5s', 1)
+            if candle_5s:
+                market_state['current_price'] = float(candle_5s['close'][-1])
+                market_state['current_volume'] = float(candle_5s['volume'][-1])
             
             # Publish to CognitiveBus for Watcher AI monitoring
             if hasattr(self, 'bus') and self.bus:

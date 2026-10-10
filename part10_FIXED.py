@@ -859,8 +859,8 @@ class FinalExecutionEngine:
         logging.info(f"Final Execution Engine initialized - GPU: {self.gpu_optimized}")
         
     def execute_strategy(self, unified_signal: dict) -> dict:
-        """Synchronous bridge for run_all_parts.py live mode execution.
-        Maps unified_signal from run_all_parts into the async trading pipeline."""
+        """Synchronous bridge for the unified live path execution.
+        Maps unified_signal into the async trading pipeline."""
         import asyncio
         
         direction = unified_signal.get('direction', 'NO-TRADE')

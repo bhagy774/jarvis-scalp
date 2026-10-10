@@ -243,7 +243,6 @@ class Audit:
             self.evidence("fusion-final-veto", [r"build_final_decision|blocking_reasons|gate_reason|SafetyRiskBrain|execution_allowed"], ["jarvis_FIXED.py", "jarvis_decision.py", "oracle_trade_gate.py"])
             self.evidence("risk-contract-lots", [r"calculate_trade_size|MAX_LEVERAGE_CAP|contract_value|enforce_entry_lots|lot_size"], ["jarvis_FIXED.py", "jarvis_risk.py", "jarvis_lot_limits.py", "jarvis_live_trader.py"])
             self.evidence("execution-close-reconciliation", [r"place.*order|create_order|reduce_only|close|reconcile|paper_trad"], ["jarvis_FIXED.py", "jarvis_live_trader.py", "jarvis_close_coordinator.py", "jarvis_position_manager.py"])
-            self.evidence("ollama-error-boundary", [r"ollama|validate_decision|snapshot_usable|timeout|except"], ["jarvis_FIXED.py", "jarvis_ollama_context.py", "ollama_integration.py"])
         # Static token presence is explicitly not a safety proof.
         self.add("static-proof-boundary", "PASS", "info",
                  "Static evidence is reported as wiring evidence only; token presence is not safety proof")

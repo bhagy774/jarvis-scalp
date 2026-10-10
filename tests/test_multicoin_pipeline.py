@@ -90,7 +90,7 @@ def test_incremental_rollover_keeps_500_closed_and_fetches_only_recent_delta():
     assert second is not first
     assert all(len(frame.closed) == TIMEFRAME_HISTORY_CANDLES[tf] for tf, frame in second.frames.items())
     assert all(limit <= 63 for _, _, limit in client.calls[len(LIVE_TIMEFRAMES):])
-    assert next(limit for _, tf, limit in client.calls[len(LIVE_TIMEFRAMES):] if tf == "1s") == 62
+    assert all(tf != "1s" for _, tf, _ in client.calls)
     for tf, frame in second.frames.items():
         closed_seconds = [int(stamp.timestamp()) for stamp in frame.closed.index]
         from binance_timeframes import next_candle_open, candle_open_time

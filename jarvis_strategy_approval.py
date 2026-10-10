@@ -366,7 +366,7 @@ def evaluate_mtf_central_strategy(
 ) -> dict[str, Any]:
     """Select a deterministic SCALP/SWING candidate from complete native evidence.
 
-    All 16 native frames are independently evaluated with the existing Parts
+    All 15 native frames are independently evaluated with the existing Parts
     1–11 quorum, Part 2 zone veto and anchor-dissent policy. Frames are then
     averaged within five predeclared correlation horizons before 65% weighted
     confluence is measured. SCALP uses fast+short horizons; SWING uses
@@ -378,7 +378,7 @@ def evaluate_mtf_central_strategy(
     if not expected_clean:
         return _result("BLOCKED", "NO_TRADE", None, ["Selected symbol is required for MTF approval"], {})
     if not isinstance(timeframe_parts, Mapping) or set(timeframe_parts) != set(REQUIRED_TIMEFRAMES):
-        return _result("BLOCKED", "NO_TRADE", None, ["Complete native 16-timeframe Part evidence is required"], {})
+        return _result("BLOCKED", "NO_TRADE", None, ["Complete native 15-timeframe Part evidence is required"], {})
     if not isinstance(part7_gate, Mapping):
         return _result("BLOCKED", "NO_TRADE", None, ["Part7 aggregate gate is missing"], {})
     aggregate_frames = part7_gate.get("timeframe_results")

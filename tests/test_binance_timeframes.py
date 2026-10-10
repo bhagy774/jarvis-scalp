@@ -1,3 +1,4 @@
+from binance_timeframes import validate_interval
 from datetime import datetime, timezone
 import pytest
 
@@ -9,7 +10,7 @@ from binance_timeframes import (
 
 
 def test_full_provider_catalogue_and_distinct_minute_month_tokens():
-    assert len(BINANCE_SPOT_TIMEFRAMES) == 16
+    assert len(BINANCE_SPOT_TIMEFRAMES) == 15
     assert "1m" in BINANCE_SPOT_TIMEFRAMES and "1M" in BINANCE_SPOT_TIMEFRAMES
     assert history_limit("1m") == TIMEFRAME_HISTORY_CANDLES["1m"]
     assert history_limit("1M") == TIMEFRAME_HISTORY_CANDLES["1M"]
@@ -34,26 +35,11 @@ def test_backtest_rejects_unclosed_native_higher_timeframe_bar():
     validate_closed_candle_timestamps("4h", [open_4], decision_10)
 
 
-def test_synchronization_excludes_fast_bars_after_latest_completed_1m_close():
-    import pandas as pd
-
-    one_minute = pd.DataFrame(
-        {"close": range(30)},
-        index=pd.date_range("2026-10-01T10:30:00Z", periods=30, freq="min"),
-    )
-    seconds = pd.DataFrame(
-        {"close": range(151)},
-        index=pd.date_range("2026-10-01T10:58:00Z", periods=151, freq="s"),
-    )
-
-    result = synchronize_native_frames_to_1m_close(
-        {"1m": one_minute, "1s": seconds}, as_of=datetime(2026, 10, 1, 11, 0, 10, tzinfo=timezone.utc).timestamp()
-    )
-
-    cutoff = datetime(2026, 10, 1, 11, 0, tzinfo=timezone.utc)
-    assert result["1m"].index[-1] == one_minute.index[-1]
-    assert result["1s"].index[-1] < cutoff
-    assert len(result["1s"]) == 120
+def test_one_second_interval_is_not_supported():
+    import pytest
+    assert "1s" not in BINANCE_SPOT_TIMEFRAMES
+    with pytest.raises(ValueError):
+        validate_interval("1s")
 
 
 def test_synchronization_rejects_forming_1m_reference_and_handles_calendar_frames():

@@ -104,7 +104,7 @@ def _validate_jarvis_broker_entry_authorization(
             return False, "Jarvis central entry scope is incomplete"
         if (not isinstance(timeframe_evidence, dict)
                 or set(timeframe_evidence) != set(REQUIRED_TIMEFRAMES)):
-            return False, "Complete native 16-timeframe Jarvis evidence is required"
+            return False, "Complete native 15-timeframe Jarvis evidence is required"
         from jarvis_strategy_approval import _clean_symbol
         expected_clean = _clean_symbol(analysis_symbol)
         for timeframe in REQUIRED_TIMEFRAMES:
