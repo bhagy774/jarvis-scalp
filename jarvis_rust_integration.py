@@ -38,6 +38,8 @@ def calculate_sma(values: Iterable[float], period: int) -> float:
     if _ENABLED:
         try:
             import jarvis_rust
+            if not callable(getattr(jarvis_rust, "calculate_sma", None)):
+                raise ImportError("jarvis_rust native SMA extension unavailable")
         except (ImportError, ModuleNotFoundError):
             global _warned_unavailable
             if not _warned_unavailable:

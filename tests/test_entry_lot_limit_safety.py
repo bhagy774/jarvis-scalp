@@ -1,5 +1,6 @@
 """Offline regressions for final entry-lot enforcement and risk accounting."""
 from __future__ import annotations
+from central_entry_fixture import entry_evidence
 
 from pathlib import Path
 
@@ -91,6 +92,14 @@ class DeltaStub:
         self.calls.append(("leverage", symbol, leverage))
         return True
 
+    def place_protected_order(self, **kwargs):
+        assert kwargs["stop_loss"] < kwargs["entry_authorization"]["broker_plan"]["entry_price"] < kwargs["take_profit"]
+        assert self.set_leverage(kwargs["symbol"], kwargs["leverage"])
+        self.calls.append(("order", kwargs))
+        return {"status": "FILLED", "authoritative": True, "protection_state": "ACTIVE",
+                "filled_quantity": kwargs["size"], "average_fill_price": kwargs["entry_authorization"]["broker_plan"]["entry_price"],
+                "order_id": "offline-order"}
+
     def place_order(self, **kwargs):
         self.calls.append(("order", kwargs))
         return {"success": True, "order_id": "offline-order"}
@@ -120,9 +129,7 @@ def test_capped_entry_recomputes_notional_margin_and_trade_risk(monkeypatch):
     })
     trader = _make_trader(monkeypatch, delta, enabled=True)
 
-    result = trader._place_trade(
-        "CALL", 95, 100.0, "SCALP", {"do_hedge": False}, "BTCUSDT"
-    )
+    result = trader._place_trade("CALL", 95, 100.0, entry_evidence("BTCUSDT", "CALL", 95, 100.0)[1], {"do_hedge": False}, "BTCUSDT", **entry_evidence("BTCUSDT", "CALL", 95, 100.0)[0])
 
     assert result["success"] is True
     position = result["position"]
@@ -130,7 +137,10 @@ def test_capped_entry_recomputes_notional_margin_and_trade_risk(monkeypatch):
     assert position["contract_value_usdt"] == pytest.approx(2.0)
     assert position["notional_usdt"] == pytest.approx(8.0)
     assert position["margin_usdt"] == pytest.approx(8.0 / position["leverage"])
-    assert position["trade_risk_usdt"] <= 8.0 * 0.002 + 1e-12
+    plan = entry_evidence("BTCUSDT", "CALL", 95, 100.0)[0]["execution_plan"]
+    assert position["trade_risk_usdt"] == pytest.approx(8.0 * plan["risk_fraction"])
+    from jarvis_live_trader import MAX_RISK_USDT
+    assert position["trade_risk_usdt"] <= MAX_RISK_USDT
     assert delta.calls[0][0] == "leverage"
     assert delta.calls[1][0] == "order"
     assert delta.calls[1][1]["size"] == 4
@@ -148,9 +158,7 @@ def test_below_minimum_blocks_before_venue_mutations(monkeypatch):
         "max_leverage": 10,
     })
     trader = _make_trader(monkeypatch, delta, enabled=True)
-    result = trader._place_trade(
-        "CALL", 95, 100.0, "SCALP", {"do_hedge": False}, "BTCUSDT"
-    )
+    result = trader._place_trade("CALL", 95, 100.0, entry_evidence("BTCUSDT", "CALL", 95, 100.0)[1], {"do_hedge": False}, "BTCUSDT", **entry_evidence("BTCUSDT", "CALL", 95, 100.0)[0])
     assert result["success"] is False
     assert result["reason"] == "Entry lot policy blocked"
     assert delta.calls == []
@@ -160,9 +168,7 @@ def test_paper_entry_keeps_lot_policy_but_never_mutates_venue(monkeypatch):
     monkeypatch.setenv("JARVIS_MAX_ENTRY_LOTS", "2")
     delta = DeltaStub(balance=100.0)
     trader = _make_trader(monkeypatch, delta, enabled=False)
-    result = trader._place_trade(
-        "CALL", 90, 100.0, "SCALP", {"do_hedge": False}, "BTCUSDT"
-    )
+    result = trader._place_trade("CALL", 90, 100.0, entry_evidence("BTCUSDT", "CALL", 90, 100.0)[1], {"do_hedge": False}, "BTCUSDT", **entry_evidence("BTCUSDT", "CALL", 90, 100.0)[0])
     assert result["success"] is True
     assert result["position"]["contracts"] == 2
     assert delta.calls == []
@@ -173,7 +179,8 @@ def test_entry_gate_remains_before_live_mutations_and_exits_remain_reduce_only()
     if not (root / "jarvis_live_trader.py").exists():
         root = root.parent
     text = (root / "jarvis_live_trader.py").read_text(encoding="utf-8")
-    gate = text.index("capped_contracts = enforce_entry_lots")
-    assert gate < text.index("self.delta.set_leverage", gate)
-    assert gate < text.index("self.delta.place_order", gate)
+    gate = text.index("contracts = enforce_entry_lots")
+    assert gate < text.index('submitter = getattr(self.delta, "place_protected_order"', gate)
+    assert gate < text.index("protected = submitter(", gate)
+    assert "raw entries are disabled" in text
     assert "reduce_only=True" in text

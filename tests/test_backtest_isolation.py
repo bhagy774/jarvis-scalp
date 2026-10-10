@@ -48,7 +48,7 @@ def test_backtester_has_no_execution_client_or_order_submission_path():
 
 def test_brain_backtest_mode_keeps_core_engines_but_does_not_construct_live_sources():
     assert "self.is_backtest_mode = bool(backtest_mode or env_backtest)" in BRAIN
-    assert "self.deepseek_enabled = not self.is_backtest_mode" in BRAIN
+    assert "self.deepseek_enabled = False" in BRAIN
     assert "# Initialize External GPU Engines" in BRAIN
     assert "if not self.is_backtest_mode:\n                    try:\n                        from part7_FIXED" in BRAIN
     assert "# Historical replay must not even construct a live data client." in BRAIN

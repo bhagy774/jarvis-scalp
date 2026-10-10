@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from native_candle_fixture import native_times, TIMEFRAME_HISTORY_CANDLES
 from direct_candle_cache import (
     CandleDataError, DirectCandleCache, FETCH_CANDLES, LIVE_TIMEFRAMES,
 )
@@ -45,12 +46,9 @@ class SyntheticDelta:
     def get_historical_candles_with_metadata(self, *, symbol, resolution, limit):
         with self._lock:
             self.calls.append((symbol, resolution, limit))
-        step = STEP[resolution]
         now = self.clock()
-        forming = int(now // step) * step
-        start = forming - (limit - 1) * step
         rows = []
-        for ts in range(start, forming + step, step):
+        for ts in native_times(resolution, now, limit):
             # Stable price for a timestamp across refreshes, including the
             # transition of the old forming candle to its final closed value.
             close = 100.0 + (ts % 1_000_000) * 1e-6 + (abs(hash(symbol)) % 1000) * 1e-4
@@ -85,18 +83,19 @@ def full_stub(key, _snapshot):
 def test_incremental_rollover_keeps_500_closed_and_fetches_only_recent_delta():
     cache, client, clock = make_cache()
     first = cache.refresh("BTCUSDT", venue="delta", market_type="perpetual", instrument_id="p-1")
-    assert all(len(frame.closed) == 500 for frame in first.frames.values())
-    assert all(limit == FETCH_CANDLES for _, _, limit in client.calls)
+    assert all(len(frame.closed) == TIMEFRAME_HISTORY_CANDLES[tf] for tf, frame in first.frames.items())
+    assert all(limit == TIMEFRAME_HISTORY_CANDLES[tf] + 1 for _, tf, limit in client.calls)
     clock.advance(60)
     second = cache.refresh("BTCUSDT", venue="delta", market_type="perpetual", instrument_id="p-1")
     assert second is not first
-    assert all(len(frame.closed) == 500 for frame in second.frames.values())
-    assert all(limit == 3 for _, _, limit in client.calls[8:])
+    assert all(len(frame.closed) == TIMEFRAME_HISTORY_CANDLES[tf] for tf, frame in second.frames.items())
+    assert all(limit <= 63 for _, _, limit in client.calls[len(LIVE_TIMEFRAMES):])
+    assert next(limit for _, tf, limit in client.calls[len(LIVE_TIMEFRAMES):] if tf == "1s") == 62
     for tf, frame in second.frames.items():
-        interval = STEP[tf]
-        closed_seconds = __import__("numpy").array([int(stamp.timestamp()) for stamp in frame.closed.index])
-        assert list(closed_seconds[1:] - closed_seconds[:-1]) == [interval] * 499
-        assert frame.current["time"] == int(clock() // interval) * interval
+        closed_seconds = [int(stamp.timestamp()) for stamp in frame.closed.index]
+        from binance_timeframes import next_candle_open, candle_open_time
+        assert all(next_candle_open(tf, left) == right for left, right in zip(closed_seconds, closed_seconds[1:]))
+        assert frame.current["time"] == candle_open_time(tf, clock())
 
 
 def test_incremental_closed_revision_or_gap_fails_closed_and_preserves_last_snapshot():
@@ -134,11 +133,12 @@ def test_delta_candle_adapter_never_calls_cross_venue_fallback():
 def test_binance_candle_adapter_rejects_bybit_fallback_and_preserves_venue_identity():
     class FakeBinance:
         last_candle_source = "bybit"
-        def get_historical_candles(self, *, symbol, resolution, limit):
-            return [{"time": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}]
+        def get_historical_candles_with_metadata(self, *, symbol, resolution, limit):
+            return {"candles": [{"time": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1, "source": "binance_spot", "market_semantics": "spot"}],
+                    "source": self.last_candle_source, "market_type": "spot", "symbol": symbol}
 
     adapter = BinanceSpotCandleClient(FakeBinance(), min_request_interval_seconds=0)
-    with pytest.raises(CandleDataError, match="fallback rejected"):
+    with pytest.raises(CandleDataError, match="source/market/symbol verification failed"):
         adapter.get_historical_candles_with_metadata(symbol="ETHUSDT", resolution="1m", limit=501)
     fake = FakeBinance()
     fake.last_candle_source = "binance"
@@ -340,7 +340,8 @@ def test_full_jarvis_parts_1_to_12_are_isolated_per_symbol_and_serial_parallel_e
     integrated_result = integrated_pipeline._run(keys[0])
     integrated_pipeline.close()
     parts_by_tf = integrated_result.get('parts_by_timeframe', {})
-    expected_adapter_parts = {f'part{i}' for i in range(1, 11)}
+    from jarvis_strategy_approval import PART_WEIGHTS
+    expected_adapter_parts = set(PART_WEIGHTS)
     for tf in ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h']:
         if tf not in parts_by_tf:
             print(f'MISSING TF: {tf}')
@@ -349,7 +350,7 @@ def test_full_jarvis_parts_1_to_12_are_isolated_per_symbol_and_serial_parallel_e
             if missing:
                 print(f'TF {tf} MISSING PARTS: {missing}')
     print('ONCE PER SYMBOL:', list(integrated_result.get('once_per_symbol_parts', {}).keys()))
-    assert integrated_result["status"] == "COMPLETE"
+    assert integrated_result["status"] == "COMPLETE", {"diagnostics": [getattr(o,"latest_diagnostics_cycle_status",None) for o in owners], "timeframes": list(parts_by_tf), "once": list(integrated_result.get("once_per_symbol_parts", {})), "missing": {tf: sorted(expected_adapter_parts-set(parts)) for tf,parts in parts_by_tf.items()}}
     assert integrated_result["coverage"] == [f"Part{i}" for i in range(1, 13)]
     assert integrated_result["execution_eligible"] is False
     assert integrated_result["execution_plan"] is None
@@ -358,7 +359,7 @@ def test_full_jarvis_parts_1_to_12_are_isolated_per_symbol_and_serial_parallel_e
     assert len({id(owner) for owner in owners}) == 7
     # assert all(len(owner.parts["part1_breakout"]._engines) == len(LIVE_TIMEFRAMES) for owner in owners)
     assert len({id(owner.parts["part2_zone"]) for owner in owners}) == 7
-    required = {f"part{i}" for i in range(1, 11)}
+    required = set(PART_WEIGHTS)
     for key, serial_result, parallel_result in zip(keys, serial, parallel):
         for result in (serial_result, parallel_result):
             assert set(result["parts_by_timeframe"]) == set(LIVE_TIMEFRAMES)

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from native_candle_fixture import native_times, TIMEFRAME_HISTORY_CANDLES
 from direct_candle_cache import (
     CandleDataError,
     DirectCandleCache,
@@ -50,13 +51,9 @@ class FakeClient:
                 time.sleep(self.delay)
             self.calls.append((symbol, resolution, limit))
             now = self.clock()
-            step = STEP[resolution]
-            forming = int(now // step) * step
-            start = forming - 500 * step
             base = BASE.get(symbol, 100.0)
             rows = []
-            for i in range(FETCH_CANDLES):
-                ts = start + i * step
+            for i, ts in enumerate(native_times(resolution, now, limit)):
                 close = base + i * base * 0.00002
                 rows.append({"time": ts, "open": close - 0.01,
                              "high": close + 0.10, "low": close - 0.10,
@@ -94,7 +91,7 @@ def test_same_symbol_market_contract_snapshots_do_not_overwrite_each_other():
     assert spot is not perpetual
     assert spot.identity == ("binance", "spot", "ETHUSDT", "ETHUSDT")
     assert perpetual.identity == ("delta", "perpetual", "71234", "ETHUSDT")
-    assert len(spot.frames["1m"].closed) == 500
+    assert len(spot.frames["1m"].closed) == TIMEFRAME_HISTORY_CANDLES["1m"]
     assert spot.frames["1m"].venue == "binance"
     assert perpetual.frames["1m"].venue == "delta"
     assert spot.frames["1m"].instrument_id != perpetual.frames["1m"].instrument_id

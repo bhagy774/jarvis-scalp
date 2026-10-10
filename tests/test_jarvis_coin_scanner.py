@@ -92,13 +92,15 @@ def test_score_coin_no_stats():
     score = scanner._score_coin("BTC", "BTCUSDT", {})
     assert score["total"] == 0
 
-@patch.object(JarvisCoinScanner, "_fetch_binance_candles")
+@patch.object(JarvisCoinScanner, "_fetch_binance_klines")
 @patch.object(JarvisCoinScanner, "_fetch_funding_rate")
 def test_score_coin_valid_stats(mock_fetch_funding, mock_fetch_candles):
     """Test scoring logic with valid statistics."""
     mock_fetch_funding.return_value = 0.01  # 1% funding
     # 15 random closes to pass RSI period
-    mock_fetch_candles.return_value = [100.0] * 15
+    now = int(time.time()*1000)
+    boundary = now // 300000 * 300000
+    mock_fetch_candles.return_value = [[boundary-i*300000, "100", "101", "99", "100", "1", boundary-(i-1)*300000-1] for i in range(16,0,-1)]
 
     scanner = JarvisCoinScanner()
     stats = {
@@ -106,7 +108,7 @@ def test_score_coin_valid_stats(mock_fetch_funding, mock_fetch_candles):
         "priceChangePercent": "4.0", # 4% change
         "highPrice": "105.0",
         "lowPrice": "95.0",
-        "lastPrice": "100.0"
+        "lastPrice": "100.0", "symbol": "ETHUSDT", "bidPrice": "99.99", "askPrice": "100.01", "closeTime": now
     }
 
     score = scanner._score_coin("ETH", "ETHUSDT", stats)
@@ -129,7 +131,9 @@ def test_score_coin_valid_stats(mock_fetch_funding, mock_fetch_candles):
     assert score["funding_score"] == 1
 
     # Total = 9 + 16 + 0 + 6 + 1 = 32.0
-    assert score["total"] == 32.0
+    assert score["eligible"] is True
+    assert score["spread_score"] == 10
+    assert score["total"] == 42.0
 
 @patch.object(JarvisCoinScanner, "_fetch_binance_stats_bulk")
 @patch.object(JarvisCoinScanner, "_score_coin")
@@ -139,7 +143,7 @@ def test_run_scan_cycle_volume_filter(mock_score_coin, mock_fetch_stats):
 
     mock_fetch_stats.return_value = {"BTCUSDT": {}}
 
-    def side_effect_score(coin, symbol, stats):
+    def side_effect_score(coin, symbol, stats, **kwargs):
         return {
             "volume_24h_usdt": 1_000_000.0, # Below 5_000_000 min volume
             "total": 100
@@ -162,11 +166,11 @@ def test_run_scan_cycle_success(mock_score_coin, mock_fetch_stats):
         "ETHUSDT": {}
     }
 
-    def side_effect_score(coin, symbol, stats):
+    def side_effect_score(coin, symbol, stats, **kwargs):
         if coin == "BTC":
-            return {"volume_24h_usdt": 10_000_000.0, "total": 80}
+            return {"volume_24h_usdt": 10_000_000.0, "total": 80, "eligible": True, "spread_bps": 2.0}
         elif coin == "ETH":
-            return {"volume_24h_usdt": 10_000_000.0, "total": 90}
+            return {"volume_24h_usdt": 10_000_000.0, "total": 90, "eligible": True, "spread_bps": 2.0}
         return {"volume_24h_usdt": 0.0, "total": 0}
 
     mock_score_coin.side_effect = side_effect_score
@@ -191,9 +195,9 @@ def test_run_scan_cycle_position_open(mock_score_coin, mock_fetch_stats):
         "ETHUSDT": {}
     }
 
-    def side_effect_score(coin, symbol, stats):
+    def side_effect_score(coin, symbol, stats, **kwargs):
         if coin == "ETH":
-            return {"volume_24h_usdt": 10_000_000.0, "total": 90}
+            return {"volume_24h_usdt": 10_000_000.0, "total": 90, "eligible": True, "spread_bps": 2.0}
         return {"volume_24h_usdt": 0.0, "total": 0}
 
     mock_score_coin.side_effect = side_effect_score

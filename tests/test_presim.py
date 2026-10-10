@@ -243,7 +243,7 @@ class PreSimWiringTests(unittest.TestCase):
         with patch("jarvis_presim.run_presim",
                    return_value={"action": "veto", "confidence_delta": 0, "reason": "bad setup"}):
             params = self.brain.PresimParams(direction="CALL", confidence=80, entry_price=100.0, result={}, df=None, current_price=100.0)
-            direction, conf = eng._presim_gate(params)
+            direction, conf = eng._presim_gate(direction=params.direction, confidence=params.confidence, entry_price=params.entry_price, result=params.result, df=params.df, current_price=params.current_price)
         self.assertIsNone(direction)
         self.assertEqual(eng.presim_stats["vetoes"], 1)
         self.assertEqual(eng.presim_stats["checks"], 1)
@@ -253,7 +253,7 @@ class PreSimWiringTests(unittest.TestCase):
         with patch("jarvis_presim.run_presim",
                    return_value={"action": "adjust", "confidence_delta": -50, "reason": "weak"}):
             params = self.brain.PresimParams(direction="PUT", confidence=80, entry_price=100.0, result={}, df=None, current_price=100.0)
-            direction, conf = eng._presim_gate(params)
+            direction, conf = eng._presim_gate(direction=params.direction, confidence=params.confidence, entry_price=params.entry_price, result=params.result, df=params.df, current_price=params.current_price)
         self.assertEqual(direction, "PUT")
         self.assertEqual(conf, 70)  # clamped to -10
         self.assertEqual(eng.presim_stats["adjustments"], 1)
@@ -263,7 +263,7 @@ class PreSimWiringTests(unittest.TestCase):
         with patch("jarvis_presim.run_presim",
                    return_value={"action": "pass", "confidence_delta": 0, "reason": ""}):
             params = self.brain.PresimParams(direction="CALL", confidence=75, entry_price=100.0, result={}, df=None, current_price=100.0)
-            direction, conf = eng._presim_gate(params)
+            direction, conf = eng._presim_gate(direction=params.direction, confidence=params.confidence, entry_price=params.entry_price, result=params.result, df=params.df, current_price=params.current_price)
         self.assertEqual((direction, conf), ("CALL", 75))
         self.assertEqual(eng.presim_stats["adjustments"], 0)
         self.assertEqual(eng.presim_stats["vetoes"], 0)
@@ -272,7 +272,7 @@ class PreSimWiringTests(unittest.TestCase):
         eng = self._engine()
         with patch("jarvis_presim.run_presim", side_effect=RuntimeError("boom")):
             params = self.brain.PresimParams(direction="CALL", confidence=75, entry_price=100.0, result={}, df=None, current_price=100.0)
-            direction, conf = eng._presim_gate(params)
+            direction, conf = eng._presim_gate(direction=params.direction, confidence=params.confidence, entry_price=params.entry_price, result=params.result, df=params.df, current_price=params.current_price)
         self.assertEqual((direction, conf), (None, 75))
         self.assertEqual(eng.presim_stats["errors"], 1)
 
@@ -280,7 +280,7 @@ class PreSimWiringTests(unittest.TestCase):
         eng = self._engine()
         with patch("jarvis_presim.run_presim", return_value={"action": "veto", "confidence_delta": 0, "reason": "blocked"}):
             params = self.brain.PresimParams(direction="CALL", confidence=80, entry_price=100.0, result={}, df=None, current_price=100.0)
-            direction, conf = eng._presim_gate(params)
+            direction, conf = eng._presim_gate(direction=params.direction, confidence=params.confidence, entry_price=params.entry_price, result=params.result, df=params.df, current_price=params.current_price)
         self.assertIsNone(direction)
         self.assertEqual(conf, 80)
 
@@ -289,7 +289,7 @@ class PreSimWiringTests(unittest.TestCase):
         eng = self._engine()
         with patch("jarvis_presim.run_presim", side_effect=AssertionError("must not run")):
             params = self.brain.PresimParams(direction="CALL", confidence=75, entry_price=100.0, result={}, df=None, current_price=100.0)
-            direction, conf = eng._presim_gate(params)
+            direction, conf = eng._presim_gate(direction=params.direction, confidence=params.confidence, entry_price=params.entry_price, result=params.result, df=params.df, current_price=params.current_price)
         self.assertEqual((direction, conf), ("CALL", 75))
         self.assertEqual(eng.presim_stats["checks"], 0)
 

@@ -364,10 +364,15 @@ class MultiCoinPipeline:
             if completed - float(snapshot.fetched_at) > self.result_max_age_seconds:
                 raise CandleDataError("analysis exceeded maximum result age")
             parts_by_tf = raw.get("parts_by_timeframe")
+            from jarvis_strategy_approval import PART_WEIGHTS
+            canonical_parts = set(PART_WEIGHTS)
             expected_adapter_parts = {f"part{i}" for i in range(1, 11)}
             complete = (isinstance(parts_by_tf, Mapping)
                         and set(parts_by_tf) == set(required_timeframes)
-                        and all(expected_adapter_parts.issubset(set(parts_by_tf[tf])) for tf in required_timeframes)
+                        and all(isinstance(parts_by_tf[tf], Mapping)
+                                and (canonical_parts.issubset(parts_by_tf[tf])
+                                     or expected_adapter_parts.issubset(parts_by_tf[tf]))
+                                for tf in required_timeframes)
                         and set(raw.get("once_per_symbol_parts", ())) == {"part11", "part12"})
             versions = {tf: {
                 "source": snapshot.frames[tf].source,

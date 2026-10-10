@@ -81,7 +81,7 @@ def test_expired_and_malformed_rows_are_not_silently_used():
     expired = row("BTC-260901-90000-C", "call", 90000, expiry="2026-09-01")
     chain = build_provider_chain("BTC", "Delta", [[expired]], pagination(), retrieved_at=AS_OF)
     assert chain["contracts"] == []
-    assert chain["validation"]["expired_rows_excluded"] == 1
+    assert chain["validation"]["same_day_expiry_rows_excluded"] == 1
     bad = row("BTC-261030-0-C", "call", 0)
     invalid = build_provider_chain("BTC", "Delta", [[bad]], pagination(), retrieved_at=AS_OF)
     assert invalid["validation"]["schema_valid"] is False

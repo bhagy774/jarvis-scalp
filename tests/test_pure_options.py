@@ -8,7 +8,8 @@ SOURCE = (Path(__file__).parent.parent / "jarvis_FIXED.py").read_text(encoding="
 TREE = ast.parse(SOURCE)
 cls = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == "Part14OptionsChain")
 method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "analyze_options_with_ollama")
-module = ast.Module(body=[method], type_ignores=[])
+deterministic = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "analyze_options_deterministically")
+module = ast.Module(body=[method, deterministic], type_ignores=[])
 
 class Fake:
     last_ollama_whale_tag = "WHALE_BULLISH"
@@ -32,18 +33,19 @@ class OptionsPathTests(unittest.TestCase):
         }
         exec(compile(module, "jarvis_FIXED.py", "exec"), ns)
         self.method = ns["analyze_options_with_ollama"]
+        Fake.analyze_options_deterministically = ns["analyze_options_deterministically"]
     def tearDown(self):
         if self.old is None: os.environ.pop("JARVIS_PURE_ALGO", None)
         else: os.environ["JARVIS_PURE_ALGO"] = self.old
     def test_pure_returns_math_and_unavailable_without_model_or_stale_tag(self):
         os.environ["JARVIS_PURE_ALGO"] = "true"
         result = self.method(Fake(), {"signal": -1}, 100.0)
-        self.assertEqual(result, ("MODEL_ADVISORY_DISABLED", "Options result is deterministic observed-chain math", -1))
+        self.assertEqual(result, ("DETERMINISTIC_CHAIN_ONLY", "Options result uses validated provider observations; Laya is commentary-only", -1))
         self.assertEqual(self.calls, [])
     def test_non_pure_mode_still_cannot_enable_model_path(self):
         os.environ["JARVIS_PURE_ALGO"] = "false"
         result = self.method(Fake(), {"signal": 0}, 100.0)
-        self.assertEqual(result, ("MODEL_ADVISORY_DISABLED", "Options result is deterministic observed-chain math", 0))
+        self.assertEqual(result, ("DETERMINISTIC_CHAIN_ONLY", "Options result uses validated provider observations; Laya is commentary-only", 0))
         self.assertEqual(self.calls, [])
 
 if __name__ == "__main__": unittest.main()

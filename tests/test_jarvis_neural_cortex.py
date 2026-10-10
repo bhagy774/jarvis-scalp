@@ -11,59 +11,26 @@ class TestJarvisNeuralCortex(unittest.TestCase):
         self.assertEqual(self.cortex.max_history_pairs, 20)
         self.assertEqual(self.cortex.get_memory_length(), 0)
 
-    @patch('jarvis_neural_cortex.JarvisNeuralCortex._call_ollama_chat')
-    def test_analyze_success_with_json(self, mock_chat):
-        mock_response = '''
-I am seeing strong bullish momentum.
-###JSON###
-{"signal": "CALL", "confidence": 85, "rationale": "Strong bull", "risk": "LOW"}
-'''
-        mock_chat.return_value = mock_response.strip()
+    def test_analyze_success_with_json(self):
+        # Model output is retired; an unsupported part cannot authorize a trade.
+        with patch("requests.post", side_effect=AssertionError("no model network")):
+            result = self.cortex.analyze({'part1_breakout': {'signal': 1}}, 50000.0)
+        self.assertEqual(result['signal'], 'NO_TRADE')
+        self.assertFalse(result['ai_online'])
+        self.assertEqual(self.cortex.get_memory_length(), 0)
 
-        part_results = {
-            'part1_breakout': {'signal': 1, 'thought': 'Breakout up'}
-        }
-
-        result = self.cortex.analyze(part_results, 50000.0)
-
-        self.assertEqual(result['signal'], 'CALL')
-        self.assertEqual(result['confidence'], 85)
-        self.assertEqual(result['risk'], 'LOW')
-        self.assertTrue(result['ai_online'])
-        self.assertEqual(result['ai_narrative'], "I am seeing strong bullish momentum.")
-
-        # Check memory was updated (1 user message + 1 assistant message)
-        self.assertEqual(self.cortex.get_memory_length(), 1)
-        self.assertEqual(len(self.cortex.chat_history), 2)
-        self.assertEqual(self.cortex.chat_history[-1]['role'], 'assistant')
-
-    @patch('jarvis_neural_cortex.JarvisNeuralCortex._call_ollama_chat')
-    def test_analyze_fallback_on_api_error(self, mock_chat):
-        mock_chat.return_value = None
-
-        part_results = {
-            'part11_fusion': {'signal': -1, 'thought': 'Math says down'},
-            'part12_confidence': {'confidence': 60}
-        }
-
-        result = self.cortex.analyze(part_results, 50000.0)
-
+    def test_analyze_fallback_on_api_error(self):
+        with patch("requests.post", side_effect=AssertionError("no model network")):
+            result = self.cortex.analyze({'part11_fusion': {'signal': -1}, 'part12_confidence': {'confidence': 60}}, 50000.0)
         self.assertEqual(result['signal'], 'PUT')
         self.assertEqual(result['confidence'], 60)
-        self.assertEqual(result['risk'], 'MEDIUM')
         self.assertFalse(result['ai_online'])
 
-    @patch('jarvis_neural_cortex.JarvisNeuralCortex._call_ollama_chat')
-    def test_analyze_fallback_on_bad_json(self, mock_chat):
-        # AI returns plain text without JSON markers
-        mock_chat.return_value = "Decision: PUT\nConfidence: 70\nMarket is bearish."
-
-        part_results = {}
-        result = self.cortex.analyze(part_results, 50000.0)
-
-        self.assertEqual(result['signal'], 'PUT')
-        self.assertEqual(result['confidence'], 70)
-        self.assertTrue(result['ai_online'])
+    def test_analyze_fallback_on_bad_json(self):
+        with patch("requests.post", side_effect=AssertionError("no model network")):
+            result = self.cortex.analyze({}, 50000.0)
+        self.assertEqual(result['signal'], 'NO_TRADE')
+        self.assertFalse(result['ai_online'])
 
     def test_memory_management(self):
         # Simulate pushing more than max_history_pairs

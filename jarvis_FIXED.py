@@ -1601,54 +1601,24 @@ class LiveTradingEngine:
             return None, confidence
 
     def _scenario_gate(self, direction, entry_price=None, sl=None, tp=None, df=None, symbol='BTCUSDT'):
-        """Pre-Trade Scenario Simulator gate (fail-open).
+        """Pre-Trade Scenario Simulator gate (fail-closed).
 
         Runs jarvis_scenario_simulator on a candidate ENTER signal. Returns
         direction — set to 'NO_TRADE' on veto (too many stress scenarios
-        fail). Any exception or disabled env → returns direction unchanged.
+        fail). Any simulator exception blocks entry; only explicit disable bypasses the gate.
         """
         try:
             if os.getenv('JARVIS_SCEN_SIM', '1') == '0':
                 return direction
-            from jarvis_scenario_simulator import run_scenarios
-            verdict = run_scenarios(
+            from jarvis_scenario_simulator import run_scenarios, ScenarioConfig
+            verdict = run_scenarios(ScenarioConfig(
                 direction=direction,
                 entry_price=entry_price,
                 sl=sl, tp=tp,
                 df=df,
                 fee_bps=float(os.getenv('JARVIS_SCEN_FEE_BPS', '10')),
                 slippage_bps=float(os.getenv('JARVIS_SCEN_SLIPPAGE_BPS', '5')),
-            )
-            if verdict.get('action') == 'veto':
-                self._dashboard_events.append(f"Scenario veto: {verdict.get('reason', 'stress gate')}")
-                logger.info(f"[SCENARIO] VETO {direction} {symbol}: {verdict.get('reason')}")
-                return 'NO_TRADE'
-            if verdict.get('total'):
-                logger.info(f"[SCENARIO] PASS {verdict.get('passed')}/{verdict.get('total')} {direction} {symbol}")
-            return direction
-        except Exception as e:
-            logger.debug(f"[SCENARIO] gate error (fail-open → pass): {e}")
-            return direction
-
-    def _scenario_gate(self, direction, entry_price=None, sl=None, tp=None, df=None, symbol='BTCUSDT'):
-        """Pre-Trade Scenario Simulator gate (fail-open).
-
-        Runs jarvis_scenario_simulator on a candidate ENTER signal. Returns
-        direction — set to 'NO_TRADE' on veto (too many stress scenarios
-        fail). Any exception or disabled env → returns direction unchanged.
-        """
-        try:
-            if os.getenv('JARVIS_SCEN_SIM', '1') == '0':
-                return direction
-            from jarvis_scenario_simulator import run_scenarios
-            verdict = run_scenarios(
-                direction=direction,
-                entry_price=entry_price,
-                sl=sl, tp=tp,
-                df=df,
-                fee_bps=float(os.getenv('JARVIS_SCEN_FEE_BPS', '10')),
-                slippage_bps=float(os.getenv('JARVIS_SCEN_SLIPPAGE_BPS', '5')),
-            )
+            ))
             if verdict.get('action') == 'veto':
                 print(f"  🛡️ SCENARIO VETO: {verdict.get('passed')}/{verdict.get('total')} pass — {verdict.get('reason')}")
                 logger.info(f"[SCENARIO] VETO {direction} {symbol}: {verdict.get('reason')}")
@@ -1657,8 +1627,8 @@ class LiveTradingEngine:
                 logger.info(f"[SCENARIO] PASS {verdict.get('passed')}/{verdict.get('total')} {direction} {symbol}")
             return direction
         except Exception as e:
-            logger.debug(f"[SCENARIO] gate error (fail-open → pass): {e}")
-            return direction
+            logger.warning("[SCENARIO] gate error; entry vetoed: %s", type(e).__name__)
+            return "NO_TRADE"
 
     def _open_paper_trade(
         self, direction, entry_price, confidence, expiry_name, tp1, tp2, sl,
@@ -2489,7 +2459,7 @@ class LiveTradingEngine:
             if tuple(snapshot.identity) != key.as_tuple():
                 return {}
             native_frames = snapshot.analysis_frames()
-            owner = JarvisElite(backtest_mode=True, analysis_only=True)
+            owner = JarvisElite(backtest_mode=True)
             owner.active_symbol = key.symbol
             owner.active_base_asset = key.symbol
             for quote in ('USDT', 'USD', 'USDC'):
@@ -4402,9 +4372,9 @@ class Part14OptionsChain:
                         source_failures.append(f"{candidate_name}: malformed response")
                         continue
                     validation = (candidate_data.get('raw_data') or {}).get('options_validation')
-                    candidate_available = bool(candidate_data.get('available', True))
-                    if isinstance(validation, dict):
-                        candidate_available = candidate_available and bool(validation.get('usable'))
+                    candidate_available = (candidate_data.get('available', True) is True
+                                           and isinstance(validation, dict)
+                                           and validation.get('usable') is True)
                     if not candidate_available:
                         source_failures.append(f"{candidate_name}: unavailable or unusable chain")
                         continue
@@ -6210,7 +6180,6 @@ class JarvisElite:
                         # This strategy entry point is explicitly the 1m
                         # primary frame. Do not infer an interval from median
                         # spacing, which can advance replay time across gaps.
-                        from binance_timeframes import next_candle_open, validate_closed_candle_timestamps
                         stamp_seconds = [float(stamp.timestamp()) for stamp in stamps]
                         _decision_epoch = next_candle_open('1m', stamp_seconds[-1])
                         validate_closed_candle_timestamps('1m', stamp_seconds, _decision_epoch)
@@ -6501,6 +6470,7 @@ class JarvisElite:
                             'selected_symbol': getattr(self, 'active_symbol', None),
                             'timeframe': tf_name,
                             'native_timeframe': tf_name,
+                            'analysis_identity': getattr(candle_snapshot, 'identity', None),
                             'is_backtest_mode': self.is_backtest_mode,
                             'shared_candle_source': 'historical_replay' if self.is_backtest_mode else 'shared_exchange',
                         })

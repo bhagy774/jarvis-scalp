@@ -1,3 +1,4 @@
+from jarvis_backtester import BacktestConfig
 import pytest
 from datetime import datetime
 from pathlib import Path
@@ -104,7 +105,7 @@ def test_backtest_risk_gate_init():
 
 def test_jarvis_full_backtester_init():
     """Test JarvisFullBacktester initialization."""
-    backtester = JarvisFullBacktester(
+    backtester = JarvisFullBacktester(BacktestConfig(
         symbol="BTCUSDT",
         timeframe="5m",
         years=3,
@@ -113,7 +114,7 @@ def test_jarvis_full_backtester_init():
         slippage_bps=5.0,
         fee_bps=10.0,
         live_audit=False
-    )
+    ))
     assert backtester.symbol == "BTCUSDT"
     assert backtester.timeframe == "5m"
     assert backtester.years == 3

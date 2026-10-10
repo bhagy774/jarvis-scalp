@@ -40,6 +40,9 @@ def load_entry(part):
     module = ast.fix_missing_locations(ast.Module(body=[future, cls], type_ignores=[]))
     namespace = {}
     exec(compile(module, str(path), "exec"), namespace)
+    if part == 1:
+        from part1_FIXED import SmartBreakoutAI
+        return SmartBreakoutAI, original_decorators
     return namespace["EntryHarness"], original_decorators
 
 
@@ -63,7 +66,7 @@ class QuantitativePartEntryTests(unittest.TestCase):
                 self.assertTrue(any(isinstance(d, ast.Call) and isinstance(d.func, ast.Name)
                                     and d.func.id == "part_advisory_entry" for d in decorators),
                                 "native analyzer must retain its Part-owned advisory decorator")
-                analyzer = object.__new__(cls)
+                analyzer = cls() if part == 1 else object.__new__(cls)
                 method = getattr(analyzer, ENTRIES[part][1])
                 if part == 1:
                     result = method({"price_action": sample}, context={}, advisory_data=sample)

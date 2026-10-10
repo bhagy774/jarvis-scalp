@@ -36,8 +36,8 @@ def test_backtest_excludes_options_vote_and_rebuilds_local_mtf():
     part_block = ENGINE[part_start:part_end]
     assert "if not self.is_backtest_mode:" in part_block
     assert "self.parts['part14_options_chain']" in part_block
-    start = ENGINE.index('if self.is_backtest_mode:', ENGINE.index('MULTI-TIMEFRAME ANALYSIS'))
-    end = ENGINE.index('# Timeframe weights', start)
+    start = ENGINE.index('elif self.is_backtest_mode:', ENGINE.index('MULTI-TIMEFRAME ANALYSIS'))
+    end = ENGINE.index('# Synchronize every native live interval', start)
     block = ENGINE[start:end]
     historical_branch = block.split('            else:', 1)[0]
     assert "mtf_data = {'1m': data.copy()}" in historical_branch

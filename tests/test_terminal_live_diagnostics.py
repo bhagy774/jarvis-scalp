@@ -52,10 +52,12 @@ class TerminalDiagnosticsTests(unittest.TestCase):
         self.assertEqual(classify_part_output({"signal": "NEUTRAL"})["signal"], "NEUTRAL")
 
     def test_timeframe_identity_age_and_closed_forming_separation(self):
-        now = 200_000.0
-        frames = {tf: Frame(now - INTERVAL_SECONDS[tf] - 5) for tf in TIMEFRAMES}
+        from native_candle_fixture import native_times
+        from binance_timeframes import next_candle_open
+        now = 1_800_000_000.0
+        frames = {tf: Frame(native_times(tf, now, 2)[0]) for tf in TIMEFRAMES}
         meta = {tf: SimpleNamespace(symbol="BTCUSDT", timeframe=tf, source="mock-source",
-                                    fetched_at=now - 4, current={"close": 101},
+                                    fetched_at=now, current={"close": 101},
                                     current_is_confirmed=False) for tf in TIMEFRAMES}
         snapshot = SimpleNamespace(symbol="BTCUSDT", venue="fixture", frames=meta, fetched_at=now - 5)
         result = build_timeframe_inputs(frames, snapshot, expected_symbol="BTC/USDT", now=now)
@@ -64,8 +66,8 @@ class TerminalDiagnosticsTests(unittest.TestCase):
             self.assertEqual(result[tf]["status"], "PRESENT")
             self.assertEqual(result[tf]["identity"], "VERIFIED")
             self.assertEqual(result[tf]["current_candle"], "FORMING / UNCONFIRMED")
-            self.assertEqual(result[tf]["snapshot_age_seconds"], 4.0)
-            self.assertEqual(result[tf]["closed_age_seconds"], 5.0)
+            self.assertEqual(result[tf]["snapshot_age_seconds"], 0.0)
+            self.assertEqual(result[tf]["closed_age_seconds"], now - next_candle_open(tf, frames[tf].index[-1]))
         bad = SimpleNamespace(symbol="ETHUSDT", timeframe="1m", source="x", fetched_at=now,
                               current=None, current_is_confirmed=False)
         mismatch = build_timeframe_inputs({"1m": Frame(now - 120)},

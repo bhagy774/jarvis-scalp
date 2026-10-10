@@ -1,3 +1,4 @@
+from central_entry_fixture import entry_evidence
 import os
 import sys
 import unittest
@@ -101,8 +102,9 @@ class ExecutionSafetyTests(unittest.TestCase):
             direction="CALL",
             confidence=90,
             price=100.0,
-            trade_type="SCALP",
-            hedge_plan={"do_hedge": False}
+            trade_type=entry_evidence("BTCUSDT", "CALL", 90, 100.0)[1],
+            hedge_plan={"do_hedge": False},
+            **entry_evidence("BTCUSDT", "CALL", 90, 100.0)[0]
         )
         response = trader._place_trade(req)
         self.assertTrue(response["success"])

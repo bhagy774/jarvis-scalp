@@ -1,3 +1,4 @@
+from jarvis_position_manager import PositionRequest
 import unittest
 from unittest.mock import MagicMock
 from jarvis_position_manager import JarvisPositionManager, PositionRecord, get_position_manager
@@ -87,50 +88,22 @@ class TestJarvisPositionManager(unittest.TestCase):
         self.assertIs(pm1, pm2)
 
     def test_register_position_success(self):
-        pos = self.manager.register_position(
-            position_id="reg_pos_1",
-            direction="CALL",
-            entry_price=50000.0,
-            contracts=1,
-            confidence=80,
-            coin="BTC"
-        )
+        pos = self.manager.register_position(PositionRequest(position_id="reg_pos_1", direction="CALL", entry_price=50000.0, contracts=1, confidence=80, coin="BTC", contract_value_usdt=1.0))
         self.assertIsInstance(pos, PositionRecord)
         self.assertEqual(self.manager.get_open_count(), 1)
         self.assertTrue(self.manager.has_open_position())
 
     def test_register_position_invalid_id(self):
         with self.assertRaises(ValueError):
-            self.manager.register_position(
-                position_id="",
-                direction="CALL",
-                entry_price=50000.0,
-                contracts=1,
-                confidence=80,
-                coin="BTC"
-            )
+            self.manager.register_position(PositionRequest(position_id="", direction="CALL", entry_price=50000.0, contracts=1, confidence=80, coin="BTC", contract_value_usdt=1.0))
 
     def test_register_position_invalid_direction(self):
         with self.assertRaises(ValueError):
-            self.manager.register_position(
-                position_id="reg_pos_inv_dir",
-                direction="INVALID",
-                entry_price=50000.0,
-                contracts=1,
-                confidence=80,
-                coin="BTC"
-            )
+            self.manager.register_position(PositionRequest(position_id="reg_pos_inv_dir", direction="INVALID", entry_price=50000.0, contracts=1, confidence=80, coin="BTC", contract_value_usdt=1.0))
 
     def test_register_position_invalid_price(self):
         with self.assertRaises(ValueError):
-            self.manager.register_position(
-                position_id="reg_pos_inv_price",
-                direction="CALL",
-                entry_price=-100.0,
-                contracts=1,
-                confidence=80,
-                coin="BTC"
-            )
+            self.manager.register_position(PositionRequest(position_id="reg_pos_inv_price", direction="CALL", entry_price=-100.0, contracts=1, confidence=80, coin="BTC", contract_value_usdt=1.0))
 
     def test_status_line(self):
         status = self.manager.status_line()

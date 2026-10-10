@@ -12,7 +12,7 @@ class Series:
 SOURCE = (Path(__file__).parent.parent / "jarvis_FIXED.py").read_text(encoding="utf-8")
 tree = ast.parse(SOURCE)
 cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Part14OptionsChain")
-methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in {"analyze", "analyze_options_with_ollama"}]
+methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in {"analyze", "analyze_options_with_ollama", "analyze_options_deterministically"}]
 module = ast.Module(body=methods, type_ignores=[])
 
 class Delta:
@@ -25,6 +25,7 @@ class Delta:
                     "coverage":{"contract_count":2}}}
 class Fake:
     asset="ETH"
+    backtest_mode=False
     delta_client=Delta()
     deribit=None
     last_ollama_whale_tag="WHALE_BEARISH"
@@ -42,6 +43,7 @@ class OptionsMathIntegration(unittest.TestCase):
             "_pure_algorithm_mode":lambda:True,"OLLAMA_INTEGRATION_AVAILABLE":True,
             "call_ollama":lambda *a,**k:calls.append(a),"_calls":calls}
         exec(compile(module,"jarvis_FIXED.py","exec"),ns)
+        Fake.analyze_options_deterministically = ns["analyze_options_deterministically"]
         self.analyze=ns["analyze"]; self.analyze_whale=ns["analyze_options_with_ollama"]; self.calls=calls
     def _run(self, price):
         fake=Fake()
@@ -54,7 +56,7 @@ class OptionsMathIntegration(unittest.TestCase):
         self.assertAlmostEqual(t["resistance_distance_pct"],10.0)
         self.assertAlmostEqual(t["max_pain_distance_pct"],2.0)
         self.assertEqual(t["math_model"],"observed_chain_descriptive_v1")
-        self.assertEqual(t["advisory_status"],"MODEL_ADVISORY_DISABLED")
+        self.assertEqual(t["advisory_status"],"DETERMINISTIC_CHAIN_ONLY")
         self.assertNotIn("ollama_whale_tag", t)
         self.assertEqual(self.calls,[])
     def test_invalid_price_fails_closed(self):

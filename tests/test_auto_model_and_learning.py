@@ -25,112 +25,48 @@ def clean_state(monkeypatch, tmp_path):
     yield
 
 
-def _tags_response(names):
-    class R:
-        status_code = 200
-        def json(self):
-            return {"models": [{"name": n} for n in names]}
-    return R()
-
-
-# ── Auto model resolution ─────────────────────────────────────────────
-
-def test_env_override_wins(monkeypatch):
-    monkeypatch.setenv("OLLAMA_MODEL", "my-custom:7b")
-    monkeypatch.setattr(oi.requests, "get", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no network")))
-    assert oi.resolve_ollama_model() == "my-custom:7b"
-
-
-def test_preference_order(monkeypatch):
-    monkeypatch.setattr(oi.requests, "get",
-                        lambda *a, **k: _tags_response(["gemma2:9b", "llama3:8b", "mistral:7b"]))
-    assert oi.resolve_ollama_model() == "mistral:7b"  # mistral preferred over llama3/gemma2
-
-
-def test_falls_back_to_any_installed(monkeypatch):
-    monkeypatch.setattr(oi.requests, "get",
-                        lambda *a, **k: _tags_response(["obscure-model:1b"]))
-    assert oi.resolve_ollama_model() == "obscure-model:1b"
-
-
-def test_unreachable_returns_none_and_caches(monkeypatch):
-    calls = {"n": 0}
-    def boom(*a, **k):
-        calls["n"] += 1
-        raise ConnectionError("down")
-    monkeypatch.setattr(oi.requests, "get", boom)
+@pytest.mark.parametrize("override", [None, "my-custom:7b", "mistral:7b"])
+def test_retired_resolver_never_probes_or_honors_model_override(monkeypatch, override):
+    import requests
+    def forbidden(*a, **k):
+        raise AssertionError("retired resolver must not use network")
+    monkeypatch.setattr(requests, "get", forbidden)
+    monkeypatch.setattr(requests, "post", forbidden)
+    if override:
+        monkeypatch.setenv("OLLAMA_MODEL", override)
     assert oi.resolve_ollama_model() is None
-    assert oi.resolve_ollama_model() is None
-    assert calls["n"] == 1  # cached in-process
+    assert oi.resolve_ollama_model(force_refresh=True) is None
+    assert oi.list_installed_models() == []
+    assert oi.runtime_metadata()["available"] is False
+    assert oi.test_ollama_connection() is False
 
-
-def test_empty_tags_returns_none(monkeypatch):
-    monkeypatch.setattr(oi.requests, "get", lambda *a, **k: _tags_response([]))
-    assert oi.resolve_ollama_model() is None
-
-
-def test_no_model_logs_once(monkeypatch, caplog):
-    import logging
-    monkeypatch.setattr(oi.requests, "get", lambda *a, **k: _tags_response([]))
-    with caplog.at_level(logging.WARNING):
-        oi.resolve_ollama_model()
-        oi.resolve_ollama_model(force_refresh=True)
-    msgs = [r.message for r in caplog.records if "math-fallback" in r.message]
-    assert len(msgs) == 1
-
-
-def test_call_ollama_local_auto_resolves(monkeypatch):
-    import jarvis_FIXED as jf
-    monkeypatch.setattr(oi.requests, "get",
-                        lambda *a, **k: _tags_response(["phi3.5:3.8b", "qwen2.5:7b"]))
-    captured = {}
-    class R:
-        status_code = 200
-        def json(self):
-            return {"response": "ok"}
-    def fake_post(url, json=None, timeout=None):
-        captured["model"] = json["model"]
-        return R()
-    monkeypatch.setattr("requests.post", fake_post)
-    content, err = jf._call_ollama_local("hi", model=None)
-    assert err is None and content == "ok"
-    assert captured["model"] == "phi3.5:3.8b"
-
+@pytest.mark.parametrize("function", ["call_ollama", "call_ollama_chat", "call_gemini_structured", "call_gemini_with_search", "analyze_trade_signal"])
+def test_retired_callers_return_unavailable_without_network(monkeypatch, function):
+    import requests
+    def forbidden(*a, **k):
+        raise AssertionError("retired caller must not use network")
+    monkeypatch.setattr(requests, "post", forbidden)
+    content, error = getattr(oi, function)("BUY", model="force-enable")
+    assert content is None
+    assert "retired" in error.lower()
 
 def test_call_ollama_local_no_model_graceful(monkeypatch):
     import jarvis_FIXED as jf
-    monkeypatch.setattr(oi.requests, "get", lambda *a, **k: (_ for _ in ()).throw(ConnectionError()))
-    content, err = jf._call_ollama_local("hi", model=None)
-    assert content is None and err
-
+    monkeypatch.setattr("requests.post", lambda *a, **k: pytest.fail("no network"))
+    content, err = jf._call_ollama_local("hi", model="force-enable")
+    assert content is None and "retired" in err.lower()
 
 def test_brains_use_auto_resolution():
     import jarvis_FIXED as jf
     assert jf.DeepSeekV3Brain().model_name is None
     assert jf.DeepSeekR1ReasoningBrain().model_name is None
 
-
 def test_preload_skips_missing_models(monkeypatch):
-    oi.OLLAMA_ENABLED = True
-    monkeypatch.setenv("MODEL_ANALYST", "deepseek-r1:14b")
-    monkeypatch.setenv("MODEL_VALIDATOR", "qwen2.5:14b")
-    monkeypatch.delenv("MODEL_RISK", raising=False)
-    # Committee warm-loading is explicitly opt-in; do not make startup load
-    # large models implicitly.
     monkeypatch.setenv("OLLAMA_PRELOAD_COMMITTEE", "1")
-    monkeypatch.setattr(oi.requests, "get",
-                        lambda *a, **k: _tags_response(["qwen2.5:14b"]))
-    loaded = []
-    class R:
-        status_code = 200
-        def json(self):
-            return {}
-    monkeypatch.setattr(oi.requests, "post",
-                        lambda url, json=None, timeout=None: loaded.append(json["model"]) or R())
-    oi.preload_committee_models()
-    assert loaded == ["qwen2.5:14b"]
-    oi.OLLAMA_ENABLED = False
-
+    monkeypatch.setenv("MODEL_ANALYST", "force-enable")
+    monkeypatch.setattr("requests.post", lambda *a, **k: pytest.fail("no network"))
+    assert oi.preload_committee_models() is None
+    assert oi.OLLAMA_ENABLED is False
 
 # ── Learning loop ─────────────────────────────────────────────────────
 
