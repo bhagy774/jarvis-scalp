@@ -28,11 +28,11 @@ class Fake:
     backtest_mode=False
     delta_client=Delta()
     deribit=None
-    last_ollama_whale_tag="WHALE_BEARISH"
-    last_ollama_insight="stale"
-    last_ollama_time=0
-    ollama_cooldown=0
-    def _generate_ollama_options_prompt(self,*a): raise AssertionError("model path called")
+    last_legacy_llm_whale_tag="WHALE_BEARISH"
+    last_legacy_llm_insight="stale"
+    last_legacy_llm_time=0
+    legacy_llm_cooldown=0
+    def _generate_legacy_llm_options_prompt(self,*a): raise AssertionError("model path called")
 
 class OptionsMathIntegration(unittest.TestCase):
     def setUp(self):
@@ -40,8 +40,8 @@ class OptionsMathIntegration(unittest.TestCase):
         self.addCleanup(lambda: os.environ.pop("JARVIS_PURE_ALGO",None) if old is None else os.environ.__setitem__("JARVIS_PURE_ALGO",old))
         calls=[]
         ns={"Dict":dict,"Tuple":tuple,"math":math,"time":time,"logging":logging,
-            "_pure_algorithm_mode":lambda:True,"OLLAMA_INTEGRATION_AVAILABLE":True,
-            "call_ollama":lambda *a,**k:calls.append(a),"_calls":calls}
+            "_pure_algorithm_mode":lambda:True,"LEGACY_LLM_INTEGRATION_AVAILABLE":True,
+            "call_legacy_llm":lambda *a,**k:calls.append(a),"_calls":calls}
         exec(compile(module,"jarvis_FIXED.py","exec"),ns)
         Fake.analyze_options_deterministically = ns["analyze_options_deterministically"]
         self.analyze=ns["analyze"]; self.analyze_whale=ns["analyze_options_deterministically"]; self.calls=calls
@@ -57,7 +57,7 @@ class OptionsMathIntegration(unittest.TestCase):
         self.assertAlmostEqual(t["max_pain_distance_pct"],2.0)
         self.assertEqual(t["math_model"],"observed_chain_descriptive_v1")
         self.assertEqual(t["advisory_status"],"DETERMINISTIC_CHAIN_ONLY")
-        self.assertNotIn("ollama_whale_tag", t)
+        self.assertNotIn("legacy_llm_whale_tag", t)
         self.assertEqual(self.calls,[])
     def test_invalid_price_fails_closed(self):
         out=self._run(float('nan'))

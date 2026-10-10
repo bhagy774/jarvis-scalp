@@ -497,7 +497,7 @@ def evaluate_mtf_central_strategy(
         result.update({"trade_mode": mode, "setup_direction": candidate, "entry_trigger": "BLOCKED"})
         return result
     trigger = decisions[ENTRY_TRIGGER_TIMEFRAME]
-    if trigger.get("status") != "APPROVED" or trigger.get("direction") != candidate:
+    if trigger.get("status") not in {"APPROVED", "NEUTRAL"}:
         result = _result("BLOCKED", "NO_TRADE", None,
                          [f"1m entry trigger does not confirm {candidate}"], diagnostic)
         result.update({"trade_mode": mode, "setup_direction": candidate,

@@ -454,8 +454,8 @@ class InstitutionalTradingEngineGPU:
         
         print(f"  Institutional SwingScalp Trading Engine GPU Initialized on {_safe_get_device_name(self.device)}")
 
-    def _generate_ollama_prompt(self, current_price: float, current_regime: str, components: Dict) -> str:
-        """Format clean prompt for Ollama Local AI Reasoning in Part 3"""
+    def _generate_legacy_llm_prompt(self, current_price: float, current_regime: str, components: Dict) -> str:
+        """Format clean prompt for LegacyLLM Local AI Reasoning in Part 3"""
         try:
             psych_signals = components.get('psychology', [])
             zone_signals = components.get('zone', [])
@@ -488,7 +488,7 @@ Provide a concise 1-2 sentence institutional analysis, then end your response wi
             return "Analyze market context and respond with [BUY], [SELL], or [NO-TRADE]."
 
     def generate_live_signals(self, df_1min, df_5min=None, df_15min=None) -> Dict:
-        """GPU-ACCELERATED INSTITUTIONAL LIVE SIGNAL GENERATION WITH LOCAL OLLAMA AI INTEGRATION"""
+        """GPU-ACCELERATED INSTITUTIONAL LIVE SIGNAL GENERATION WITH LOCAL LEGACY_LLM AI INTEGRATION"""
         _empty = {'signals': [], 'components': {}}
         try:
             if df_1min is None or len(df_1min) < 5:

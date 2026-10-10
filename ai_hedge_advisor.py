@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AI Hedge Advisor - Brain for Options Hedged Scalp Strategy
-Uses Ollama (deepseek-r1:14b) with memory to make hedging decisions.
+Uses LegacyLLM (deepseek-r1:14b) with memory to make hedging decisions.
 """
 
 import os
@@ -19,8 +19,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL", "deepseek-r1:14b")
+LEGACY_LLM_BASE_URL = os.environ.get("LEGACY_LLM_BASE_URL", "http://localhost:11434")
+LEGACY_LLM_MODEL    = os.environ.get("LEGACY_LLM_MODEL", "deepseek-r1:14b")
 
 class AIHedgeAdvisor:
     """
@@ -57,7 +57,7 @@ class AIHedgeAdvisor:
     def __init__(self):
         self.chat_history: List[Dict] = []
         self.max_history_pairs = 10
-        self.model = OLLAMA_MODEL
+        self.model = LEGACY_LLM_MODEL
         self._call_count = 0
         logger.info(f"[HEDGE-AI] Initialized -- model={self.model} memory={self.max_history_pairs} trades")
 

@@ -565,7 +565,7 @@ class EnhancedGPULiveDataEngine:
         self.candle_buffers_gpu: Dict[str, Dict] = {}
         
         # Multi-timeframe candle storage
-        self.timeframes: List[str] = ['5s', '1m', '5m', '15m']
+        self.timeframes: List[str] = ['1m', '5m', '15m']
         self._initialize_candle_buffers()
         
         # Real-time feature tensors
@@ -608,7 +608,6 @@ class EnhancedGPULiveDataEngine:
     def _initialize_candle_buffers(self):
         """Initialize GPU-optimized candle buffers for all timeframes"""
         buffer_sizes = {
-            '5s': 4320,   # 6 hours of 5-second data  
             '1m': 1440,   # 1 day of 1-minute data
             '5m': 864,    # 3 days of 5-minute data
             '15m': 672    # 7 days of 15-minute data
@@ -866,7 +865,6 @@ class EnhancedGPULiveDataEngine:
         last_timestamp = buffer['timestamp'][buffer['pointer']].item() / 1000
         
         timeframe_seconds = {
-            '5s': 5,
             '1m': 60,
             '5m': 300,
             '15m': 900
@@ -1237,11 +1235,11 @@ class EnhancedGPULiveDataEngine:
                 }
             }
             
-            # Add current price from 5-second data (1-second frames are not used)
-            candle_5s = self.get_candle_data('5s', 1)
-            if candle_5s:
-                market_state['current_price'] = float(candle_5s['close'][-1])
-                market_state['current_volume'] = float(candle_5s['volume'][-1])
+            # Add current price from 1-minute data (sub-1m frames are not used)
+            candle_1m = self.get_candle_data('1m', 1)
+            if candle_1m:
+                market_state['current_price'] = float(candle_1m['close'][-1])
+                market_state['current_volume'] = float(candle_1m['volume'][-1])
             
             # Publish to CognitiveBus for Watcher AI monitoring
             if hasattr(self, 'bus') and self.bus:
@@ -1431,11 +1429,11 @@ class EnhancedLiveTradingSystem:
         self.signal_generator = None
         self.logger = EnhancedLogger()
         
-        # Ollama Volatility & Risk Monitor Cooldown setup
-        self.last_ollama_time = 0
-        self.ollama_cooldown = 30  # seconds
-        self.last_ollama_insight = "Market features stable. No anomalous volatility detected."
-        self.last_ollama_risk_state = "NORMAL"
+        # LegacyLLM Volatility & Risk Monitor Cooldown setup
+        self.last_legacy_llm_time = 0
+        self.legacy_llm_cooldown = 30  # seconds
+        self.last_legacy_llm_insight = "Market features stable. No anomalous volatility detected."
+        self.last_legacy_llm_risk_state = "NORMAL"
     
     async def start_live_trading(self):
         """એન્હાન્સ્ડ લાઈવ ટ્રેડિંગ સ્ટાર્ટ"""
@@ -1455,8 +1453,8 @@ class EnhancedLiveTradingSystem:
             self.is_live = False
             self.trading_enabled = False
     
-    def _generate_ollama_volatility_prompt(self, market_state: Dict) -> str:
-        """Generate Ollama prompt for Institutional Risk & Anomaly Monitoring"""
+    def _generate_legacy_llm_volatility_prompt(self, market_state: Dict) -> str:
+        """Generate LegacyLLM prompt for Institutional Risk & Anomaly Monitoring"""
         features = market_state.get('features', {})
         current_price = market_state.get('current_price', 'N/A')
         current_volume = market_state.get('current_volume', 'N/A')
@@ -1492,7 +1490,7 @@ Follow the tag with a brief 1-2 sentence institutional risk assessment.
         return prompt
 
     def get_enhanced_market_data(self) -> Optional[Dict]:
-        """એન્હાન્સ્ડ માર્કેટ ડેટા with trading signals and Ollama Volatility Risk Monitor"""
+        """એન્હાન્સ્ડ માર્કેટ ડેટા with trading signals and LegacyLLM Volatility Risk Monitor"""
         if not self.launcher.data_engine:
             return None
         

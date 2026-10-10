@@ -19,7 +19,7 @@ import requests
 import subprocess
 
 # --- ZERO LAG PURE ALGO MODE ---
-# Set to "True" to completely bypass all LLM/Ollama network calls during live trading
+# Set to "True" to completely bypass all LLM/LegacyLLM network calls during live trading
 os.environ.setdefault("JARVIS_PURE_ALGO", "true")
 # -------------------------------
 def _pure_algorithm_mode():
@@ -33,7 +33,7 @@ from jarvis_dashboard import UnifiedDashboard
 from jarvis_risk import calculate_trade_size, MAX_LEVERAGE_CAP
 from jarvis_decision import normalize_confidence, confidence_text, build_final_decision
 from jarvis_runtime import detect_backend, torch_device
-# Legacy Ollama context removed; deterministic gates are authoritative.
+# Legacy LegacyLLM context removed; deterministic gates are authoritative.
 pro_display = ProfessionalSignalDisplay()
 import warnings
 from collections import deque, defaultdict
@@ -1450,7 +1450,7 @@ class LiveTradingEngine:
                 'gpu': getattr(self.jarvis, 'gpu_status', {'backend': 'unknown'}),
                 'readiness': dict(getattr(self, 'readiness', {'status': 'UNKNOWN'})),
                 'native_engines': getattr(self.jarvis, 'native_engine_status', {}),
-                'ai_suggestion': getattr(self.jarvis, 'last_ollama_decision', {'decision': 'unavailable'}),
+                'ai_suggestion': getattr(self.jarvis, 'last_legacy_llm_decision', {'decision': 'unavailable'}),
                 'part7': part7,
             }
             reasons = (result.get('intelligence_board', []) or [])[:3]
@@ -3105,7 +3105,7 @@ class LiveTradingEngine:
                     traceback.print_exc()
                     # Report main loop error to Cognitive Bus
                     if hasattr(self.jarvis, 'bus') and self.jarvis.bus:
-                        self.jarvis.bus.report_error('JarvisElite_LiveLoop', e, context='main _live_loop cycle', try_ollama=False)
+                        self.jarvis.bus.report_error('JarvisElite_LiveLoop', e, context='main _live_loop cycle', try_legacy_llm=False)
                     time.sleep(30)
             self.is_running = False
             if self.readiness.get('status') not in {'STOPPING', 'STOPPED'}:
@@ -4467,7 +4467,7 @@ class DeepSeekV3Brain:
         self.enabled = False
 
     def analyze_sentiment(self, data, market_context):
-        return 0, "unavailable: legacy Ollama/DeepSeek voting retired; Laya is commentary-only"
+        return 0, "unavailable: legacy LegacyLLM/DeepSeek voting retired; Laya is commentary-only"
 
 
 class DeepSeekR1ReasoningBrain:
@@ -4478,7 +4478,7 @@ class DeepSeekR1ReasoningBrain:
 
     def complex_reasoning(self, all_signals, market_data, context):
         return {"signal": "NO-TRADE", "confidence": 0,
-                "reasoning": "unavailable: legacy Ollama/DeepSeek voting retired; Laya is commentary-only",
+                "reasoning": "unavailable: legacy LegacyLLM/DeepSeek voting retired; Laya is commentary-only",
                 "key_factors": [], "available": False}
 
 class QuantumV5:
@@ -5518,8 +5518,8 @@ class JarvisElite:
         self.runtime = detect_backend()
         self.device = torch_device(self.runtime)
         self.gpu_status = self.runtime.to_dict()
-        self.last_ollama_decision = {"decision": "WAIT", "confidence": 0, "rationale": "not queried"}
-        self.last_ollama_snapshot = None
+        self.last_legacy_llm_decision = {"decision": "WAIT", "confidence": 0, "rationale": "not queried"}
+        self.last_legacy_llm_snapshot = None
         self.scoring_matrix = TradeScoringMatrix()
         self.trade_manager = TradeManager()
         self.expiry_optimizer = TradeOptimizer()
@@ -7362,7 +7362,7 @@ class JarvisElite:
             return {'approved': True, 'reason': 'PURE ALGO BYPASS (Auto-Approved)', 'verdict': 'EXECUTE'}
         """Retired compatibility hook; model output is never an entry gate."""
         result = {'approved': False, 'reason': 'Retired legacy model gate unavailable; unsupported callers must reject', 'verdict': 'NO_TRADE'}
-        self.last_ollama_decision = {'decision': 'UNAVAILABLE', 'confidence': 0, 'rationale': result['reason']}
+        self.last_legacy_llm_decision = {'decision': 'UNAVAILABLE', 'confidence': 0, 'rationale': result['reason']}
         return result
 
     def _create_deepseek_prompt(self, data, score, detailed_scores, telemetry=None):
@@ -7714,7 +7714,7 @@ class JarvisElite:
 
     def _live_mode_with_deepseek(self, data):
         """DEPRECATED: Only called from process_data() which is itself dead code.
-        The active validation path is _get_deepseek_validation() using Ollama phi3.5."""
+        The active validation path is _get_deepseek_validation() using LegacyLLM phi3.5."""
         import warnings
         warnings.warn("_live_mode_with_deepseek() is dead code.", DeprecationWarning, stacklevel=2)
         try:

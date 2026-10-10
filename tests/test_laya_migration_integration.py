@@ -21,12 +21,12 @@ class MigrationIntegration(unittest.TestCase):
 
     def test_cortex_math_not_model_and_no_cached_vote(self):
         cortex = JarvisNeuralCortex()
-        cortex._call_ollama_chat = Mock(side_effect=AssertionError('model called'))
+        cortex._call_legacy_llm_chat = Mock(side_effect=AssertionError('model called'))
         result = cortex.analyze({'part11_fusion': {'signal': -1},
                                  'part12_confidence': {'confidence': 66}}, 101.0)
         self.assertEqual(result['signal'], 'PUT')
         self.assertFalse(result['ai_online'])
-        cortex._call_ollama_chat.assert_not_called()
+        cortex._call_legacy_llm_chat.assert_not_called()
         self.assertEqual(cortex.analyze_holistic_context('prompt')[0], '')
 
     def test_hedge_and_paper_execution_ignore_model_even_when_env_disabled(self):

@@ -295,12 +295,12 @@ class GPUOrderExecutionEngine:
         self.is_running = True
         self.executor = ThreadPoolExecutor(max_workers=3)  # i5 3-core optimized
         
-        # Ollama Position Sizer Cooldown setup
-        self.last_ollama_time = 0
-        self.ollama_cooldown = 30  # seconds
-        self.last_ollama_size_tag = "SIZE: FULL"
-        self.last_ollama_multiplier = 1.0
-        self.last_ollama_insight = "Full position size approved by AI Chief Position Sizer."
+        # LegacyLLM Position Sizer Cooldown setup
+        self.last_legacy_llm_time = 0
+        self.legacy_llm_cooldown = 30  # seconds
+        self.last_legacy_llm_size_tag = "SIZE: FULL"
+        self.last_legacy_llm_multiplier = 1.0
+        self.last_legacy_llm_insight = "Full position size approved by AI Chief Position Sizer."
 
         # Initialize GPU buffers
         self._initialize_execution_buffers()
@@ -464,8 +464,8 @@ class GPUOrderExecutionEngine:
             max_trade_value = self.current_capital * self.risk_config['max_position_size']
             position_size = min(risk_adjusted_size * self.current_capital, max_trade_value) / (current_price + 1e-8)
             
-            # Apply Ollama AI Chief Position Sizer Multiplier (FULL = 1.0, HALF = 0.5, QUARTER = 0.25)
-            multiplier, size_tag, insight = self.get_ollama_position_multiplier(confidence, current_price)
+            # Apply LegacyLLM AI Chief Position Sizer Multiplier (FULL = 1.0, HALF = 0.5, QUARTER = 0.25)
+            multiplier, size_tag, insight = self.get_legacy_llm_position_multiplier(confidence, current_price)
             position_size *= multiplier
 
             return max(position_size, 0.0)  # Ensure non-negative
@@ -474,8 +474,8 @@ class GPUOrderExecutionEngine:
             print(f"ERROR Position sizing calculation error: {e}")
             return 0.0
 
-    def _generate_ollama_sizing_prompt(self, confidence: float, current_price: float) -> str:
-        """Generate Ollama prompt for Chief Position Sizer"""
+    def _generate_legacy_llm_sizing_prompt(self, confidence: float, current_price: float) -> str:
+        """Generate LegacyLLM prompt for Chief Position Sizer"""
         vol_info = {}
         if hasattr(self, 'execution_analysis') and isinstance(self.execution_analysis, dict):
             for k, v in self.execution_analysis.items():
@@ -503,7 +503,7 @@ Follow the tag with a 1-sentence risk justification.
 """
         return prompt
 
-    def get_ollama_position_multiplier(self, confidence: float, current_price: float) -> Tuple[float, str, str]:
+    def get_legacy_llm_position_multiplier(self, confidence: float, current_price: float) -> Tuple[float, str, str]:
         """Legacy hook: preserve deterministic risk sizing, never reuse a cached multiplier."""
         return 1.0, "UNAVAILABLE", "Model sizing disabled; deterministic risk sizing only"
     
@@ -947,9 +947,9 @@ Follow the tag with a 1-sentence risk justification.
                     'timing_score': _safe_float(self.execution_analysis.get('timing_score', 0))
                 }
             
-            analytics['ollama_position_size_tag'] = self.last_ollama_size_tag
-            analytics['ollama_multiplier'] = self.last_ollama_multiplier
-            analytics['ollama_insight'] = self.last_ollama_insight
+            analytics['legacy_llm_position_size_tag'] = self.last_legacy_llm_size_tag
+            analytics['legacy_llm_multiplier'] = self.last_legacy_llm_multiplier
+            analytics['legacy_llm_insight'] = self.last_legacy_llm_insight
 
             # Publish to CognitiveBus for Watcher AI monitoring
             if hasattr(self, 'trading_system') and hasattr(self.trading_system, 'bus') and self.trading_system.bus:

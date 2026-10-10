@@ -113,7 +113,7 @@ class ProfessionalSignalDisplay:
         current_price – live price (float)
         part_results  – dict  {part_name: {signal: -1/0/1, thought: str, …}}
         symbol        – active trading symbol (e.g. 'NEARUSD', 'BTCUSDT')
-        model_name    – active Ollama model name
+        model_name    – active LegacyLLM model name
         """
         self._cycle += 1
 
@@ -194,7 +194,7 @@ class ProfessionalSignalDisplay:
         ap(self._top())
         # Use active symbol from param; fallback to env var or BTC/USDT
         _sym = symbol or __import__('os').environ.get('JARVIS_DEFAULT_SYMBOL', 'BTC/USDT')
-        _model = model_name or __import__('os').environ.get('OLLAMA_MODEL', 'deepseek-r1:14b')
+        _model = model_name or __import__('os').environ.get('LEGACY_LLM_MODEL', 'deepseek-r1:14b')
         header = (
             _clr('  🤖 JARVIS', BD + C) +
             _clr(' NEURAL CORTEX', C) +

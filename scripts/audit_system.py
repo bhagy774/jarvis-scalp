@@ -349,9 +349,9 @@ release_close('BTCUSDT','p', force=True)
 """)
         else:
             self.add("close-idempotency-ownership", "SKIPPED", "high", "Ownership/close helpers absent", category="environment")
-        if "jarvis_ollama_context.py" in self.sources:
-            self.probe("ollama-error-boundary", """
-from jarvis_ollama_context import validate_decision, snapshot_usable, build_snapshot
+        if "jarvis_legacy_llm_context.py" in self.sources:
+            self.probe("legacy_llm-error-boundary", """
+from jarvis_legacy_llm_context import validate_decision, snapshot_usable, build_snapshot
 assert validate_decision(None)[0] is None
 assert validate_decision({'direction':'BUY', 'confidence':'not-a-score'})[0] is None
 valid, err = validate_decision({'decision':'WAIT', 'confidence':0, 'rationale':'no trade', 'plan':{}})
@@ -364,7 +364,7 @@ mismatch = build_snapshot(symbol='BTCUSDT', timestamp=None, current_price=100, m
 assert snapshot_usable(mismatch)[0] is False
 """, severity="medium")
         else:
-            self.add("ollama-error-boundary", "SKIPPED", "medium", "Ollama context helper absent", category="environment")
+            self.add("legacy_llm-error-boundary", "SKIPPED", "medium", "LegacyLLM context helper absent", category="environment")
         rust = self.root / "jarvis_rust"
         if rust.exists() and (rust / "Cargo.toml").exists():
             self.add("rust-optional-parity", "SKIPPED", "medium",

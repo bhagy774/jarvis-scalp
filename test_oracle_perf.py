@@ -12,9 +12,9 @@ def test_oracle_api_retry_performance():
     # Mock running so the wait actually happens
     oracle._running = True
 
-    # Create market_data and ollama_board dicts
+    # Create market_data and legacy_llm_board dicts
     market_data = {"btc_spot": 90000.0}
-    ollama_board = {"analyst": "Bullish", "validator": "Bullish", "risk_officer": "Bullish", "chairman": "CALL"}
+    legacy_llm_board = {"analyst": "Bullish", "validator": "Bullish", "risk_officer": "Bullish", "chairman": "CALL"}
 
     # We want to measure the time it takes when the API fails multiple times with 503
     # Configure the mock to raise Exception with "503" string
@@ -25,7 +25,7 @@ def test_oracle_api_retry_performance():
     oracle._gemini_client.models.generate_content.side_effect = mock_generate_content
 
     start_time = time.time()
-    result = oracle._call_gemini_oracle(market_data, ollama_board)
+    result = oracle._call_gemini_oracle(market_data, legacy_llm_board)
     end_time = time.time()
 
     duration = end_time - start_time

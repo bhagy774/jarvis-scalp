@@ -450,17 +450,17 @@ class DeepSeekValidator:
                 "timestamp": datetime.now().isoformat()
             }
 
-# ==================== OLLAMA LOCAL AI TRADE VALIDATOR (THE JUDGE) ====================
+# ==================== LEGACY_LLM LOCAL AI TRADE VALIDATOR (THE JUDGE) ====================
 
 # Model judges are retired; validator stays disabled (fail closed).
-OLLAMA_INTEGRATION_AVAILABLE = False
+LEGACY_LLM_INTEGRATION_AVAILABLE = False
 
 
-class OllamaLocalValidator:
-    """100% Offline Local AI Trade Validator (The Judge) using Ollama"""
+class LegacyLLMLocalValidator:
+    """100% Offline Local AI Trade Validator (The Judge) using LegacyLLM"""
     
     def __init__(self):
-        self.enabled = OLLAMA_INTEGRATION_AVAILABLE
+        self.enabled = LEGACY_LLM_INTEGRATION_AVAILABLE
         self.validation_cache = deque(maxlen=100)
         self.log_file = Path(tempfile.gettempdir()) / "judge_verdict.log"
     
@@ -495,8 +495,8 @@ Follow the tag with a 1-sentence institutional risk justification.
         return prompt
 
     async def validate_signal(self, signal_data: Dict) -> Dict[str, Any]:
-        """Retired OllamaLocalValidator model judge; unavailable never means approved."""
-        return {"status": "UNAVAILABLE", "verdict": "NO_TRADE", "reasoning": "OllamaLocalValidator retired"}
+        """Retired LegacyLLMLocalValidator model judge; unavailable never means approved."""
+        return {"status": "UNAVAILABLE", "verdict": "NO_TRADE", "reasoning": "LegacyLLMLocalValidator retired"}
 
     def _append_verdict_log(self, result: Dict):
         try:
@@ -839,7 +839,7 @@ class FinalExecutionEngine:
         self.price_feed = DeltaPriceFeed(self.http_client, symbol)
         self.trade_executor = SwingScalpTradeExecutor(self.price_feed, symbol)
         self.deepseek_validator = DeepSeekValidator(self.http_client, openrouter_key)
-        self.ollama_validator = OllamaLocalValidator()
+        self.legacy_llm_validator = LegacyLLMLocalValidator()
         self.telegram_notifier = TelegramNotifier(self.http_client, telegram_token, telegram_chat_id)
         
         # Execution state

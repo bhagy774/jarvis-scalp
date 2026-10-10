@@ -1,7 +1,7 @@
 """Centralized, honest runtime backend detection for Jarvis.
 
 The result describes the backend selected by this process.  It deliberately does
-not claim that a remote Ollama server or every optional engine uses that
+not claim that a remote LegacyLLM server or every optional engine uses that
 backend; those are reported separately by their owners.
 """
 from __future__ import annotations
@@ -126,5 +126,5 @@ def safe_device(value: Any, fallback: str = "cpu"):
 
 
 def runtime_status() -> Dict[str, Any]:
-    """Small telemetry-safe status object for dashboard/Ollama context."""
+    """Small telemetry-safe status object for dashboard/LegacyLLM context."""
     return detect_backend().to_dict()

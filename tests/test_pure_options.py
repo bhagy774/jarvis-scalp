@@ -12,11 +12,11 @@ deterministic = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n
 module = ast.Module(body=[deterministic], type_ignores=[])
 
 class Fake:
-    last_ollama_whale_tag = "WHALE_BULLISH"
-    last_ollama_insight = "stale model result must not leak"
-    last_ollama_time = 0
-    ollama_cooldown = 0
-    def _generate_ollama_options_prompt(self, *_):
+    last_legacy_llm_whale_tag = "WHALE_BULLISH"
+    last_legacy_llm_insight = "stale model result must not leak"
+    last_legacy_llm_time = 0
+    legacy_llm_cooldown = 0
+    def _generate_legacy_llm_options_prompt(self, *_):
         return "test prompt"
 
 class OptionsPathTests(unittest.TestCase):
@@ -27,8 +27,8 @@ class OptionsPathTests(unittest.TestCase):
             "Dict": dict, "Tuple": tuple,
             "_pure_algorithm_mode": lambda: os.getenv("JARVIS_PURE_ALGO", "true").lower() in ("true", "1", "yes", "on"),
             "time": type("Clock", (), {"time": staticmethod(lambda: 999999)})(),
-            "OLLAMA_INTEGRATION_AVAILABLE": True,
-            "call_ollama": lambda *a, **kw: self.calls.append(a) or ("[WHALE_BEARISH]", None),
+            "LEGACY_LLM_INTEGRATION_AVAILABLE": True,
+            "call_legacy_llm": lambda *a, **kw: self.calls.append(a) or ("[WHALE_BEARISH]", None),
             "logging": __import__("logging"),
         }
         exec(compile(module, "jarvis_FIXED.py", "exec"), ns)

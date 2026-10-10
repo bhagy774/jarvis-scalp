@@ -7,7 +7,7 @@ from neural_advisory import part_advisory_entry
 # JARVIS PART 6 - GPU-ACCELERATED BACKTESTING & PERFORMANCE OPTIMIZATION ENGINE
 # Fully hardened against hidden bugs, PyTorch 2.x incompatibilities, Windows platform limits,
 # CUDA tensor .cpu().numpy() conversion warnings, and SSD path cross-platform safety.
-# Includes Ollama Local AI Integration for Backtest Strategy Evaluation.
+# Includes LegacyLLM Local AI Integration for Backtest Strategy Evaluation.
 # ==============================================================================
 
 import sys

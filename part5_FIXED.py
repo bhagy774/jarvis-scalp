@@ -4,7 +4,7 @@ from neural_advisory import part_advisory_entry
 # JARVIS PART 5 - INSTITUTIONAL GPU FUSION ENGINE (GTX 1650 & CPU OPTIMIZED)
 # Fully hardened against hidden bugs, missing CUDA helpers, syntax flaws,
 # missing method signatures, parameter mismatches, and PyTorch fallback errors.
-# Includes Ollama Local AI Integration for Institutional Fusion Validation.
+# Includes LegacyLLM Local AI Integration for Institutional Fusion Validation.
 # ==============================================================================
 
 import sys
@@ -377,13 +377,13 @@ class GPUEnhancedFusionEngine:
                 fused_signal = self._fuse_signals_gpu(module_results)
                 final_confidence = self._aggregate_confidence_gpu(module_results)
                 
-                # Perform Ollama AI Sanity Check if available
-                ollama_thought, ollama_sig = self._call_ollama_fusion_sanity_check(module_results, fused_signal, final_confidence)
+                # Perform LegacyLLM AI Sanity Check if available
+                legacy_llm_thought, legacy_llm_sig = self._call_legacy_llm_fusion_sanity_check(module_results, fused_signal, final_confidence)
                 
                 res = self._create_gpu_signal(fused_signal, final_confidence, "GPU Results Fusion")
-                if ollama_thought:
-                    res['ollama_thought'] = ollama_thought
-                    res['ollama_signal'] = ollama_sig
+                if legacy_llm_thought:
+                    res['legacy_llm_thought'] = legacy_llm_thought
+                    res['legacy_llm_signal'] = legacy_llm_sig
                 return res
 
             df_1min = df_1min_or_results
@@ -399,20 +399,20 @@ class GPUEnhancedFusionEngine:
             fused_signal = self._fuse_signals_gpu(module_results)
             final_confidence = self._aggregate_confidence_gpu(module_results)
             
-            # Ollama AI Sanity Check
-            ollama_thought, ollama_sig = self._call_ollama_fusion_sanity_check(module_results, fused_signal, final_confidence)
+            # LegacyLLM AI Sanity Check
+            legacy_llm_thought, legacy_llm_sig = self._call_legacy_llm_fusion_sanity_check(module_results, fused_signal, final_confidence)
             
             res = self._create_gpu_signal(fused_signal, final_confidence, "GPU Data Fusion")
-            if ollama_thought:
-                res['ollama_thought'] = ollama_thought
-                res['ollama_signal'] = ollama_sig
+            if legacy_llm_thought:
+                res['legacy_llm_thought'] = legacy_llm_thought
+                res['legacy_llm_signal'] = legacy_llm_sig
             return res
             
         except Exception as e:
             error_msg = f"Fusion error: {str(e)}"
             return self._create_gpu_signal("NO TRADE", 0, error_msg)
 
-    def _call_ollama_fusion_sanity_check(self, module_results, fused_signal, confidence):
+    def _call_legacy_llm_fusion_sanity_check(self, module_results, fused_signal, confidence):
         """Compatibility hook: unavailable is not an approval or vote."""
         return None, None
 

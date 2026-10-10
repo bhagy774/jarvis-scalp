@@ -134,7 +134,7 @@ class _Delta:
 
 
 class DeterministicRouterTests(unittest.TestCase):
-    def test_production_router_selects_without_ollama(self):
+    def test_production_router_selects_without_legacy_llm(self):
         with patch.dict(os.environ, {"JARVIS_MULTI_MARKET": "1"}):
             scanner_module = importlib.reload(jarvis_coin_scanner)
             scanner = _scanner(

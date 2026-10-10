@@ -196,7 +196,7 @@ class CognitiveBus:
         Automatically:
         1. Determines severity (WARNING vs CRITICAL).
         2. Logs full traceback to jarvis_thoughts.log.
-        3. Tries to call Ollama to explain what went wrong.
+        3. Tries to call LegacyLLM to explain what went wrong.
         4. Publishes on HEALTH channel so other parts can react.
         
         Usage inside any part:
@@ -219,7 +219,7 @@ class CognitiveBus:
         self.logger.log('HEALTH', part_name, diag)
         self.logger.log('TRACEBACK', part_name, tb_str.replace('\n', ' | '))
         
-        # Try Ollama diagnosis in background (non-blocking)
+        # Try LegacyLLM diagnosis in background (non-blocking)
         if False:  # Retired model diagnosis; do not spawn a thread.
             threading.Thread(
                 target=self._ai_diagnose,

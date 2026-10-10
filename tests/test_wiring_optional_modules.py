@@ -73,7 +73,7 @@ def test_brain_imports_cleanly_with_wired_modules_present(tmp_path):
 
 
 def test_brain_initializes_optional_wiring_without_network(tmp_path):
-    # All HTTP paths are blocked before importing the brain, including local Ollama.
+    # All HTTP paths are blocked before importing the brain, including local LegacyLLM.
     script = '''\
 import requests
 from requests.sessions import Session

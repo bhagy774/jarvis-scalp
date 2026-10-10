@@ -41,14 +41,14 @@ def test_generate_local_forecast_bullish():
         }
     }
 
-    ollama_board = {
+    legacy_llm_board = {
         "analyst": "Bullish",
         "validator": "Bullish",
         "risk_officer": "Safe",
         "chairman": "CONSENSUS_EXECUTE (CALL, 80%)"
     }
 
-    forecast = oracle._generate_local_forecast(market_data, ollama_board)
+    forecast = oracle._generate_local_forecast(market_data, legacy_llm_board)
 
     assert forecast.get("model_used") == "local_synthesizer"
     assert forecast["5min"]["direction"] == "BULLISH"
@@ -72,9 +72,9 @@ def test_generate_local_forecast_bearish():
         }
     }
 
-    ollama_board = {} # Don't really care about the board for local_synthesizer heuristics, but good to pass it
+    legacy_llm_board = {} # Don't really care about the board for local_synthesizer heuristics, but good to pass it
 
-    forecast = oracle._generate_local_forecast(market_data, ollama_board)
+    forecast = oracle._generate_local_forecast(market_data, legacy_llm_board)
 
     assert forecast.get("model_used") == "local_synthesizer"
     assert forecast["5min"]["direction"] == "BEARISH"
