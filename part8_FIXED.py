@@ -255,6 +255,13 @@ class EnhancedPatternGPUMemoryManager:
 
 # ==================== GPU-ACCELERATED MARKET STRUCTURE & SMC ENGINE ====================
 
+try:
+    from brain_xgb import xgb_shadow
+except Exception:  # xgboost helper missing -> no-op, engine unchanged
+    def xgb_shadow(name, method):
+        return lambda cls: cls
+
+@xgb_shadow('p8_structure_engine', 'analyze')
 class MarketStructureEngineGPU:
     """
     JARVIS PART 8 - GPU-ACCELERATED MARKET STRUCTURE & SMART MONEY CONCEPTS (SMC) ENGINE

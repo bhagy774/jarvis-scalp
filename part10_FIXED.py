@@ -144,6 +144,13 @@ from typing import Dict, List, Tuple, Any, Optional, Union
 
 # ==================== GPU-ACCELERATED CANDLESTICK STATS ENGINE ====================
 
+try:
+    from brain_xgb import xgb_shadow
+except Exception:  # xgboost helper missing -> no-op, engine unchanged
+    def xgb_shadow(name, method):
+        return lambda cls: cls
+
+@xgb_shadow('p10_candlestats_engine', 'analyze')
 class CandleStatsEngineGPU:
     """
     JARVIS PART 10 - GPU-ACCELERATED CANDLESTICK STATISTICAL & PRICE ACTION ENGINE

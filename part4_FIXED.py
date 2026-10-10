@@ -1080,6 +1080,13 @@ class RealTimePerformanceMonitor:
 
 # ==================== INSTITUTIONAL VOLUME PROFILE ENGINE (PART 4) ====================
 
+try:
+    from brain_xgb import xgb_shadow
+except Exception:  # xgboost helper missing -> no-op, engine unchanged
+    def xgb_shadow(name, method):
+        return lambda cls: cls
+
+@xgb_shadow('p4_volume_engine', 'analyze')
 class VolumeProfileEngineGPU:
     """
     INSTITUTIONAL VOLUME PROFILE & ORDER FLOW DELTA ENGINE (Part 4)

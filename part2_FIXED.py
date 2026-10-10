@@ -609,6 +609,9 @@ class AutoUpdateSystem:
 # 2. CandlePsychologyMasterGPU (Already implemented in Part 1)
 
 # 3. VolumeProfileBrainGPU
+from brain_xgb import xgb_shadow
+
+@xgb_shadow('volume_profile_brain', 'analyze_volume_profile')
 class VolumeProfileBrainGPU:
     """Advanced Volume Analysis and Profiling"""
     def __init__(self, master_system):
@@ -784,6 +787,7 @@ class VolumeProfileBrainGPU:
             return False
 
 # 4. MarketStructureBrainGPU
+@xgb_shadow('market_structure_brain', 'analyze_market_structure')
 class MarketStructureBrainGPU:
     """Market Structure Analysis and Identification"""
     def __init__(self, master_system):
@@ -1053,6 +1057,7 @@ class MarketStructureBrainGPU:
         return signals
 
 # 5. OrderFlowBrainGPU
+@xgb_shadow('order_flow_brain', 'analyze_order_flow')
 class OrderFlowBrainGPU:
     """Order Flow and Liquidity Analysis"""
     def __init__(self, master_system):
@@ -1275,6 +1280,7 @@ class OrderFlowBrainGPU:
         return signals
 
 # 6. MomentumOscillatorBrainGPU
+@xgb_shadow('momentum_osc_brain', 'calculate_all_oscillators')
 class MomentumOscillatorBrainGPU:
     """Advanced Momentum and Oscillator Analysis"""
     def __init__(self, master_system):
@@ -1607,6 +1613,7 @@ class MomentumOscillatorBrainGPU:
         return signals
 
 # 7. VolatilityRegimeBrainGPU
+@xgb_shadow('vol_regime_brain', 'analyze_volatility_regime')
 class VolatilityRegimeBrainGPU:
     """Volatility Regime Detection and Analysis"""
     def __init__(self, master_system):
@@ -1857,6 +1864,7 @@ class VolatilityRegimeBrainGPU:
         return signals
 
 # 8. CycleAnalysisBrainGPU  
+@xgb_shadow('cycle_brain', 'analyze_market_cycles')
 class CycleAnalysisBrainGPU:
     """Market Cycle Analysis and Identification"""
     def __init__(self, master_system):
@@ -2047,6 +2055,7 @@ class CycleAnalysisBrainGPU:
         return signals
 
 # 9. CorrelationMatrixBrainGPU
+@xgb_shadow('correlation_brain', 'analyze_correlations')
 class CorrelationMatrixBrainGPU:
     """Inter-market Correlation Analysis"""
     def __init__(self, master_system):
@@ -2269,6 +2278,7 @@ class CorrelationMatrixBrainGPU:
         return signals
 
 # 10. PatternRecognitionBrainGPU
+@xgb_shadow('pattern_brain', 'recognize_chart_patterns')
 class PatternRecognitionBrainGPU:
     """Advanced Chart Pattern Recognition"""
     def __init__(self, master_system):
@@ -2542,6 +2552,7 @@ class PatternRecognitionBrainGPU:
         return signals
 
 # 11. SupportResistanceBrainGPU
+@xgb_shadow('sr_brain', 'calculate_support_resistance')
 class SupportResistanceBrainGPU:
     """Dynamic Support and Resistance Level Calculation"""
     def __init__(self, master_system):
@@ -2855,6 +2866,7 @@ class SupportResistanceBrainGPU:
         return signals
 
 # 12. TrendAnalysisBrainGPU
+@xgb_shadow('trend_analysis_brain', 'analyze_multi_timeframe_trends')
 class TrendAnalysisBrainGPU:
     """Multi-timeframe Trend Analysis"""
     def __init__(self, master_system):
@@ -3013,6 +3025,7 @@ class TrendAnalysisBrainGPU:
         return signals
 
 # 13. MarketRegimeBrainGPU
+@xgb_shadow('market_regime_brain', 'detect_market_regime')
 class MarketRegimeBrainGPU:
     """Market Condition and Regime Detection"""
     def __init__(self, master_system):
@@ -3249,6 +3262,7 @@ class MarketRegimeBrainGPU:
         return signals
 
 # 14. PriceActionBrainGPU
+@xgb_shadow('price_action_brain', 'analyze_price_action')
 class PriceActionBrainGPU:
     """Pure Price Action Analysis"""
     def __init__(self, master_system):
@@ -3550,6 +3564,7 @@ class PriceActionBrainGPU:
         return signals
 
 # 15. InstitutionalFlowBrainGPU
+@xgb_shadow('inst_flow_brain', 'analyze_institutional_flow')
 class InstitutionalFlowBrainGPU:
     """Smart Money and Institutional Flow Tracking"""
     def __init__(self, master_system):
@@ -3813,6 +3828,7 @@ class InstitutionalFlowBrainGPU:
         return signals
 
 # 16. SignalFusionBrainGPU
+@xgb_shadow('signal_fusion_brain', 'fuse_signals')
 class SignalFusionBrainGPU:
     """Multi-Brain Signal Fusion and Confidence Weighting"""
     def __init__(self, master_system):

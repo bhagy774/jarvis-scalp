@@ -117,6 +117,44 @@ class ModeEngine:
             if self.p3_institutional:
                 self.p3_institutional.bus = bus
 
+    # ---------------- XGBoost micro-brain support (SHADOW by default) ----------------
+    # Each brain may expose an XGBoost confidence (0..1, 0.5 = neutral / no model).
+    # By default it is only REPORTED (self.last_xgb_report). Vote weighting is OFF unless the
+    # operator sets JARVIS_XGB_VOTE_WEIGHTING=1, and then ONLY brains whose own validated model
+    # is active are weighted: weight = clamp(0.5 + confidence, 0.5, 1.5). Missing/neutral = 1.0.
+    # This never changes the Part 5 veto, institutional rules or the global live_godmode veto.
+    @staticmethod
+    def _xgb_weighting_enabled():
+        import os
+        return os.environ.get("JARVIS_XGB_VOTE_WEIGHTING", "0") == "1"
+
+    def _xgb_vote_weight(self, brain_name):
+        if not self._xgb_weighting_enabled():
+            return 1
+        rep_ = getattr(self, "last_xgb_report", {}).get(brain_name)
+        if not rep_ or not rep_.get("active"):
+            return 1
+        try:
+            c = float(rep_.get("confidence", 0.5))
+            if not (0.0 <= c <= 1.0):
+                return 1
+            return min(max(0.5 + c, 0.5), 1.5)
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _xgb_from(obj):
+        """(confidence, active) from a result dict or a brain's last_xgb side-channel."""
+        try:
+            if isinstance(obj, dict) and "xgb_confidence" in obj:
+                return float(obj["xgb_confidence"]), bool(obj.get("xgb_active", False))
+            lx = getattr(obj, "last_xgb", None)
+            if isinstance(lx, dict):
+                return float(lx.get("confidence", 0.5)), bool(lx.get("active", False))
+        except Exception:
+            pass
+        return None
+
     def evaluate_all_brains(self, tf_dict):
         """
         Omni-Timeframe Loop:
@@ -131,6 +169,7 @@ class ModeEngine:
         price = primary_df['close'].iloc[-1] if primary_df is not None else 0
         
         brain_tf_signals = {}  # {brain_name: {tf_name: (direction, confidence)}}
+        xgb_acc = {}  # {brain_name: [(confidence, active), ...]} (shadow report)
 
         # Iterate through EVERY timeframe provided by API
         for tf_name, df in available_tfs.items():
@@ -165,6 +204,15 @@ class ModeEngine:
                 'mini_r1': r1_res,
                 'mini_v3': v3_res
             })
+
+            for _n, _o in (("P1_Trend", t_res), ("P1_Volatility", v_res), ("P1_Strength", st_res),
+                           ("P1_Risk", rk_res), ("P1_Reversal", rv_res), ("P1_Regime", reg_res),
+                           ("P1_DeepSeek", ds_res), ("P1_Evolution", evo_res), ("P1_Memory", mem_res),
+                           ("P1_SelfHealing", heal_res), ("P1_MiniR1", r1_res), ("P1_MiniV3", v3_res),
+                           ("P1_MetaFusion", mf_res)):
+                _x = self._xgb_from(_o)
+                if _x:
+                    xgb_acc.setdefault(_n, []).append(_x)
 
             def add_tf_sig(b_name, dir_val, conf_val):
                 if b_name not in brain_tf_signals: brain_tf_signals[b_name] = {}
@@ -215,6 +263,31 @@ class ModeEngine:
             add_tf_sig("P2_PriceAction", *eval_p2_tf(lambda: (b2["price_action"].analyze_price_action(df), b2["price_action"].get_pa_signals(price, psy))[1]))
             add_tf_sig("P2_InstitutionalFlow", *eval_p2_tf(lambda: (b2["institutional_flow"].analyze_institutional_flow(df), b2["institutional_flow"].get_institutional_signals(price, psy))[1]))
             add_tf_sig("P2_SignalFusion", *eval_p2_tf(lambda: b2["signal_fusion"].fuse_signals([], price, {})))
+
+        # ---- shadow XGBoost report (Part 2/3 brains expose brain.last_xgb) ----
+        _p2_map = {"P2_ZonePointFiveDetector": "zone_detector", "P2_CandlePsychologyMaster": "candle_psychology",
+                   "P2_VolumeProfile": "volume_profile", "P2_MarketStructure": "market_structure",
+                   "P2_OrderFlow": "order_flow", "P2_MomentumOscillator": "momentum_oscillator",
+                   "P2_VolatilityRegime": "volatility_regime", "P2_CycleAnalysis": "cycle_analysis",
+                   "P2_CorrelationMatrix": "correlation_matrix", "P2_PatternRecognition": "pattern_recognition",
+                   "P2_SupportResistance": "support_resistance", "P2_TrendAnalysis": "trend_analysis",
+                   "P2_MarketRegime": "market_regime", "P2_PriceAction": "price_action",
+                   "P2_InstitutionalFlow": "institutional_flow", "P2_SignalFusion": "signal_fusion"}
+        for _n, _k in _p2_map.items():
+            _b = self.p2_brains.get(_k) if isinstance(self.p2_brains, dict) else None
+            _x = self._xgb_from(_b) if _b is not None else None
+            if _x:
+                xgb_acc.setdefault(_n, []).append(_x)
+        _p3 = getattr(self, "p3_institutional", None)
+        _x = self._xgb_from(_p3) if _p3 is not None else None
+        if _x:
+            xgb_acc.setdefault("P3_Institutional", []).append(_x)
+        _report = {}
+        for _n, _l in xgb_acc.items():
+            _act = [c for c, a in _l if a]
+            _report[_n] = {"confidence": float(sum(_act) / len(_act)) if _act else 0.5,
+                           "active": bool(_act)}
+        self.last_xgb_report = _report
 
         # Synthesize final vote per brain across ALL timeframes
         final_brain_votes = {}
@@ -295,7 +368,7 @@ class ModeEngine:
         
         for brain_name, (m, d) in votes.items():
             if (m, d) in tally:
-                tally[(m, d)] += 1
+                tally[(m, d)] += self._xgb_vote_weight(brain_name)  # 1.0 unless opt-in weighting + active model
 
         # --- PART 3 INSTITUTIONAL SUPER-VOTING ---
         institutional_veto_dir = None
@@ -391,7 +464,8 @@ class ModeEngine:
                 "timeframes_evaluated": list(tf_dict.keys()),
                 "all_brain_votes": votes,
                 "vote_tally": tally,
-                "reason": "NO_29_BRAIN_CONSENSUS"
+                "reason": "NO_29_BRAIN_CONSENSUS",
+                "xgb_shadow": getattr(self, "last_xgb_report", {})
             }
 
         sl, tp, rr = self.calculate_dynamic_sl_tp(m5 if winning_mode == "SCALP" else h1, price, winning_dir, winning_mode)
@@ -408,7 +482,8 @@ class ModeEngine:
             "timeframes_evaluated": list(tf_dict.keys()),
             "all_brain_votes": votes,
             "vote_tally": tally,
-            "reason": f"ALL_29_BRAIN_CONSENSUS_{winning_mode}_{winning_dir}"
+            "reason": f"ALL_29_BRAIN_CONSENSUS_{winning_mode}_{winning_dir}",
+            "xgb_shadow": getattr(self, "last_xgb_report", {})
         }
 
         # Let the internal brains know the final verdict via the Cognitive Bus

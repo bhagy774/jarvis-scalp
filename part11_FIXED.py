@@ -997,6 +997,13 @@ class EnhancedConfidenceSystem:
 
 # ==================== GPU-OPTIMIZED PART-11: SIGNAL FUSION ENGINE ====================
 
+try:
+    from brain_xgb import xgb_shadow
+except Exception:  # xgboost helper missing -> no-op, engine unchanged
+    def xgb_shadow(name, method):
+        return lambda cls: cls
+
+@xgb_shadow('p11_signal_fusion_engine', 'analyze')
 class SignalFusionEngineGPU:
     """
     INSTITUTIONAL QUANTITATIVE SIGNAL FUSION ENGINE (PART 11)

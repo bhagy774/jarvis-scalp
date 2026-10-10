@@ -137,6 +137,13 @@ from typing import Dict, List, Tuple, Any, Optional, Union
 
 # ==================== GPU-ACCELERATED ORDERFLOW & CVD DELTA ENGINE ====================
 
+try:
+    from brain_xgb import xgb_shadow
+except Exception:  # xgboost helper missing -> no-op, engine unchanged
+    def xgb_shadow(name, method):
+        return lambda cls: cls
+
+@xgb_shadow('p9_orderflow_engine', 'analyze')
 class OrderflowEngineGPU:
     """
     JARVIS PART 9 - GPU-ACCELERATED ORDERFLOW & CUMULATIVE VOLUME DELTA (CVD) ENGINE

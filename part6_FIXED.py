@@ -904,6 +904,13 @@ Status: Failed
 
 # ==================== INSTITUTIONAL TREND ENGINE (PART 6) ====================
 
+try:
+    from brain_xgb import xgb_shadow
+except Exception:  # xgboost helper missing -> no-op, engine unchanged
+    def xgb_shadow(name, method):
+        return lambda cls: cls
+
+@xgb_shadow('p6_trend_engine', 'analyze')
 class TrendEngineGPU:
     """
     INSTITUTIONAL MULTI-TIMEFRAME TREND & CHOP REGIME ENGINE (Part 6)

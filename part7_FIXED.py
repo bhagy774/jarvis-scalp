@@ -373,6 +373,13 @@ def _cuda_guard(device):
 
 # ==================== GPU-ACCELERATED VOLATILITY & REGIME ENGINE ====================
 
+try:
+    from brain_xgb import xgb_shadow
+except Exception:  # xgboost helper missing -> no-op, engine unchanged
+    def xgb_shadow(name, method):
+        return lambda cls: cls
+
+@xgb_shadow('p7_volatility_engine', 'analyze')
 class VolatilityEngineGPU:
     """
     JARVIS PART 7 - GPU-ACCELERATED VOLATILITY & REGIME ENGINE

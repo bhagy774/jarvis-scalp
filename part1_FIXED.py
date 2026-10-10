@@ -2,6 +2,9 @@ from neural_advisory import part_advisory_entry
 
 import numpy as np
 
+# Shadow-mode micro-XGBoost per brain (adds xgb_confidence only; never changes decisions)
+from brain_xgb import xgb_brain
+
 from collections import deque
 
 # PyTorch with fallback for Windows/WSL compatibility
@@ -355,6 +358,7 @@ class GPUFeatureExtractor:
             pass
         return {'trend_strength': 0.0, 'volatility_regime': 'UNKNOWN'}
 
+@xgb_brain('trend_brain', 'analyze_trend')
 class TrendBrain:
     def __init__(self):
         self.trend_memory = LinuxOptimizedDeque(maxlen=100)
@@ -411,6 +415,7 @@ class TrendBrain:
         except:
             return {'trend_direction': 0, 'trend_strength': 0, 'trend_quality': 0, 'momentum': 0, 'support_score': 0}
 
+@xgb_brain('volatility_brain', 'analyze_volatility')
 class VolatilityBrain:
     def __init__(self):
         self.volatility_history = LinuxOptimizedDeque(maxlen=50)
@@ -480,6 +485,7 @@ class VolatilityBrain:
         except Exception as e:
             return {'volatility_regime': 'UNKNOWN', 'volatility_score': 0, 'breakout_potential': 0, 'volatility_trend': 0, 'support_score': 0}
 
+@xgb_brain('strength_brain', 'analyze_strength')
 class StrengthBrain:
     def __init__(self):
         self.strength_memory = LinuxOptimizedDeque(maxlen=100)
@@ -529,6 +535,7 @@ class StrengthBrain:
         except:
             return {'breakout_strength': 0, 'momentum_strength': 0, 'volume_confirmation': 0, 'overall_strength': 0, 'strength_momentum': 0, 'support_score': 0}
 
+@xgb_brain('risk_brain', 'analyze_risk')
 class RiskBrain:
     def __init__(self):
         self.risk_history = LinuxOptimizedDeque(maxlen=50)
@@ -573,6 +580,7 @@ class RiskBrain:
         except:
             return {'risk_score': 0.5, 'fakeout_probability': 0.5, 'stop_distance': 0, 'position_size': 0, 'avg_risk': 0.5, 'support_score': 0.5}
 
+@xgb_brain('reversal_brain', 'analyze_reversal')
 class ReversalBrain:
     def __init__(self):
         self.reversal_patterns = LinuxOptimizedDeque(maxlen=100)
@@ -630,6 +638,7 @@ class ReversalBrain:
         except:
             return {'reversal_probability': 0, 'exhaustion_signals': 0, 'divergence_detected': False, 'price_momentum': 0, 'volume_momentum': 0, 'support_score': 1}
 
+@xgb_brain('regime_brain', 'analyze_regime')
 class RegimeBrain:
     def __init__(self):
         self.regime_history = LinuxOptimizedDeque(maxlen=100)
@@ -685,6 +694,7 @@ class RegimeBrain:
         except:
             return {'regime_type': 'UNKNOWN', 'regime_confidence': 0, 'transition_phase': False, 'support_score': 0}
 
+@xgb_brain('deepseek_brain', 'analyze_deepseek')
 class DeepSeekBrain:
     def __init__(self):
         self.correction_memory = LinuxOptimizedDeque(maxlen=200)
@@ -746,6 +756,7 @@ class DeepSeekBrain:
         except:
             return {'correction_factor': 0, 'noise_level': 0, 'fakeout_block': 0, 'contradiction_score': 0, 'threshold_boost': 0, 'support_score': 0}
 
+@xgb_brain('evolution_brain', 'analyze_evolution')
 class EvolutionBrain:
     def __init__(self):
         self.generation = 1
@@ -791,6 +802,7 @@ class EvolutionBrain:
         except:
             return {'generation': 1, 'adaptation_factor': 0.5, 'performance_score': 0.5, 'learning_rate': 0.1, 'support_score': 0.5}
 
+@xgb_brain('memory_brain', 'analyze_memory')
 class MemoryBrain:
     def __init__(self):
         self.short_term_memory = LinuxOptimizedDeque(maxlen=50)
@@ -835,6 +847,7 @@ class MemoryBrain:
         except:
             return {'short_term_recall': 0, 'long_term_pattern': 0, 'prediction_confidence': 0, 'memory_strength': 0, 'support_score': 0}
 
+@xgb_brain('selfhealing_brain', 'analyze_self_heal')
 class SelfHealingBrain:
     def __init__(self):
         self.stability_memory = LinuxOptimizedDeque(maxlen=100)
@@ -879,6 +892,7 @@ class SelfHealingBrain:
         except:
             return {'stability_score': 0.8, 'error_rate': 0.1, 'health_index': 0.9, 'recovery_factor': 0.5, 'support_score': 0.7}
 
+@xgb_brain('metafusion_brain', 'analyze_meta_fusion')
 class MetaFusionBrain:
     def __init__(self):
         self.fusion_scores = LinuxOptimizedDeque(maxlen=100)
@@ -931,6 +945,7 @@ class MetaFusionBrain:
         except:
             return {'fusion_score': 0, 'consensus_level': 0, 'weight_distribution': [], 'support_score': 0}
 
+@xgb_brain('mini_r1_brain', 'analyze_mini_r1')
 class MiniR1Brain:
     def __init__(self):
         self.reasoning_stack = LinuxOptimizedDeque(maxlen=20)
@@ -985,6 +1000,7 @@ class MiniR1Brain:
         except:
             return {'reasoning_depth': 0, 'trap_probability': 0, 'psychology_score': 0, 'volatility_override': 0, 'support_score': 0}
 
+@xgb_brain('mini_v3_brain', 'analyze_mini_v3')
 class MiniV3Brain:
     def __init__(self):
         self.microstructure_memory = LinuxOptimizedDeque(maxlen=100)
