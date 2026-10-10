@@ -12,7 +12,7 @@ class Series:
 SOURCE = (Path(__file__).parent.parent / "jarvis_FIXED.py").read_text(encoding="utf-8")
 tree = ast.parse(SOURCE)
 cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Part14OptionsChain")
-methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in {"analyze", "analyze_options_with_ollama", "analyze_options_deterministically"}]
+methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in {"analyze", "analyze_options_deterministically"}]
 module = ast.Module(body=methods, type_ignores=[])
 
 class Delta:
@@ -44,10 +44,10 @@ class OptionsMathIntegration(unittest.TestCase):
             "call_ollama":lambda *a,**k:calls.append(a),"_calls":calls}
         exec(compile(module,"jarvis_FIXED.py","exec"),ns)
         Fake.analyze_options_deterministically = ns["analyze_options_deterministically"]
-        self.analyze=ns["analyze"]; self.analyze_whale=ns["analyze_options_with_ollama"]; self.calls=calls
+        self.analyze=ns["analyze"]; self.analyze_whale=ns["analyze_options_deterministically"]; self.calls=calls
     def _run(self, price):
         fake=Fake()
-        fake.analyze_options_with_ollama=lambda telemetry, current: self.analyze_whale(fake, telemetry, current)
+        fake.analyze_options_deterministically=lambda telemetry, current: self.analyze_whale(fake, telemetry, current)
         return self.analyze(fake,{"close":Series([price])},{"symbol":"ETHUSDT"})
     def test_observed_levels_produce_finite_distances_without_model_call(self):
         out=self._run(100.0); t=out["telemetry"]
@@ -71,7 +71,7 @@ class OptionsMathIntegration(unittest.TestCase):
             def get_institutional_bias(self, asset):
                 return {"bias":"NEUTRAL", "score":0, "reasons":["No Data"]}
         fake.delta_client = NoData()
-        fake.analyze_options_with_ollama=lambda telemetry, current: self.analyze_whale(fake, telemetry, current)
+        fake.analyze_options_deterministically=lambda telemetry, current: self.analyze_whale(fake, telemetry, current)
         out = self.analyze(fake, {"close":Series([100.0])}, {"selected_symbol":"ETHUSDT"})
         self.assertEqual(out["signal"], 0)
         self.assertFalse(out["telemetry"]["available"])

@@ -7,9 +7,9 @@ from pathlib import Path
 SOURCE = (Path(__file__).parent.parent / "jarvis_FIXED.py").read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
 cls = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == "Part14OptionsChain")
-method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "analyze_options_with_ollama")
+method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "analyze_options_deterministically")
 deterministic = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "analyze_options_deterministically")
-module = ast.Module(body=[method, deterministic], type_ignores=[])
+module = ast.Module(body=[deterministic], type_ignores=[])
 
 class Fake:
     last_ollama_whale_tag = "WHALE_BULLISH"
@@ -32,7 +32,7 @@ class OptionsPathTests(unittest.TestCase):
             "logging": __import__("logging"),
         }
         exec(compile(module, "jarvis_FIXED.py", "exec"), ns)
-        self.method = ns["analyze_options_with_ollama"]
+        self.method = ns["analyze_options_deterministically"]
         Fake.analyze_options_deterministically = ns["analyze_options_deterministically"]
     def tearDown(self):
         if self.old is None: os.environ.pop("JARVIS_PURE_ALGO", None)
