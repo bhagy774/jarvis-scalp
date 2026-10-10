@@ -90,8 +90,10 @@ class JarvisXGBoostEngine:
             except Exception as e:
                 logger.warning("Failed to load existing XGBoost model: %s; re-initializing", e)
 
-        # Initialize with baseline institutional trees
-        self._create_bootstrap_baseline()
+        # No synthetic/random baseline is created: without a real trained model
+        # the engine is UNAVAILABLE and evaluate() returns a non-approving neutral result.
+        self.model = None
+        self.is_bootstrapped = False
 
     def _create_bootstrap_baseline(self):
         """Create initial calibrated baseline model using synthetic institutional priors."""
@@ -357,6 +359,11 @@ class JarvisXGBoostEngine:
         """
         if self.model is None:
             self._load_or_initialize()
+        if self.model is None:
+            return {"win_probability": 0.5, "win_probability_pct": "50.0%", "kelly_fraction": 0.0,
+                    "expected_return_pct": 0.0, "regime": "UNKNOWN", "approved": False,
+                    "status": "UNAVAILABLE", "reason": "no real trained model",
+                    "min_threshold": MIN_WIN_PROBABILITY, "features_evaluated": 0}
 
         feat = features_48.reshape(1, -1).astype(np.float32)
         dmatrix = xgb.DMatrix(feat, feature_names=self.feature_names)

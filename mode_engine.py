@@ -372,47 +372,10 @@ class ModeEngine:
                 }
         # --- END VETO ---
 
-        # --- XGBOOST CONTINUOUS META-LEARNING VETO ---
-        if winning_dir:
-            try:
-                import os
-                import pandas as pd
-                import xgboost as xgb
-                if os.path.exists("live_godmode.xgb"):
-                    # Create the feature array [SwingBuy, SwingSell, ScalpBuy, ScalpSell, Part5Veto]
-                    p5_val = 1 if part5_veto else 0
-                    xgb_features = pd.DataFrame([{
-                        'Swing_Buy_Votes': swing_buy,
-                        'Swing_Sell_Votes': swing_sell,
-                        'Scalp_Buy_Votes': scalp_buy,
-                        'Scalp_Sell_Votes': scalp_sell,
-                        'Part5_Veto': p5_val
-                    }])
-                    
-                    xgb_model = xgb.Booster()
-                    xgb_model.load_model("live_godmode.xgb")
-                    dtest = xgb.DMatrix(xgb_features)
-                    win_prob = xgb_model.predict(dtest)[0]
-                    
-                    if win_prob < 0.65:
-                        return {
-                            "action": "HOLD",
-                            "trade_type": None,
-                            "direction": None,
-                            "entry": price,
-                            "sl": None,
-                            "tp": None,
-                            "rr": None,
-                            "total_brains_voted": len(votes),
-                            "timeframes_evaluated": list(tf_dict.keys()),
-                            "all_brain_votes": votes,
-                            "vote_tally": tally,
-                            "reason": f"XGBOOST_META_VETO: AI calculated only {win_prob*100:.1f}% win probability for this {winning_mode} {winning_dir}."
-                        }
-                    else:
-                        tally["XGBoost_Win_Prob"] = f"{win_prob*100:.1f}%" # Attach for logging
-            except Exception as e:
-                pass # If model fails to load or predict, fallback to normal ModeEngine
+        # XGBoost veto removed here: the previous live_godmode.xgb was trained on
+        # RANDOM vote features (pure noise). The only XGBoost layer is now the
+        # validated, per-symbol 15m meta-gate in jarvis_xgb_meta.py, applied in
+        # jarvis_FIXED._xgb_meta_gate (veto-only, fail-neutral).
         # --- END XGBOOST VETO ---
 
         if not winning_dir:
