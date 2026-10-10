@@ -6558,6 +6558,75 @@ class JarvisElite:
                     'entry_blocked': True, 'risk_veto': False, 'data_status': 'error',
                     'computation_backend': 'pandas_cpu', 'timeframe_results': part7_by_timeframe,
                 }
+            # JARVIS owns the final entry decision.  Part 7 is advisory: its
+            # volatility vetoes are reported, but only invalid/missing data or a
+            # veto on the entry timeframe(s) may block a new entry.
+            try:
+                _p7 = self.latest_part7 if isinstance(self.latest_part7, dict) else {}
+                _rows = _p7.get('timeframe_results') or {}
+                _hard = [tf for tf, r in _rows.items()
+                         if not isinstance(r, dict)
+                         or r.get('data_status') != 'valid'
+                         or r.get('status') not in ('ok', 'neutral', 'veto')]
+                _vetoed = list(_p7.get('veto_timeframes') or [])
+                _entry_tfs = ('15m',)
+                _entry_veto = [tf for tf in _vetoed if tf in _entry_tfs]
+                _p7['advisory_veto_timeframes'] = _vetoed
+                _p7['jarvis_hard_data_blocks'] = _hard
+                _p7['jarvis_entry_veto_timeframes'] = _entry_veto
+                if _hard:
+                    _p7['entry_blocked'] = True
+                    _p7['reason'] = 'Part7 data invalid on ' + ', '.join(_hard)
+                elif _entry_veto:
+                    _p7['entry_blocked'] = True
+                    _p7['reason'] = 'JARVIS: extreme volatility on entry timeframe ' + ', '.join(_entry_veto)
+                else:
+                    # Advisory-only: keep the originals under advisory_* keys and
+                    # present a clean, execution-valid aggregate to the approval layer.
+                    _new_rows = {}
+                    for _tf, _r in _rows.items():
+                        _r2 = dict(_r)
+                        if _r2.get('risk_veto') or _r2.get('entry_blocked') or _r2.get('status') == 'veto':
+                            _r2['advisory_risk_veto'] = bool(_r2.get('risk_veto'))
+                            _r2['advisory_status'] = _r2.get('status')
+                            _r2['risk_veto'] = False
+                            _r2['entry_blocked'] = False
+                            if _r2.get('status') == 'veto':
+                                _r2['status'] = 'neutral'
+                        _new_rows[_tf] = _r2
+                    _p7['timeframe_results'] = _new_rows
+                    _p7['status'] = 'ok'
+                    _p7['data_status'] = 'valid'
+                    _p7['risk_veto'] = False
+                    _p7['veto_timeframes'] = []
+                    _p7['blocked_timeframes'] = []
+                    _p7['entry_blocked'] = False
+                    for _tf, _d in list(mtf_breakdown.items()):
+                        _pv = _d.get('part7_volatility') if isinstance(_d, dict) else None
+                        if isinstance(_pv, dict) and (_pv.get('risk_veto') or _pv.get('entry_blocked') or _pv.get('status') == 'veto'):
+                            _pv = dict(_pv)
+                            _pv['advisory_status'] = _pv.get('status')
+                            _pv['advisory_risk_veto'] = bool(_pv.get('risk_veto'))
+                            _pv['risk_veto'] = False
+                            _pv['entry_blocked'] = False
+                            _pv['status'] = 'neutral'
+                            _d['part7_volatility'] = _pv
+                    for _tf, _d in list(mtf_diagnostics.items()):
+                        _pv = _d.get('part7_volatility') if isinstance(_d, dict) else None
+                        if isinstance(_pv, dict) and (_pv.get('risk_veto') or _pv.get('entry_blocked') or _pv.get('status') == 'veto'):
+                            _pv = dict(_pv)
+                            _pv['advisory_status'] = _pv.get('status')
+                            _pv['advisory_risk_veto'] = bool(_pv.get('risk_veto'))
+                            _pv['risk_veto'] = False
+                            _pv['entry_blocked'] = False
+                            _pv['status'] = 'neutral'
+                            _d['part7_volatility'] = _pv
+                    _p7['reason'] = ('Part7 advisory only (higher-timeframe vol noted: '
+                                     + ', '.join(_vetoed) + ')') if _vetoed else 'Part7 data valid'
+                self.latest_part7 = _p7
+            except Exception as _p7_exc:
+                self.latest_part7 = {**(self.latest_part7 or {}), 'entry_blocked': True,
+                                     'reason': 'Part7 policy error: %r' % (_p7_exc,)}
             self.latest_part7_cycle_display = dict(self.latest_part7)
 
             # Build final part_results with MTF confirmation & veto protection
